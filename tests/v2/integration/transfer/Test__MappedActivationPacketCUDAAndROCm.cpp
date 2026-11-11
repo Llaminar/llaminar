@@ -1,30 +1,15 @@
 /**
  * @file Test__MappedActivationPacketCUDAAndROCm.cpp
- * Canonical ticket lifecycle also covers actual QFN H2560 chunk capacities,
- * preserving original twenty-generation dirty-tail and held-publication checks.
- * @brief Real-device sparse-payload proof for node-local ExpertOverlay epochs.
+ * @brief Original-owned canonical CPU ticket, sparse route and dense publication proofs.
  *
- * The production node-local transport resolves one mapped packet lane for each
- * planner-selected endpoint. This test runs the complete CUDA/ROCm packet path
- * in both role assignments and across three ordered model stages. The retained
- * endpoint graphs cover continuation route compaction, exact-stream mapped
- * publication, follower validation/CSR expansion, follower device work,
- * compact return publication, and deterministic continuation accumulation.
- * The three stages reuse both alternating packet banks, and all work is
- * submitted before either terminal event is observed.
- * CPU-return coverage likewise replays a retained consumer before publishing
- * its payload and checks unrelated DMA and prepared maintenance-copy progress
- * while that consumer waits, including model-sized prefill grids.
- * Large odd-sized sparse packets additionally force multiple payload grid
- * strides in both backend directions. Early replay also leaves the old admission and return timelines
- * live while the new source graph is queued: both fused and forked paths must
- * wait for the next generation, and explicit abort must drain that wait.
- * Portable shared-union controls use ordinary rank-pair consumers. Original
- * CPU cohort declarations retain distinct rank/NUMA members; packet metadata
- * coverage never advertises several CPU sockets executing in one MPI rank.
- * Paired mock ranks deliver real startup declaration/ACK packets through an
- * explicit replay link; production file authentication and exact live extents
- * remain authoritative before either native backend registers its mapping.
+ * Each native body selects actual rank-local GPUs from the original MPI/NUMA
+ * inventory and admits its complete serial geometry roster once. The numerical
+ * oracles preserve exact sparse routing order, changing ownership, retained
+ * capture reuse, dirty capacity tails, and independent background-copy progress
+ * behind a held CPU ticket. True mixed node-local routes require both device
+ * families to belong to the same original rank; cross-rank packet transport is
+ * tested by the separate captured-transfer fixture. Device-free source-map
+ * controls live in their original protocol Unit owner without native startup.
  */
 
 #include <gtest/gtest.h>
@@ -32,48 +17,27 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
-#include "execution/compute_stages/ComputeStageFactory.h"
-#include "execution/local_execution/device/DeviceContext.h"
-#include "execution/local_execution/graph/ComputeGraph.h"
-#include "execution/local_execution/graph/DeviceGraphExecutor.h"
-#include "execution/moe/MoEOverlayActivationEpochProtocol.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
-#include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
-#include "execution/moe/MoEOverlayRetainedActivationTransaction.h"
-#include "execution/moe/MoERuntimeTable.h"
+#include "OriginalMappedComponentResources.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
-#include "mocks/MockMPIContext.h"
-#include "fixtures/mpi/OwnedSharedBackingReplay.h"
-#include "mocks/MockMPITopology.h"
-#include "memory/BufferArena.h"
-#include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
-#include "utils/DebugEnv.h"
-#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <bit>
 #include <array>
-#include <bit>
-#include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <cstdlib>
-#include "execution/moe/MoEExpertShardCohort.h"
-#include "execution/moe/MoEExpertOwnerMap.h"
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <span>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -82,147 +46,6 @@ using namespace llaminar2::test;
 
 namespace
 {
-    constexpr std::int32_t kSourceParticipant = 2;
-    constexpr std::int32_t kTargetParticipant = 7;
-    constexpr std::array<std::int32_t, 3> kLayers{5, 9, 14};
-    constexpr std::int32_t kDModel = 8;
-    constexpr std::int32_t kTopK = 2;
-    constexpr std::uint32_t kExpertCount = 18u;
-    constexpr std::uint64_t kPlacementEpoch = 41u;
-    constexpr std::uint64_t kSchedulerPlacementEpochFloor =
-        kPlacementEpoch - 1u;
-    constexpr std::array<std::int32_t, 8> kRouteParticipantPattern{
-        kTargetParticipant, kSourceParticipant,
-        kSourceParticipant, kSourceParticipant,
-        kTargetParticipant, kTargetParticipant,
-        kSourceParticipant, kTargetParticipant};
-    constexpr std::array<float, 8> kRouteWeightPattern{
-        0.75f, 0.25f, 0.6f, 0.4f,
-        0.55f, 0.45f, 0.9f, 0.1f};
-
-    /** @return Planner owner used by the deterministic router fixture. */
-    constexpr std::int32_t routeParticipant(std::size_t slot) noexcept
-    {
-        return kRouteParticipantPattern[slot % kRouteParticipantPattern.size()];
-    }
-
-    /** @return Whether one logical row carries any route for the follower. */
-    constexpr bool rowVisitsTarget(std::int32_t row) noexcept
-    {
-        for (std::int32_t slot = 0; slot < kTopK; ++slot)
-        {
-            if (routeParticipant(
-                    static_cast<std::size_t>(row * kTopK + slot)) ==
-                kTargetParticipant)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /** @return Number of compact follower rows for a fixed physical geometry. */
-    constexpr std::uint64_t targetLiveRows(std::int32_t rows) noexcept
-    {
-        std::uint64_t result = 0u;
-        for (std::int32_t row = 0; row < rows; ++row)
-            result += rowVisitsTarget(row) ? 1u : 0u;
-        return result;
-    }
-
-    /** @return Number of compact route entries for a fixed physical geometry. */
-    constexpr std::uint64_t targetLiveEntries(std::int32_t rows) noexcept
-    {
-        std::uint64_t result = 0u;
-        for (std::int32_t row = 0; row < rows; ++row)
-        {
-            for (std::int32_t slot = 0; slot < kTopK; ++slot)
-            {
-                result += routeParticipant(
-                              static_cast<std::size_t>(row * kTopK + slot)) ==
-                              kTargetParticipant
-                              ? 1u
-                              : 0u;
-            }
-        }
-        return result;
-    }
-
-    /**
-     * @brief Enable packet and graph fork/join evidence for this process.
-     *
-     * CTest requests the same domain, but the binary is also run directly by
-     * profiler and repetition workflows. Reloading the parsed environment here
-     * keeps those invocations self-certifying without enabling unrelated hot-
-     * path instrumentation.
-     */
-    class ScopedActivationEpochPerfStats final
-    {
-    public:
-        ScopedActivationEpochPerfStats()
-        {
-            preserve("LLAMINAR_PERF_STATS_SUMMARY", summary_);
-            preserve("LLAMINAR_PERF_STATS_FILTER", filter_);
-            ::setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
-            ::setenv(
-                "LLAMINAR_PERF_STATS_FILTER",
-                "moe_overlay_activation_epoch,forward_graph",
-                1);
-            mutableDebugEnv().reload();
-            PerfStatsCollector::reset();
-        }
-
-        ~ScopedActivationEpochPerfStats()
-        {
-            restore("LLAMINAR_PERF_STATS_SUMMARY", summary_);
-            restore("LLAMINAR_PERF_STATS_FILTER", filter_);
-            mutableDebugEnv().reload();
-            PerfStatsCollector::reset();
-        }
-
-        ScopedActivationEpochPerfStats(
-            const ScopedActivationEpochPerfStats &) = delete;
-        ScopedActivationEpochPerfStats &operator=(
-            const ScopedActivationEpochPerfStats &) = delete;
-
-    private:
-        struct SavedValue
-        {
-            bool present = false;
-            std::string value;
-        };
-
-        /** @brief Snapshot one variable before the focused test override. */
-        static void preserve(const char *name, SavedValue &saved)
-        {
-            if (const char *const value = ::getenv(name))
-            {
-                saved.present = true;
-                saved.value = value;
-            }
-        }
-
-        /** @brief Restore one variable exactly as the enclosing process supplied it. */
-        static void restore(const char *name, const SavedValue &saved)
-        {
-            if (saved.present)
-                ::setenv(name, saved.value.c_str(), 1);
-            else
-                ::unsetenv(name);
-        }
-
-        SavedValue summary_;
-        SavedValue filter_;
-    };
-
-    /** @return Main-prefill graph-role bit used by the retained test family. */
-    constexpr std::uint32_t prefillRoleBit() noexcept
-    {
-        return std::uint32_t{1}
-               << static_cast<std::uint32_t>(
-                      MoEOverlayInferenceGraphRole::MainPrefill);
-    }
-
     /** @brief Poll one terminal event without synchronizing its complete device. */
     bool awaitEvent(
         IBackend *backend,
@@ -241,117 +64,6 @@ namespace
             std::this_thread::yield();
         }
         return false;
-    }
-
-    /**
-     * @brief Bind same-node endpoints through their immutable transport channel.
-     * @param rank Synthetic endpoint rank.
-     * @param identity Existing exact channel identity shared by the pair.
-     * @return Context delivering the real startup declaration and live-byte ACK.
-     */
-    std::shared_ptr<MockMPIContext> makeContext(int rank, const std::string &identity, int world_size = 2)
-    {
-        auto context = std::make_shared<OwnedSharedBackingReplayContext>(rank, world_size);
-        context->bind(ownedSharedBackingReplayLink(identity));
-        context->set_topology(MockMPITopology::createSimple(
-            rank, world_size, world_size));
-        return context;
-    }
-
-    /**
-     * @brief Bind the same immutable geometry in wire and captured storage.
-     * @tparam Rows Captured physical row capacity.
-     * @tparam Width Hidden width, including unaligned row tails.
-     * @return Fixed wire workspace required by transport construction.
-     */
-    template <std::int32_t Rows, std::int32_t Width = kDModel>
-    std::shared_ptr<MoEOverlayRankBatchWireWorkspace> makeWireWorkspace(int target = kTargetParticipant, const std::vector<int>& targets = {})
-    {
-        constexpr std::size_t entries =
-            static_cast<std::size_t>(Rows * kTopK);
-        return std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-            MoEOverlayRankBatchWireWorkspace::Config{
-                .participant_ids = targets.empty()?std::vector<int>{target}:targets,
-                .max_total_rows = static_cast<std::size_t>(Rows) *
-                    (targets.empty()?1u:std::min(static_cast<std::size_t>(kTopK),targets.size())),
-                .max_total_entries = entries,
-                .d_model = Width,
-                .top_k = kTopK,
-            });
-    }
-
-    /**
-     * @brief Describe one endpoint without assuming which vendor continues.
-     * @tparam Rows Captured physical row capacity.
-     * @tparam Width Hidden width shared by the two endpoint graphs.
-     * @param local_rank Synthetic rank owning this endpoint.
-     * @param local_device Real device executing the endpoint graph.
-     * @param identity Unique transport binding for this fixture.
-     * @return Exact rank-pair transport config for one process-local endpoint.
-     */
-    template <std::int32_t Rows, std::int32_t Width = kDModel>
-    MoEOverlayRankBatchTransportConfig makeTransportConfig(
-        int local_rank,
-        DeviceId local_device,
-        std::string identity, int target = kTargetParticipant,
-        std::shared_ptr<const MoEExpertOwnerMap> owners = {}, const std::vector<int>& targets = {})
-    {
-        constexpr std::size_t entries =
-            static_cast<std::size_t>(Rows * kTopK);
-        const int target_rank=owners ? owners->participantForId(target)->world_rank : 1;
-        MoEOverlayRankBatchTransportConfig config{
-            .mpi_ctx = makeContext(local_rank == 0 ? 0 : target_rank, identity, owners ? static_cast<int>(owners->participants().size()) : 2),
-            .source_world_rank = 0,
-            .target_world_rank = target_rank,
-            .workspace = makeWireWorkspace<Rows, Width>(target,targets),
-            .max_rows_per_participant = static_cast<std::size_t>(Rows),
-            .max_entries_per_participant = entries,
-            .d_model = Width,
-            .top_k = kTopK,
-            .tier_index = 3,
-            .domain_ordinal = 9,
-            .channel_identity = std::move(identity),
-            .transaction_slot_count = 8,
-            .transaction_topology = {
-                .workspace_generation = 17u,
-                .topology_fingerprint_low = 0x1234567812345678ull,
-                .topology_fingerprint_high = 0x8765432187654321ull,
-                .source_world_rank = 0,
-                .target_world_rank = target_rank,
-            },
-            .source_endpoint = {
-                .world_rank = 0,
-                .participant_id = owners ? 0 : kSourceParticipant,
-                .tier_priority = 80,
-                .domain_ordinal = 4,
-            },
-            .target_tier_priority = 30,
-            .activation_graph_families = {{
-                .graph_role_mask = prefillRoleBit(),
-                .model_layer_indices = std::vector<std::int32_t>(
-                    kLayers.begin(), kLayers.end()),
-            }},
-            // Use the admission planner's exact mapping rather than leaving
-            // the now-required physical layout absent in this fixture.
-            .activation_layout = planMoEOverlayNodeLocalActivationLayout({
-                .participant_count = targets.empty()?1u:targets.size(),
-                .max_rows_per_participant = static_cast<std::size_t>(Rows),
-                .max_entries_per_participant = entries,
-                .d_model = Width,
-                .activation_graph_family_count = 1u,
-            }),
-            .local_lanes = {{
-                .participant_id = target,
-                .device = owners && local_rank != 0 ? DeviceId::cpu() : local_device,
-            }},
-            .original_cpu_joint_owners = owners,
-        };
-        if(!targets.empty()) {
-            config.local_lanes.clear();
-            for(const int id:targets)config.local_lanes.push_back({.participant_id=id,
-                .device=local_rank==0?local_device:DeviceId::cpu()});
-        }
-        return config;
     }
 
     /** @return Backend selected solely from one planner-provided device id. */
@@ -380,3201 +92,8 @@ namespace
         IBackend *backend = nullptr;
         void *address = nullptr;
         int ordinal = 0;
+        std::optional<PhysicalMemoryAllocationLease> claim;
     };
-
-    /**
-     * @brief Own one role-neutral real-device sparse activation round trip.
-     * @tparam Rows Captured physical row capacity.
-     * @tparam Width Hidden width shared by tensors, wire storage and kernels.
-     *
-     * Teardown first publishes abort sentinels, then drains exact streams and
-     * only afterward releases device pointers and mapped transport pages. This
-     * keeps failed assertions from leaving a GPU wait referencing unmapped RAM.
-     */
-    /** @return Cold original source cohort, including mixed ordinary GPU experts. */
-    std::shared_ptr<const MoEExpertOwnerMap>
-    jointPacketOwners(int degree, DeviceId device,
-                      const MoEExpertOwnerMap *original = nullptr, bool swapped = false)
-    {
-        MoERoutedExpertPlacementPlan p; p.enabled=true; p.first_model_layer=kLayers.front();
-        p.topology=RoutedExpertPlacementTopology::TieredOverlay;
-        p.continuation_domain=p.base_model_domain=p.shared_expert_domain="compute";
-        RoutedExpertDomain gpu;gpu.name="compute";gpu.scope=ExecutionDomainScope::RANK_LOCAL;
-        gpu.backend=device.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;gpu.owner_rank=0;
-        gpu.participants={device.is_cuda()?GlobalDeviceAddress::cuda(0):GlobalDeviceAddress::rocm(0)};
-        gpu.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
-        RoutedExpertDomain cpu;cpu.name="joint";cpu.scope=ExecutionDomainScope::NODE_LOCAL;
-        cpu.backend=CollectiveBackendType::UPI;cpu.owner_rank=-1;
-        cpu.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
-        cpu.routed_phase_policy=RoutedExpertPhasePolicy::Uniform;
-        cpu.routed_decode_assignment_policy=cpu.routed_prefill_assignment_policy=RoutedExpertAssignmentPolicy::StaticOwner;
-        for (int member = 0; member < degree; ++member)
-        {
-            cpu.participants.push_back(GlobalDeviceAddress::cpu(member));
-            cpu.world_ranks.push_back(member + 1);
-        }
-        RoutedExpertDomain outsider=cpu;outsider.name="outside";outsider.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
-        outsider.participants={GlobalDeviceAddress::cpu(degree)};outsider.world_ranks={degree+1};
-        p.domains={gpu,cpu,outsider};
-        p.routed_tiers={{.name="whole",.domain="compute",.priority=0,.max_experts_per_layer=14},
-                        {.name="fragments",.domain="joint",.priority=3,.max_experts_per_layer=4,.fallback=true},
-                        {.name="outsider",.domain="outside",.priority=2,.max_experts_per_layer=1}};
-        std::vector<MoEOverlayLayerWeightManifest> sources;
-        const auto fp=ExpertWeightFormat::floating(TensorType::FP32);
-        for(const int layer:kLayers){
-            std::vector<int> tiers(kExpertCount, 0);
-            if (swapped)
-            {
-                for (int e : {11, 12, 13, 16})
-                    tiers[e] = 1;
-            }
-            else
-            {
-                for (int e : {10, 14, 15, 17})
-                    tiers[e] = 1;
-            }
-            p.placements.push_back({.layer=layer,.routed_expert_tier=tiers});
-            sources.push_back({.layer_idx=layer,.projections={{{ExpertTierWeightProjection::Gate,64,8,fp},
-                {ExpertTierWeightProjection::Up,64,8,fp},{ExpertTierWeightProjection::Down,8,64,fp}}}});
-        }
-        return std::make_shared<const MoEExpertOwnerMap>(
-            original ? MoEExpertOwnerMap::buildShardTransition(p, *original, *original)
-                     : MoEExpertOwnerMap::buildShardPlacement(p, sources));
-    }
-
-    template <std::int32_t Rows, std::int32_t Width = kDModel,
-              std::int32_t BackingRows = Rows>
-    class PacketRoundTrip final
-    {
-    public:
-        static_assert(Rows > 0);
-        static_assert(BackingRows >= Rows);
-        static_assert(Width > 0);
-        // Class-local geometry deliberately shadows the small fixture default.
-        static constexpr std::int32_t kDModel = Width;
-        static constexpr std::int32_t kRows = Rows;
-        static constexpr std::size_t kEntries =
-            static_cast<std::size_t>(Rows * kTopK);
-        static constexpr bool kUsesSingleRowDirectPacket = Rows == 1;
-
-        PacketRoundTrip(DeviceId source_device, DeviceId target_device,
-                        std::shared_ptr<const MoEExpertOwnerMap> owners = {}, int target = kTargetParticipant,
-                        int live_rows = Rows, std::vector<int> dispatch_targets = {})
-            : source_device_(source_device), target_device_(target_device),
-              joint_owners_(std::move(owners)), target_participant_(target), live_rows_(live_rows), dispatch_targets_(std::move(dispatch_targets))
-        {
-        }
-
-        PacketRoundTrip(const PacketRoundTrip &) = delete;
-        PacketRoundTrip &operator=(const PacketRoundTrip &) = delete;
-
-        ~PacketRoundTrip()
-        {
-            publishAbort();
-            drain(source_backend_, source_stream_, source_terminal_);
-            drain(target_backend_, target_stream_, target_terminal_);
-            if (terminal_timeout_observed_)
-            {
-                reportRetiredGrant("continuation", source_backend_, source_stream_,
-                                   source_terminal_, source_lane_);
-                reportRetiredGrant("follower", target_backend_, target_stream_,
-                                   target_terminal_, target_lane_);
-            }
-            source_cache_.reset(
-                DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::
-                    Destroy);
-            target_cache_.reset(
-                DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::
-                    Destroy);
-            source_graph_.reset();
-            target_graph_.reset();
-            source_capture_.reset();
-            target_capture_.reset();
-            source_dispatch_captures_.clear();
-            source_return_captures_.clear();
-            target_compute_captures_.clear();
-            source_dispatch_graphs_.clear();
-            source_return_graphs_.clear();
-            target_compute_graphs_.clear();
-            source_executor_.reset();
-            target_executor_.reset();
-            source_arena_.reset();
-            target_arena_.reset();
-            source_execution_context_.reset();
-            target_execution_context_.reset();
-            source_hidden_tensor_.reset();
-            source_routing_weights_tensor_.reset();
-            source_canonical_route_tensor_.reset();
-            source_zero_tensor_.reset();
-            target_hidden_tensor_.reset();
-            target_routing_indices_tensor_.reset();
-            target_routing_weights_tensor_.reset();
-            target_route_input_tensor_.reset();
-            target_canonical_route_tensor_.reset();
-            for (const auto &allocation : allocations_)
-            {
-                if (allocation.backend && allocation.address)
-                    allocation.backend->free(
-                        allocation.address, allocation.ordinal);
-            }
-            allocations_.clear();
-            if (source_backend_ && source_terminal_)
-                source_backend_->destroyEvent(source_terminal_, 0);
-            if (target_backend_ && target_terminal_)
-                target_backend_->destroyEvent(target_terminal_, 0);
-            if (source_backend_ && source_stream_)
-                source_backend_->destroyStream(source_stream_, 0);
-            if (target_backend_ && target_stream_)
-                target_backend_->destroyStream(target_stream_, 0);
-            source_transport_.reset();
-            target_transport_.reset();
-        }
-
-        /** @brief Build planner-derived transports, kernels, and persistent buffers. */
-        bool initialize()
-        {
-            source_backend_ = backendFor(source_device_);
-            target_backend_ = backendFor(target_device_);
-            if (!source_backend_ || !target_backend_ ||
-                source_backend_->deviceCount() < 1 ||
-                target_backend_->deviceCount() < 1)
-            {
-                error_ = "required endpoint backend/device is unavailable";
-                return false;
-            }
-
-            static std::atomic<std::uint64_t> identity_counter{0u};
-            const std::string identity =
-                "mapped_activation_packet_pid" +
-                std::to_string(static_cast<unsigned long>(::getpid())) + "_" +
-                std::to_string(identity_counter.fetch_add(1u));
-            try
-            {
-                /* The production constructors rendezvous before either GPU
-                 * driver may pin the full shared mapping. Build these mocked
-                 * ranks concurrently to preserve that setup protocol. */
-                std::exception_ptr source_error;
-                std::exception_ptr target_error;
-                std::thread source_builder([&]
-                                           {
-                                               try
-                                               {
-                                                   source_transport_ = std::make_unique<
-                                                       MoEOverlayNodeLocalRankBatchTransport>(
-                                                       makeTransportConfig<Rows, Width>(
-                                                           /*local_rank=*/0,
-                                                           source_device_,
-                                                           identity, target_participant_, joint_owners_, dispatch_targets_));
-                                               }
-                                               catch (...)
-                                               {
-                                                   source_error =
-                                                       std::current_exception();
-                                               }
-                                           });
-                std::thread target_builder([&]
-                                           {
-                                               try
-                                               {
-                                                   target_transport_ = std::make_unique<
-                                                       MoEOverlayNodeLocalRankBatchTransport>(
-                                                       makeTransportConfig<Rows, Width>(
-                                                           /*local_rank=*/1,
-                                                           target_device_,
-                                                           identity, target_participant_, joint_owners_, dispatch_targets_));
-                                               }
-                                               catch (...)
-                                               {
-                                                   target_error =
-                                                       std::current_exception();
-                                               }
-                                           });
-                source_builder.join();
-                target_builder.join();
-                if (source_error)
-                    std::rethrow_exception(source_error);
-                if (target_error)
-                    std::rethrow_exception(target_error);
-                source_lane_ = source_transport_->activationDeviceLane(
-                    target_participant_, /*graph_family_ordinal=*/0u,
-                    source_device_);
-                target_lane_ = target_transport_->activationDeviceLane(
-                    target_participant_, /*graph_family_ordinal=*/0u,
-                    (joint_owners_ || !dispatch_targets_.empty()) ? DeviceId::cpu() : target_device_);
-            }
-            catch (const std::exception &exception)
-            {
-                error_ = exception.what();
-                return false;
-            }
-
-            source_stream_ = source_backend_->createStream(0);
-            target_stream_ = target_backend_->createStream(0);
-            source_terminal_ = source_backend_->createEvent(0);
-            target_terminal_ = target_backend_->createEvent(0);
-            if (!source_stream_ || !target_stream_ || !source_terminal_ ||
-                !target_terminal_)
-            {
-                error_ = "could not create exact endpoint streams or events";
-                return false;
-            }
-
-            source_placement_banks_ = allocate(
-                source_backend_,
-                kDeviceMoEOverlayEpochBankCount *
-                    sizeof(DeviceMoEPlacementBank));
-            source_placement_ticket_ = allocate(
-                source_backend_, sizeof(DeviceMoEOverlayEpochTicket));
-            source_placement_status_ = allocate(
-                source_backend_, sizeof(DeviceMoEOverlayEpochStatus));
-            target_placement_banks_ = allocate(
-                target_backend_,
-                kDeviceMoEOverlayEpochBankCount *
-                    sizeof(DeviceMoEPlacementBank));
-            target_placement_ticket_ = allocate(
-                target_backend_, sizeof(DeviceMoEOverlayEpochTicket));
-            target_placement_status_ = allocate(
-                target_backend_, sizeof(DeviceMoEOverlayEpochStatus));
-            if (joint_owners_)
-            {
-                source_epoch_control_ = static_cast<DeviceMoEOverlayEpochControl *>(
-                    allocate(source_backend_, sizeof(DeviceMoEOverlayEpochControl)));
-                source_candidate_epoch_ =
-                    static_cast<std::uint64_t *>(allocate(source_backend_, sizeof(std::uint64_t)));
-            }
-            source_active_rows_ = allocate(source_backend_, sizeof(std::int32_t));
-            target_active_rows_ = allocate(target_backend_, sizeof(std::int32_t));
-            if (!allAllocationsValid())
-            {
-                error_ = "could not allocate persistent endpoint metadata buffers";
-                return false;
-            }
-            source_hidden_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
-                    static_cast<std::size_t>(kDModel)});
-            source_routing_indices_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
-                    static_cast<std::size_t>(kTopK)});
-            source_routing_weights_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
-                    static_cast<std::size_t>(kTopK)});
-            source_canonical_route_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    kEntries,
-                    static_cast<std::size_t>(kDModel)});
-            source_zero_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    kEntries,
-                    static_cast<std::size_t>(kDModel)});
-            target_hidden_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(BackingRows),
-                    static_cast<std::size_t>(kDModel)});
-            target_routing_indices_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(BackingRows),
-                    static_cast<std::size_t>(kTopK)});
-            target_routing_weights_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(BackingRows),
-                    static_cast<std::size_t>(kTopK)});
-            target_route_input_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(BackingRows * kTopK),
-                    static_cast<std::size_t>(kDModel)});
-            target_canonical_route_tensor_ = std::make_shared<FP32Tensor>(
-                std::vector<std::size_t>{
-                    static_cast<std::size_t>(BackingRows * kTopK),
-                    static_cast<std::size_t>(kDModel)});
-            return initializeSourcePayload() && initializeProtocol() &&
-                   captureDeviceOwnedGraphs();
-        }
-
-        /**
-         * @brief Materialize the same complete endpoint graphs used in production.
-         *
-         * Packet stages append admission, dispatch, and return timeline nodes
-         * directly to an active full-graph capture. The ordinary executor owns
-         * cold capture, instantiation, transaction-zero state, and steady replay;
-         * there are no child executables or test-only parent composer in this
-         * proof.
-         */
-        bool captureDeviceOwnedGraphs()
-        {
-            source_execution_context_ = IDeviceContext::create(source_device_);
-            target_execution_context_ = IDeviceContext::create(target_device_);
-            source_arena_ = std::make_unique<BufferArena>();
-            target_arena_ = std::make_unique<BufferArena>();
-            if (!source_execution_context_ || !target_execution_context_ ||
-                !source_arena_ || !target_arena_ ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::NORMALIZED, source_hidden_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_INDICES,
-                    source_routing_indices_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_WEIGHTS,
-                    source_routing_weights_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
-                    source_canonical_route_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::RESIDUAL, source_zero_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::NORMALIZED, target_hidden_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_INDICES,
-                    target_routing_indices_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_WEIGHTS,
-                    target_routing_weights_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::RESIDUAL,
-                    target_route_input_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
-                    target_canonical_route_tensor_.get()))
-            {
-                error_ =
-                    "could not bind production packet tensors into exact-device arenas";
-                return false;
-            }
-
-            auto *const source_worker =
-                &GPUDeviceContextPool::instance().getContext(source_device_);
-            auto *const target_worker =
-                &GPUDeviceContextPool::instance().getContext(target_device_);
-            GraphExecutorConfig source_executor_config;
-            source_executor_config.default_device = source_device_;
-            source_executor_config.worker_gpu_context_resolver =
-                [source_worker, expected = source_device_](DeviceId requested)
-                    -> IWorkerGPUContext *
-            {
-                return requested == expected ? source_worker : nullptr;
-            };
-            source_executor_config.worker_gpu_context_uses_process_pool = false;
-            GraphExecutorConfig target_executor_config;
-            target_executor_config.default_device = target_device_;
-            target_executor_config.worker_gpu_context_resolver =
-                [target_worker, expected = target_device_](DeviceId requested)
-                    -> IWorkerGPUContext *
-            {
-                return requested == expected ? target_worker : nullptr;
-            };
-            target_executor_config.worker_gpu_context_uses_process_pool = false;
-            source_executor_ = std::make_unique<DeviceGraphExecutor>(
-                std::move(source_executor_config));
-            target_executor_ = std::make_unique<DeviceGraphExecutor>(
-                std::move(target_executor_config));
-            source_executor_->setArena(source_arena_.get());
-            target_executor_->setArena(target_arena_.get());
-
-            source_graph_ = std::make_unique<ComputeGraph>();
-            target_graph_ = std::make_unique<ComputeGraph>();
-            source_graph_->setNativeCaptureEnvelope(
-                GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
-            target_graph_->setNativeCaptureEnvelope(
-                GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
-
-            ResidualAddStage::Params clear_params;
-            clear_params.device_id = source_device_;
-            clear_params.input = source_zero_tensor_.get();
-            clear_params.output = source_canonical_route_tensor_.get();
-            clear_params.num_elements =
-                kEntries * static_cast<std::size_t>(kDModel);
-            clear_params.input_buffer_id = BufferId::RESIDUAL;
-            clear_params.output_buffer_id =
-                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
-            const std::string clear_name = "source_clear_canonical_routes";
-            source_graph_->addNode(
-                clear_name,
-                ComputeStageFactory::createResidualAdd(clear_params),
-                source_device_);
-
-            std::string source_dependency = clear_name;
-            std::string target_dependency;
-            for (std::size_t stage_index = 0u;
-                 stage_index < kLayers.size();
-                 ++stage_index)
-            {
-                const auto ordinal =
-                    static_cast<std::uint32_t>(stage_index);
-                const std::int32_t layer = kLayers[stage_index];
-
-                const MoEOverlayRoutePlacementDeviceBinding placement{
-                    .banks = {placementBankView(0u), placementBankView(1u)},
-                    .ticket = static_cast<
-                        const DeviceMoEOverlayEpochTicket *>(
-                        source_placement_ticket_),
-                    .status = static_cast<
-                        const DeviceMoEOverlayEpochStatus *>(
-                        source_placement_status_),
-                    .expert_count = kExpertCount,
-                };
-                const std::string dispatch_name =
-                    "source_dispatch_pack_" +
-                    std::to_string(stage_index);
-                std::shared_ptr<MoEOverlayActivationLaneBatchState>
-                    lane_transaction;
-                if constexpr (Rows > 1)
-                {
-                    /* Production prefill forks every remote lane onto a
-                     * persistent side stream. A one-lane fixture still proves
-                     * the exact event fork/import/join lifecycle without
-                     * duplicating the planner or transport in test code. */
-                    lane_transaction = std::make_shared<
-                        MoEOverlayActivationLaneBatchState>(
-                        source_device_,
-                        dispatchSourceLanes(),
-                        kRows,
-                        ordinal,
-                        layer);
-                    MoEOverlayActivationDispatchPackBatchStage::Params
-                        dispatch_params;
-                    dispatch_params.device_id = source_device_;
-                    if (joint_owners_)
-                        for (const auto &lane : dispatchSourceLanes())
-                            dispatch_params.joint_route_targets.push_back(
-                                jointMembership(layer, lane.target_participant_id));
-                    dispatch_params.transaction = lane_transaction;
-                    dispatch_params.hidden = source_hidden_tensor_.get();
-                    dispatch_params.routing_indices =
-                        source_routing_indices_tensor_.get();
-                    dispatch_params.routing_weights =
-                        source_routing_weights_tensor_.get();
-                    dispatch_params.placement = placement;
-                    dispatch_params.active_row_count_device =
-                        static_cast<const std::int32_t *>(source_active_rows_);
-                    dispatch_params.hidden_buffer_id = BufferId::NORMALIZED;
-                    dispatch_params.routing_indices_buffer_id =
-                        BufferId::MOE_EXPERT_INDICES;
-                    dispatch_params.routing_weights_buffer_id =
-                        BufferId::MOE_EXPERT_WEIGHTS;
-                    source_graph_->addNode(
-                        dispatch_name,
-                        ComputeStageFactory::
-                            createMoEOverlayActivationDispatchPackBatch(
-                                dispatch_params),
-                        source_device_);
-                }
-                else
-                {
-                    MoEOverlayActivationDispatchPackStage::Params
-                        dispatch_params;
-                    dispatch_params.device_id = source_device_;
-                    if (joint_owners_)
-                        dispatch_params.joint_route_target = jointMembership(layer);
-                    dispatch_params.lane = source_lane_;
-                    dispatch_params.hidden = source_hidden_tensor_.get();
-                    dispatch_params.routing_indices =
-                        source_routing_indices_tensor_.get();
-                    dispatch_params.routing_weights =
-                        source_routing_weights_tensor_.get();
-                    dispatch_params.placement = placement;
-                    dispatch_params.active_row_count_device =
-                        static_cast<const std::int32_t *>(source_active_rows_);
-                    dispatch_params.hidden_buffer_id = BufferId::NORMALIZED;
-                    dispatch_params.routing_indices_buffer_id =
-                        BufferId::MOE_EXPERT_INDICES;
-                    dispatch_params.routing_weights_buffer_id =
-                        BufferId::MOE_EXPERT_WEIGHTS;
-                    dispatch_params.physical_rows = kRows;
-                    dispatch_params.stage_ordinal = ordinal;
-                    dispatch_params.model_layer_index = layer;
-                    source_graph_->addNode(
-                        dispatch_name,
-                        ComputeStageFactory::
-                            createMoEOverlayActivationDispatchPack(
-                                dispatch_params),
-                        source_device_);
-                }
-                source_graph_->addDependency(
-                    dispatch_name, source_dependency);
-                if (joint_owners_ || !dispatch_targets_.empty()) break; // Packet-only proof never fabricates a CPU joint return.
-
-                const std::string return_consume_name =
-                    "source_return_consume_" +
-                    std::to_string(stage_index);
-                if constexpr (Rows > 1)
-                {
-                    MoEOverlayActivationReturnConsumeBatchStage::Params
-                        return_consume_params;
-                    return_consume_params.device_id = source_device_;
-                    return_consume_params.transaction = lane_transaction;
-                    return_consume_params.canonical_route_contributions =
-                        source_canonical_route_tensor_.get();
-                    return_consume_params
-                        .canonical_route_contributions_buffer_id =
-                        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
-                    source_graph_->addNode(
-                        return_consume_name,
-                        ComputeStageFactory::
-                            createMoEOverlayActivationReturnConsumeBatch(
-                                return_consume_params),
-                        source_device_);
-                }
-                else
-                {
-                    MoEOverlayActivationReturnConsumeStage::Params
-                        return_consume_params;
-                    return_consume_params.device_id = source_device_;
-                    return_consume_params.lane = source_lane_;
-                    return_consume_params.canonical_route_contributions =
-                        source_canonical_route_tensor_.get();
-                    return_consume_params.physical_rows = kRows;
-                    return_consume_params.stage_ordinal = ordinal;
-                    return_consume_params.model_layer_index = layer;
-                    source_graph_->addNode(
-                        return_consume_name,
-                        ComputeStageFactory::
-                            createMoEOverlayActivationReturnConsume(
-                                return_consume_params),
-                        source_device_);
-                }
-                source_graph_->addDependency(
-                    return_consume_name, dispatch_name);
-                source_dependency = return_consume_name;
-
-                MoEOverlayActivationDispatchConsumeStage::Params
-                    consume_params;
-                consume_params.device_id = target_device_;
-                consume_params.lane = target_lane_;
-                consume_params.placement = {
-                    .banks = {
-                        placementBankView(target_placement_banks_, 0u),
-                        placementBankView(target_placement_banks_, 1u),
-                    },
-                    .ticket = static_cast<
-                        const DeviceMoEOverlayEpochTicket *>(
-                            target_placement_ticket_),
-                    .status = static_cast<
-                        const DeviceMoEOverlayEpochStatus *>(
-                            target_placement_status_),
-                    .expert_count = kExpertCount,
-                };
-                consume_params.hidden = target_hidden_tensor_.get();
-                consume_params.routing_indices =
-                    target_routing_indices_tensor_.get();
-                consume_params.routing_weights =
-                    target_routing_weights_tensor_.get();
-                consume_params.active_row_count_device =
-                    static_cast<std::int32_t *>(target_active_rows_);
-                consume_params.physical_rows = kRows;
-                consume_params.stage_ordinal = ordinal;
-                consume_params.model_layer_index = layer;
-                const std::string consume_name =
-                    "target_dispatch_consume_" +
-                    std::to_string(stage_index);
-                target_graph_->addNode(
-                    consume_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationDispatchConsume(
-                            consume_params),
-                    target_device_);
-                if (!target_dependency.empty())
-                {
-                    target_graph_->addDependency(
-                        consume_name, target_dependency);
-                }
-
-                ResidualAddStage::Params device_work_params;
-                device_work_params.device_id = target_device_;
-                device_work_params.input = target_route_input_tensor_.get();
-                device_work_params.output =
-                    target_canonical_route_tensor_.get();
-                device_work_params.num_elements =
-                    kEntries * static_cast<std::size_t>(kDModel);
-                device_work_params.input_buffer_id = BufferId::RESIDUAL;
-                device_work_params.output_buffer_id =
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
-                const std::string work_name =
-                    "target_device_work_" +
-                    std::to_string(stage_index);
-                target_graph_->addNode(
-                    work_name,
-                    ComputeStageFactory::createResidualAdd(
-                        device_work_params),
-                    target_device_);
-                target_graph_->addDependency(work_name, consume_name);
-
-                MoEOverlayActivationReturnPackStage::Params
-                    return_pack_params;
-                return_pack_params.device_id = target_device_;
-                return_pack_params.lane = target_lane_;
-                return_pack_params.local_canonical_route_contributions =
-                    target_canonical_route_tensor_.get();
-                return_pack_params.physical_rows = kRows;
-                return_pack_params.stage_ordinal = ordinal;
-                return_pack_params.model_layer_index = layer;
-                const std::string return_pack_name =
-                    "target_return_pack_" +
-                    std::to_string(stage_index);
-                target_graph_->addNode(
-                    return_pack_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationReturnPack(
-                            return_pack_params),
-                    target_device_);
-                target_graph_->addDependency(
-                    return_pack_name, work_name);
-                target_dependency = return_pack_name;
-            }
-
-            source_cache_.perf_context =
-                "mapped_activation_packet_continuation";
-            target_cache_.perf_context =
-                "mapped_activation_packet_follower";
-            source_cache_.steady_replay_host_policy =
-                DeviceGraphExecutor::GraphSegmentCache::
-                    SteadyReplayHostPolicy::RetainedFullGraph;
-            target_cache_.steady_replay_host_policy =
-                DeviceGraphExecutor::GraphSegmentCache::
-                    SteadyReplayHostPolicy::RetainedFullGraph;
-            if (!source_cache_.bindBorrowedCaptureStream(
-                    source_worker,
-                    source_stream_,
-                    source_device_,
-                    /*context_from_process_pool=*/false) ||
-                !target_cache_.bindBorrowedCaptureStream(
-                    target_worker,
-                    target_stream_,
-                    target_device_,
-                    /*context_from_process_pool=*/false))
-            {
-                error_ = "could not bind exact production endpoint streams";
-                return false;
-            }
-
-            source_graph_->reset();
-            target_graph_->reset();
-            const auto materialize = [](
-                                         DeviceGraphExecutor &executor,
-                                         ComputeGraph &graph,
-                                         IDeviceContext *context,
-                                         DeviceGraphExecutor::GraphSegmentCache &cache,
-                                         void *stream,
-                                         IWorkerGPUContext *worker)
-            {
-                return executor.executeWithCachedGraphReplay(
-                    graph,
-                    context,
-                    cache,
-                    stream,
-                    worker,
-                    /*collective_nodes=*/nullptr,
-                    /*collectives_graph_capturable=*/false,
-                    /*force_recapture=*/false,
-                    /*defer_final_sync=*/true,
-                    {},
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireFullGraph,
-                    {},
-                    {},
-                    {},
-                    DeviceGraphExecutor::GraphInitialSubmissionPolicy::
-                        MaterializeWithoutLaunch);
-            };
-            if (joint_owners_ || !dispatch_targets_.empty())
-                return materialize(*source_executor_, *source_graph_, source_execution_context_.get(),
-                                   source_cache_, source_stream_, source_worker);
-            if (!materialize(
-                    *source_executor_,
-                    *source_graph_,
-                    source_execution_context_.get(),
-                    source_cache_,
-                    source_stream_,
-                    source_worker) ||
-                !materialize(
-                    *target_executor_,
-                    *target_graph_,
-                    target_execution_context_.get(),
-                    target_cache_,
-                    target_stream_,
-                    target_worker) ||
-                !source_cache_.retained_full_graph_replay.valid() ||
-                !target_cache_.retained_full_graph_replay.valid() ||
-                source_cache_.executable_submission_state !=
-                    DeviceGraphExecutor::GraphSegmentCache::
-                        ExecutableSubmissionState::MaterializedUnlaunched ||
-                target_cache_.executable_submission_state !=
-                    DeviceGraphExecutor::GraphSegmentCache::
-                        ExecutableSubmissionState::MaterializedUnlaunched)
-            {
-                error_ =
-                    "production executor did not materialize both endpoint graphs without launching transaction zero";
-                return false;
-            }
-
-            const IGPUGraphCapture *const source_capture =
-                captureFrom(source_cache_);
-            const IGPUGraphCapture *const target_capture =
-                captureFrom(target_cache_);
-            /* Multi-row dispatch publishes one shared physical matrix from the
-             * source, while followers and compact returns access the mapping
-             * directly. HIP exposes every root node, so these exact totals
-             * prove that no per-follower import/export bounce node survived. */
-            constexpr std::size_t source_node_count =
-                kUsesSingleRowDirectPacket
-                    ? 2u + 2u * kLayers.size()
-                    : 2u + 6u * kLayers.size();
-            constexpr std::size_t target_node_count =
-                kUsesSingleRowDirectPacket
-                    ? 1u + 3u * kLayers.size()
-                    : 1u + 7u * kLayers.size();
-            constexpr std::size_t native_wait_nodes =
-                kUsesSingleRowDirectPacket ? 1u : kLayers.size() + 1u;
-            if (!source_capture || !target_capture ||
-                !validateROCmTimelineLowering(
-                    *source_capture,
-                    source_device_,
-                    source_node_count,
-                    native_wait_nodes,
-                    "continuation") ||
-                !validateROCmTimelineLowering(
-                    *target_capture,
-                    target_device_,
-                    target_node_count,
-                    native_wait_nodes,
-                    "follower"))
-            {
-                return false;
-            }
-
-            const auto &captured_control =
-                source_transport_->activationEpochControl(
-                    target_participant_, 0u);
-            for (std::uint32_t bank = 0u;
-                 bank < kMoEOverlayActivationBufferCount;
-                 ++bank)
-            {
-                if (captured_control.buffers[bank].dispatch_signal.value != 0u ||
-                    captured_control.buffers[bank].return_signal.value != 0u)
-                {
-                    error_ =
-                        "setup materialization executed a mapped timeline publication";
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        /** @brief Capture both complete endpoint transactions exactly once. */
-        bool captureRetainedGraphs()
-        {
-            try
-            {
-                auto &source_context = GPUDeviceContextPool::instance()
-                                           .getContext(source_device_);
-                auto &target_context = GPUDeviceContextPool::instance()
-                                           .getContext(target_device_);
-                source_dispatch_captures_.reserve(kLayers.size());
-                source_return_captures_.reserve(kLayers.size());
-                target_compute_captures_.reserve(kLayers.size());
-                for (std::size_t stage = 0; stage < kLayers.size(); ++stage)
-                {
-                    source_dispatch_captures_.push_back(
-                        source_context.createGraphCapture(source_stream_));
-                    source_return_captures_.push_back(
-                        source_context.createGraphCapture(source_stream_));
-                    target_compute_captures_.push_back(
-                        target_context.createGraphCapture(target_stream_));
-                }
-                source_capture_ =
-                    source_context.createGraphCapture(source_stream_);
-                target_capture_ =
-                    target_context.createGraphCapture(target_stream_);
-            }
-            catch (const std::exception &exception)
-            {
-                error_ = exception.what();
-                return false;
-            }
-            const auto capturesComplete = [](const auto &captures)
-            {
-                return std::all_of(
-                    captures.begin(), captures.end(),
-                    [](const auto &capture) { return capture != nullptr; });
-            };
-            if (source_dispatch_captures_.size() != kLayers.size() ||
-                source_return_captures_.size() != kLayers.size() ||
-                target_compute_captures_.size() != kLayers.size() ||
-                !capturesComplete(source_dispatch_captures_) ||
-                !capturesComplete(source_return_captures_) ||
-                !capturesComplete(target_compute_captures_) ||
-                !source_capture_ || !target_capture_)
-            {
-                error_ = "could not create retained endpoint graph fragments";
-                return false;
-            }
-
-            source_execution_context_ =
-                IDeviceContext::create(source_device_);
-            target_execution_context_ =
-                IDeviceContext::create(target_device_);
-            source_arena_ = std::make_unique<BufferArena>();
-            target_arena_ = std::make_unique<BufferArena>();
-            if (!source_execution_context_ || !target_execution_context_ ||
-                !source_arena_ || !target_arena_ ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::NORMALIZED, source_hidden_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_INDICES,
-                    source_routing_indices_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_WEIGHTS,
-                    source_routing_weights_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
-                    source_canonical_route_tensor_.get()) ||
-                !source_arena_->registerExternalBuffer(
-                    BufferId::RESIDUAL, source_zero_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::NORMALIZED, target_hidden_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_INDICES,
-                    target_routing_indices_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_EXPERT_WEIGHTS,
-                    target_routing_weights_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::RESIDUAL,
-                    target_route_input_tensor_.get()) ||
-                !target_arena_->registerExternalBuffer(
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
-                    target_canonical_route_tensor_.get()))
-            {
-                error_ = "could not bind typed packet tensors into exact-device arenas";
-                return false;
-            }
-            auto *const source_worker =
-                &GPUDeviceContextPool::instance().getContext(source_device_);
-            auto *const target_worker =
-                &GPUDeviceContextPool::instance().getContext(target_device_);
-            GraphExecutorConfig source_executor_config;
-            source_executor_config.default_device = source_device_;
-            source_executor_config.worker_gpu_context_resolver =
-                [source_worker,
-                 expected = source_device_](DeviceId requested)
-                    -> IWorkerGPUContext *
-                {
-                    return requested == expected ? source_worker : nullptr;
-                };
-            source_executor_config.worker_gpu_context_uses_process_pool = false;
-            GraphExecutorConfig target_executor_config;
-            target_executor_config.default_device = target_device_;
-            target_executor_config.worker_gpu_context_resolver =
-                [target_worker,
-                 expected = target_device_](DeviceId requested)
-                    -> IWorkerGPUContext *
-                {
-                    return requested == expected ? target_worker : nullptr;
-                };
-            target_executor_config.worker_gpu_context_uses_process_pool = false;
-            source_executor_ = std::make_unique<DeviceGraphExecutor>(
-                std::move(source_executor_config));
-            target_executor_ = std::make_unique<DeviceGraphExecutor>(
-                std::move(target_executor_config));
-            source_executor_->setArena(source_arena_.get());
-            target_executor_->setArena(target_arena_.get());
-
-            struct SemanticCaptureUnit
-            {
-                const IGPUGraphCapture *capture = nullptr;
-                std::vector<std::string> stage_names;
-            };
-            ComputeGraph source_semantic_graph;
-            ComputeGraph target_semantic_graph;
-            std::vector<SemanticCaptureUnit> source_semantic_units;
-            std::vector<SemanticCaptureUnit> target_semantic_units;
-            source_semantic_units.reserve(kLayers.size() * 2u);
-            target_semantic_units.reserve(kLayers.size());
-            for (std::size_t stage_index = 0;
-                 stage_index < kLayers.size(); ++stage_index)
-            {
-                const auto ordinal = static_cast<std::uint32_t>(stage_index);
-                const std::int32_t layer = kLayers[stage_index];
-                auto &dispatch_capture =
-                    source_dispatch_captures_[stage_index];
-                auto dispatch_graph = std::make_unique<ComputeGraph>();
-                std::string dispatch_dependency;
-                std::vector<std::string> semantic_dispatch_stages;
-                if (stage_index == 0u)
-                {
-                    ResidualAddStage::Params clear_params;
-                    clear_params.device_id = source_device_;
-                    clear_params.input = source_zero_tensor_.get();
-                    clear_params.output = source_canonical_route_tensor_.get();
-                    clear_params.num_elements =
-                        kEntries * static_cast<std::size_t>(kDModel);
-                    clear_params.input_buffer_id = BufferId::RESIDUAL;
-                    clear_params.output_buffer_id =
-                        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
-                    dispatch_dependency = "clear_canonical_routes";
-                    dispatch_graph->addNode(
-                        dispatch_dependency,
-                        ComputeStageFactory::createResidualAdd(clear_params),
-                        source_device_);
-                    const std::string semantic_clear_name =
-                        "source_clear_canonical_routes";
-                    source_semantic_graph.addNode(
-                        semantic_clear_name,
-                        ComputeStageFactory::createResidualAdd(clear_params),
-                        source_device_);
-                    semantic_dispatch_stages.push_back(
-                        semantic_clear_name);
-                }
-                MoEOverlayActivationDispatchPackStage::Params dispatch_params;
-                dispatch_params.device_id = source_device_;
-                dispatch_params.lane = source_lane_;
-                dispatch_params.hidden = source_hidden_tensor_.get();
-                dispatch_params.routing_indices =
-                    source_routing_indices_tensor_.get();
-                dispatch_params.routing_weights =
-                    source_routing_weights_tensor_.get();
-                dispatch_params.placement = {
-                    .banks = {
-                        placementBankView(0u),
-                        placementBankView(1u),
-                    },
-                    .ticket =
-                        static_cast<const DeviceMoEOverlayEpochTicket *>(
-                            source_placement_ticket_),
-                    .status =
-                        static_cast<const DeviceMoEOverlayEpochStatus *>(
-                            source_placement_status_),
-                    .expert_count = kExpertCount,
-                };
-                dispatch_params.active_row_count_device =
-                    static_cast<const std::int32_t *>(source_active_rows_);
-                dispatch_params.hidden_buffer_id = BufferId::NORMALIZED;
-                dispatch_params.routing_indices_buffer_id =
-                    BufferId::MOE_EXPERT_INDICES;
-                dispatch_params.routing_weights_buffer_id =
-                    BufferId::MOE_EXPERT_WEIGHTS;
-                dispatch_params.physical_rows = kRows;
-                dispatch_params.stage_ordinal = ordinal;
-                dispatch_params.model_layer_index = layer;
-                const std::string dispatch_name = "dispatch_pack";
-                dispatch_graph->addNode(
-                    dispatch_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationDispatchPack(
-                            dispatch_params),
-                    source_device_);
-                if (!dispatch_dependency.empty())
-                {
-                    dispatch_graph->addDependency(
-                        dispatch_name, dispatch_dependency);
-                }
-                if (!source_executor_->captureRetainedGraphFragment(
-                        *dispatch_graph,
-                        source_execution_context_.get(),
-                        dispatch_capture.get(),
-                        "typed_continuation_dispatch_pack"))
-                {
-                    error_ = "typed continuation dispatch fragment capture failed";
-                    return false;
-                }
-                const std::string semantic_dispatch_name =
-                    "source_dispatch_pack_" +
-                    std::to_string(stage_index);
-                source_semantic_graph.addNode(
-                    semantic_dispatch_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationDispatchPack(
-                            dispatch_params),
-                    source_device_);
-                if (!semantic_dispatch_stages.empty())
-                {
-                    source_semantic_graph.addDependency(
-                        semantic_dispatch_name,
-                        semantic_dispatch_stages.back());
-                }
-                semantic_dispatch_stages.push_back(
-                    semantic_dispatch_name);
-                source_semantic_units.push_back({
-                    .capture = dispatch_capture.get(),
-                    .stage_names = semantic_dispatch_stages,
-                });
-
-                auto &target_capture =
-                    target_compute_captures_[stage_index];
-                auto target_graph = std::make_unique<ComputeGraph>();
-                MoEOverlayActivationDispatchConsumeStage::Params
-                    consume_params;
-                consume_params.device_id = target_device_;
-                consume_params.lane = target_lane_;
-                consume_params.placement = {
-                    .banks = {
-                        placementBankView(target_placement_banks_, 0u),
-                        placementBankView(target_placement_banks_, 1u),
-                    },
-                    .ticket = static_cast<
-                        const DeviceMoEOverlayEpochTicket *>(
-                            target_placement_ticket_),
-                    .status = static_cast<
-                        const DeviceMoEOverlayEpochStatus *>(
-                            target_placement_status_),
-                    .expert_count = kExpertCount,
-                };
-                consume_params.hidden = target_hidden_tensor_.get();
-                consume_params.routing_indices =
-                    target_routing_indices_tensor_.get();
-                consume_params.routing_weights =
-                    target_routing_weights_tensor_.get();
-                consume_params.active_row_count_device =
-                    static_cast<std::int32_t *>(target_active_rows_);
-                consume_params.physical_rows = kRows;
-                consume_params.stage_ordinal = ordinal;
-                consume_params.model_layer_index = layer;
-                target_graph->addNode(
-                    "dispatch_consume",
-                    ComputeStageFactory::
-                        createMoEOverlayActivationDispatchConsume(
-                            consume_params),
-                    target_device_);
-
-                ResidualAddStage::Params device_work_params;
-                device_work_params.device_id = target_device_;
-                device_work_params.input = target_route_input_tensor_.get();
-                device_work_params.output =
-                    target_canonical_route_tensor_.get();
-                device_work_params.num_elements =
-                    kEntries * static_cast<std::size_t>(kDModel);
-                device_work_params.input_buffer_id = BufferId::RESIDUAL;
-                device_work_params.output_buffer_id =
-                    BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
-                target_graph->addNode(
-                    "device_work",
-                    ComputeStageFactory::createResidualAdd(
-                        device_work_params),
-                    target_device_);
-                target_graph->addDependency(
-                    "device_work", "dispatch_consume");
-
-                MoEOverlayActivationReturnPackStage::Params return_pack_params;
-                return_pack_params.device_id = target_device_;
-                return_pack_params.lane = target_lane_;
-                return_pack_params.local_canonical_route_contributions =
-                    target_canonical_route_tensor_.get();
-                return_pack_params.physical_rows = kRows;
-                return_pack_params.stage_ordinal = ordinal;
-                return_pack_params.model_layer_index = layer;
-                target_graph->addNode(
-                    "return_pack",
-                    ComputeStageFactory::
-                        createMoEOverlayActivationReturnPack(
-                            return_pack_params),
-                    target_device_);
-                target_graph->addDependency(
-                    "return_pack", "device_work");
-                if (!target_executor_->captureRetainedGraphFragment(
-                        *target_graph,
-                        target_execution_context_.get(),
-                        target_capture.get(),
-                        "typed_follower_packet_compute"))
-                {
-                    error_ = "typed follower packet fragment capture failed";
-                    return false;
-                }
-                const std::string semantic_consume_name =
-                    "target_dispatch_consume_" +
-                    std::to_string(stage_index);
-                const std::string semantic_work_name =
-                    "target_device_work_" +
-                    std::to_string(stage_index);
-                const std::string semantic_return_pack_name =
-                    "target_return_pack_" +
-                    std::to_string(stage_index);
-                target_semantic_graph.addNode(
-                    semantic_consume_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationDispatchConsume(
-                            consume_params),
-                    target_device_);
-                target_semantic_graph.addNode(
-                    semantic_work_name,
-                    ComputeStageFactory::createResidualAdd(
-                        device_work_params),
-                    target_device_);
-                target_semantic_graph.addDependency(
-                    semantic_work_name,
-                    semantic_consume_name);
-                target_semantic_graph.addNode(
-                    semantic_return_pack_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationReturnPack(
-                            return_pack_params),
-                    target_device_);
-                target_semantic_graph.addDependency(
-                    semantic_return_pack_name,
-                    semantic_work_name);
-                target_semantic_units.push_back({
-                    .capture = target_capture.get(),
-                    .stage_names = {
-                        semantic_consume_name,
-                        semantic_work_name,
-                        semantic_return_pack_name,
-                    },
-                });
-
-                auto &return_capture =
-                    source_return_captures_[stage_index];
-                auto return_graph = std::make_unique<ComputeGraph>();
-                MoEOverlayActivationReturnConsumeStage::Params
-                    return_consume_params;
-                return_consume_params.device_id = source_device_;
-                return_consume_params.lane = source_lane_;
-                return_consume_params.canonical_route_contributions =
-                    source_canonical_route_tensor_.get();
-                return_consume_params.physical_rows = kRows;
-                return_consume_params.stage_ordinal = ordinal;
-                return_consume_params.model_layer_index = layer;
-                return_graph->addNode(
-                    "return_consume",
-                    ComputeStageFactory::
-                        createMoEOverlayActivationReturnConsume(
-                            return_consume_params),
-                    source_device_);
-                if (!source_executor_->captureRetainedGraphFragment(
-                        *return_graph,
-                        source_execution_context_.get(),
-                        return_capture.get(),
-                        "typed_continuation_return_consume"))
-                {
-                    error_ = "typed continuation return fragment capture failed";
-                    return false;
-                }
-                const std::string semantic_return_name =
-                    "source_return_consume_" +
-                    std::to_string(stage_index);
-                source_semantic_graph.addNode(
-                    semantic_return_name,
-                    ComputeStageFactory::
-                        createMoEOverlayActivationReturnConsume(
-                            return_consume_params),
-                    source_device_);
-                source_semantic_units.push_back({
-                    .capture = return_capture.get(),
-                    .stage_names = {semantic_return_name},
-                });
-                source_dispatch_graphs_.push_back(
-                    std::move(dispatch_graph));
-                target_compute_graphs_.push_back(std::move(target_graph));
-                source_return_graphs_.push_back(std::move(return_graph));
-            }
-            try
-            {
-                std::vector<MoEOverlayRetainedCaptureUnit> source_units;
-                std::vector<MoEOverlayRetainedCaptureUnit> target_units;
-                source_units.reserve(source_semantic_units.size());
-                target_units.reserve(target_semantic_units.size());
-                for (const auto &unit : source_semantic_units)
-                {
-                    source_units.push_back({
-                        .capture = unit.capture,
-                        .stage_names = unit.stage_names,
-                    });
-                }
-                for (const auto &unit : target_semantic_units)
-                {
-                    target_units.push_back({
-                        .capture = unit.capture,
-                        .stage_names = unit.stage_names,
-                    });
-                }
-                MoEOverlayRetainedActivationTransaction::
-                    buildContinuationFromCapturedUnits(
-                        *source_capture_,
-                        source_semantic_graph,
-                        source_units);
-                MoEOverlayRetainedActivationTransaction::
-                    buildFollowerFromCapturedUnits(
-                        *target_capture_,
-                        target_semantic_graph,
-                        target_units);
-            }
-            catch (const std::exception &exception)
-            {
-                error_ = exception.what();
-                return false;
-            }
-            const auto totalFragmentNodes = [](const auto &captures)
-            {
-                std::size_t total = 0u;
-                for (const auto &capture : captures)
-                    total += capture ? capture->nodeCount() : 0u;
-                return total;
-            };
-            const std::size_t native_timeline_nodes =
-                1u + 2u * kLayers.size();
-            if (!validateROCmTimelineLowering(
-                    *source_capture_,
-                    source_device_,
-                    totalFragmentNodes(source_dispatch_captures_) +
-                        totalFragmentNodes(source_return_captures_) +
-                        native_timeline_nodes,
-                    /*expected_wait_nodes=*/kLayers.size() + 1u,
-                    "continuation") ||
-                !validateROCmTimelineLowering(
-                    *target_capture_,
-                    target_device_,
-                    totalFragmentNodes(target_compute_captures_) +
-                        native_timeline_nodes,
-                    /*expected_wait_nodes=*/kLayers.size() + 1u,
-                    "follower"))
-            {
-                return false;
-            }
-            if (!target_capture_->instantiate() ||
-                !source_capture_->instantiate())
-            {
-                error_ = "retained endpoint parent graph instantiation failed";
-                return false;
-            }
-            const auto &captured_control =
-                source_transport_->activationEpochControl(
-                    target_participant_, 0u);
-            for (std::uint32_t bank = 0u;
-                 bank < kMoEOverlayActivationBufferCount;
-                 ++bank)
-            {
-                if (captured_control.buffers[bank].dispatch_signal.value != 0u ||
-                    captured_control.buffers[bank].return_signal.value != 0u)
-                {
-                    error_ =
-                        "graph capture executed a mapped timeline publication bank=" +
-                        std::to_string(bank) + ": " +
-                        std::to_string(
-                            captured_control.buffers[bank]
-                                .dispatch_signal.value) +
-                        "/" +
-                        std::to_string(
-                            captured_control.buffers[bank]
-                                .return_signal.value);
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        /**
-         * @brief Dirty capacity beyond this retained graph's exact physical rows.
-         *
-         * Called only between retired transactions. These bytes belong to the
-         * backing family, not dispatch/compute/return or the compact wire.
-         * @return Whether both ordered suffix writes were enqueued successfully.
-         */
-        bool poisonCapacitySuffix()
-        {
-            if constexpr (BackingRows == Rows) return true;
-            constexpr size_t hidden_offset = size_t(Rows) * kDModel * sizeof(float);
-            constexpr size_t hidden_bytes = size_t(BackingRows - Rows) * kDModel * sizeof(float);
-            constexpr size_t route_offset = hidden_offset * kTopK;
-            constexpr size_t route_bytes = hidden_bytes * kTopK;
-            return target_backend_->memset(static_cast<std::byte *>(target_hidden_) + hidden_offset,
-                       0x5a, hidden_bytes, target_device_.ordinal, target_stream_) &&
-                   target_backend_->memset(static_cast<std::byte *>(target_canonical_routes_) + route_offset,
-                       0x5a, route_bytes, target_device_.ordinal, target_stream_);
-        }
-
-        /** @brief Arm and submit one retained replay with no per-layer host work. */
-        bool submit(std::uint64_t generation)
-        {
-            if (!arm(generation) || !source_graph_ || !target_graph_ ||
-                !captureFrom(source_cache_) || !captureFrom(target_cache_))
-                return false;
-            /* Queue the follower first, matching the production transaction
-             * service. Prove that its terminal event remains blocked before
-             * the continuation is even submitted; an immediate back-to-back
-             * launch can accidentally hide a non-functional mapped wait. */
-            IWorkerGPUContext *const target_worker =
-                &GPUDeviceContextPool::instance().getContext(target_device_);
-            IWorkerGPUContext *const source_worker =
-                &GPUDeviceContextPool::instance().getContext(source_device_);
-            if (!launchEndpoint(
-                    *target_executor_,
-                    *target_graph_,
-                    target_execution_context_.get(),
-                    target_cache_,
-                    target_stream_,
-                    target_worker) ||
-                !target_backend_->recordEvent(
-                    target_terminal_, 0, target_stream_))
-            {
-                error_ = "follower production graph submission failed";
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            bool follower_completed_before_source = false;
-            if (!target_backend_->queryEvent(
-                    target_terminal_, 0, &follower_completed_before_source))
-            {
-                error_ = "could not query the follower-first blocking proof";
-                return false;
-            }
-            if (!launchEndpoint(
-                    *source_executor_,
-                    *source_graph_,
-                    source_execution_context_.get(),
-                    source_cache_,
-                    source_stream_,
-                    source_worker) ||
-                !source_backend_->recordEvent(
-                    source_terminal_, 0, source_stream_))
-            {
-                error_ = "continuation production graph submission failed";
-                return false;
-            }
-            terminals_recorded_ = true;
-            if (follower_completed_before_source)
-            {
-                error_ =
-                    "follower retained graph bypassed its unpublished dispatch wait";
-                return false;
-            }
-            return true;
-        }
-
-        /**
-         * @brief Queue generation N+1 while N's reusable admission value is live.
-         *
-         * Production continuation submission can run ahead of follower-rank
-         * retirement. The capture-stable admission threshold is therefore still
-         * satisfied by generation N when this replay starts. A correct stage-zero
-         * acquisition must remain blocked on its private generation cursor rather
-         * than aborting against N's Complete control record.
-         */
-        bool queueSourceBeforePriorRetirement()
-        {
-            if (!identity_ || !terminals_recorded_ || source_queued_ahead_ ||
-                !source_graph_ || !captureFrom(source_cache_))
-            {
-                error_ =
-                    "stale-admission proof requires one completed live lease";
-                return false;
-            }
-            IWorkerGPUContext *const source_worker =
-                &GPUDeviceContextPool::instance().getContext(source_device_);
-            if (!launchEndpoint(
-                    *source_executor_,
-                    *source_graph_,
-                    source_execution_context_.get(),
-                    source_cache_,
-                    source_stream_,
-                    source_worker) ||
-                !source_backend_->recordEvent(
-                    source_terminal_, 0, source_stream_))
-            {
-                error_ =
-                    "ahead-of-retirement continuation replay submission failed";
-                return false;
-            }
-
-            /* Give the tiny retained graph ample time to expose the former ABA:
-             * the old implementation immediately changed Complete to Aborted at
-             * layer zero. The fixed graph stays resident on the device wait. */
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-            bool source_ready = false;
-            if (!source_backend_->queryEvent(
-                    source_terminal_, 0, &source_ready))
-            {
-                error_ =
-                    "could not query ahead-of-retirement continuation replay";
-                return false;
-            }
-            const auto &control = source_transport_->activationEpochControl(
-                target_participant_, 0u);
-            if (source_ready ||
-                control.continuation_status.typedState() !=
-                    MoEOverlayActivationEndpointState::Complete ||
-                control.continuation_status.typedCode() !=
-                    MoEOverlayActivationStatusCode::Success)
-            {
-                error_ =
-                    "continuation consumed stale admission instead of waiting for a newer authenticated generation";
-                return false;
-            }
-            source_queued_ahead_ = true;
-            return true;
-        }
-
-        /**
-         * @brief Retire N, arm N+1, and release the already-queued continuation.
-         *
-         * Only the ordinary protocol reset/arm transition changes mapped state.
-         * The continuation executable and its private grant remain untouched;
-         * the follower is then submitted exactly as in production.
-         */
-        bool releaseQueuedSourceWithGeneration(std::uint64_t generation)
-        {
-            if (!source_queued_ahead_)
-            {
-                error_ = "no ahead-of-retirement continuation replay is queued";
-                return false;
-            }
-            if (!retire() || !arm(generation))
-                return false;
-
-            IWorkerGPUContext *const target_worker =
-                &GPUDeviceContextPool::instance().getContext(target_device_);
-            if (!launchEndpoint(
-                    *target_executor_,
-                    *target_graph_,
-                    target_execution_context_.get(),
-                    target_cache_,
-                    target_stream_,
-                    target_worker) ||
-                !target_backend_->recordEvent(
-                    target_terminal_, 0, target_stream_))
-            {
-                error_ = "follower submission after generation release failed";
-                return false;
-            }
-            source_queued_ahead_ = false;
-            terminals_recorded_ = true;
-            return true;
-        }
-
-        /**
-         * @brief Abort an unpublished successor and prove its graph drains.
-         * @return Success only after both the terminal event and semantic abort.
-         *
-         * This publishes the same mapped abort sentinels as failure cleanup;
-         * it never manufactures a new admission to release a stuck waiter.
-         */
-        bool abortQueuedSourceAndValidate()
-        {
-            if (!source_queued_ahead_ || !protocol_ || !identity_)
-                return false;
-            if (!protocol_->cancelOriginalInvocation(*identity_,
-                    MoEOverlayActivationStatusCode::ExplicitAbort, &error_))
-                return false;
-            if (!awaitEvent(source_backend_, source_terminal_,
-                            std::chrono::seconds(2)))
-            {
-                error_ = "aborted epoch admission did not drain its retained graph";
-                return false;
-            }
-            const auto &control = source_transport_->activationEpochControl(
-                target_participant_, 0u);
-            if (control.continuation_status.typedState() !=
-                MoEOverlayActivationEndpointState::Aborted)
-            {
-                error_ = "aborted epoch admission did not publish terminal failure";
-                return false;
-            }
-            if (protocol_->admissionState() != MoEOverlayActivationAdmissionState::Failed ||
-                protocol_->reset(*identity_, &error_))
-            {
-                error_ = "cancelled original scheduler invocation became reusable";
-                return false;
-            }
-            source_queued_ahead_ = false;
-            return true;
-        }
-
-        /** @brief Observe terminal events, then copy diagnostic outputs once. */
-        bool awaitAndValidate()
-        {
-            bool source_ready = false;
-            bool target_ready = false;
-            bool source_query_ok = terminals_recorded_;
-            bool target_query_ok = terminals_recorded_;
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (terminals_recorded_ &&
-                   std::chrono::steady_clock::now() < deadline &&
-                   (!source_ready || !target_ready))
-            {
-                if (!source_ready)
-                {
-                    source_query_ok = source_backend_->queryEvent(
-                        source_terminal_, /*device_id=*/0, &source_ready);
-                }
-                if (!target_ready)
-                {
-                    target_query_ok = target_backend_->queryEvent(
-                        target_terminal_, /*device_id=*/0, &target_ready);
-                }
-                if (!source_query_ok || !target_query_ok)
-                    break;
-                std::this_thread::yield();
-            }
-            if (!source_ready || !target_ready)
-            {
-                terminal_timeout_observed_ = true;
-                auto &control =
-                    source_transport_->activationEpochControl(
-                        target_participant_, 0u);
-                auto &target_control = target_transport_->activationEpochControl(
-                    target_participant_, 0u);
-                bool source_initialized = false;
-                bool target_initialized = false;
-                const bool source_initialization_query = source_backend_->queryEvent(
-                    source_lane_.grant_initialization_event, source_device_.ordinal,
-                    &source_initialized);
-                const bool target_initialization_query = target_lane_.device.is_gpu() &&
-                    target_backend_->queryEvent(target_lane_.grant_initialization_event,
-                                                target_device_.ordinal, &target_initialized);
-                error_ =
-                    "packet transaction terminal event did not complete"
-                    " grants(source/target)=" +
-                    std::to_string(reinterpret_cast<std::uintptr_t>(source_lane_.grant_device)) + "/" +
-                    std::to_string(reinterpret_cast<std::uintptr_t>(target_lane_.grant_device)) +
-                    " initialization(query/ready,query/ready)=" +
-                    std::to_string(source_initialization_query) + "/" +
-                    std::to_string(source_initialized) + "," +
-                    std::to_string(target_initialization_query) + "/" +
-                    std::to_string(target_initialized) +
-                    " admission(source_ready/target_ready/source_generation/target_generation)=" +
-                    std::to_string(std::atomic_ref(control.admission.ready_signal).load(std::memory_order_acquire)) + "/" +
-                    std::to_string(std::atomic_ref(target_control.admission.ready_signal).load(std::memory_order_acquire)) + "/" +
-                    std::to_string(std::atomic_ref(control.admission.last_generation).load(std::memory_order_acquire)) + "/" +
-                    std::to_string(std::atomic_ref(target_control.admission.last_generation).load(std::memory_order_acquire)) +
-                    " endpoint_last_timeline(continuation/follower)=" +
-                    std::to_string(control.continuation_status.observed_timeline) + "/" +
-                    std::to_string(control.follower_status.observed_timeline) +
-                    " source(query/ready)=" +
-                    std::to_string(source_query_ok) + "/" +
-                    std::to_string(source_ready) +
-                    " target(query/ready)=" +
-                    std::to_string(target_query_ok) + "/" +
-                    std::to_string(target_ready) +
-                    " continuation(state/code/pub/consume)=" +
-                    std::to_string(control.continuation_status.state) + "/" +
-                    std::to_string(control.continuation_status.code) + "/" +
-                    std::to_string(
-                        control.continuation_status.last_published_stage) +
-                    "/" +
-                    std::to_string(
-                        control.continuation_status.last_consumed_stage) +
-                    " follower(state/code/pub/consume)=" +
-                    std::to_string(control.follower_status.state) + "/" +
-                    std::to_string(control.follower_status.code) + "/" +
-                    std::to_string(
-                        control.follower_status.last_published_stage) +
-                    "/" +
-                    std::to_string(
-                        control.follower_status.last_consumed_stage) +
-                    " signals(dispatch/return)=" +
-                    std::to_string(
-                        control.buffers[0].dispatch_signal.value) + "/" +
-                    std::to_string(control.buffers[0].return_signal.value) +
-                    " descriptor_rows=" +
-                    std::to_string(
-                        control.buffers[0].dispatch_descriptor.live_rows);
-                return false;
-            }
-
-            if constexpr (BackingRows > Rows)
-            {
-                constexpr size_t elements = size_t(BackingRows - Rows) * kDModel;
-                std::array<std::uint8_t, elements * sizeof(float)> hidden_suffix{};
-                std::array<std::uint8_t, elements * kTopK * sizeof(float)> route_suffix{};
-                if (!target_backend_->deviceToHost(hidden_suffix.data(),
-                        static_cast<const std::byte *>(target_hidden_) + size_t(Rows) * kDModel * sizeof(float),
-                        hidden_suffix.size(), target_device_.ordinal, target_stream_) ||
-                    !target_backend_->deviceToHost(route_suffix.data(),
-                        static_cast<const std::byte *>(target_canonical_routes_) + size_t(Rows) * kTopK * kDModel * sizeof(float),
-                        route_suffix.size(), target_device_.ordinal, target_stream_) ||
-                    !target_backend_->synchronizeStream(target_stream_, target_device_.ordinal) ||
-                    !std::all_of(hidden_suffix.begin(), hidden_suffix.end(), [](auto byte) { return byte == 0x5a; }) ||
-                    !std::all_of(route_suffix.begin(), route_suffix.end(), [](auto byte) { return byte == 0x5a; }))
-                {
-                    error_ = "exact-row packet graph touched its backing-capacity suffix";
-                    return false;
-                }
-            }
-
-            std::array<float, kEntries * kDModel> canonical_routes{};
-            std::int32_t target_live_rows = -1;
-            float target_first_hidden = -1.0f;
-            const std::int32_t source_return_live_rows =
-                static_cast<std::int32_t>(
-                    source_transport_->activationEpochControl(
-                        target_participant_, 0u)
-                        .buffers[0]
-                        .return_descriptor.live_rows);
-            float target_return_first = -1.0f;
-            if (!source_backend_->deviceToHost(
-                    canonical_routes.data(), source_canonical_routes_,
-                    sizeof(canonical_routes), 0, source_stream_) ||
-                !target_backend_->deviceToHost(
-                    &target_live_rows, target_active_rows_,
-                    sizeof(target_live_rows), 0, target_stream_) ||
-                !target_backend_->deviceToHost(
-                    &target_first_hidden, target_hidden_,
-                    sizeof(target_first_hidden), 0, target_stream_) ||
-                !target_backend_->deviceToHost(
-                    &target_return_first, target_canonical_routes_,
-                    sizeof(target_return_first), 0, target_stream_))
-            {
-                error_ = "terminal diagnostic copy failed";
-                return false;
-            }
-            const auto expected_live_rows = static_cast<std::int32_t>(
-                targetLiveRows(live_rows_));
-            if (target_live_rows != expected_live_rows)
-            {
-                const auto &control =
-                    source_transport_->activationEpochControl(
-                        target_participant_, 0u);
-                error_ =
-                    "generation=" +
-                    std::to_string(
-                        identity_ ? identity_->epoch_generation : 0u) +
-                    " follower live_rows=" +
-                    std::to_string(target_live_rows) +
-                    " continuation(state/code/pub/consume)=" +
-                    std::to_string(control.continuation_status.state) + "/" +
-                    std::to_string(control.continuation_status.code) + "/" +
-                    std::to_string(
-                        control.continuation_status.last_published_stage) +
-                    "/" +
-                    std::to_string(
-                        control.continuation_status.last_consumed_stage) +
-                    " follower(state/code/pub/consume)=" +
-                    std::to_string(control.follower_status.state) + "/" +
-                    std::to_string(control.follower_status.code) + "/" +
-                    std::to_string(
-                        control.follower_status.last_published_stage) +
-                    "/" +
-                    std::to_string(
-                        control.follower_status.last_consumed_stage) +
-                    " signals(dispatch/return)=" +
-                    std::to_string(
-                        control.buffers[0].dispatch_signal.value) +
-                    "/" +
-                    std::to_string(control.buffers[0].return_signal.value) +
-                    " descriptor_rows=" +
-                    std::to_string(
-                        control.buffers[0]
-                            .dispatch_descriptor.live_rows);
-                return false;
-            }
-            for (std::int32_t row = 0; row < kRows; ++row)
-            {
-                for (std::int32_t route = 0; route < kTopK; ++route)
-                {
-                    const std::size_t original_slot =
-                        static_cast<std::size_t>(row * kTopK + route);
-                    for (std::int32_t column = 0;
-                         column < kDModel;
-                         ++column)
-                    {
-                        const float expected =
-                            row < live_rows_ &&
-                            routeParticipant(original_slot) ==
-                                    target_participant_
-                                ? kRouteWeightPattern[
-                                      original_slot %
-                                      kRouteWeightPattern.size()] *
-                                      sourceValue(row, column)
-                                : 0.0f;
-                        const float observed = canonical_routes[
-                            original_slot *
-                                static_cast<std::size_t>(kDModel) +
-                            static_cast<std::size_t>(column)];
-                        if (observed != expected)
-                        {
-                            const auto &control =
-                                source_transport_->activationEpochControl(
-                                    target_participant_, 0u);
-                            error_ =
-                                "continuation canonical route bank did not preserve exact original-slot bytes"
-                                " generation=" +
-                                std::to_string(
-                                    identity_
-                                        ? identity_->epoch_generation
-                                        : 0u) +
-                                " row=" + std::to_string(row) +
-                                " route=" + std::to_string(route) +
-                                " column=" + std::to_string(column) +
-                                " expected=" + std::to_string(expected) +
-                                " observed=" + std::to_string(observed) +
-                                " target_first_hidden=" +
-                                std::to_string(target_first_hidden) +
-                                " source_return_live_rows=" +
-                                std::to_string(source_return_live_rows) +
-                                " target_return_first=" +
-                                std::to_string(target_return_first) +
-                                " mapped_dispatch_first=" +
-                                std::to_string(
-                                    source_transport_->sharedDispatchRows(
-                                        target_participant_)
-                                        .hidden_rows_fp32[0]) +
-                                " mapped_return_first=" +
-                                std::to_string(
-                                    source_transport_->sharedReturnRows(
-                                        target_participant_)
-                                        .output_rows_fp32[0]) +
-                                " continuation(state/code)=" +
-                                std::to_string(
-                                    control.continuation_status.state) + "/" +
-                                std::to_string(
-                                    control.continuation_status.code) +
-                                " follower(state/code)=" +
-                                std::to_string(
-                                    control.follower_status.state) + "/" +
-                                std::to_string(
-                                    control.follower_status.code) +
-                                " signals(dispatch/return)=" +
-                                std::to_string(
-                                    control.buffers[0]
-                                        .dispatch_signal.value) +
-                                "/" +
-                                std::to_string(
-                                    control.buffers[0]
-                                        .return_signal.value) +
-                                " full_graph_nodes(source/target)=" +
-                                std::to_string(
-                                    captureFrom(source_cache_)->nodeCount()) +
-                                "," +
-                                std::to_string(
-                                    captureFrom(target_cache_)->nodeCount());
-                            return false;
-                        }
-                    }
-                }
-            }
-            const auto &control = source_transport_->activationEpochControl(
-                target_participant_, 0u);
-            if (static_cast<MoEOverlayActivationEndpointState>(
-                    control.continuation_status.state) !=
-                    MoEOverlayActivationEndpointState::Complete ||
-                static_cast<MoEOverlayActivationEndpointState>(
-                    control.follower_status.state) !=
-                    MoEOverlayActivationEndpointState::Complete ||
-                control.continuation_status.code !=
-                    static_cast<std::uint32_t>(
-                        MoEOverlayActivationStatusCode::Success) ||
-                control.follower_status.code !=
-                    static_cast<std::uint32_t>(
-                        MoEOverlayActivationStatusCode::Success))
-            {
-                error_ = "mapped endpoint statuses did not complete successfully";
-                return false;
-            }
-            if (!identity_)
-            {
-                error_ = "mapped endpoint completed without an active epoch identity";
-                return false;
-            }
-            std::string traffic_error;
-            const auto traffic = protocol_->completedTraffic(
-                *identity_, &traffic_error);
-            const std::uint64_t expected_stage_count = kLayers.size();
-            const std::uint64_t expected_rows =
-                targetLiveRows(live_rows_) * expected_stage_count;
-            const std::uint64_t expected_entries =
-                targetLiveEntries(live_rows_) * expected_stage_count;
-            const std::uint64_t expected_dispatch_bytes =
-                moeOverlayDispatchPayloadBytes(
-                    targetLiveRows(live_rows_),
-                    targetLiveEntries(live_rows_),
-                    static_cast<std::uint32_t>(kDModel)) *
-                expected_stage_count;
-            const std::uint64_t expected_return_bytes =
-                moeOverlayReturnPayloadBytes(
-                    targetLiveEntries(live_rows_),
-                    static_cast<std::uint32_t>(kDModel)) *
-                expected_stage_count;
-            if (!traffic ||
-                traffic->dispatch_payload_bytes != expected_dispatch_bytes ||
-                traffic->dispatch_shared_hidden_bytes != (kUsesSingleRowDirectPacket ? 0u :
-                    targetLiveRows(live_rows_)*kDModel*sizeof(float)*expected_stage_count) ||
-                traffic->return_payload_bytes != expected_return_bytes ||
-                traffic->dispatch_live_rows != expected_rows ||
-                traffic->return_live_rows != expected_rows ||
-                traffic->dispatch_live_entries != expected_entries ||
-                traffic->return_live_entries != expected_entries ||
-                traffic->dispatch_stage_count != expected_stage_count ||
-                traffic->return_stage_count != expected_stage_count)
-            {
-                error_ =
-                    "device-owned activation traffic totals were incomplete: " +
-                    traffic_error;
-                return false;
-            }
-            return true;
-        }
-
-        /** @brief Retire both terminal events and reset the leased signal banks. */
-        bool retire()
-        {
-            if (!protocol_ || !identity_ || !terminals_recorded_)
-            {
-                error_ = "cannot retire an incomplete activation replay";
-                return false;
-            }
-            std::string reset_error;
-            last_digest_ = identity_->digest;
-            if (!protocol_->reset(*identity_, &reset_error))
-            {
-                error_ = reset_error;
-                return false;
-            }
-            auto &control = source_transport_->activationEpochControl(
-                target_participant_, 0u);
-            for (std::uint32_t bank = 0u;
-                 bank < kMoEOverlayActivationBufferCount;
-                 ++bank)
-            {
-                if (control.buffers[bank].dispatch_signal.value != 0u ||
-                    control.buffers[bank].return_signal.value != 0u)
-                {
-                    error_ = "retired activation lease retained a timeline signal";
-                    return false;
-                }
-            }
-            identity_.reset();
-            terminals_recorded_ = false;
-            return true;
-        }
-
-        /**
-         * @brief Change replay inputs after the preceding native terminals.
-         * @param live_rows Exact next live extent, bounded by captured geometry.
-         * @param bias New exactly representable source payload bias.
-         * @return True when original stream uploads completed successfully.
-         *
-         * Keep the old completed admission published: the queued-source proof
-         * must wait for its successor generation rather than reuse this one.
-         * No tensor address, capture geometry, or placement policy changes.
-         */
-        bool preparePublicationReplayInputs(int live_rows, float bias)
-        {
-            if (!identity_ || !terminals_recorded_ || source_queued_ahead_ ||
-                live_rows < 0 || live_rows > Rows)
-                return false;
-            bool source_ready = false;
-            bool target_ready = false;
-            if (!source_backend_->queryEvent(source_terminal_, 0, &source_ready) ||
-                !target_backend_->queryEvent(target_terminal_, 0, &target_ready) ||
-                !source_ready || !target_ready)
-                return false;
-            const auto &control = source_transport_->activationEpochControl(
-                target_participant_, 0u);
-            if (control.continuation_status.state !=
-                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete) ||
-                control.follower_status.state !=
-                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete))
-                return false;
-            live_rows_ = live_rows;
-            payload_bias_ = bias;
-            return initializeSourcePayload();
-        }
-
-        /** @return Stable diagnostic from the first failed setup/operation. */
-        const std::string &error() const noexcept { return error_; }
-
-        /** @brief Capture and inspect dispatch only; original CPU return remains unexecuted. */
-        bool replayJointDispatch(int live = -1, bool swapped = false, int zero_pattern = 0,
-                                 std::uint64_t epoch = kPlacementEpoch)
-        {
-            if (!joint_owners_ || !acquireCapturedJointSource())
-                return false;
-            if (live >= 0)
-                live_rows_ = live;
-            live_joint_swapped_ = swapped;
-            if (!prepareRecordedJointPlacement(swapped))
-                return false;
-            joint_zero_pattern_ = zero_pattern;
-            live_placement_epoch_ = epoch;
-            if (!publishRecordedJointEpoch() || !arm(++dispatch_replay_generation_))
-                return false;
-            const auto payload = source_lane_.dispatchPayload(kRows);
-            if (!payload.valid())
-                return false;
-            auto *payload_matrix = static_cast<float *>(
-                source_lane_.mapped_region->mutableHostData(payload.hidden_payload_offset));
-            constexpr float untouched=-137.0f;
-            std::fill_n(payload_matrix, kRows * kDModel, untouched);
-            auto* worker=&GPUDeviceContextPool::instance().getContext(source_device_);
-            if (!launchEndpoint(*source_executor_,*source_graph_,source_execution_context_.get(),
-                                source_cache_,source_stream_,worker) ||
-                !source_backend_->recordEvent(source_terminal_,0,source_stream_)) return false;
-            terminals_recorded_=true;
-            if (!awaitEvent(source_backend_,source_terminal_,std::chrono::seconds(10))) return false;
-            const auto& control=source_transport_->activationEpochControl(target_participant_,0u);
-            const auto& d=control.buffers[0].dispatch_descriptor;
-            std::uint64_t rows=0, entries=0;
-            for(int row=0;row<live_rows_;++row) {
-                bool seen=false;
-                for (int slot = 0; slot < kTopK; ++slot)
-                    if (selectedJointRoute(row * kTopK + slot))
-                    {
-                        ++entries;
-                        seen = true;
-                    }
-                rows+=seen;
-            }
-            bool correct =
-                d.live_rows == rows && d.live_entries == entries &&
-                d.payload_bytes == moeOverlayDispatchPayloadBytes(rows, entries, kDModel) &&
-                d.placement_epoch == live_placement_epoch_ &&
-                d.model_layer_index == kLayers.front();
-            const auto view=source_transport_->sharedDispatchRows(target_participant_);
-            std::size_t compact=0,entry=0;
-            for(int row=0;row<live_rows_;++row) {
-                bool seen=false;
-                for(int slot=0;slot<kTopK;++slot) {
-                    const auto original=static_cast<std::size_t>(row*kTopK+slot);
-                    if (!selectedJointRoute(original))
-                        continue;
-                    if(!seen)correct=correct && view.row_ids_host[compact]==row && view.entry_offsets_host[compact]==static_cast<int>(entry);
-                    correct = correct &&
-                              view.expert_ids_host[entry] == static_cast<int>(10 + original % 8) &&
-                              view.original_route_slots_host[entry] == static_cast<int>(original) &&
-                              std::bit_cast<std::uint32_t>(view.route_weights_host[entry]) ==
-                                  std::bit_cast<std::uint32_t>(jointRouteWeight(original));
-                    ++entry;seen=true;
-                }
-                compact+=seen;
-            }
-            correct=correct && view.entry_offsets_host[compact]==static_cast<int>(entry);
-            MoEOverlayActivationDeviceEpochGrant observed{};
-            if(!source_backend_->deviceToHost(&observed,source_lane_.grant_device,sizeof(observed),0,source_stream_))return false;
-            correct =
-                correct &&
-                observed.published_shared_hidden_bytes ==
-                    (payload.selection.usesSharedPhysicalRows() ? rows * kDModel * sizeof(float)
-                                                                : 0u) &&
-                observed.published_payload_bytes == d.payload_bytes &&
-                observed.state ==
-                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Active) &&
-                observed.code ==
-                    static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) &&
-                observed.generation == dispatch_replay_generation_ &&
-                observed.placement_epoch == live_placement_epoch_ &&
-                observed.last_published_stage == 0 && observed.published_stage_count == 1u;
-            for(int row=0;row<kRows;++row) {
-                bool needed=false;
-                if (row < live_rows_)
-                    for (int slot = 0; slot < kTopK; ++slot)
-                        needed = needed || selectedJointRoute(row * kTopK + slot);
-                for(int col=0;col<kDModel;++col)
-                    correct = correct && payload_matrix[row * kDModel + col] ==
-                                             (needed ? sourceValue(row, col) : untouched);
-            }
-            std::vector<GPUGraphKernelNodeInfo> kernels;std::string inspection_error;
-            const auto* capture=captureFrom(source_cache_);
-            if(!capture || !capture->inspectKernelNodes(kernels,&inspection_error))return false;
-            const auto writers=std::count_if(kernels.begin(),kernels.end(),[](const auto& node){
-                return node.name.find("packSharedDispatchUnionKernel")!=std::string::npos;});
-            const auto compact_writers = std::count_if(
-                kernels.begin(), kernels.end(), [](const auto &node)
-                { return node.name.find("packSingleRowDispatchKernel") != std::string::npos; });
-            correct = correct && writers == (payload.selection.usesSharedPhysicalRows() ? 1 : 0) &&
-                      (payload.selection.usesSharedPhysicalRows() || compact_writers == 1) &&
-                      capture == recorded_source_capture_;
-            correct = releaseRecordedJointEpoch() && correct;
-            // No CPU return witness is manufactured: cancel this original dispatch-only invocation.
-            const bool cancelled=protocol_->cancelOriginalInvocation(*identity_,MoEOverlayActivationStatusCode::ExplicitAbort,&error_);
-            return correct && cancelled;
-        }
-
-        /**
-         * @brief Capture one original two-consumer matrix with no fabricated return.
-         * Every lane is armed from its own original channel/ticket. The source
-         * terminal proves row stores; cancellation closes the unfinished CPU work.
-         */
-        bool replaySharedUnionGroup(int live = -1, bool swapped = false, int zero_pattern = 0,
-                                    std::uint64_t epoch = kPlacementEpoch)
-        {
-            if (joint_owners_)
-            {
-                if (!acquireCapturedJointSource())
-                    return false;
-                if (live >= 0)
-                    live_rows_ = live;
-                live_joint_swapped_ = swapped;
-                joint_zero_pattern_ = zero_pattern;
-                if (!prepareRecordedJointPlacement(swapped))
-                    return false;
-                live_placement_epoch_ = epoch;
-                if (!publishRecordedJointEpoch())
-                    return false;
-                ++dispatch_replay_generation_;
-            }
-
-            if(dispatch_targets_.size()!=2u)return false;
-            struct Armed {std::unique_ptr<MoEOverlayActivationEpochProtocol> protocol;MoEOverlayActivationEpochIdentity identity;bool cancelled=false;};
-            std::vector<Armed> armed;
-            struct CancelAll {
-                std::vector<Armed>& handles;
-                ~CancelAll(){for(auto& h:handles)if(!h.cancelled){std::string error;(void)h.protocol->cancelOriginalInvocation(h.identity,MoEOverlayActivationStatusCode::ExplicitAbort,&error);}}
-            } cancellation{armed};
-            for(const int target:dispatch_targets_) {
-                if (!initializeProtocol(target) ||
-                    !arm(joint_owners_ ? dispatch_replay_generation_ : 1u))
-                    return false;
-                armed.push_back({std::move(protocol_),*identity_});
-            }
-            auto* matrix=static_cast<float*>(source_lane_.mapped_region->mutableHostData(source_lane_.shared_dispatch_hidden_offset));
-            constexpr float sentinel=-137.0f;std::fill_n(matrix,kRows*kDModel,sentinel);
-            auto* worker=&GPUDeviceContextPool::instance().getContext(source_device_);
-            bool ok=launchEndpoint(*source_executor_,*source_graph_,source_execution_context_.get(),source_cache_,source_stream_,worker) &&
-                source_backend_->recordEvent(source_terminal_,0,source_stream_);
-            terminals_recorded_=ok;
-            if(ok)ok=awaitEvent(source_backend_,source_terminal_,std::chrono::seconds(10));
-            if(!ok){if(error_.empty())error_="Shared group source enqueue/event/terminal failed";return false;}
-            const auto require=[&](bool condition,const std::string& diagnostic){
-                if(!condition && error_.empty())error_=diagnostic;
-                ok=condition && ok;
-            };
-            std::uint64_t union_rows=0;
-            for (int row = 0; row < live_rows_; ++row)
-                union_rows += joint_owners_ ? (selectedJointRoute(row * kTopK) ||
-                                               selectedJointRoute(row * kTopK + 1))
-                                            : row % 4 != 1;
-            std::uint64_t physical_bytes=0;
-            for(const int target:dispatch_targets_) {
-                const auto lane=source_transport_->activationDeviceLane(target,0u,source_device_);
-                MoEOverlayActivationDeviceEpochGrant observed{};
-                if(!source_backend_->deviceToHost(&observed,lane.grant_device,sizeof(observed),0,source_stream_)){require(false,"Original shared lane terminal copy failed target="+std::to_string(target));continue;}
-                physical_bytes+=observed.published_shared_hidden_bytes;
-                const auto& descriptor=source_transport_->activationEpochControl(target,0u).buffers[0].dispatch_descriptor;
-                std::uint64_t rows=0,entries=0;
-                constexpr std::array<int,8> routes{7,19,2,2,7,7,19,2};
-                for(int row=0;row<live_rows_;++row){bool seen=false;for(int slot=0;slot<kTopK;++slot)
-                        if (joint_owners_ ? selectedJointRoute(row * kTopK + slot)
-                                          : routes[(row * kTopK + slot) % 8] == target)
-                        {
-                            ++entries;
-                            seen = true;
-                        }
-                    rows += seen;
-                }
-                require(
-                    observed.state ==
-                            static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Active) &&
-                        observed.code ==
-                            static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) &&
-                        observed.generation == (joint_owners_ ? dispatch_replay_generation_ : 1u) &&
-                        observed.last_published_stage == 0 &&
-                        observed.published_stage_count == 1u &&
-                        descriptor.digest == observed.digest && descriptor.stage_ordinal == 0u &&
-                        descriptor.model_layer_index == kLayers.front() &&
-                        descriptor.placement_epoch == live_placement_epoch_ &&
-                        descriptor.live_rows == rows && descriptor.live_entries == entries &&
-                        descriptor.payload_bytes ==
-                            moeOverlayDispatchPayloadBytes(rows, entries, kDModel),
-                    "Original shared lane descriptor/state mismatch target=" +
-                        std::to_string(target));
-            }
-            for(int row=0;row<kRows;++row) {
-                const bool needed =
-                    row < live_rows_ && (joint_owners_ ? (selectedJointRoute(row * kTopK) ||
-                                                          selectedJointRoute(row * kTopK + 1))
-                                                       : row % 4 != 1);
-                for(int col=0;col<kDModel;++col)require(matrix[row*kDModel+col]==(needed?sourceValue(row,col):sentinel),
-                    "Shared matrix useful/untouched mismatch at row="+std::to_string(row)+" col="+std::to_string(col));
-            }
-            require(physical_bytes==union_rows*kDModel*sizeof(float),"Shared group physical bytes="+std::to_string(physical_bytes)+" expected="+std::to_string(union_rows*kDModel*sizeof(float)));
-            std::vector<GPUGraphKernelNodeInfo> kernels;std::string inspection;
-            const auto* capture=captureFrom(source_cache_);
-            require(capture && capture->inspectKernelNodes(kernels,&inspection),"Shared group kernel inspection failed: "+inspection);
-            require(std::count_if(kernels.begin(),kernels.end(),[](const auto& n){return n.name.find("packSharedDispatchUnionKernel")!=std::string::npos;})==1,"Shared group must have exactly one captured payload writer");
-            if (joint_owners_)
-            {
-                require(capture == recorded_source_capture_,
-                        "Original setup capture identity changed");
-                require(releaseRecordedJointEpoch(), "Original acquired epoch did not release");
-            }
-            for(auto& handle:armed) {
-                std::string error;
-                const bool cancelled=handle.protocol->cancelOriginalInvocation(handle.identity,MoEOverlayActivationStatusCode::ExplicitAbort,&error);
-                handle.cancelled=cancelled;ok=cancelled && ok;
-            }
-            return ok;
-        }
-
-    private:
-        /** @return Every actual source lane in the original rank-pair workspace. */
-        std::vector<MoEOverlayMappedActivationDeviceLane> dispatchSourceLanes() const {
-            if(dispatch_targets_.empty())return {source_lane_};
-            std::vector<MoEOverlayMappedActivationDeviceLane> result;
-            for(const int target:dispatch_targets_)result.push_back(source_transport_->activationDeviceLane(target,0u,source_device_));
-            return result;
-        }
-        std::vector<int> dispatch_targets_;
-
-        /** @return Cold original source-map projection, never CPU readiness. */
-        MoEOverlayJointRouteTarget jointMembership(int layer, int target = -1) const
-        {
-            if (target < 0)
-                target = target_participant_;
-            for (const auto &row : joint_owners_->owners())
-            {
-                if (row.layer_idx != layer || !row.shard_cohort)
-                    continue;
-                for (const auto &member : row.shard_cohort->participants())
-                    if (member.participant_id == target)
-                        return MoEOverlayJointRouteTarget::fromOriginalCohort(kExpertCount, target,
-                                                                              layer, row.tier_idx);
-            }
-            return {};
-        }
-        /**
-         * @brief Acquire the original epoch for the already materialized packet graph.
-         * @return True after actual acquisition with the original executable still unlaunched.
-         */
-        bool acquireCapturedJointSource()
-        {
-            // initialize() already materialized this exact source graph. The
-            // transaction must reuse it, never ask setup to capture it again.
-            if (recorded_source_capture_ || !source_cache_.initialized ||
-                source_cache_.executable_submission_state !=
-                    DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
-                        MaterializedUnlaunched ||
-                !source_cache_.retained_full_graph_replay.valid() ||
-                !captureFrom(source_cache_))
-            {
-                error_ = "Joint trace requires its original unlaunched captured source";
-                return false;
-            }
-            source_epoch_kernel_ = kernelFor(source_device_);
-            DeviceMoEOverlayEpochControl original{};
-            original.bank_epochs[1] = kPlacementEpoch;
-            original.bank_states[1] =
-                static_cast<std::uint32_t>(DeviceMoEOverlayEpochBankState::Published);
-            original.published_selector = deviceMoEOverlayEpochSelector(3u, 1u);
-            if (!source_epoch_kernel_ ||
-                !source_backend_->hostToDevice(source_epoch_control_, &original, sizeof(original),
-                                               0, source_stream_) ||
-                !source_epoch_kernel_->acquireMoEOverlayEpoch(
-                    {.stream = source_stream_}, source_epoch_control_,
-                    static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_),
-                    static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_)))
-                return false;
-            if (!observeRecordedEpoch(DeviceMoEOverlayEpochOperation::Acquire, kPlacementEpoch, 1u))
-                return false;
-            recorded_source_capture_ = captureFrom(source_cache_);
-            return recorded_source_capture_ != nullptr;
-        }
-        /**
-         * @brief Publish only the reserved peer bank through the original native epoch operations.
-         * @return True after actual acquire; this fixture grants no host/CPU model readiness.
-         */
-        bool publishRecordedJointEpoch()
-        {
-            if (live_placement_epoch_ == kPlacementEpoch)
-                return true;
-            const MoEKernelLaunchContext launch{.stream = source_stream_};
-            auto *ticket = static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_);
-            auto *status = static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_);
-            if (!source_epoch_kernel_->releaseMoEOverlayEpoch(launch, source_epoch_control_, ticket,
-                                                              status) ||
-                !source_backend_->hostToDevice(source_candidate_epoch_, &live_placement_epoch_,
-                                               sizeof(live_placement_epoch_), 0, source_stream_) ||
-                !source_epoch_kernel_->reserveMoEOverlayEpochCandidate(
-                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
-                !observeRecordedEpoch(DeviceMoEOverlayEpochOperation::ReserveCandidate,
-                                      live_placement_epoch_, 0u) ||
-                !initializeSourcePayload(true) ||
-                !source_epoch_kernel_->markMoEOverlayEpochCandidateReady(
-                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
-                !source_epoch_kernel_->publishMoEOverlayEpochCandidate(
-                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
-                !source_epoch_kernel_->acquireMoEOverlayEpoch(launch, source_epoch_control_, ticket,
-                                                              status))
-                return false;
-            return observeRecordedEpoch(DeviceMoEOverlayEpochOperation::Acquire,
-                                        live_placement_epoch_, 0u);
-        }
-        /**
-         * @brief Observe setup-only native status before permitting the next typed operation.
-         * @param operation Original producer that must have completed successfully.
-         * @param epoch Exact recorded epoch, not a host substitute for an acquired ticket.
-         * @param bank Original physical bank selected by that operation.
-         * @return True after its terminal event and exact semantic status match.
-         */
-        bool observeRecordedEpoch(DeviceMoEOverlayEpochOperation operation, std::uint64_t epoch,
-                                  std::uint32_t bank)
-        {
-            if (!source_backend_->recordEvent(source_terminal_, 0, source_stream_) ||
-                !awaitEvent(source_backend_, source_terminal_, std::chrono::seconds(10)))
-                return false;
-            DeviceMoEOverlayEpochStatus observed{};
-            return source_backend_->deviceToHost(&observed, source_placement_status_,
-                                                 sizeof(observed), 0, source_stream_) &&
-                   observed.code ==
-                       static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success) &&
-                   observed.operation == static_cast<std::uint32_t>(operation) &&
-                   observed.epoch == epoch && observed.bank == bank;
-        }
-        /** @return Whether actual native reader release reaches the original terminal event. */
-        bool releaseRecordedJointEpoch()
-        {
-            if (!source_epoch_kernel_->releaseMoEOverlayEpoch(
-                    {.stream = source_stream_}, source_epoch_control_,
-                    static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_),
-                    static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_)) ||
-                !source_backend_->recordEvent(source_terminal_, 0, source_stream_) ||
-                !awaitEvent(source_backend_, source_terminal_, std::chrono::seconds(10)))
-                return false;
-            DeviceMoEOverlayEpochStatus released{};
-            DeviceMoEOverlayEpochControl observed{};
-            return source_backend_->deviceToHost(&released, source_placement_status_,
-                                                 sizeof(released), 0, source_stream_) &&
-                   source_backend_->deviceToHost(&observed, source_epoch_control_, sizeof(observed),
-                                                 0, source_stream_) &&
-                   released.code ==
-                       static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success) &&
-                   observed.bank_readers[0] == 0u && observed.bank_readers[1] == 0u;
-        }
-        const IGPUGraphCapture *recorded_source_capture_ = nullptr;
-        std::unique_ptr<IMoEKernel> source_epoch_kernel_;
-        DeviceMoEOverlayEpochControl *source_epoch_control_ = nullptr;
-        std::uint64_t *source_candidate_epoch_ = nullptr;
-        /** @return Recorded route weight; zero holes retain original slot coordinates. */
-        float jointRouteWeight(std::size_t slot) const noexcept
-        {
-            if (joint_zero_pattern_ == 2 || (joint_zero_pattern_ == 1 && slot % 3 != 1))
-                return 0.f;
-            if (joint_zero_pattern_ == 3)
-                return std::bit_cast<float>(std::uint32_t{1});
-            return kRouteWeightPattern[slot % kRouteWeightPattern.size()];
-        }
-        /** @return Expected live CPU cohort selection, independent of packet compaction. */
-        bool selectedJointRoute(std::size_t slot) const
-        {
-            return jointMembership(kLayers.front()).enabled() &&
-                   (joint_zero_pattern_ != 2 && (joint_zero_pattern_ != 1 || slot % 3 == 1)) &&
-                   ((routeParticipant(slot) == kTargetParticipant) != live_joint_swapped_);
-        }
-        /**
-         * @brief Build recorded candidate metadata through the original fixed-quota transition
-         * builder.
-         * @param swapped Whether the trace exchanges the four original tier assignments.
-         * @return True with the same original cohort/cuts; no global snapshot is published.
-         */
-        bool prepareRecordedJointPlacement(bool swapped)
-        {
-            if (!swapped)
-            {
-                recorded_joint_owners_ = joint_owners_;
-                return true;
-            }
-            for (const auto &row : joint_owners_->owners())
-                if (row.shard_cohort)
-                {
-                    const auto members = row.shard_cohort->participants();
-                    recorded_joint_owners_ =
-                        jointPacketOwners(static_cast<int>(members.size()), source_device_,
-                                          joint_owners_.get(), true);
-                    return true;
-                }
-            return false;
-        }
-        /** @param expert Original source expert. @return Target from the checked recorded map. */
-        int recordedJointTarget(int expert) const
-        {
-            const auto &owners = recorded_joint_owners_ ? *recorded_joint_owners_ : *joint_owners_;
-            const auto *row = owners.placementFor(kLayers.front(), expert);
-            if (!row)
-                throw std::logic_error("Native joint source fixture lost its original expert");
-            return row->shard_cohort ? MoEOverlayRouteTarget::cpuCohort(row->tier_idx).word()
-                                     : MoEOverlayRouteTarget::whole(row->owner_participant).word();
-        }
-        std::shared_ptr<const MoEExpertOwnerMap> recorded_joint_owners_;
-        bool live_joint_swapped_ = false;
-        int joint_zero_pattern_ = 0;
-        std::uint64_t live_placement_epoch_ = kPlacementEpoch;
-        std::uint64_t dispatch_replay_generation_ = 0;
-        std::shared_ptr<const MoEExpertOwnerMap> joint_owners_;
-        int target_participant_=kTargetParticipant;
-        int live_rows_=Rows;
-        float payload_bias_ = 0.0f;
-
-        /** @brief Submit one complete retained endpoint graph asynchronously. */
-        static bool launchEndpoint(
-            DeviceGraphExecutor &executor, ComputeGraph &graph, IDeviceContext *context,
-            DeviceGraphExecutor::GraphSegmentCache &cache, void *stream, IWorkerGPUContext *worker,
-            DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission =
-                DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch)
-        {
-            return executor.executeWithCachedGraphReplay(
-                graph, context, cache, stream, worker,
-                /*collective_nodes=*/nullptr,
-                /*collectives_graph_capturable=*/false,
-                /*force_recapture=*/false,
-                /*defer_final_sync=*/true, {},
-                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph, {}, {}, {},
-                initial_submission);
-        }
-
-        /** @return Sole complete executable owned by a production full-graph cache. */
-        static const IGPUGraphCapture *captureFrom(
-            const DeviceGraphExecutor::GraphSegmentCache &cache) noexcept
-        {
-            if (cache.segments.size() != 1u ||
-                !cache.segments.front().capturable ||
-                !cache.segments.front().capture ||
-                !cache.segments.front().capture->hasExecutable())
-            {
-                return nullptr;
-            }
-            return cache.segments.front().capture.get();
-        }
-
-        /**
-         * @brief Prove HIP imported real fragment nodes behind device waits.
-         *
-         * CUDA may retain native child graphs. HIP must not: its mapped wait
-         * ordering is certified only when every fragment kernel is a root-level
-         * node behind an ordinary device wait kernel.
-         */
-        bool validateROCmTimelineLowering(
-            const IGPUGraphCapture &capture,
-            DeviceId device,
-            std::size_t expected_node_count,
-            std::size_t expected_wait_nodes,
-            const char *role)
-        {
-            if (!device.is_rocm())
-                return true;
-            std::vector<GPUGraphKernelNodeInfo> kernels;
-            std::string inspection_error;
-            if (capture.nodeCount() != expected_node_count ||
-                !capture.inspectKernelNodes(kernels, &inspection_error))
-            {
-                error_ = std::string(role) +
-                         " HIP timeline graph did not expose its complete "
-                         "flattened node DAG: expected=" +
-                         std::to_string(expected_node_count) +
-                         " observed=" +
-                         std::to_string(capture.nodeCount()) + " error=" +
-                         inspection_error;
-                return false;
-            }
-            std::size_t wait_nodes = 0u;
-            std::vector<std::string> wait_node_names;
-            for (const auto &kernel : kernels)
-            {
-                if (kernel.nesting_depth != 0u)
-                {
-                    error_ = std::string(role) +
-                             " HIP timeline retained a nested child kernel: " +
-                             kernel.name;
-                    return false;
-                }
-                if (kernel.name.find("waitSystemValue64") !=
-                    std::string::npos)
-                {
-                    ++wait_nodes;
-                    wait_node_names.push_back(kernel.name);
-                }
-            }
-            if (wait_nodes != expected_wait_nodes)
-            {
-                std::ostringstream detail;
-                detail << role
-                       << " HIP timeline did not contain the exact number of "
-                          "device-owned system waits: expected="
-                       << expected_wait_nodes << " observed=" << wait_nodes;
-                for (const auto &name : wait_node_names)
-                    detail << " wait_node='" << name << "'";
-                error_ = detail.str();
-                return false;
-            }
-            return true;
-        }
-
-        /** @return Deterministic source activation value for one logical row. */
-        float sourceValue(std::int32_t row, std::int32_t column) const
-        {
-            return static_cast<float>(row * 100 + column) + 0.25f + payload_bias_;
-        }
-
-        /** @brief Allocate and remember one exact-device buffer. */
-        void *allocate(IBackend *backend, std::size_t bytes)
-        {
-            void *address = backend ? backend->allocate(bytes, 0) : nullptr;
-            allocations_.push_back({
-                .backend = backend, .address = address, .ordinal = 0});
-            return address;
-        }
-
-        /** @return Whether every allocation attempted by initialize() succeeded. */
-        bool allAllocationsValid() const noexcept
-        {
-            for (const auto &allocation : allocations_)
-            {
-                if (!allocation.address)
-                    return false;
-            }
-            return !allocations_.empty();
-        }
-
-        /**
-         * @brief Resolve one exact device alias into the real placement-bank ABI.
-         *
-         * Production graph construction performs the same setup-only offset
-         * calculation from DeviceMoELayerRuntime. Keeping it here makes the
-         * integration proof sensitive to host/CUDA/HIP bank layout drift.
-         */
-        MoEOverlayRoutePlacementBankDeviceView placementBankView(
-            void *placement_banks,
-            std::uint32_t bank) const
-        {
-            if (!placement_banks ||
-                bank >= kDeviceMoEOverlayEpochBankCount)
-            {
-                return {};
-            }
-            auto *const bank_base =
-                static_cast<std::byte *>(placement_banks) +
-                static_cast<std::size_t>(bank) *
-                    sizeof(DeviceMoEPlacementBank);
-            return {
-                .route_participants =
-                    reinterpret_cast<const std::int32_t *>(
-                        bank_base + offsetof(
-                                        DeviceMoEPlacementBank,
-                                        overlay_route_participant)),
-                .epoch = reinterpret_cast<const std::uint32_t *>(
-                    bank_base + offsetof(DeviceMoEPlacementBank, epoch)),
-            };
-        }
-
-        /** @return Source-device view used by continuation packet stages. */
-        MoEOverlayRoutePlacementBankDeviceView placementBankView(
-            std::uint32_t bank) const
-        {
-            return placementBankView(source_placement_banks_, bank);
-        }
-
-        /** @brief Upload deterministic router output before transaction admission. */
-        bool initializeSourcePayload(bool candidate_only = false)
-        {
-            if (!source_hidden_tensor_ || !source_routing_indices_tensor_ ||
-                !source_routing_weights_tensor_ ||
-                !source_canonical_route_tensor_ || !source_zero_tensor_ ||
-                !target_hidden_tensor_ || !target_routing_indices_tensor_ ||
-                !target_routing_weights_tensor_ ||
-                !target_route_input_tensor_ ||
-                !target_canonical_route_tensor_)
-            {
-                error_ = "typed packet tensors were not constructed";
-                return false;
-            }
-            std::array<float, kRows * kDModel> hidden{};
-            for (std::int32_t row = 0; row < kRows; ++row)
-            {
-                for (std::int32_t column = 0; column < kDModel; ++column)
-                {
-                    hidden[static_cast<std::size_t>(row * kDModel + column)] =
-                        sourceValue(row, column);
-                }
-            }
-            std::array<std::int32_t, kEntries> experts{};
-            std::array<float, kEntries> weights{};
-            std::array<std::int32_t, kEntries> participants{};
-            for (std::size_t slot = 0u; slot < kEntries; ++slot)
-            {
-                experts[slot] = static_cast<std::int32_t>(10u + slot % 8u);
-                weights[slot] = joint_owners_
-                                    ? jointRouteWeight(slot)
-                                    : kRouteWeightPattern[slot % kRouteWeightPattern.size()];
-                participants[slot] = routeParticipant(slot) == kTargetParticipant
-                    ? target_participant_ : (joint_owners_ ? 0 : kSourceParticipant);
-                if(!dispatch_targets_.empty()) {
-                    constexpr std::array<int,8> group_routes{7,19,2,2,7,7,19,2};
-                    participants[slot]=group_routes[slot%group_routes.size()];
-                }
-            }
-            std::array<float, kEntries * kDModel> compact_route_input{};
-            std::size_t compact_row = 0u;
-            for (std::int32_t row = 0; row < kRows; ++row)
-            {
-                std::size_t compact_route = 0u;
-                for (std::int32_t slot = 0; slot < kTopK; ++slot)
-                {
-                    const std::size_t original_slot =
-                        static_cast<std::size_t>(row * kTopK + slot);
-                    if (participants[original_slot] != target_participant_)
-                        continue;
-                    const std::size_t compact_slot =
-                        compact_row * static_cast<std::size_t>(kTopK) +
-                        compact_route++;
-                    for (std::int32_t column = 0;
-                         column < kDModel;
-                         ++column)
-                    {
-                        /* Model expert compute publishes independently rounded,
-                         * preweighted rows. This identity-expert fixture keeps
-                         * that production arithmetic while isolating packet
-                         * slot preservation from GEMM behavior. */
-                        compact_route_input[
-                            compact_slot *
-                                static_cast<std::size_t>(kDModel) +
-                            static_cast<std::size_t>(column)] =
-                            weights[original_slot] *
-                            sourceValue(row, column);
-                    }
-                }
-                compact_row += compact_route != 0u ? 1u : 0u;
-            }
-            const std::int32_t active_rows = live_rows_;
-            std::array<DeviceMoEPlacementBank,
-                       kDeviceMoEOverlayEpochBankCount>
-                placement_banks{};
-            for (auto &bank : placement_banks)
-            {
-                bank.epoch = static_cast<std::uint32_t>(live_placement_epoch_);
-                bank.expert_count = kExpertCount;
-                if (joint_owners_)
-                    for (std::uint32_t expert = 0; expert < kExpertCount; ++expert)
-                        bank.overlay_route_participant[expert] =
-                            recordedJointTarget(static_cast<int>(expert));
-                else
-                    std::fill_n(bank.overlay_route_participant, kExpertCount, kSourceParticipant);
-            }
-            /* Bank zero is intentionally adversarial. The request ticket selects
-             * bank one, whose global owner map reproduces the router oracle. */
-            for (std::size_t slot = 0u; slot < kEntries; ++slot)
-            {
-                placement_banks[static_cast<std::size_t>(
-                                    live_placement_epoch_ == kPlacementEpoch ? 1u : 0u)]
-                    .overlay_route_participant[static_cast<std::size_t>(experts[slot])] =
-                    joint_owners_ ? recordedJointTarget(experts[slot]) : participants[slot];
-            }
-            const DeviceMoEOverlayEpochTicket placement_ticket{
-                .epoch = live_placement_epoch_,
-                .selector = deviceMoEOverlayEpochSelector(
-                    /*generation=*/3u + live_placement_epoch_ - kPlacementEpoch,
-                    /*bank=*/static_cast<std::uint32_t>(
-                        live_placement_epoch_ == kPlacementEpoch ? 1u : 0u)),
-            };
-            const DeviceMoEOverlayEpochStatus placement_status{
-                .epoch = live_placement_epoch_,
-                .selector = placement_ticket.selector,
-                .operation = static_cast<std::uint32_t>(DeviceMoEOverlayEpochOperation::Acquire),
-                .code = static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success),
-                .bank = placement_ticket.bank(),
-                .observed_state =
-                    static_cast<std::uint32_t>(DeviceMoEOverlayEpochBankState::Published),
-            };
-            // Joint traces exercise the actual native acquire operation, which
-            // must start without an existing reader. Only that operation may
-            // publish the source ticket and successful acquisition status.
-            const auto initial_source_ticket = joint_owners_
-                ? DeviceMoEOverlayEpochTicket{} : placement_ticket;
-            const auto initial_source_status = joint_owners_
-                ? DeviceMoEOverlayEpochStatus{} : placement_status;
-
-            std::copy(
-                hidden.begin(), hidden.end(),
-                static_cast<float *>(
-                    source_hidden_tensor_->raw_mutable_data()));
-            std::transform(
-                experts.begin(), experts.end(),
-                static_cast<float *>(
-                    source_routing_indices_tensor_->raw_mutable_data()),
-                [](std::int32_t expert)
-                {
-                    return static_cast<float>(expert);
-                });
-            std::copy(
-                weights.begin(), weights.end(),
-                static_cast<float *>(
-                    source_routing_weights_tensor_->raw_mutable_data()));
-            std::copy(
-                compact_route_input.begin(), compact_route_input.end(),
-                static_cast<float *>(
-                    target_route_input_tensor_->raw_mutable_data()));
-            const auto clear_tensor = [](FP32Tensor &tensor)
-            {
-                std::fill_n(
-                    static_cast<float *>(tensor.raw_mutable_data()),
-                    tensor.numel(), 0.0f);
-            };
-            clear_tensor(*source_canonical_route_tensor_);
-            clear_tensor(*source_zero_tensor_);
-            clear_tensor(*target_hidden_tensor_);
-            clear_tensor(*target_routing_indices_tensor_);
-            clear_tensor(*target_routing_weights_tensor_);
-            clear_tensor(*target_canonical_route_tensor_);
-
-            const bool tensors_ready =
-                source_hidden_tensor_->ensureOnDevice(
-                    source_device_, source_stream_) &&
-                source_routing_indices_tensor_->ensureOnDevice(
-                    source_device_, source_stream_) &&
-                source_routing_weights_tensor_->ensureOnDevice(
-                    source_device_, source_stream_) &&
-                source_canonical_route_tensor_->ensureOnDevice(
-                    source_device_, source_stream_) &&
-                source_zero_tensor_->ensureOnDevice(
-                    source_device_, source_stream_) &&
-                target_hidden_tensor_->ensureOnDevice(
-                    target_device_, target_stream_) &&
-                target_routing_indices_tensor_->ensureOnDevice(
-                    target_device_, target_stream_) &&
-                target_routing_weights_tensor_->ensureOnDevice(
-                    target_device_, target_stream_) &&
-                target_route_input_tensor_->ensureOnDevice(
-                    target_device_, target_stream_) &&
-                target_canonical_route_tensor_->ensureOnDevice(
-                    target_device_, target_stream_);
-            if (!tensors_ready)
-            {
-                error_ = "could not bind typed packet tensors to their exact devices";
-                return false;
-            }
-            source_hidden_ = source_hidden_tensor_->gpu_data_ptr();
-            source_indices_ =
-                source_routing_indices_tensor_->gpu_data_ptr();
-            source_weights_ =
-                source_routing_weights_tensor_->gpu_data_ptr();
-            source_canonical_routes_ =
-                source_canonical_route_tensor_->gpu_data_ptr();
-            target_hidden_ = target_hidden_tensor_->gpu_data_ptr();
-            target_indices_ =
-                target_routing_indices_tensor_->gpu_data_ptr();
-            target_weights_ =
-                target_routing_weights_tensor_->gpu_data_ptr();
-            target_canonical_routes_ =
-                target_canonical_route_tensor_->gpu_data_ptr();
-            if (!source_hidden_ || !source_indices_ || !source_weights_ ||
-                !source_canonical_routes_ ||
-                !target_hidden_ || !target_indices_ || !target_weights_ ||
-                !target_route_input_tensor_->gpu_data_ptr() ||
-                !target_canonical_routes_)
-            {
-                error_ = "typed packet tensors did not expose stable device addresses";
-                return false;
-            }
-
-            const bool uploaded =
-                source_backend_->hostToDevice(source_placement_banks_, placement_banks.data(),
-                                              candidate_only ? sizeof(DeviceMoEPlacementBank)
-                                                             : sizeof(placement_banks),
-                                              0, source_stream_) &&
-                (candidate_only ||
-                 source_backend_->hostToDevice(source_placement_ticket_, &initial_source_ticket,
-                                               sizeof(initial_source_ticket), 0, source_stream_)) &&
-                (candidate_only ||
-                 source_backend_->hostToDevice(source_placement_status_, &initial_source_status,
-                                               sizeof(initial_source_status), 0, source_stream_)) &&
-                target_backend_->hostToDevice(target_placement_banks_, placement_banks.data(),
-                                              sizeof(placement_banks), 0, target_stream_) &&
-                target_backend_->hostToDevice(target_placement_ticket_, &placement_ticket,
-                                              sizeof(placement_ticket), 0, target_stream_) &&
-                target_backend_->hostToDevice(target_placement_status_, &placement_status,
-                                              sizeof(placement_status), 0, target_stream_) &&
-                source_backend_->hostToDevice(source_active_rows_, &active_rows,
-                                              sizeof(active_rows), 0, source_stream_) &&
-                target_backend_->memset(target_active_rows_, 0, sizeof(std::int32_t), 0,
-                                        target_stream_);
-            if (!uploaded)
-                error_ = "could not initialize endpoint device buffers";
-            return uploaded;
-        }
-
-        /** @brief Bind the CPU oracle to the exact planner-produced lane header. */
-        bool initializeProtocol(int target = -1)
-        {
-            auto &control = source_transport_->activationEpochControl(
-                target<0?target_participant_:target, 0u);
-            const auto &header = control.channel;
-            protocol_config_ = MoEOverlayActivationEpochConfig{
-                .channel_nonce = header.channel_nonce,
-                .topology_fingerprint_low = header.topology_fingerprint_low,
-                .topology_fingerprint_high = header.topology_fingerprint_high,
-                .workspace_generation = header.workspace_generation,
-                .source =
-                    {
-                        .world_rank = header.source_world_rank,
-                        .participant_id = header.source_participant_id,
-                        .tier_priority = header.source_tier_priority,
-                        .domain_ordinal = header.source_domain_ordinal,
-                    },
-                .target =
-                    {
-                        .world_rank = header.target_world_rank,
-                        .participant_id = header.target_participant_id,
-                        .tier_priority = header.target_tier_priority,
-                        .domain_ordinal = header.target_domain_ordinal,
-                    },
-                .lane_ordinal = header.lane_ordinal,
-                .graph_role_mask = header.graph_role_mask,
-                .model_layer_indices = std::vector<std::int32_t>(kLayers.begin(), kLayers.end()),
-                .return_role = static_cast<MoEOverlayActivationReturnRole>(header.return_role),
-                .cohort_target = header.cohort_target,
-            };
-            protocol_ = std::make_unique<MoEOverlayActivationEpochProtocol>(
-                control, protocol_config_);
-            return true;
-        }
-
-        /** @brief Arm one new authenticated generation for retained replay. */
-        bool arm(std::uint64_t generation)
-        {
-            if (!protocol_ || !protocol_config_.valid() || generation == 0u)
-            {
-                error_ = "activation protocol was not initialized";
-                return false;
-            }
-            const auto &config = protocol_config_;
-            const MoEOverlayInferenceTopologyIdentity topology{
-                .workspace_generation = config.workspace_generation,
-                .topology_fingerprint_low = config.topology_fingerprint_low,
-                .topology_fingerprint_high = config.topology_fingerprint_high,
-                .source_world_rank = config.source.world_rank,
-                .target_world_rank = config.target.world_rank,
-            };
-            const MoEOverlayInferenceCommandIdentity command{
-                .request_generation = generation,
-                .command_id = generation,
-                .initial_placement_epoch =
-                    kSchedulerPlacementEpochFloor,
-            };
-            const auto ticket = makeMoEOverlayInferenceExecutionTicket(
-                topology,
-                command,
-                /*transaction_ordinal=*/generation,
-                /*logical_step_id=*/generation,
-                /*placement_epoch=*/kSchedulerPlacementEpochFloor,
-                MoEOverlayInferenceGraphRole::MainPrefill,
-                /*request_count=*/1,
-                /*logical_rows_per_request=*/kRows,
-                /*physical_rows_per_request=*/kRows);
-            std::string arm_error;
-            identity_ = protocol_->arm(
-                ticket,
-                /*epoch_generation=*/generation,
-                /*deadline_ns=*/10'000'000'000u,
-                &arm_error);
-            if (!identity_)
-            {
-                error_ = "generation=" + std::to_string(generation) +
-                         " arm failed: " + arm_error;
-                return false;
-            }
-            if (last_digest_.valid() && identity_->digest == last_digest_)
-            {
-                error_ = "distinct replay generations produced the same digest";
-                return false;
-            }
-            return true;
-        }
-
-        /** @brief Release any queued GEQ waits during failure cleanup. */
-        void publishAbort() noexcept
-        {
-            if (!source_transport_)
-                return;
-            const std::array<int,1> singleton{target_participant_};
-            const auto targets=dispatch_targets_.empty()?std::span<const int>(singleton):std::span<const int>(dispatch_targets_);
-            for(const int target:targets) {
-            auto &control = source_transport_->activationEpochControl(target, 0u);
-            for (std::uint32_t bank = 0u;
-                 bank < kMoEOverlayActivationBufferCount;
-                 ++bank)
-            {
-                std::atomic_ref<std::uint64_t>(
-                    control.buffers[bank].dispatch_signal.value)
-                    .store(kMoEOverlayActivationAbortTimeline,
-                           std::memory_order_release);
-                std::atomic_ref<std::uint64_t>(
-                    control.buffers[bank].return_signal.value)
-                    .store(kMoEOverlayActivationAbortTimeline,
-                           std::memory_order_release);
-            }
-            std::atomic_ref<std::uint64_t>(
-                control.admission.ready_signal)
-                .store(kMoEOverlayActivationAbortTimeline,
-                       std::memory_order_release);
-            }
-        }
-
-        /** @brief Drain one exact stream through an event before releasing pages. */
-        static void drain(
-            IBackend *backend, void *stream, void *event) noexcept
-        {
-            if (backend && stream && event &&
-                backend->recordEvent(event, 0, stream))
-            {
-                (void)awaitEvent(backend, event, std::chrono::seconds(5));
-            }
-        }
-
-        /**
-         * @brief Diagnose an existing private grant only after abort has drained it.
-         * @param role Endpoint name in this fixture's timeout evidence.
-         * @param backend Original endpoint backend.
-         * @param stream Original endpoint stream, never a diagnostic replacement.
-         * @param terminal Event recorded after the existing abort publication.
-         * @param lane Original grant and mapped-lane owner retained until teardown.
-         *
-         * A copy on a stalled stream would itself block. Query the post-abort
-         * terminal first and skip inspection unless that original stream drained.
-         * This failure-only fixture observation adds no production state mirror.
-         */
-        static void reportRetiredGrant(
-            const char *role, IBackend *backend, void *stream, void *terminal,
-            const MoEOverlayMappedActivationDeviceLane &lane) noexcept
-        {
-            bool ready = false;
-            if (!backend || !stream || !terminal || !lane.device.is_gpu() ||
-                !lane.grant_device ||
-                !backend->queryEvent(terminal, lane.device.ordinal, &ready) || !ready)
-            {
-                std::cerr << "[packet-timeout] " << role
-                          << " post-abort grant inspection unavailable\n";
-                return;
-            }
-            MoEOverlayActivationDeviceEpochGrant observed{};
-            if (!backend->deviceToHost(&observed, lane.grant_device, sizeof(observed),
-                                       lane.device.ordinal, stream))
-            {
-                std::cerr << "[packet-timeout] " << role << " grant copy failed\n";
-                return;
-            }
-            std::cerr << "[packet-timeout] " << role
-                      << " post-abort generation=" << observed.generation
-                      << " endpoint=" << observed.endpoint
-                      << " state=" << observed.state
-                      << " code=" << observed.code
-                      << " physical_rows=" << observed.physical_rows
-                      << " last_published=" << observed.last_published_stage
-                      << " last_consumed=" << observed.last_consumed_stage
-                      << " digest_valid=" << observed.digest.valid()
-                      << '\n';
-        }
-
-        DeviceId source_device_;
-        DeviceId target_device_;
-        IBackend *source_backend_ = nullptr;
-        IBackend *target_backend_ = nullptr;
-        bool terminal_timeout_observed_ = false; ///< Enables failure-only post-drain diagnostics.
-        std::unique_ptr<MoEOverlayNodeLocalRankBatchTransport> source_transport_;
-        std::unique_ptr<MoEOverlayNodeLocalRankBatchTransport> target_transport_;
-        MoEOverlayMappedActivationDeviceLane source_lane_;
-        MoEOverlayMappedActivationDeviceLane target_lane_;
-        std::unique_ptr<MoEOverlayActivationEpochProtocol> protocol_;
-        MoEOverlayActivationEpochConfig protocol_config_;
-        std::optional<MoEOverlayActivationEpochIdentity> identity_;
-        MoEOverlayActivationDigest last_digest_{};
-        std::vector<std::unique_ptr<IGPUGraphCapture>>
-            source_dispatch_captures_;
-        std::vector<std::unique_ptr<IGPUGraphCapture>>
-            source_return_captures_;
-        std::vector<std::unique_ptr<IGPUGraphCapture>>
-            target_compute_captures_;
-        std::vector<std::unique_ptr<ComputeGraph>> source_dispatch_graphs_;
-        std::vector<std::unique_ptr<ComputeGraph>> source_return_graphs_;
-        std::vector<std::unique_ptr<ComputeGraph>> target_compute_graphs_;
-        std::unique_ptr<IGPUGraphCapture> source_capture_;
-        std::unique_ptr<IGPUGraphCapture> target_capture_;
-        std::unique_ptr<IDeviceContext> source_execution_context_;
-        std::unique_ptr<IDeviceContext> target_execution_context_;
-        std::unique_ptr<BufferArena> source_arena_;
-        std::unique_ptr<BufferArena> target_arena_;
-        std::unique_ptr<DeviceGraphExecutor> source_executor_;
-        std::unique_ptr<DeviceGraphExecutor> target_executor_;
-        std::unique_ptr<ComputeGraph> source_graph_;
-        std::unique_ptr<ComputeGraph> target_graph_;
-        DeviceGraphExecutor::GraphSegmentCache source_cache_;
-        DeviceGraphExecutor::GraphSegmentCache target_cache_;
-        void *source_stream_ = nullptr;
-        void *target_stream_ = nullptr;
-        void *source_terminal_ = nullptr;
-        void *target_terminal_ = nullptr;
-        void *source_hidden_ = nullptr;
-        void *source_indices_ = nullptr;
-        void *source_weights_ = nullptr;
-        void *source_placement_banks_ = nullptr;
-        void *source_placement_ticket_ = nullptr;
-        void *source_placement_status_ = nullptr;
-        void *source_active_rows_ = nullptr;
-        void *source_canonical_routes_ = nullptr;
-        void *target_hidden_ = nullptr;
-        void *target_indices_ = nullptr;
-        void *target_weights_ = nullptr;
-        void *target_placement_banks_ = nullptr;
-        void *target_placement_ticket_ = nullptr;
-        void *target_placement_status_ = nullptr;
-        void *target_active_rows_ = nullptr;
-        void *target_canonical_routes_ = nullptr;
-        std::shared_ptr<FP32Tensor> source_hidden_tensor_;
-        std::shared_ptr<FP32Tensor> source_routing_indices_tensor_;
-        std::shared_ptr<FP32Tensor> source_routing_weights_tensor_;
-        std::shared_ptr<FP32Tensor> source_canonical_route_tensor_;
-        std::shared_ptr<FP32Tensor> source_zero_tensor_;
-        std::shared_ptr<FP32Tensor> target_hidden_tensor_;
-        std::shared_ptr<FP32Tensor> target_routing_indices_tensor_;
-        std::shared_ptr<FP32Tensor> target_routing_weights_tensor_;
-        std::shared_ptr<FP32Tensor> target_route_input_tensor_;
-        std::shared_ptr<FP32Tensor> target_canonical_route_tensor_;
-        std::vector<DeviceAllocation> allocations_;
-        bool terminals_recorded_ = false;
-        bool source_queued_ahead_ = false;
-        std::string error_;
-    };
-
-    /**
-     * @brief Replay a retained pair across independently authenticated leases.
-     * @param source Continuation device that acquires the peer descriptor.
-     * @param target Follower device publishing canonical route contributions.
-     * @param generations Number of independently authenticated descriptor generations.
-     * @tparam Rows Captured physical row capacity.
-     * @tparam Width Captured hidden width, including unaligned row tails.
-     * @tparam BackingRows Retained storage capacity, independent of exact captured work.
-     */
-    template <std::int32_t Rows, std::int32_t Width = kDModel,
-              std::int32_t BackingRows = Rows>
-    void runRoleAssignment(DeviceId source, DeviceId target,
-                           std::uint64_t generations = 2u)
-    {
-        SCOPED_TRACE(::testing::Message() << "physical_rows=" << Rows
-            << " backing_rows=" << BackingRows << " width=" << Width);
-        ScopedActivationEpochPerfStats perf_stats;
-        PacketRoundTrip<Rows, Width, BackingRows> transaction(source, target);
-        ASSERT_TRUE(transaction.initialize()) << transaction.error();
-
-        double waits_enqueued = 0.0;
-        double publications_enqueued = 0.0;
-        double kernel_wait_bindings = 0.0;
-        double kernel_publication_bindings = 0.0;
-        double dispatch_d2h_bytes = 0.0;
-        double dispatch_h2d_bytes = 0.0;
-        double return_d2h_bytes = 0.0;
-        double return_h2d_bytes = 0.0;
-        double shared_dispatch_payload_publications = 0.0;
-        double asynchronous_lane_forks = 0.0;
-        double asynchronous_lane_joins = 0.0;
-        for (const auto &record : PerfStatsCollector::snapshot(
-                 {"moe_overlay_activation_epoch", "forward_graph"}))
-        {
-            if (record.domain == "forward_graph" &&
-                record.name == "moe_overlay_async_lane_forks")
-            {
-                asynchronous_lane_forks += record.value;
-                ASSERT_EQ(record.tags.at("lanes"), "1");
-                ASSERT_EQ(record.tags.at("rows"), std::to_string(Rows));
-            }
-            else if (record.domain == "forward_graph" &&
-                     record.name == "moe_overlay_async_lane_joins")
-            {
-                asynchronous_lane_joins += record.value;
-                ASSERT_EQ(record.tags.at("lanes"), "1");
-                ASSERT_EQ(record.tags.at("rows"), std::to_string(Rows));
-                ASSERT_EQ(
-                    record.tags.at("canonical_materialization"),
-                    "true");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name == "device_timeline_waits_enqueued")
-            {
-                waits_enqueued += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "exact_stream_64bit_geq");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                     "device_timeline_publications_enqueued")
-            {
-                publications_enqueued += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "exact_stream_64bit_fenced");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                     "device_timeline_kernel_wait_bindings")
-            {
-                kernel_wait_bindings += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "fused_packet_system_acquire");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                     "device_timeline_kernel_publication_bindings")
-            {
-                kernel_publication_bindings += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "fused_packet_system_release");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                         "shared_physical_dispatch_d2h_bytes")
-            {
-                dispatch_d2h_bytes += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("payload_path"),
-                    "shared_physical_mapped");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                         "shared_physical_dispatch_h2d_bytes")
-            {
-                dispatch_h2d_bytes += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "mapped_timeline_then_bulk_dma");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                         "shared_physical_return_d2h_bytes")
-            {
-                return_d2h_bytes += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "device_payload_then_bulk_dma");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                         "shared_physical_return_h2d_bytes")
-            {
-                return_h2d_bytes += record.value;
-                ASSERT_EQ(record.tags.at("host_blocking"), "false");
-                ASSERT_EQ(
-                    record.tags.at("ordering"),
-                    "mapped_timeline_then_bulk_dma");
-            }
-            else if (record.domain == "moe_overlay_activation_epoch" &&
-                     record.name ==
-                         "shared_dispatch_payload_publications")
-            {
-                shared_dispatch_payload_publications += record.value;
-                ASSERT_EQ(record.tags.at("lanes"), "1");
-                ASSERT_EQ(record.tags.at("rows"), std::to_string(Rows));
-            }
-        }
-        constexpr bool single_row_direct = Rows == 1;
-        // Shared row stores are device-counted at terminal; setup has no fixed-capacity DMA.
-        const double expected_shared_dispatch_bytes = 0.0;
-        EXPECT_EQ(
-            waits_enqueued,
-            single_row_direct ? 2.0 : 2.0 * (kLayers.size() + 1u));
-        EXPECT_EQ(
-            publications_enqueued,
-            single_row_direct ? 0.0 : 2.0 * kLayers.size());
-        EXPECT_EQ(
-            kernel_wait_bindings,
-            single_row_direct ? 2.0 * kLayers.size() : 0.0);
-        EXPECT_EQ(
-            kernel_publication_bindings,
-            single_row_direct ? 2.0 * kLayers.size() : 0.0);
-        EXPECT_EQ(dispatch_d2h_bytes, expected_shared_dispatch_bytes);
-        EXPECT_EQ(dispatch_h2d_bytes, 0.0);
-        EXPECT_EQ(return_d2h_bytes, 0.0);
-        EXPECT_EQ(return_h2d_bytes, 0.0);
-        EXPECT_EQ(
-            shared_dispatch_payload_publications,
-            single_row_direct ? 0.0
-                              : static_cast<double>(kLayers.size()));
-        EXPECT_EQ(
-            asynchronous_lane_forks,
-            single_row_direct ? 0.0 : static_cast<double>(kLayers.size()));
-        EXPECT_EQ(
-            asynchronous_lane_joins,
-            single_row_direct ? 0.0 : static_cast<double>(kLayers.size()));
-
-        for (std::uint64_t generation = 1u; generation <= generations; ++generation)
-        {
-            SCOPED_TRACE(::testing::Message() << "generation=" << generation);
-            ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
-            const auto submit_begin = std::chrono::steady_clock::now();
-            ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
-            EXPECT_LT(
-                std::chrono::steady_clock::now() - submit_begin,
-                std::chrono::seconds(2))
-                << "submission contains a host-side per-stage wait";
-            ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-            ASSERT_TRUE(transaction.retire()) << transaction.error();
-        }
-    }
-
-    /**
-     * @brief Prove early replay cannot consume a prior lease's admission/return.
-     * @tparam Rows One-row fused decode or multi-row forked dispatch geometry.
-     */
-    template <std::int32_t Rows = 1>
-    void runStaleAdmissionABAProof(DeviceId source, DeviceId target)
-    {
-        PacketRoundTrip<Rows> transaction(source, target);
-        ASSERT_TRUE(transaction.initialize()) << transaction.error();
-        ASSERT_TRUE(transaction.submit(/*generation=*/1u))
-            << transaction.error();
-        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-        ASSERT_TRUE(transaction.queueSourceBeforePriorRetirement())
-            << transaction.error();
-        ASSERT_TRUE(transaction.releaseQueuedSourceWithGeneration(
-            /*generation=*/2u))
-            << transaction.error();
-        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-        ASSERT_TRUE(transaction.retire()) << transaction.error();
-    }
-
-    /**
-     * @brief Replay changing peer metadata through retained real packet graphs.
-     * @tparam Rows Original physical packet rows.
-     * @tparam BackingRows Original tensor capacity, including poisoned suffix.
-     * @param device Actual backend device used by both original endpoints.
-     */
-    template <int Rows, int BackingRows = Rows>
-    void runChangedPublicationReplay(DeviceId device)
-    {
-        PacketRoundTrip<Rows, kDModel, BackingRows> transaction(device, device);
-        ASSERT_TRUE(transaction.initialize()) << transaction.error();
-        ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
-        ASSERT_TRUE(transaction.submit(1u)) << transaction.error();
-        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-        constexpr std::array<int, 4> live_rows{Rows, Rows - 1, 0, 1};
-        for (std::uint64_t generation = 2; generation <= 20; ++generation)
-        {
-            ASSERT_TRUE(transaction.preparePublicationReplayInputs(
-                live_rows[(generation - 2) % live_rows.size()],
-                static_cast<float>(generation * 16))) << transaction.error();
-            ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
-            if (generation % 2 == 0)
-            {
-                // Submit before successor admission identity is published.
-                ASSERT_TRUE(transaction.queueSourceBeforePriorRetirement())
-                    << transaction.error();
-                ASSERT_TRUE(transaction.releaseQueuedSourceWithGeneration(generation))
-                    << transaction.error();
-            }
-            else
-            {
-                ASSERT_TRUE(transaction.retire()) << transaction.error();
-                // The existing follower-first submit delays descriptor publication.
-                ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
-            }
-            ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-        }
-        ASSERT_TRUE(transaction.retire()) << transaction.error();
-    }
-
-    /** @brief Terminal abort releases a forked admission without another request. */
-    void runAdmissionAbortProof(DeviceId source, DeviceId target)
-    {
-        PacketRoundTrip<4> transaction(source, target);
-        ASSERT_TRUE(transaction.initialize()) << transaction.error();
-        ASSERT_TRUE(transaction.submit(1u)) << transaction.error();
-        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
-        ASSERT_TRUE(transaction.queueSourceBeforePriorRetirement()) << transaction.error();
-        ASSERT_TRUE(transaction.abortQueuedSourceAndValidate()) << transaction.error();
-    }
 
     /**
      * @brief Own exact streams and buffers for one sparse-route exchange proof.
@@ -3586,43 +105,33 @@ namespace
     class SparseRouteExchangeResources final
     {
     public:
-        SparseRouteExchangeResources(DeviceId root, DeviceId producer)
-            : root_device(root), producer_device(producer),
-              root_backend(backendFor(root)),
-              producer_backend(backendFor(producer))
-        {
+        using Graph=RetainedParticipantGraphExecutableFixtureAccess;
+        SparseRouteExchangeResources(OriginalMappedComponentSource& original,OriginalMappedComponentProgram program,
+            DeviceId root,DeviceId producer)
+            : source(original),program_(original.requireProgram(program)),root_device(root),producer_device(producer),
+              root_backend(backendFor(root)),producer_backend(backendFor(producer)) {
+            source.index(root);source.index(producer);
+            const auto banks=program_.deviceBanks();
+            const auto count=banks[0].size()+banks[1].size();
+            allocations.reserve(count);transfer_buffers.reserve(count);transfer_claims_.reserve(count);
+            mapped_claims_.reserve(2);mapped_regions_.reserve(2);arenas_.reserve(1);graphs_.reserve(2);
+            root_stream=source.stream(root);
+            producer_stream=source.stream(producer,producer==root);
+            root_terminal=source.event(root,0);producer_terminal=source.event(producer,producer==root?1:0);
         }
-
-        ~SparseRouteExchangeResources()
-        {
-            if (exchange)
-                exchange->abortForShutdown();
-            if (root_backend && root_stream)
-                (void)root_backend->synchronizeStream(
-                    root_stream, root_device.ordinal);
-            if (producer_backend && producer_stream)
-                (void)producer_backend->synchronizeStream(
-                    producer_stream, producer_device.ordinal);
-            for (auto iterator = allocations.rbegin();
-                 iterator != allocations.rend(); ++iterator)
-            {
-                if (iterator->backend && iterator->address)
-                    iterator->backend->free(
-                        iterator->address, iterator->ordinal);
+        ~SparseRouteExchangeResources() {
+            if(exchange)exchange->abortForShutdown();
+            if(root_backend && root_stream && !root_backend->synchronizeStream(root_stream,root_device.ordinal))std::terminate();
+            if(producer_backend && producer_stream && producer_stream!=root_stream &&
+               !producer_backend->synchronizeStream(producer_stream,producer_device.ordinal))std::terminate();
+            for(auto& graph:graphs_)if(graph.submissions && !Graph::observeTerminal(graph.owner))std::terminate();
+            graphs_.clear();exchange.reset();
+            for(auto iterator=allocations.rbegin();iterator!=allocations.rend();++iterator) {
+                if(iterator->address)iterator->backend->free(iterator->address,iterator->ordinal);
+                iterator->claim.reset();
             }
-            if (root_backend && root_terminal)
-                root_backend->destroyEvent(
-                    root_terminal, root_device.ordinal);
-            if (producer_backend && producer_terminal)
-                producer_backend->destroyEvent(
-                    producer_terminal, producer_device.ordinal);
-            if (root_backend && root_stream)
-                root_backend->destroyStream(
-                    root_stream, root_device.ordinal);
-            if (producer_backend && producer_stream)
-                producer_backend->destroyStream(
-                    producer_stream, producer_device.ordinal);
-            exchange.reset();
+            transfer_buffers.clear();transfer_claims_.clear();
+            arenas_.clear();mapped_regions_.clear();mapped_claims_.clear();
         }
 
         SparseRouteExchangeResources(
@@ -3631,29 +140,67 @@ namespace
             const SparseRouteExchangeResources &) = delete;
 
         /** @brief Allocate one buffer on its exact endpoint and retain ownership. */
-        void *allocate(IBackend *backend, DeviceId device, std::size_t bytes)
-        {
-            void *const address = backend
-                                      ? backend->allocate(bytes, device.ordinal)
-                                      : nullptr;
-            allocations.push_back({
-                .backend = backend,
-                .address = address,
-                .ordinal = device.ordinal,
-            });
-            return address;
+        void *allocate(IBackend *backend,DeviceId device,std::size_t bytes) {
+            consumeBank(device,bytes);
+            auto claim=source.memory()->claimNewAllocation(device,PhysicalMemoryOwner::ExecutionWorkspace,bytes);
+            void* address=backend?backend->allocate(bytes,device.ordinal):nullptr;
+            allocations.push_back({backend,address,device.ordinal,std::move(claim)});return address;
         }
-
-        /** @brief Allocate stable transfer scratch retained through stream drain. */
-        std::shared_ptr<DeviceTransferBuffer> allocateTransferBuffer(
-            DeviceId device,
-            std::size_t bytes)
-        {
-            auto buffer = TransferEngine::instance()
-                              .allocateDeviceTransferBuffer(bytes, device);
-            transfer_buffers.push_back(buffer);
-            return buffer;
+        /** @brief Retain the exact original claim until TransferEngine storage is destroyed. */
+        std::shared_ptr<DeviceTransferBuffer> allocateTransferBuffer(DeviceId device,std::size_t bytes) {
+            consumeBank(device,bytes);
+            auto claim=source.memory()->claimNewAllocation(device,PhysicalMemoryOwner::ExecutionWorkspace,bytes);
+            auto buffer=TransferEngine::instance().allocateDeviceTransferBuffer(bytes,device);
+            transfer_buffers.push_back(buffer);transfer_claims_.push_back(std::move(claim));return buffer;
         }
+        /** @brief Original page-rounded mapping claim precedes the sole native allocator. */
+        std::shared_ptr<MappedHostTransferRegion> mapped(std::size_t bytes,DeviceId device) {
+            source.index(device);
+            auto claim=source.memory()->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+                TransferEngine::mappedHostRegionAllocationBytes(bytes));
+            auto region=TransferEngine::instance().allocateMappedHostRegion(bytes,std::array{device});
+            mapped_regions_.push_back(region);mapped_claims_.push_back(std::move(claim));return region;
+        }
+        /** @brief Keep every captured metadata backing alive until its original graph retires. */
+        std::shared_ptr<MappedHostTransferArena> arena(std::span<const DeviceId> devices,
+            std::span<const MappedHostTransferArena::AllocationRequest> requests) {
+            auto arena=TransferEngine::instance().createMappedHostArena(devices,source.memory(),requests);
+            arenas_.push_back(arena);return arena;
+        }
+        /** @brief Require exact declared native bank order before the first captured/native request. */
+        void requireDeclarationConsumed()const {
+            const auto expected=program_.deviceBanks();
+            if(consumed_[0]!=expected[0].size() || consumed_[1]!=expected[1].size())
+                throw std::logic_error("Original component did not materialize its exact declared banks");
+        }
+        /** @return Real admitted General definition created off-worker and retained through retirement. */
+        std::shared_ptr<RetainedParticipantGraphExecutable> graph(DeviceId device,void* stream) {
+            auto owner=Graph::original(source.permit(device),stream);graphs_.push_back({owner,0});return owner;
+        }
+        /** @brief Submit through the original owner; native identity advances once per accepted launch. */
+        bool submit(const std::shared_ptr<RetainedParticipantGraphExecutable>& graph) {
+            auto found=std::find_if(graphs_.begin(),graphs_.end(),[&](const auto& entry){return entry.owner==graph;});
+            if(found==graphs_.end())throw std::logic_error("Component submitted a foreign native definition");
+            return Graph::submit(graph,++found->submissions);
+        }
+        OriginalMappedComponentSource& source;
+    private:
+        /** @brief Immutable declared bank consumption; the PMA remains the only live byte ledger. */
+        void consumeBank(DeviceId device,std::size_t bytes) {
+            const auto role=device==root_device?0u:device==producer_device?1u:2u;
+            const auto banks=program_.deviceBanks();
+            if(role>1 || consumed_[role]>=banks[role].size() || banks[role][consumed_[role]]!=bytes)
+                throw std::logic_error("Component allocation changed its original declared bank geometry");
+            ++consumed_[role];
+        }
+        struct GraphOwner {std::shared_ptr<RetainedParticipantGraphExecutable> owner;std::uint64_t submissions;};
+        OriginalMappedComponentProgram program_;
+        std::array<std::size_t,2> consumed_{};
+        std::vector<GraphOwner> graphs_;
+        std::vector<PhysicalMemoryAllocationLease> transfer_claims_,mapped_claims_;
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> mapped_regions_;
+        std::vector<std::shared_ptr<MappedHostTransferArena>> arenas_;
+    public:
 
         DeviceId root_device;
         DeviceId producer_device;
@@ -3680,27 +227,32 @@ namespace
     {
     public:
         /** @brief Prepare thirty-two independent exact-stream copy witnesses. */
-        explicit CanonicalTicketMaintenanceProof(DeviceId device)
-            : device_(device), backend_(backendFor(device)),
-              destination_(TransferEngine::instance().allocateDeviceTransferBuffer(
-                  kLanes * kBytes, device)),
-              lanes_(TransferEngine::instance().allocatePersistentTransferExecutionLanes(
-                  kLanes, device, "canonical_ticket_maintenance_progress"))
-        {
-            echo_ = TransferEngine::instance().allocateMappedHostRegion(
-                kLanes * kBytes, std::array{device});
-            for (auto &event : events_)
-                event = backend_->createEvent(device_.ordinal);
+        explicit CanonicalTicketMaintenanceProof(SparseRouteExchangeResources& resources,DeviceId device)
+            :device_(device),backend_(backendFor(device)),
+             destination_(resources.allocateTransferBuffer(device,kLanes*kBytes)),
+             lanes_(TransferEngine::instance().allocatePersistentTransferExecutionLanes(kLanes,device,
+                 "canonical_ticket_maintenance_progress",resources.source.permit(device))) {
+            echo_=resources.mapped(kLanes*kBytes,device);
+            for(std::size_t lane=0;lane<kLanes;++lane)events_[lane]=resources.source.event(device,2+lane);
+            const auto& original=resources.source.permit(device);
+            original.worker()->submitAndWait([&] {
+                for(std::size_t lane=0;lane<kLanes;++lane) {
+                    const auto name="persistent_transfer_execution:canonical_ticket_maintenance_progress:"+device.toString()+":lane:"+std::to_string(lane);
+                    bool created=true;
+                    if(original.worker()->getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance,original,&created)!=lanes_[lane].stream() || created)
+                        throw std::logic_error("Background lane did not retain its original admitted stream identity");
+                    for(const auto changed:{GPUAuxiliaryStreamSchedulingClass::Normal,GPUAuxiliaryStreamSchedulingClass::LatencyCritical})
+                        EXPECT_THROW(original.worker()->getOrCreateAdmittedAuxiliaryStream(name,changed,original),std::logic_error);
+                }
+            });
         }
-
-        /** @brief Drain accepted copies before retiring events or their storage. */
-        ~CanonicalTicketMaintenanceProof()
-        {
-            for (std::size_t lane = 0; lane < kLanes; ++lane)
-            {
-                (void)backend_->synchronizeStream(lanes_[lane].stream(), device_.ordinal);
-                if (events_[lane])
-                    backend_->destroyEvent(events_[lane], device_.ordinal);
+        ~CanonicalTicketMaintenanceProof() {
+            for(std::size_t lane=0;lane<kLanes;++lane) {
+                if(!backend_->synchronizeStream(lanes_[lane].stream(),device_.ordinal)) {
+                    std::fprintf(stderr,"Original canonical ticket maintenance retirement failed: device=%s lane=%zu\n",
+                        device_.toString().c_str(),lane);
+                    std::terminate();
+                }
             }
         }
 
@@ -3806,7 +358,7 @@ namespace
      *        without rebinding the captured capacity or clearing old device rows.
      */
     void runCanonicalRouteTicketReuseProof(
-        DeviceId continuation_device,
+        OriginalMappedComponentSource& original,DeviceId continuation_device,
         std::size_t route_capacity,
         std::int32_t d_model = 3072,
         TicketRoutePattern pattern = TicketRoutePattern::Full)
@@ -3823,22 +375,14 @@ namespace
             route_capacity * static_cast<std::size_t>(d_model);
         const std::size_t payload_bytes = element_count * sizeof(float);
 
-        SparseRouteExchangeResources resources(
-            continuation_device, continuation_device);
+        SparseRouteExchangeResources resources(original,
+            {OriginalMappedComponentProgram::Kind::Ticket,route_capacity,std::size_t(d_model),20,true},continuation_device,continuation_device);
         ASSERT_NE(resources.root_backend, nullptr);
         ASSERT_GT(
             resources.root_backend->deviceCount(),
             continuation_device.ordinal);
-        resources.root_stream = resources.root_backend->createStream(
-            continuation_device.ordinal);
-        resources.root_terminal = resources.root_backend->createEvent(
-            continuation_device.ordinal);
         ASSERT_NE(resources.root_stream, nullptr);
         ASSERT_NE(resources.root_terminal, nullptr);
-        resources.producer_stream = resources.root_backend->createStream(
-            continuation_device.ordinal);
-        resources.producer_terminal = resources.root_backend->createEvent(
-            continuation_device.ordinal);
         ASSERT_NE(resources.producer_stream, nullptr);
         ASSERT_NE(resources.producer_terminal, nullptr);
         constexpr std::size_t progress_bytes = 4096u;
@@ -3858,13 +402,14 @@ namespace
 
         const std::array<DeviceId, 1> endpoints{continuation_device};
         auto metadata_arena =
-            TransferEngine::instance().createMappedHostArena(endpoints);
+            resources.arena(endpoints,
+                std::array{MappedHostTransferArena::AllocationRequest{
+                    MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(route_capacity).bytes,64}});
         auto contribution_region =
-            TransferEngine::instance().allocateMappedHostRegion(
-                payload_bytes, endpoints);
+            resources.mapped(payload_bytes,continuation_device);
         ASSERT_NE(contribution_region, nullptr);
         ASSERT_TRUE(contribution_region->isBound());
-        CanonicalTicketMaintenanceProof maintenance(continuation_device);
+        CanonicalTicketMaintenanceProof maintenance(resources,continuation_device);
 
         MoEOverlayCanonicalRouteReturnTicketStorage storage;
         storage.bindFixedCapacity(
@@ -3876,6 +421,7 @@ namespace
             contribution_region,
             metadata_arena);
         ASSERT_TRUE(storage.hasValidBoundIdentity());
+        metadata_arena->requireDeclarationConsumed();resources.requireDeclarationConsumed();
 
         std::unique_ptr<IMoEKernel> kernel;
         if (continuation_device.is_cuda())
@@ -3936,14 +482,15 @@ namespace
 
         auto &worker = GPUDeviceContextPool::instance().getContext(
             continuation_device);
-        std::unique_ptr<IGPUGraphCapture> consumer;
+        auto consumer_owner=resources.graph(continuation_device,resources.root_stream);
+        auto* consumer=&RetainedParticipantGraphExecutableFixtureAccess::capture(consumer_owner);
         worker.submitAndWait([&] {
-            consumer = worker.createGraphCapture(resources.root_stream);
-            ASSERT_NE(consumer, nullptr);
-            ASSERT_TRUE(consumer->beginCapture());
+            ScopedBackendGraphCapture recording(worker,*consumer,"original canonical ticket consumer");
+            ASSERT_TRUE(recording.begin());
             ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
                 MoEKernelLaunchContext{.stream = resources.root_stream}, ticket));
-            ASSERT_TRUE(consumer->endCapture());
+            recording.finish();
+            ASSERT_TRUE(consumer->prepareRuntimeContextStorage(original.memory()));
             ASSERT_TRUE(consumer->instantiate());
         });
         ASSERT_TRUE(consumer && consumer->hasExecutable());
@@ -3954,8 +501,10 @@ namespace
             // An assertion must not strand a retained wait or release mapped
             // payload storage before the accepted graph has stopped reading.
             (void)storage.publishAbort();
-            (void)resources.root_backend->synchronizeStream(
-                resources.root_stream, continuation_device.ordinal);
+            if(!resources.root_backend->synchronizeStream(resources.root_stream,continuation_device.ordinal)) {
+                std::fputs("Original canonical ticket consumer retirement failed before backing release\n",stderr);
+                std::terminate();
+            }
         };
         std::unique_ptr<void, decltype(drain_consumer)> consumer_guard(
             &storage, drain_consumer);
@@ -4015,7 +564,7 @@ namespace
                 }
             }
 
-            ASSERT_TRUE(consumer->launchOnStream(resources.root_stream));
+            ASSERT_TRUE(resources.submit(consumer_owner));
             consumer_pending = true;
             ASSERT_TRUE(resources.root_backend->recordEvent(
                 resources.root_terminal,
@@ -4060,6 +609,7 @@ namespace
                 resources.root_terminal,
                 std::chrono::seconds(5),
                 continuation_device.ordinal));
+            ASSERT_TRUE(RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(consumer_owner));
             consumer_pending = false;
             maintenance.verify(contribution_rows, resources.producer_stream);
             ASSERT_EQ(maintenance_ready, CanonicalTicketMaintenanceProof::kLanes)
@@ -4104,7 +654,7 @@ namespace
      *        peer epoch to exercise blocks which must do no payload work.
      */
     void runSparseCanonicalRouteExchange(
-        DeviceId root_device,
+        OriginalMappedComponentSource& original,DeviceId root_device,
         DeviceId producer_device,
         std::uint32_t rows = 64u,
         std::uint32_t d_model = 512u,
@@ -4122,8 +672,8 @@ namespace
         ASSERT_GE(epochs, 2u);
         const std::uint32_t invariant_epoch_begin = epochs - 2u;
 
-        SparseRouteExchangeResources resources(
-            root_device, producer_device);
+        SparseRouteExchangeResources resources(original,
+            {OriginalMappedComponentProgram::Kind::Sparse,rows,d_model,epochs,replay_through_retained_graphs},root_device,producer_device);
         ASSERT_NE(resources.root_backend, nullptr);
         ASSERT_NE(resources.producer_backend, nullptr);
         ASSERT_GT(resources.root_backend->deviceCount(), root_device.ordinal);
@@ -4131,16 +681,6 @@ namespace
             resources.producer_backend->deviceCount(),
             producer_device.ordinal);
 
-        resources.root_stream = resources.root_backend->createStream(
-            root_device.ordinal);
-        resources.producer_stream =
-            resources.producer_backend->createStream(
-                producer_device.ordinal);
-        resources.root_terminal = resources.root_backend->createEvent(
-            root_device.ordinal);
-        resources.producer_terminal =
-            resources.producer_backend->createEvent(
-                producer_device.ordinal);
         ASSERT_NE(resources.root_stream, nullptr);
         ASSERT_NE(resources.producer_stream, nullptr);
         ASSERT_NE(resources.root_terminal, nullptr);
@@ -4151,8 +691,9 @@ namespace
                 MoEOverlayNodeLocalRouteExchange::Config{
                     .devices = {root_device, producer_device},
                     .root_device = root_device,
-                    .identity = "real_device_sparse_canonical_route_test",
-                });
+                    .identity = "original_component_routes",
+                },MoEOverlayNodeLocalRouteExchange::declareStorage(
+                    {{root_device,producer_device},root_device,"original_component_routes"},rows,top_k,d_model),original.memory(),original.inventory());
         resources.exchange->materialize(
             {
                 {.participant_id = root_participant, .device = root_device},
@@ -4308,6 +849,7 @@ namespace
             root_device,
             root_peer_bindings.size() *
                 sizeof(MoENodeLocalRoutePeerDeviceBinding));
+        resources.requireDeclarationConsumed();
         ASSERT_TRUE(std::all_of(
             resources.allocations.begin(), resources.allocations.end(),
             [](const DeviceAllocation &allocation)
@@ -4404,36 +946,36 @@ namespace
          * descriptors are deliberately shared with the immediate path so this
          * is a transport-lifecycle proof, not a synthetic alternate path.
          */
-        std::unique_ptr<IGPUGraphCapture> root_capture;
-        std::unique_ptr<IGPUGraphCapture> producer_capture;
+        std::shared_ptr<RetainedParticipantGraphExecutable> root_owner,producer_owner;
+        IGPUGraphCapture* root_capture=nullptr;IGPUGraphCapture* producer_capture=nullptr;
         if (replay_through_retained_graphs)
         {
             auto &root_worker = GPUDeviceContextPool::instance().getContext(
                 root_device);
             auto &producer_worker =
                 GPUDeviceContextPool::instance().getContext(producer_device);
+            root_owner=resources.graph(root_device,resources.root_stream);
+            producer_owner=resources.graph(producer_device,resources.producer_stream);
+            root_capture=&RetainedParticipantGraphExecutableFixtureAccess::capture(root_owner);
+            producer_capture=&RetainedParticipantGraphExecutableFixtureAccess::capture(producer_owner);
             root_worker.submitAndWait([&] {
-                root_capture = root_worker.createGraphCapture(
-                    resources.root_stream);
-                ASSERT_NE(root_capture, nullptr);
-                ASSERT_TRUE(root_capture->beginCapture());
+                ScopedBackendGraphCapture recording(root_worker,*root_capture,"original canonical route root");
+                ASSERT_TRUE(recording.begin());
                 ASSERT_TRUE(root_kernel->acquireNodeLocalCanonicalRoutes(
                     root_launch, consume));
                 ASSERT_TRUE(root_kernel->stageNodeLocalCanonicalRoutes(
                     root_launch, consume));
                 ASSERT_TRUE(root_kernel->foldNodeLocalCanonicalRoutes(
                     root_launch, consume));
-                ASSERT_TRUE(root_capture->endCapture());
+                recording.finish();ASSERT_TRUE(root_capture->prepareRuntimeContextStorage(original.memory()));
                 ASSERT_TRUE(root_capture->instantiate());
             });
             producer_worker.submitAndWait([&] {
-                producer_capture = producer_worker.createGraphCapture(
-                    resources.producer_stream);
-                ASSERT_NE(producer_capture, nullptr);
-                ASSERT_TRUE(producer_capture->beginCapture());
+                ScopedBackendGraphCapture recording(producer_worker,*producer_capture,"original canonical route producer");
+                ASSERT_TRUE(recording.begin());
                 ASSERT_TRUE(producer_kernel->publishNodeLocalCanonicalRoutes(
                     producer_launch, publish));
-                ASSERT_TRUE(producer_capture->endCapture());
+                recording.finish();ASSERT_TRUE(producer_capture->prepareRuntimeContextStorage(original.memory()));
                 ASSERT_TRUE(producer_capture->instantiate());
             });
             ASSERT_NE(root_capture, nullptr);
@@ -4462,7 +1004,7 @@ namespace
             // monotonic SPSC epochs without an intervening host observation.
             if (replay_through_retained_graphs)
             {
-                ASSERT_TRUE(root_capture->launchOnStream(resources.root_stream));
+                ASSERT_TRUE(resources.submit(root_owner));
             }
             else
             {
@@ -4495,7 +1037,7 @@ namespace
             if (replay_through_retained_graphs)
             {
                 ASSERT_TRUE(
-                    producer_capture->launchOnStream(resources.producer_stream));
+                    resources.submit(producer_owner));
             }
             else
             {
@@ -4588,7 +1130,7 @@ namespace
      * nodes are ordered by the monotonic channel rather than host timing.
      */
     void runDenseContinuationPublication(
-        DeviceId root_device,
+        OriginalMappedComponentSource& original,DeviceId root_device,
         DeviceId peer_device)
     {
         constexpr std::uint32_t rows = 64u;
@@ -4601,21 +1143,14 @@ namespace
             static_cast<std::size_t>(rows) * d_model;
         constexpr std::size_t bytes = elements * sizeof(float);
 
-        SparseRouteExchangeResources resources(root_device, peer_device);
+        SparseRouteExchangeResources resources(original,
+            {OriginalMappedComponentProgram::Kind::Dense,rows,d_model,epochs,false},root_device,peer_device);
         ASSERT_NE(resources.root_backend, nullptr);
         ASSERT_NE(resources.producer_backend, nullptr);
         ASSERT_GT(resources.root_backend->deviceCount(), root_device.ordinal);
         ASSERT_GT(
             resources.producer_backend->deviceCount(), peer_device.ordinal);
 
-        resources.root_stream = resources.root_backend->createStream(
-            root_device.ordinal);
-        resources.producer_stream =
-            resources.producer_backend->createStream(peer_device.ordinal);
-        resources.root_terminal = resources.root_backend->createEvent(
-            root_device.ordinal);
-        resources.producer_terminal =
-            resources.producer_backend->createEvent(peer_device.ordinal);
         ASSERT_NE(resources.root_stream, nullptr);
         ASSERT_NE(resources.producer_stream, nullptr);
         ASSERT_NE(resources.root_terminal, nullptr);
@@ -4626,8 +1161,9 @@ namespace
                 MoEOverlayNodeLocalRouteExchange::Config{
                     .devices = {root_device, peer_device},
                     .root_device = root_device,
-                    .identity = "real_device_dense_continuation_test",
-                });
+                    .identity = "original_component_routes",
+                },MoEOverlayNodeLocalRouteExchange::declareStorage(
+                    {{root_device,peer_device},root_device,"original_component_routes"},rows,top_k,d_model),original.memory(),original.inventory());
         resources.exchange->materialize(
             {
                 {.participant_id = root_participant, .device = root_device},
@@ -4645,7 +1181,7 @@ namespace
         ASSERT_NE(root_payload, nullptr);
         ASSERT_NE(peer_payload, nullptr);
         ASSERT_TRUE(root_payload->isBound());
-        ASSERT_TRUE(peer_payload->isBound());
+        ASSERT_TRUE(peer_payload->isBound());resources.requireDeclarationConsumed();
 
         std::vector<float> expected(elements);
         for (std::size_t index = 0u; index < elements; ++index)
@@ -4753,285 +1289,63 @@ namespace
         for (std::size_t index = 0u; index < actual.size(); ++index)
             EXPECT_FLOAT_EQ(actual[index], expected[index]) << "index=" << index;
     }
+
+    /** @brief One actual original source covers the full existing ticket geometry/policy roster. */
+    void originalCanonicalTicketReplay(DeviceType family) {
+        originalRankLocalReplay(family,1,[&](const auto& devices) {
+            std::vector<OriginalMappedComponentProgram> programs;
+            for(const auto [slots,width]:std::array<std::pair<std::size_t,std::size_t>,10>{{
+                {8,3072},{512,3072},{4800,3072},{19,67},{128,3072},{19,67},{19,257},{19,513},{640,2560},{4480,2560}}})
+                programs.push_back({OriginalMappedComponentProgram::Kind::Ticket,slots,width,20,true});
+            OriginalMappedComponentSource original(devices,programs);
+            for(std::size_t profile=0;profile<programs.size();++profile)
+                runCanonicalRouteTicketReuseProof(original,devices[0],programs[profile].rows,programs[profile].width,
+                    profile<4?TicketRoutePattern::Full:TicketRoutePattern::Varying);
+        });
+    }
+    /** @brief Original sparse row/stride record; runtime ownership still comes from real discovery. */
+    struct OriginalSparseProfile {std::uint32_t rows=64,width=512,epochs=5;bool retained=false;std::uint32_t stride=0;};
+    /** @brief Admit one real local pair once and preserve each original sparse numerical program. */
+    void originalSparseReplay(DeviceType first,DeviceType second,std::vector<OriginalSparseProfile> profiles) {
+        const std::vector<NativeReplayFamily> families=first==second?std::vector<NativeReplayFamily>{{first,2}}:
+            std::vector<NativeReplayFamily>{{first,1},{second,1}};
+        originalRankLocalReplay(families,[&](const auto& devices) {
+            std::vector<OriginalMappedComponentProgram> programs;
+            for(const auto& profile:profiles)programs.push_back({OriginalMappedComponentProgram::Kind::Sparse,
+                profile.rows,profile.width,profile.epochs,profile.retained});
+            OriginalMappedComponentSource original(devices,programs);
+            for(const auto& profile:profiles)runSparseCanonicalRouteExchange(original,devices[0],devices[1],
+                profile.rows,profile.width,profile.epochs,profile.retained,profile.stride);
+        });
+    }
+    /** @brief Dense publication stays rank-local on its two observed native owners. */
+    void originalDenseReplay(DeviceType first,DeviceType second) {
+        const std::vector<NativeReplayFamily> families=first==second?std::vector<NativeReplayFamily>{{first,2}}:
+            std::vector<NativeReplayFamily>{{first,1},{second,1}};
+        originalRankLocalReplay(families,[&](const auto& devices) {
+            OriginalMappedComponentSource original(devices,{{OriginalMappedComponentProgram::Kind::Dense,64,512,3,false}});
+            runDenseContinuationPublication(original,devices[0],devices[1]);
+        });
+    }
 } // namespace
 
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     PlannerSelectedCUDAContinuationROCmFollowerIsExact)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires at least one CUDA and one ROCm device";
-    runRoleAssignment<4>(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     PlannerSelectedROCmContinuationCUDAFollowerIsExact)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires at least one CUDA and one ROCm device";
-    runRoleAssignment<4>(DeviceId::rocm(0), DeviceId::cuda(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CooperativeReturnDescriptorCUDAReplaysTwentyGenerations)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    // Each lease changes descriptor identity while reusing exactly
-    // the same captured graph and mapped addresses. The cooperative read must
-    // never mix generations or expose payload before complete validation.
-    runRoleAssignment<17>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CooperativeReturnDescriptorROCmReplaysTwentyGenerations)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runRoleAssignment<17>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAContinuationReturnRowsCoverGridStrideAndUnalignedWidth)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    // Sparse original/compact slot maps cross the bounded row grid. Width 67
-    // must not drop tail columns or leak a preceding row's shared identities.
-    runRoleAssignment<257, 67>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmContinuationReturnRowsCoverGridStrideAndUnalignedWidth)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runRoleAssignment<257, 67>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAFollowerDispatchRowsPreserveWidePayloadsAcrossTwentyGenerations)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    // Multiple iterations within each row exercise the cooperative metadata
-    // lifetime; width 3073 also leaves a scalar tail after vectorized copies.
-    runRoleAssignment<33, 3073>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmFollowerDispatchRowsPreserveWidePayloadsAcrossTwentyGenerations)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runRoleAssignment<33, 3073>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     SingleRowCUDAContinuationROCmFollowerFusesTimelineAndIsExact)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires at least one CUDA and one ROCm device";
-    runRoleAssignment<1>(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     SingleRowWideReturnRetainsBytesAcrossTwentyGenerations)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    // Both vectorized rows and scalar tails must preserve the original route
-    // permutation through the fused acquire/copy/publication replay lifetime.
-    runRoleAssignment<1, 3072>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
-    runRoleAssignment<1, 3073>(DeviceId::cuda(0), DeviceId::rocm(0), 20u);
-    runRoleAssignment<1, 3072>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
-    runRoleAssignment<1, 3073>(DeviceId::rocm(0), DeviceId::cuda(0), 20u);
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAContinuationLargeSparseReturnTraversesEveryGridStride)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    // The fixture uses width eight and alternating expert owners. This odd
-    // row count takes the live compact payload beyond one bounded grid, not
-    // merely its padded capacity. Two authenticated generations poison and
-    // validate every original route slot through the real captured stages.
-    runRoleAssignment<16385>(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmContinuationLargeSparseReturnTraversesEveryGridStride)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    runRoleAssignment<16385>(DeviceId::rocm(0), DeviceId::cuda(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     SingleRowROCmContinuationCUDAFollowerFusesTimelineAndIsExact)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires at least one CUDA and one ROCm device";
-    runRoleAssignment<1>(DeviceId::rocm(0), DeviceId::cuda(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAContinuationWaitsForNewGenerationAfterStaleAdmission)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    runStaleAdmissionABAProof(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmContinuationWaitsForNewGenerationAfterStaleAdmission)
-{
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    runStaleAdmissionABAProof(DeviceId::rocm(0), DeviceId::cuda(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAForkedPrefillWaitsForNewGenerationAfterStaleAdmission)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runStaleAdmissionABAProof<4>(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmForkedPrefillWaitsForNewGenerationAfterStaleAdmission)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runStaleAdmissionABAProof<4>(DeviceId::rocm(0), DeviceId::cuda(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDAForkedPrefillAbortDrainsPendingAdmission)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runAdmissionAbortProof(DeviceId::cuda(0), DeviceId::rocm(0));
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmForkedPrefillAbortDrainsPendingAdmission)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runAdmissionAbortProof(DeviceId::rocm(0), DeviceId::cuda(0));
-}
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      CPUCanonicalRouteTicketReusesSafelyOnCUDA)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 1)
-        GTEST_SKIP() << "Requires one CUDA device";
-    for (const auto slots : {8u, 512u, 4800u})
-    {
-        SCOPED_TRACE(slots);
-        runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), slots);
-    }
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67);
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 128u, 3072, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67, TicketRoutePattern::Varying);
-    // Straddle both the second-read boundary and the next loop iteration.
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 257, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 513, TicketRoutePattern::Varying);
-    // Actual QFN chunk contracts: H2560 and top10, retained M64/M448.
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 640u, 2560, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 4480u, 2560, TicketRoutePattern::Varying);
+    originalCanonicalTicketReplay(DeviceType::CUDA);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      CPUCanonicalRouteTicketReusesSafelyOnROCm)
 {
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(rocm, nullptr);
-    if (rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires one ROCm device";
-    for (const auto slots : {8u, 512u, 4800u})
-    {
-        SCOPED_TRACE(slots);
-        runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), slots);
-    }
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67);
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 128u, 3072, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67, TicketRoutePattern::Varying);
-    // Straddle both the second-read boundary and the next loop iteration.
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 257, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 513, TicketRoutePattern::Varying);
-    // Keep the original representative endpoint; diagnostic visibility binding
-    // is external and must retain the actual native hardware identity.
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 640u, 2560, TicketRoutePattern::Varying);
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 4480u, 2560, TicketRoutePattern::Varying);
+    originalCanonicalTicketReplay(DeviceType::ROCm);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossTwoCUDADevicesAreExactAndAsync)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    runSparseCanonicalRouteExchange(DeviceId::cuda(0), DeviceId::cuda(1));
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{}});
 }
 
 /**
@@ -5046,12 +1360,7 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossTwoCUDADevicesMatchOrnithQ4KPrefillGeometry)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    runSparseCanonicalRouteExchange(
-        DeviceId::cuda(0), DeviceId::cuda(1), 39u, 2048u);
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{39,2048}});
 }
 
 /**
@@ -5066,12 +1375,7 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossTwoCUDADevicesSurviveOrnithModelEpochCount)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    runSparseCanonicalRouteExchange(
-        DeviceId::cuda(0), DeviceId::cuda(1), 39u, 2048u, 48u);
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{39,2048,48}});
 }
 
 /**
@@ -5087,27 +1391,13 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossTwoCUDADevicesRemainExactUnderRetainedGraphsAtOrnithGeometry)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    runSparseCanonicalRouteExchange(
-        DeviceId::cuda(0),
-        DeviceId::cuda(1),
-        /*rows=*/39u,
-        /*d_model=*/2048u,
-        /*epochs=*/48u,
-        /*replay_through_retained_graphs=*/true);
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{39,2048,48,true}});
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossTwoROCmDevicesAreExactAndAsync)
 {
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(rocm, nullptr);
-    if (rocm->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two ROCm devices";
-    runSparseCanonicalRouteExchange(DeviceId::rocm(0), DeviceId::rocm(1));
+    originalSparseReplay(DeviceType::ROCm,DeviceType::ROCm,{{}});
 }
 
 /**
@@ -5121,38 +1411,20 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      CUDASparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs)
 {
-    auto *const backend = getCUDABackend();
-    ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    for (const auto width : {3072u, 3073u})
-        runSparseCanonicalRouteExchange(
-            DeviceId::cuda(0), DeviceId::cuda(1), 16u, width, 20u, true, 17u);
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{16,3072,20,true,17},{16,3073,20,true,17}});
 }
 
 /** @brief Symmetric HIP proof of staged route lifetime, tails and fold order. */
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      ROCmSparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs)
 {
-    auto *const backend = getROCmBackend();
-    ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two ROCm devices";
-    for (const auto width : {3072u, 3073u})
-        runSparseCanonicalRouteExchange(
-            DeviceId::rocm(0), DeviceId::rocm(1), 16u, width, 20u, true, 17u);
+    originalSparseReplay(DeviceType::ROCm,DeviceType::ROCm,{{16,3072,20,true,17},{16,3073,20,true,17}});
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      SparseCanonicalRoutesAcrossCUDAAndROCmAreExactAndAsync)
 {
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    runSparseCanonicalRouteExchange(DeviceId::cuda(0), DeviceId::rocm(0));
+    originalSparseReplay(DeviceType::CUDA,DeviceType::ROCm,{{}});
 }
 
 /**
@@ -5165,257 +1437,30 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      CUDASparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
 {
-    auto *const backend = getCUDABackend();
-    ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    for (const auto rows : {63u, 64u, 65u, 512u})
-        runSparseCanonicalRouteExchange(
-            DeviceId::cuda(0), DeviceId::cuda(1), rows, 2049u, 20u, true, 17u);
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{63,2049,20,true,17},{64,2049,20,true,17},{65,2049,20,true,17},{512,2049,20,true,17}});
 }
 
 /** @brief Symmetric retained-HIP proof of full-prefill publication and reuse. */
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      ROCmSparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
 {
-    auto *const backend = getROCmBackend();
-    ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two ROCm devices";
-    for (const auto rows : {63u, 64u, 65u, 512u})
-        runSparseCanonicalRouteExchange(
-            DeviceId::rocm(0), DeviceId::rocm(1), rows, 2049u, 20u, true, 17u);
+    originalSparseReplay(DeviceType::ROCm,DeviceType::ROCm,{{63,2049,20,true,17},{64,2049,20,true,17},{65,2049,20,true,17},{512,2049,20,true,17}});
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      DenseContinuationPublicationAcrossTwoCUDADevicesIsExactAndAsync)
 {
-    IBackend *const cuda = getCUDABackend();
-    ASSERT_NE(cuda, nullptr);
-    if (cuda->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two CUDA devices";
-    runDenseContinuationPublication(DeviceId::cuda(0), DeviceId::cuda(1));
+    originalDenseReplay(DeviceType::CUDA,DeviceType::CUDA);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      DenseContinuationPublicationAcrossTwoROCmDevicesIsExactAndAsync)
 {
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(rocm, nullptr);
-    if (rocm->deviceCount() < 2)
-        GTEST_SKIP() << "Requires two ROCm devices";
-    runDenseContinuationPublication(DeviceId::rocm(0), DeviceId::rocm(1));
+    originalDenseReplay(DeviceType::ROCm,DeviceType::ROCm);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      DenseContinuationPublicationAcrossCUDAAndROCmIsExactAndAsync)
 {
-    IBackend *const cuda = getCUDABackend();
-    IBackend *const rocm = getROCmBackend();
-    ASSERT_NE(cuda, nullptr);
-    ASSERT_NE(rocm, nullptr);
-    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA and ROCm devices";
-    runDenseContinuationPublication(DeviceId::cuda(0), DeviceId::rocm(0));
+    originalDenseReplay(DeviceType::CUDA,DeviceType::ROCm);
 }
-
-/** @brief Actual native dispatch fanout without claiming CPU joint return readiness. */
-void runLiveJointPacketFanout(DeviceId device)
-{
-    for(const int degree:{2,4,8}) {
-        const auto owners=jointPacketOwners(degree,device);
-        for(auto member=owners->participants().rbegin();member!=owners->participants().rend();++member) {
-            if(member->domain_name!="joint" && member->domain_name!="outside")continue;
-            SCOPED_TRACE("degree="+std::to_string(degree)+" target="+std::to_string(member->participant_id));
-            // Each recorded trace owns a fresh channel: dispatch-only cancellation is
-            // process-terminal. No follower success/reset is fabricated to reuse it.
-            for (const int pass : {0, 1, 2, 3, 4})
-            {
-                const int live = pass == 1 ? 9 : pass == 2 ? 0 : pass == 3 ? 1 : 65;
-                PacketRoundTrip<65> packet(device, device, owners, member->participant_id, 65);
-                ASSERT_TRUE(packet.initialize())<<packet.error();
-                ASSERT_TRUE(packet.replayJointDispatch(live, pass == 1 || pass == 3,
-                                                       pass == 3   ? 2
-                                                       : pass == 1 ? 1
-                                                                   : 0,
-                                                       kPlacementEpoch + pass))
-                    << packet.error();
-            }
-            for (int pass : {0, 1, 2, 3})
-            {
-                PacketRoundTrip<1> single(device, device, owners, member->participant_id, 1);
-                ASSERT_TRUE(single.initialize()) << single.error();
-                ASSERT_TRUE(single.replayJointDispatch(pass == 2 ? 0 : 1, pass == 1,
-                                                       pass == 3   ? 2
-                                                       : pass == 1 ? 1
-                                                                   : 0,
-                                                       kPlacementEpoch + pass))
-                    << single.error();
-            }
-        }
-    }
-}
-
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     CUDALiveJointDispatchReplaysEveryOriginalCPU2CPU4CPU8Member)
-{
-    if(!backendFor(DeviceId::cuda(0)) || backendFor(DeviceId::cuda(0))->deviceCount()<1) GTEST_SKIP()<<"Requires CUDA";
-    runLiveJointPacketFanout(DeviceId::cuda(0));
-}
-TEST(Test__MappedActivationPacketCUDAAndROCm,
-     ROCmLiveJointDispatchReplaysEveryOriginalCPU2CPU4CPU8Member)
-{
-    if(!backendFor(DeviceId::rocm(0)) || backendFor(DeviceId::rocm(0))->deviceCount()<1) GTEST_SKIP()<<"Requires ROCm";
-    runLiveJointPacketFanout(DeviceId::rocm(0));
-}
-
-/** @brief Focused native regression: exact compact counts and original slots after zero holes. */
-void runJointZeroWeightPacketReplay(DeviceId device)
-{
-    const auto owners = jointPacketOwners(2, device);
-    const auto found =
-        std::find_if(owners->participants().begin(), owners->participants().end(),
-                     [](const auto &participant) { return participant.domain_name == "joint"; });
-    ASSERT_NE(found, owners->participants().end());
-    for (int pattern : {1, 2, 3})
-    {
-        PacketRoundTrip<65> packet(device, device, owners, found->participant_id, 65);
-        ASSERT_TRUE(packet.initialize()) << packet.error();
-        ASSERT_TRUE(packet.replayJointDispatch(pattern == 1 ? 9 : 1, true, pattern,
-                                               kPlacementEpoch + pattern))
-            << packet.error();
-    }
-}
-TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAJointZeroWeightCompactionReplay)
-{
-    if (!backendFor(DeviceId::cuda(0)) || backendFor(DeviceId::cuda(0))->deviceCount() < 1)
-        GTEST_SKIP() << "Requires CUDA";
-    runJointZeroWeightPacketReplay(DeviceId::cuda(0));
-}
-TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmJointZeroWeightCompactionReplay)
-{
-    if (!backendFor(DeviceId::rocm(0)) || backendFor(DeviceId::rocm(0))->deviceCount() < 1)
-        GTEST_SKIP() << "Requires ROCm";
-    runJointZeroWeightPacketReplay(DeviceId::rocm(0));
-}
-
-/** @brief Two ordinary packet consumers share one rank-pair matrix and one native writer. */
-void runSharedPhysicalUnionGroup(DeviceId device)
-{
-    for(const auto& targets:{std::vector<int>{7,19},std::vector<int>{19,7}})
-    for(int live:{65,1,0,17,65}) {
-        SCOPED_TRACE("live="+std::to_string(live)+" first="+std::to_string(targets.front()));
-        PacketRoundTrip<65> packet(device,device,{},7,live,targets);
-        ASSERT_TRUE(packet.initialize())<<packet.error();
-        ASSERT_TRUE(packet.replaySharedUnionGroup())<<packet.error();
-    }
-    // Closed CPU cohorts require distinct original ranks. Their valid per-member
-    // live-bank/zero-hole packet cases below remain separate from this ordinary
-    // shared-union proof; no same-rank multi-socket execution is fabricated.
-}
-TEST(Test__MappedActivationPacketCUDAAndROCm, CUDASharedPhysicalUnionHasOneWriterAndOnlyLivePayload)
-{
-    if(!backendFor(DeviceId::cuda(0)) || backendFor(DeviceId::cuda(0))->deviceCount()<1)GTEST_SKIP()<<"Requires CUDA";
-    runSharedPhysicalUnionGroup(DeviceId::cuda(0));
-}
-TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmSharedPhysicalUnionHasOneWriterAndOnlyLivePayload)
-{
-    if(!backendFor(DeviceId::rocm(0)) || backendFor(DeviceId::rocm(0))->deviceCount()<1)GTEST_SKIP()<<"Requires ROCm";
-    runSharedPhysicalUnionGroup(DeviceId::rocm(0));
-}
-
-/** @test Cold fixture obeys original fallback ordering and retains every real source member. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, JointSourceFixtureHasCompleteOriginalColdPlacement)
-{
-    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
-    for(const int degree:{2,4,8}) {
-        SCOPED_TRACE("degree="+std::to_string(degree)+" device="+device.toString());
-        const auto owners=jointPacketOwners(degree,device);
-        ASSERT_EQ(owners->participants().size(),static_cast<std::size_t>(degree+2));
-        for(const int layer:kLayers) {
-            ASSERT_EQ(owners->expertsForParticipant(layer,0).size(),14u);
-            for(int expert:{10,14,15,17}) {
-                const auto* row=owners->placementFor(layer,expert);
-                ASSERT_NE(row,nullptr);ASSERT_TRUE(row->shard_cohort);
-                ASSERT_EQ(row->shard_cohort->participants().size(),static_cast<std::size_t>(degree));
-                EXPECT_EQ(row->owner_participant,-1);
-                const auto members=row->shard_cohort->participants();
-                for(size_t index=0;index<members.size();++index) {
-                    const auto& member=members[index];
-                    const auto* original=owners->participantForId(member.participant_id);
-                    ASSERT_NE(original,nullptr);EXPECT_EQ(original->domain_name,"joint");
-                    EXPECT_EQ(original->world_rank,member.world_rank);EXPECT_EQ(original->address,member.address);
-                    EXPECT_EQ(member.world_rank,static_cast<int>(index)+1);
-                    EXPECT_EQ(member.address.numa_node,static_cast<int>(index));
-                    for(size_t previous=0;previous<index;++previous) {
-                        EXPECT_NE(member.world_rank,members[previous].world_rank);
-                        EXPECT_NE(member.address.numa_node,members[previous].address.numa_node);
-                        EXPECT_NE(member.participant_id,members[previous].participant_id);
-                    }
-                }
-            }
-        }
-        const auto candidate = jointPacketOwners(degree, device, owners.get(), true);
-        for (const int layer : kLayers)
-        {
-            const auto *original_cohort = owners->placementFor(layer, 10);
-            for (int expert : {11, 12, 13, 16})
-            {
-                const auto *incoming = candidate->placementFor(layer, expert);
-                ASSERT_TRUE(incoming && incoming->shard_cohort);
-                EXPECT_EQ(incoming->shard_cohort, original_cohort->shard_cohort);
-                EXPECT_FALSE(incoming->shard_cohort.owner_before(original_cohort->shard_cohort));
-                EXPECT_FALSE(original_cohort->shard_cohort.owner_before(incoming->shard_cohort));
-            }
-            EXPECT_EQ(candidate->expertsForParticipant(layer, 0).size(), 14u);
-            EXPECT_TRUE(owners->placementFor(layer, 10)->shard_cohort);
-        }
-        const auto outside=std::find_if(owners->participants().begin(),owners->participants().end(),[](const auto& p){return p.domain_name=="outside";});
-        ASSERT_NE(outside,owners->participants().end());
-        for(const int layer:kLayers)EXPECT_TRUE(owners->expertsForParticipant(layer,outside->participant_id).empty());
-    }
-}
-
-/** @test Actual CUDA packet consume/return keeps exact M=3 extents in a four-row tensor family. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAExactRowsWithinFourRowBacking)
-{
-    auto *backend = getCUDABackend();
-    ASSERT_NE(backend, nullptr);
-    ASSERT_GT(backend->deviceCount(), 0);
-    runRoleAssignment<4, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 2);
-    runRoleAssignment<3, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 20);
-    runRoleAssignment<1, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 20);
-}
-
-/** @test Actual ROCm packet consume/return keeps exact M=3 extents in a four-row tensor family. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmExactRowsWithinFourRowBacking)
-{
-    auto *backend = getROCmBackend();
-    ASSERT_NE(backend, nullptr);
-    ASSERT_GT(backend->deviceCount(), 0);
-    runRoleAssignment<4, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 2);
-    runRoleAssignment<3, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
-    runRoleAssignment<1, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
-}
-
-/** @test CUDA retained packet graphs acquire changed admission and descriptor publications. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAChangedPublicationReplay)
-{
-    ASSERT_NE(getCUDABackend(), nullptr);
-    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
-    runChangedPublicationReplay<1>(DeviceId::cuda(0));
-    runChangedPublicationReplay<3, 4>(DeviceId::cuda(0));
-    runChangedPublicationReplay<4>(DeviceId::cuda(0));
-}
-
-/** @test ROCm retained packet graphs acquire changed admission and descriptor publications. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmChangedPublicationReplay)
-{
-    ASSERT_NE(getROCmBackend(), nullptr);
-    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
-    runChangedPublicationReplay<1>(DeviceId::rocm(0));
-    runChangedPublicationReplay<3, 4>(DeviceId::rocm(0));
-    runChangedPublicationReplay<4>(DeviceId::rocm(0));
-}
-
-#include "MoERecurrentOriginalSlotPacketReplay.inc"

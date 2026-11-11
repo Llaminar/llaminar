@@ -1462,6 +1462,74 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, GraphScopeSelectsDistribute
     }
 }
 
+/** @test NodeTP dense coordinates cannot replace the original rank in sparse source weight requests. */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, GraphScopeKeepsSparseOriginalRanksAcrossDenseSubset)
+{
+    /** @brief Metadata-only dense membership, with no live communicator or collective. */
+    struct StageTP final : IGlobalTPContext
+    {
+        std::vector<int> ranks{1, 3, 4};
+        int index = 1;
+        GlobalDeviceAddress address = GlobalDeviceAddress::cpu(9, "original-node");
+        int degree() const override { return static_cast<int>(ranks.size()); }
+        int myIndex() const override { return index; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::UPI; }
+        MPI_Comm communicator() const override { return MPI_COMM_NULL; }
+        int domainId() const override { return 2; }
+        const std::vector<int>& worldRanks() const override { return ranks; }
+        GlobalDeviceAddress localDevice() const override { return address; }
+        void barrier() const override {}
+        bool allreduce(TensorBase*) override { return false; }
+        bool broadcast(TensorBase*, int) override { return false; }
+        bool allgather(const TensorBase*, TensorBase*) override { return false; }
+        bool gatherVariableFloatRecordsToRoot(const float*, size_t, float*, size_t, size_t,
+            int, size_t&, const std::string&) override { return false; }
+        bool broadcastFloatElements(TensorBase*, size_t, int, const std::string&) override { return false; }
+        bool send(const TensorBase*, int) override { return false; }
+        bool recv(TensorBase*, int) override { return false; }
+    };
+    StageTP dense;
+    auto source = singleLayerCpuColdPlan(6);
+    source->domains.front().world_ranks = dense.ranks;
+    source->domains.front().owner_rank = dense.ranks.front();
+    source->domains.front().participants = {GlobalDeviceAddress::cpu(5, "original-node"),
+        dense.address, GlobalDeviceAddress::cpu(17, "original-node")};
+    const auto runtime = resolveMoEExpertOverlayRuntimePlan(source,
+        {.current_world_rank = 3, .validate_mvp_root_reachability = false});
+    const auto scope = MoEExpertOverlayGraphScope::resolveForTPParticipant(*runtime, DeviceId::cpu(), &dense, 1);
+    ASSERT_EQ(scope.participants().size(), 1u);
+    EXPECT_TRUE(scope.contains("cpu_cold", DeviceId::cpu(), 3, 1));
+    EXPECT_FALSE(scope.contains("cpu_cold", DeviceId::cpu(), 1, 1));
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, 6);
+    const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, *loader)
+        .filteredForGraphScope(*runtime, scope);
+    const auto weights = preparation.sourceWeightPlan(*loader, ModelContextId{931});
+    ASSERT_EQ(weights.size(), 3u);
+    for (const auto& request : weights.requirements())
+    {
+        EXPECT_EQ(request.overlay_participant_world_rank, 3);
+        EXPECT_EQ(request.overlay_participant_index, 1);
+        EXPECT_EQ(request.slice.expert_ids, (std::vector<int>{2, 3}));
+    }
+
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &dense, 3), std::invalid_argument);
+    auto foreign = dense;
+    foreign.index = 0;
+    foreign.address = source->domains.front().participants.front();
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 0), std::invalid_argument);
+    foreign = dense;
+    foreign.ranks = {4, 3, 1}; // Same local rank/index, but foreign ordered membership.
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 1), std::invalid_argument);
+    foreign = dense;
+    foreign.address.numa_node = 17;
+    EXPECT_THROW((void)MoEExpertOverlayGraphScope::resolveForTPParticipant(
+        *runtime, DeviceId::cpu(), &foreign, 1), std::invalid_argument);
+}
+
 /**
  * @test Initial CPU packs retain one physical claim across aliases and graph reuse.
  *

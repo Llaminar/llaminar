@@ -8,6 +8,7 @@
  * payload allocation or corrective participant transfer is introduced.
  */
 #include "DeviceGraphOrchestrator.h"
+#include "Qwen4ExpFixedHeadPipelinePort.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/compute_stages/stages/NativeVocabularyAllGatherStage.h"
@@ -19,15 +20,26 @@
 namespace llaminar2 {
 Qwen4ExpReplicatedPLEQuery DeviceGraphOrchestrator::fixedHeadPLEQuery(const ForwardInput &input) const
 {
-    const auto &cfg=graph_builder_->config();const auto &cohort=cfg.ngram_replicated_ple_cohort;
-    if(!cohort || !cfg.ngram_table_placement || !Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(*cfg.ngram_table_placement) ||
-        cohort->placement()!=*cfg.ngram_table_placement || &cohort->context()!=cfg.tp_ctx ||
-        cohort->modelOwner()!=injected_model_ctx_.get() || !state_.device_id.is_gpu() ||
-        input.device!=state_.device_id || input.batch_size!=1 || input.seq_len<=0 ||
-        !input.token_ids_device || input.getKVCacheForDevice(input.device)!=state_.kv_cache.get())
-        throw std::invalid_argument("Fixed-head PLE query requires its actual Rank cohort, native DGO bank and canonical main cache");
-    if(cohort->placement().isFixedHeadShards())(void)cohort->requireParticipant(input.device,cfg.tp_device_idx);
-    else cohort->requireConsumer(input.device,cfg.tp_device_idx);
+    const auto &cfg = graph_builder_->config();
+    const auto &cohort = cfg.ngram_replicated_ple_cohort;
+    const auto &pipeline = input.fixed_head_pipeline_port;
+    if (!cfg.ngram_table_placement || !injected_model_ctx_ || !state_.device_id.is_gpu() ||
+        input.device != state_.device_id || input.batch_size != 1 || input.seq_len <= 0 ||
+        !input.token_ids_device || input.getKVCacheForDevice(input.device) != state_.kv_cache.get())
+        throw std::invalid_argument("Fixed-head PLE query requires its actual native DGO bank and canonical main cache");
+    int participant = cfg.tp_device_idx;
+    if (pipeline) {
+        if (cohort || !arena_ || !cfg.ngram_table_placement->fixedHeadPipeline())
+            throw std::invalid_argument("Fixed PLE pipeline query lost its actual placement and original arena");
+        participant = pipeline->requireConsumer(*injected_model_ctx_, *arena_, input.device);
+    } else {
+        if (!cohort || !Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(*cfg.ngram_table_placement) ||
+            cohort->placement() != *cfg.ngram_table_placement || &cohort->context() != cfg.tp_ctx ||
+            cohort->modelOwner() != injected_model_ctx_.get())
+            throw std::invalid_argument("Fixed-head PLE query requires its original Rank cohort");
+        if (cohort->placement().isFixedHeadShards()) (void)cohort->requireParticipant(input.device, participant);
+        else cohort->requireConsumer(input.device, participant);
+    }
     const auto *tokens=static_cast<const std::int32_t *>(input.token_ids_device);
     const std::int32_t *count=nullptr;Qwen4ExpPLEQuerySource source;
     if(input.graph_submission_intent==ForwardGraphSubmissionIntent::WorkspaceDeclaration)
@@ -64,9 +76,9 @@ Qwen4ExpReplicatedPLEQuery DeviceGraphOrchestrator::fixedHeadPLEQuery(const Forw
         }
         if(!arena_ || !original)
             throw std::invalid_argument("Fixed-head workspace declaration changed its actual cohort/arena input geometry");
-        return Qwen4ExpReplicatedPLEQuery(cohort.get(),this,input.device,cfg.tp_device_idx,tokens,
+        return Qwen4ExpReplicatedPLEQuery(cohort.get(),this,input.device,participant,tokens,
             count?DeviceRowRange::deviceCounted(input.seq_len,count):DeviceRowRange::fullyActive(input.seq_len),
-            state_.kv_cache.get(),input.execution_role,input.execution_phase,Qwen4ExpPLEQuerySource::WorkspaceDeclaration);
+            state_.kv_cache.get(),input.execution_role,input.execution_phase,Qwen4ExpPLEQuerySource::WorkspaceDeclaration,pipeline.get());
     }
     if(!executableForwardSubmissionIntent(input.graph_submission_intent))
         throw std::invalid_argument("Fixed-head query has an unknown submission intent");
@@ -125,9 +137,9 @@ Qwen4ExpReplicatedPLEQuery DeviceGraphOrchestrator::fixedHeadPLEQuery(const Forw
         source=Qwen4ExpPLEQuerySource::ConditionFrontier;
     }
     else throw std::invalid_argument("Fixed-head PLE has no replicated producer for this invocation role/phase");
-    return Qwen4ExpReplicatedPLEQuery(cohort.get(),this,input.device,cfg.tp_device_idx,tokens,
+    return Qwen4ExpReplicatedPLEQuery(cohort.get(),this,input.device,participant,tokens,
         count?DeviceRowRange::deviceCounted(input.seq_len,count):DeviceRowRange::fullyActive(input.seq_len),
-        state_.kv_cache.get(),input.execution_role,input.execution_phase,source);
+        state_.kv_cache.get(),input.execution_role,input.execution_phase,source,pipeline.get());
 }
 /**
  * @brief Authenticate the actual prepared mirrored terminal programs before Rank publishes readiness.

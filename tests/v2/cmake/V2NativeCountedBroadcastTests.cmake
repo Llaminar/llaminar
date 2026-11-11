@@ -45,12 +45,12 @@ if(NOT V2_PERF_TESTS_ONLY OR
         foreach(_bytes_backend IN ITEMS CUDA ROCm)
             if((_bytes_backend STREQUAL "CUDA" AND HAVE_CUDA AND HAVE_NCCL) OR
                (_bytes_backend STREQUAL "ROCm" AND HAVE_ROCM AND HAVE_RCCL))
-                foreach(_bytes_shape IN ITEMS WireReplay ReaderAckReplay)
+                foreach(_bytes_shape IN ITEMS WireReplay WideWireReplay ReaderAckReplay SourceWaitReaderAckReplay)
                     add_v2_test(V2_Integration_${_bytes_backend}NativeCompletedCollective_${_bytes_shape}
                         COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                             --gtest_filter=NativeCompletedCollective.${_bytes_backend}_${_bytes_shape}
                         LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_bytes_backend};Devices2;Regression"
-                        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+                        MPI_PROCS 2 NO_MODELS TIMEOUT 30)
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                         V2_Integration_${_bytes_backend}NativeCompletedCollective_${_bytes_shape})
                 endforeach()
@@ -70,11 +70,18 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_captured_transfer_channel)
                 math(EXPR _addressed_last "${_addressed_degree} - 1")
                 foreach(_addressed_source IN ITEMS 0 ${_addressed_last})
                     set(_addressed_case "${_addressed_backend}_Addressed${_addressed_degree}Source${_addressed_source}Replay")
+                    set(_addressed_optional "")
+                    # These authored wide geometries can be absent locally. Required
+                    # two-device and ROCm4 gates stay strict even if a board is lost.
+                    if((_addressed_backend STREQUAL "CUDA" AND _addressed_degree GREATER 2) OR
+                       (_addressed_backend STREQUAL "ROCm" AND _addressed_degree EQUAL 8))
+                        set(_addressed_optional ";HardwareOptional")
+                    endif()
                     add_v2_test(V2_Integration_NativeCompleted_${_addressed_case}
                         COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                             --gtest_filter=NativeCompletedCollective.${_addressed_case}
-                        LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_addressed_backend};Devices${_addressed_degree};TraceReplay;Regression"
-                        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+                        LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_addressed_backend};Devices${_addressed_degree};TraceReplay;Regression${_addressed_optional}"
+                        MPI_PROCS 2 NO_MODELS TIMEOUT 30)
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeCompleted_${_addressed_case})
                 endforeach()
             endforeach()
@@ -91,8 +98,26 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_captured_transfer_channel)
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=NativeCompletedCollective.${_progress_backend}_Addressed2LiveProgressReplay
                 LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;Economy;${_progress_backend};Devices2;TraceReplay;Regression"
-                MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+                MPI_PROCS 2 NO_MODELS TIMEOUT 30)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeCompleted_${_progress_backend}_Addressed2LiveProgressReplay)
         endif()
     endforeach()
+endif()
+
+# The original Python owner proves actual scheduling, typed receipts and absent-card
+# registration without a GPU probe, compiler or alternate native test implementation.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_NativeCompletedOptionalHardwareEligibility
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_optional_native_geometry_uses_actual_inventory_and_keeps_required_cells_strict
+            ProductionParityCampaignTest.test_optional_native_geometry_rejects_bad_hardware_and_dropped_receipt_evidence
+            ProductionParityCampaignTest.test_optional_rank_transfer_geometry_requires_distinct_known_numa_owners
+            ProductionParityCampaignTest.test_optional_native_geometry_reuse_requires_same_current_hardware
+            ProductionParityCampaignTest.test_optional_native_exporter_uses_original_owner_and_preserves_native_failure
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Collective;Inventory;Regression"
+        ENVIRONMENT "LLAMINAR_TEST_MPI_SESSION_HELPER=$<TARGET_FILE:llaminar_mpi_session>"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_NativeCompletedOptionalHardwareEligibility)
 endif()

@@ -1309,7 +1309,8 @@ TEST(Test__ForwardGraphSignature, SerialCommitOwnershipExcludesSpeculationAndPre
                                  ForwardExecutionPhase::Decode})
             for (const auto transaction : {ForwardStateTransaction::Ordinary,
                  ForwardStateTransaction::CommittedMTPCondition,
-                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge})
+                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge,
+                 ForwardStateTransaction::ForwardOnlyCondition})
             {
                 const bool expected = phase == ForwardExecutionPhase::Decode &&
                     ((role == ForwardExecutionRole::MainInference &&
@@ -8886,3 +8887,23 @@ TEST(HostedDeviceGenerationFragment, OrdinaryForwardRequiresOriginalSamplerAndCo
 }
 
 #include "RetainedParticipantAuxiliaryRangeReplay.inc"
+
+/** @test Zero-output condition source identity cannot reuse a one-round serial body. */
+TEST(Test__ForwardGraphSignature, PipelineForwardOnlyHasDistinctZeroRoundSourceAndSharedDiagnosticLane)
+{
+    using namespace llaminar2;
+    ForwardGraphSignature ordinary;
+    ordinary.device = DeviceId::rocm(0); ordinary.decode = true;
+    ordinary.execution_role = ForwardExecutionRole::MainInference;
+    ordinary.state_transaction = ForwardStateTransaction::Ordinary;
+    ordinary.seq_len = ordinary.batch_size = 1;
+    ordinary.snapshot_configuration_identity = 73;
+    auto condition = ordinary;
+    condition.state_transaction = ForwardStateTransaction::ForwardOnlyCondition;
+    EXPECT_NE(condition, ordinary);
+    EXPECT_TRUE(ownsSerialDecodeCommitBoundary(ordinary.execution_role, ForwardExecutionPhase::Decode, ordinary.state_transaction));
+    EXPECT_FALSE(ownsSerialDecodeCommitBoundary(condition.execution_role, ForwardExecutionPhase::Decode, condition.state_transaction));
+    auto prefill = ordinary; prefill.decode = false;
+    EXPECT_EQ(graphSnapshotArenaReusePolicyForSignature(condition), graphSnapshotArenaReusePolicyForSignature(prefill));
+    EXPECT_FALSE(graphSnapshotArenaReusePolicyForSignature(ordinary).shared());
+}

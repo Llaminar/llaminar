@@ -45,6 +45,13 @@ namespace llaminar2
             [[nodiscard]] const std::string &path() const;
             /** @brief Create one exact basename with O_EXCL/O_NOFOLLOW and mode0600. */
             [[nodiscard]] SharedFile createExclusive(const std::string &basename) const;
+            /**
+             * @brief Create an independent temporary file beneath the original directory.
+             * @param prefix Single-component diagnostic prefix; a native unique suffix is appended.
+             * @return The same inode-authenticated RAII owner used for exact-name backing.
+             * Separate launches may share one ancestor without sharing a rankfile name.
+             */
+            [[nodiscard]] SharedFile createUnique(const std::string &prefix) const;
             /** @brief Open an existing exact basename without following a symlink. */
             [[nodiscard]] SharedFile openExisting(const std::string &basename, SharedIdentity creator,
                                                   std::uint64_t expected_bytes) const;

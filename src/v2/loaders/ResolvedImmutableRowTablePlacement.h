@@ -13,6 +13,8 @@
  */
 #pragma once
 #include "ImmutableRowTableLayoutGeometry.h"
+#include "ImmutableRowTableObservationMode.h"
+#include "ImmutableFixedHeadPipelineProjection.h"
 #include "ImmutableRowTableSourceRange.h"
 #include "ImmutableRowAllocatorInventory.h"
 #include "CpuImmutableRowCachePolicy.h"
@@ -32,6 +34,13 @@ public:
     bool isGPUAdaptive() const noexcept;
     /** @return Whether this is the checked fixed-head source component; no serving selector exists yet. */
     bool isFixedHeadShards() const noexcept;
+    /** @return Exact decoder for the native observation interval, issued by this resolved placement. */
+    ImmutableRowTableObservationMode terminalObservationMode() const noexcept {
+        using Mode = ImmutableRowTableObservationMode;
+        if (const auto *fixed = std::get_if<FixedHeadShards>(&value_))
+            return fixed->pipeline ? Mode::FixedHeadPipeline : Mode::FixedHeadStandalone;
+        return std::holds_alternative<GPUAdaptive>(value_) ? Mode::GPUAdaptive : Mode::None;
+    }
     /** @return Whole-tier concrete policy; adaptive and fixed shards reject instead of pretending a full copy. */
     const ImmutableRowTableStoragePolicy &storagePolicy() const;
     /** @return Whole-tier concrete kind; rejects adaptive storage and fixed shards. */
@@ -79,6 +88,8 @@ public:
     std::size_t gpuAdaptiveMaximumLiveRows() const;
     /** @return The sole fixed range/owner/consumer inventory; other alternatives reject. */
     const ImmutableRowTableLayoutGeometry &fixedHeadShardLayout() const;
+    /** @return Exact original pipeline ownership, or null outside the fixed pipeline arm. */
+    const ImmutableFixedHeadPipelineProjection* fixedHeadPipeline() const noexcept;
     /** @return Exact original-native source range for one actual owner; foreign or whole-tier access rejects. */
     ImmutableRowTableSourceRange fixedHeadSourceRangeFor(PhysicalMemoryAllocatorIdentity owner) const;
     /**
@@ -93,6 +104,7 @@ public:
     bool operator==(const ResolvedImmutableRowTablePlacement &) const = default;
 private:
     friend class ImmutableRowTablePlacementPlanner;
+    friend class ImmutableRowTableExecutionProvision;
     friend struct test::Qwen4ExpReplicatedPLECohortReplayAccess;
     friend class Qwen4ExpFixedHeadShards;
     /** @brief Existing whole-tier owner record, without a duplicate retained layout. */
@@ -120,10 +132,17 @@ private:
     /** @brief Exactly one existing checked layout owns all fixed range/storage metadata. */
     struct FixedHeadShards {
         ImmutableRowTableLayoutGeometry layout;
-        bool operator==(const FixedHeadShards &) const = default;
+        std::shared_ptr<const ImmutableFixedHeadPipelineProjection> pipeline;
+        /** @return Equality of immutable source geometry and original pipeline role declarations. */
+        bool operator==(const FixedHeadShards& other) const
+        {
+            return layout == other.layout && bool(pipeline) == bool(other.pipeline) &&
+                (!pipeline || *pipeline == *other.pipeline);
+        }
     };
     /** @brief Declare checked fixed source ownership; PMA admission remains separately required before materialization. */
-    explicit ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry fixed_layout);
+    explicit ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry fixed_layout,
+        std::shared_ptr<const ImmutableFixedHeadPipelineProjection> pipeline = {});
     /** @brief Seal existing whole-tier ownership after complete PMA admission. */
     ResolvedImmutableRowTablePlacement(ImmutableRowTableStoragePolicy storage, ImmutableRowTableExtent extent,
         std::vector<PhysicalMemoryAllocatorIdentity> allocators,

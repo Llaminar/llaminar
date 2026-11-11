@@ -10,6 +10,8 @@
  * host-participation intent, optional planning workload and exact physical
  * backend-device counts, native ngram storage/window policies, and an optional
  * explicit shared predictor source and benchmark campaign input identity.
+ * Resolved node-local route transport and diagnostic binding are retained
+ * losslessly and revalidated against the original inventory on apply.
  * Older documents are rejected rather
  * than silently assigning newly introduced policy defaults.
  */
@@ -22,7 +24,7 @@
 namespace llaminar2
 {
     /** @brief Exact field schema shared by the writer and fail-closed reader. */
-    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 12;
+    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 13;
 
     /**
      * @brief Encode every supported configuration field without normalization.

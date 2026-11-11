@@ -19,13 +19,21 @@
  *
  * @author David Sanftenberg
  * @date April 2026
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
+ * Stage checkpoint projection borrows the exact registry-owned child without
+ * flattening its TP participant snapshots or duplicating payload/event owners.
  */
 
 #pragma once
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
+#include "../local_execution/graph/ReadAheadScheduling.h"
 #include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../global_pp/GlobalPPTopology.h"
+#include "OriginalCPUPipelineDomainOwners.h"
 #include "../global_pp/GlobalPPRankPlan.h"
 #include "../../interfaces/IMPIContext.h"
 #include "../../collective/ITPContext.h"
@@ -33,6 +41,7 @@
 #include "../../collective/IGlobalTPContext.h"
 #include "../factory/FactoryPPStageConfig.h"
 #include "../../utils/Sampler.h"
+#include "../moe/MoEOverlayInferenceTransactionService.h"
 
 #include <memory>
 #include <optional>
@@ -44,6 +53,11 @@ namespace llaminar2
 
     class TensorBase;
     class PreparedWeightStore;
+    class MoEOverlayPipelineStageBinding;
+    class CapturedTransferRankSession;
+    class CapturedTransferChannel;
+    class PipelineForwardGraphEdges;
+    class PipelineDeviceGeneration;
 
     /**
      * @brief Stage-local weight ownership record for one pipeline domain.
@@ -91,6 +105,13 @@ namespace llaminar2
         /// Stage-local scope retaining the model-owned prepared handle store.
         std::shared_ptr<StageWeightContext> weight_context;
 
+        /// Original stage expert owner, absent for dense stages. Retired after
+        /// its runner; never a model-wide placement or a remote source handle.
+        std::shared_ptr<const MoEOverlayPipelineStageBinding> moe_runtime;
+
+        /// Actual original MPI owner, including dense stages; raw aliases never manufacture a second namespace.
+        std::shared_ptr<IMPIContext> original_mpi_ctx;
+
         /// Runner is declared after its context owners so destruction tears the
         /// runner down before any raw TP/prepared-store pointers can expire.
         std::unique_ptr<IInferenceRunner> runner;
@@ -116,6 +137,8 @@ namespace llaminar2
 
         /** @brief Admit a unique, non-null, explicitly identified stage owner. */
         void add(StageRunnerEntry entry);
+        /** @brief Destroy all local graph/worker/context borrowers before original CPU domain retirement. */
+        void releaseAllAfterTerminalDrain();
 
         /** @return Whether no local stage has been admitted. */
         bool empty() const;
@@ -203,6 +226,10 @@ namespace llaminar2
          */
         bool configureMTPRequestPenaltyPolicyAll(
             const MTPRequestPenaltyPolicy &policy);
+        /** @brief Forward hosted verifier ordering to every original local stage, including non-tail ranks. */
+        void setMTPAllPositionVerifierSyncDeferralAll(bool enabled);
+        /** @brief Forward hosted main-forward ordering without borrowing a remote vocabulary owner. */
+        void setMTPMainDecodeSyncDeferralAll(bool enabled);
         /** @copydoc IInferenceRunner::setSkipLogitsGatherDecode */
         void setSkipLogitsGatherDecodeAll(bool skip);
         /** @copydoc IInferenceRunner::setSkipLogitsGatherPrefill */
@@ -356,6 +383,18 @@ namespace llaminar2
         /** @brief Capture the same sealed request cursor on all stages, retaining child leases. */
         PrefixStateSnapshot captureLivePrefixCheckpointAll(
             const PrefixCheckpointCaptureRequest &request) const;
+
+        /**
+         * @brief Borrow one exact local stage checkpoint from this registry's capture envelope.
+         * @param snapshot Complete aggregate returned by captureLivePrefixCheckpointAll.
+         * @param runner Actual owned stage runner, never an inferred terminal index.
+         * @return Its valid child, or nullptr for incomplete cardinality, a foreign
+         * runner, an invalid child or a stale child frontier.
+         * The child remains intact: its nested TP participant snapshots and ready
+         * event/source handles are independently authenticated by that stage runner.
+         */
+        [[nodiscard]] const PrefixStateSnapshot *prefixCheckpointForRunner(
+            const PrefixStateSnapshot &snapshot, const IInferenceRunner &runner) const;
         /** @brief Restore each stage from its own child snapshot for seq_idx. */
         bool restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx = 0);
         /** @brief Truncate every stage to cached_tokens for the same seq_idx. */
@@ -390,13 +429,26 @@ namespace llaminar2
     class StageActivationRouter
     {
     public:
+        /**
+         * @brief Complete one declared live hosted activation edge.
+         * @param action Original local handoff or MPI send/receive action.
+         * @param registry Actual locally owned source and destination runners.
+         * @param mpi_ctx Original communicator used by the declared edge.
+         * @param rank Original rank owning this action.
+         * @param last_seq_len Actual live rows produced by the preceding stage.
+         * @param d_model Residual width of each live row.
+         * @param activation_buffer Original cold-admitted CPU boundary bank.
+         * @param phase Explicit prefill or decode role of this completed range.
+         * @return True after the exact host-visible payload completes.
+         */
         bool executeTransfer(const RankTransferAction &action,
                              StageRunnerRegistry &registry,
                              IMPIContext &mpi_ctx,
                              int rank,
                              int last_seq_len,
                              int d_model,
-                             std::shared_ptr<TensorBase> &activation_buffer) const;
+                             std::shared_ptr<TensorBase> &activation_buffer,
+                             ForwardExecutionPhase phase = ForwardExecutionPhase::Decode) const;
 
     private:
         static size_t transferElementCount(int last_seq_len, int d_model);
@@ -445,6 +497,14 @@ namespace llaminar2
             int vocab_size = 0;              ///< Full vocabulary size
             int d_model = 0;                 ///< Hidden state dimension
             std::string architecture_name = "unknown";
+
+            /// Same original shared owner as every local stage; raw mpi_ctx aliases it exactly for native rank transport.
+            std::shared_ptr<IMPIContext> original_mpi_ctx;
+            /// Sole original admitted CPU expert contexts; retired after actual local stage graphs disappear.
+            std::shared_ptr<OriginalCPUPipelineDomainOwners> original_cpu_domains;
+            /// Exact original rank PMA and shared stage row envelope for hosted activation storage.
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory;
+            int hosted_activation_rows=0;
         };
 
         // =================================================================
@@ -463,7 +523,20 @@ namespace llaminar2
          */
         explicit GlobalOrchestrator(Config config);
 
-        ~GlobalOrchestrator() override = default;
+        /** @brief Retire original local graph/cohort owners before transport bindings and context owners. */
+        ~GlobalOrchestrator() override;
+
+        /** @return Whether the complete declared multi-stage pipeline consists of actual GPU stages. */
+        bool requiresOriginalRankGPUTransport() const noexcept;
+        /** @brief Validate the same original rank namespace before any all-rank session collective.
+         * @param original Actual shared MPI owner retained by OrchestrationRunner and StageRunnerFactory.
+         * @throws std::invalid_argument For foreign rank/topology/context owners. */
+        void validateOriginalRankGPUTransportContext(const std::shared_ptr<IMPIContext> &original) const;
+        /** @brief One-time cold bind; physical session remains enclosed by original runner shutdown consensus.
+         * @param original Same validated original MPI owner. @param session Existing all-rank session.
+         * @throws std::invalid_argument For replacement or after graph ports were installed. */
+        void bindOriginalRankGPUTransportSession(const std::shared_ptr<IMPIContext> &original,
+            std::shared_ptr<CapturedTransferRankSession> session);
 
         // Non-copyable, non-movable (owns unique_ptrs)
         GlobalOrchestrator(const GlobalOrchestrator &) = delete;
@@ -481,6 +554,13 @@ namespace llaminar2
         void endSparseQueryExecutionProgram() noexcept override;
 
         bool forward(const int *tokens, int seq_len) override;
+        /**
+         * @brief Preserve explicit prefill through the original retained serving family.
+         * @param tokens Immutable real request tokens beginning at the current cursor.
+         * @param seq_len Positive live token count, independent of retained bank capacity.
+         * @return True after all original stages complete the shared retained schedule.
+         */
+        bool forwardPrefill(const int *tokens, int seq_len) override;
         /**
          * @brief Execute a CPU grouped-MTP verifier transaction through GlobalPP/TP.
          *
@@ -739,6 +819,10 @@ namespace llaminar2
 
         /** @brief Number of local stage/domain runners owned by this rank */
         size_t stageRunnerCount() const;
+        /** @copydoc IInferenceRunner::requireMoEPipelineRuntimeOwnership */
+        void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const override;
+        /** @copydoc IInferenceRunner::setMoEOverlayCollectiveRequestGeneration */
+        bool setMoEOverlayCollectiveRequestGeneration(uint64_t generation_id) override;
 
         /** @brief Stage runner entry for a local stage, or nullptr if absent */
         StageRunnerEntry *stageRunnerEntryForStage(int stage_id);
@@ -768,13 +852,33 @@ namespace llaminar2
         // =================================================================
 
         /**
-         * @brief Execute a single EXECUTE_STAGE step
-         *
-         * Delegates to the rank runner's forward(), passing tokens only
-         * for the pipeline head stage; other stages use hidden state input.
+         * @brief Execute the existing hosted stage/transfer sequence for one live range.
+         * @param tokens Original live request tokens, already offset for this range.
+         * @param seq_len Exact live rows crossing every activation boundary.
+         * @param phase Original explicit prefill or decode role.
+         * @param prefill Original one-chunk prefill policy, or null for ordinary forward.
+         * @param pad_token_id Token owned by the admitted prefill capture policy.
+         * @param allow_padding Whether that prefill policy admits initialized physical rows.
+         * @return True after the original local stages and transfers complete.
          */
-        bool executeStage(const RankStageAction &action,
-                          const int *tokens, int seq_len);
+        bool forwardHosted(const int *tokens, int seq_len, ForwardExecutionPhase phase,
+            const PrefillChunkSchedulerPolicy *prefill = nullptr,
+            int pad_token_id = 0, bool allow_padding = false);
+
+        /**
+         * @brief Execute one original hosted stage with its typed forward role.
+         * @param action Original local stage action.
+         * @param tokens Live request tokens, including native nonembedding ingress.
+         * @param seq_len Exact live rows.
+         * @param phase Original explicit prefill or decode role.
+         * @param prefill Original one-chunk prefill policy, or null for ordinary forward.
+         * @param pad_token_id Token owned by the admitted prefill capture policy.
+         * @param allow_padding Whether that prefill policy admits initialized physical rows.
+         * @return True after the stage completes on its existing runner.
+         */
+        bool executeStage(const RankStageAction &action, const int *tokens, int seq_len,
+            ForwardExecutionPhase phase, const PrefillChunkSchedulerPolicy *prefill,
+            int pad_token_id, bool allow_padding);
 
         /**
          * @brief Execute one local stage with the typed grouped-verifier role.
@@ -792,7 +896,8 @@ namespace llaminar2
          *
          * Uses synchronous MPI_Send / MPI_Recv for activation transfer.
          */
-        bool executeTransfer(const RankTransferAction &action);
+        bool executeTransfer(const RankTransferAction &action,
+            ForwardExecutionPhase phase = ForwardExecutionPhase::Decode);
 
         /**
          * @brief Resolve the unique vocabulary-head domain's request leader.
@@ -805,8 +910,591 @@ namespace llaminar2
         // State
         // =================================================================
 
+        /** @brief Prepare complete original-rank activation/reverse metadata ports before generation capture.
+         * @param plan Exact already-agreed serving bucket family; no request state is executed.
+         * @throws std::exception Through original all-rank initialization consensus for incomplete stage ownership. */
+        void prepareOriginalRankPipelinePorts(const ServingGraphFamilyMaterializationPlan &plan);
+
+    public:
+        /** @brief Freeze every original rank-local graph body and its exact rank ports.
+         * @param plan Complete admitted serving family, identical on the original ranks.
+         * @return True only after original local cohort capture completes.
+         * @throws std::exception For substituted context/roles, stale family, or partial capture.
+         */
+        /** @copydoc IInferenceRunner::servingGraphPreparationKind */
+        ServingGraphPreparationKind servingGraphPreparationKind() const noexcept override;
+        /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
+        bool forwardRestoredPrefixMTPDecodeBridge(const RestoredPrefixMTPDecodeBridgeRequest &request) override;
+        /** @return Whether the exact original pipeline cohort/transport/service was prepared on this rank. */
+        bool originalRankPipelineReady() const noexcept { return rank_service_ready_; }
+        bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override;
+        /** @copydoc IInferenceRunner::forwardBatchWithDeviceTokenIds */
+        bool forwardBatchWithDeviceTokenIds(const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override;
+        /** @copydoc IInferenceRunner::prepareMTPVerifierInputTokensOnDevice */
+        const void * prepareMTPVerifierInputTokensOnDevice(int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        /** @copydoc IInferenceRunner::prepareMTPVerifierInputTokenBatchOnDevice */
+        const void * prepareMTPVerifierInputTokenBatchOnDevice(const DeviceMTPVerifierInputBatchRequest *requests,
+            int request_count,
+            int logical_padded_seq_len) override;
+        /** @copydoc IInferenceRunner::prepareMTPVerifierInputTokensOnDeviceFromHostRow */
+        const void * prepareMTPVerifierInputTokensOnDeviceFromHostRow(const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override;
+        /** @copydoc IInferenceRunner::forwardMTPForDeviceSampling */
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
+        /** @copydoc IInferenceRunner::supportsMTPSidecarSampleFusion */
+        bool supportsMTPSidecarSampleFusion() const override;
+        /** @copydoc IInferenceRunner::supportsMTPSidecarLogitsStreamHandoff */
+        bool supportsMTPSidecarLogitsStreamHandoff() const override;
+        /** @copydoc IInferenceRunner::supportsMTPDeviceDraftTokenInput */
+        bool supportsMTPDeviceDraftTokenInput() const override;
+        /** @copydoc IInferenceRunner::supportsMTPSidecarPreservesMainState */
+        bool supportsMTPSidecarPreservesMainState() const override;
+        /** @copydoc IInferenceRunner::supportsLogicalMTPVerifierBaseCheckpoint */
+        bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
+        /** @copydoc IInferenceRunner::supportsMTPShiftedRowReuseFromSidecar */
+        bool supportsMTPShiftedRowReuseFromSidecar() const override;
+        /** @copydoc IInferenceRunner::requiresMTPDecodeEquivalentVerifierReplay */
+        bool requiresMTPDecodeEquivalentVerifierReplay() const override;
+        /** @copydoc IInferenceRunner::supportsMTPSpecStatePublication */
+        bool supportsMTPSpecStatePublication() const override;
+        /** @copydoc IInferenceRunner::supportsDeviceResidentMTPSpecStatePublication */
+        bool supportsDeviceResidentMTPSpecStatePublication() const override;
+        /** @copydoc IInferenceRunner::publishAcceptedMTPSpecState */
+        bool publishAcceptedMTPSpecState(const MTPSpecStepPlan &plan,
+            std::string *error = nullptr) override;
+        /** @copydoc IInferenceRunner::publishAcceptedMTPSpecStateBatch */
+        bool publishAcceptedMTPSpecStateBatch(const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromLastDraftForDeviceSampling */
+        bool forwardMTPFromLastDraftForDeviceSampling(int32_t draft_condition_token,
+            int position_id) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling */
+        bool forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(int draft_sample_slot,
+            int position_offset) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling */
+        bool forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(int target_sample_slot) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot */
+        bool forwardMTPFromDeviceTargetAtLivePositionAndSampleGreedyToDeviceDraftSlot(int target_sample_slot,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceResidentLogicalStateForDeviceSampling */
+        bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot */
+        bool forwardMTPFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlot(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPAndSampleGreedy */
+        bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPAndSampleGreedyToDeviceDraftSlot */
+        bool forwardMTPAndSampleGreedyToDeviceDraftSlot(int32_t draft_condition_token,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPBatchAndSampleGreedy */
+        bool forwardMTPBatchAndSampleGreedy(const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
+        /** @copydoc IInferenceRunner::advanceMTPRequestBatchConditionOnDevice */
+        bool advanceMTPRequestBatchConditionOnDevice(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds = nullptr) override;
+        /** @copydoc IInferenceRunner::forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots */
+        bool forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            int first_draft_slot,
+            int slot_stride) override;
+        /** @copydoc IInferenceRunner::forwardMTPBatchFromLastDraftAndSampleGreedy */
+        bool forwardMTPBatchFromLastDraftAndSampleGreedy(const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
+        /** @copydoc IInferenceRunner::forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots */
+        bool forwardMTPBatchFromDeviceDraftSlotsAndSampleGreedyToDeviceDraftSlots(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_batch,
+            int first_condition_slot,
+            int condition_slot_stride,
+            int position_offset,
+            int first_draft_slot,
+            int draft_slot_stride) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromLastDraftAndSampleGreedy */
+        bool forwardMTPFromLastDraftAndSampleGreedy(int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot */
+        bool forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(int32_t draft_condition_token,
+            int position_id,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot */
+        bool forwardMTPFromDeviceDraftAtLivePositionAndSampleGreedyToDeviceDraftSlot(int draft_condition_sample_slot,
+            int position_offset,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::flushPendingMTPWork */
+        bool flushPendingMTPWork() override;
+        /** @copydoc IInferenceRunner::setMTPAllPositionVerifierSyncDeferralEnabled */
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
+        /** @copydoc IInferenceRunner::setMTPMainDecodeSyncDeferralEnabled */
+        void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
+        /** @copydoc IInferenceRunner::commitMTPInitialShiftedRowFromDeviceOutcome */
+        bool commitMTPInitialShiftedRowFromDeviceOutcome(const PrefixStateSnapshot &checkpoint,
+            const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            bool allow_speculative_discard = false) override;
+        /** @copydoc IInferenceRunner::commitMTPShiftedRowFromDeviceTargetSample */
+        bool commitMTPShiftedRowFromDeviceTargetSample(int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false) override;
+        /** @copydoc IInferenceRunner::commitMTPShiftedRowFromDeviceResidentLogicalState */
+        bool commitMTPShiftedRowFromDeviceResidentLogicalState(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false) override;
+        /** @copydoc IInferenceRunner::commitMTPShiftedRowsFromDeviceOutcome */
+        bool commitMTPShiftedRowsFromDeviceOutcome(const DeviceSpeculativeOutcomeHandle &outcome,
+            int request_index,
+            int already_appended_tokens,
+            int max_state_commit_rows,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false) override;
+        /** @copydoc IInferenceRunner::publishesFullVocabularyMTPLogits */
+        bool publishesFullVocabularyMTPLogits() const override;
+        /** @copydoc IInferenceRunner::sampleGreedyFromMTPLogitsToDeviceDraftSlot */
+        bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(int draft_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows */
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(int start_row,
+            int row_count,
+            int32_t *out_tokens) override;
+        /** @copydoc IInferenceRunner::supportsGreedyAllPositionBatchOutcomeOnDevice */
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
+        /** @copydoc IInferenceRunner::verifyGreedyAllPositionBatchOutcomeOnDevice */
+        bool verifyGreedyAllPositionBatchOutcomeOnDevice(const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
+        /** @copydoc IInferenceRunner::verifyGreedyAllPositionBatchOutcomeOnDeviceResident */
+        bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /** @copydoc IInferenceRunner::prepareGreedyAllPositionBatchOutcomeGraph */
+        bool prepareGreedyAllPositionBatchOutcomeGraph(int verifier_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            const MTPRequestPenaltyPolicy &penalty_policy =
+                MTPRequestPenaltyPolicy{}) override;
+        /** @copydoc IInferenceRunner::verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident */
+        bool verifyGreedyAllPositionRequestBatchOutcomesOnDeviceResident(const DeviceGreedyBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /** @copydoc IInferenceRunner::deviceResidentLogicalSequenceState */
+        DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override;
+        /** @copydoc IInferenceRunner::observeDeviceResidentNextConditionTokens */
+        bool observeDeviceResidentNextConditionTokens(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_count,
+            int32_t *out_tokens) override;
+        /** @copydoc IInferenceRunner::sampleGreedyFromMainLogitsToDeviceTargetSlot */
+        bool sampleGreedyFromMainLogitsToDeviceTargetSlot(int target_sample_slot,
+            int32_t *out_token) override;
+        /** @copydoc IInferenceRunner::sampleOnDeviceAtLogicalPosition */
+        int sampleOnDeviceAtLogicalPosition(const SamplingParams &params,
+            int logical_position) override;
+        /** @copydoc IInferenceRunner::publishMainLogitsBatchSamplesToDeviceResidentState */
+        bool publishMainLogitsBatchSamplesToDeviceResidentState(int request_count,
+            const SamplingParams &params,
+            const uint64_t *stochastic_position_seeds = nullptr) override;
+        /** @copydoc IInferenceRunner::moeOverlayDeviceControllerRuntimeBindings */
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding> moeOverlayDeviceControllerRuntimeBindings() const override;
+        /** @copydoc IInferenceRunner::applyPenaltiesOnDevice */
+        bool applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties,
+                                            int vocab_size) override;
+        /** @copydoc IInferenceRunner::applyPenaltiesToMTPLogitsOnDevice */
+        bool applyPenaltiesToMTPLogitsOnDevice(const LogitPenaltyBatch &penalties,
+                                                       int vocab_size) override;
+        /** @copydoc IInferenceRunner::applyPenaltiesToAllPositionLogitsOnDeviceRow */
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(int row,
+            const LogitPenaltyBatch &penalties,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::applyDeviceOwnedMTPPenaltiesToLogitRows */
+        bool applyDeviceOwnedMTPPenaltiesToLogitRows(DeviceLogitsSource source,
+            int row_count,
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
+        /** @copydoc IInferenceRunner::applyDeviceOwnedMTPBranchPenaltiesToLogits */
+        bool applyDeviceOwnedMTPBranchPenaltiesToLogits(int prior_draft_count,
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
+        /** @copydoc IInferenceRunner::supportsRowLocalAllPositionPenaltyApplication */
+        bool supportsRowLocalAllPositionPenaltyApplication() const override;
+        /** @copydoc IInferenceRunner::supportsDeviceStochasticMTPVerification */
+        bool supportsDeviceStochasticMTPVerification() const override;
+        /** @copydoc IInferenceRunner::buildStochasticDistributionOnDevice */
+        bool buildStochasticDistributionOnDevice(DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::buildStochasticDistributionsOnDevice */
+        bool buildStochasticDistributionsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::buildCapturedStochasticVerifierTargetDistributions */
+        bool buildCapturedStochasticVerifierTargetDistributions(int row_count,
+            const SamplingParams &params,
+            const MTPRequestPenaltyPolicy &penalty_policy,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::buildStochasticProbabilityRowsOnDevice */
+        bool buildStochasticProbabilityRowsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::buildStochasticProcessedLogitRowsOnDevice */
+        bool buildStochasticProcessedLogitRowsOnDevice(DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        /** @copydoc IInferenceRunner::sampleStochasticDraftProposalOnDevice */
+        int sampleStochasticDraftProposalOnDevice(DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        /** @copydoc IInferenceRunner::publishCapturedMTPDraftToken */
+        bool publishCapturedMTPDraftToken(int row,
+            int slot,
+            const MTPRequestPenaltyPolicy &penalty_policy) override;
+        /** @copydoc IInferenceRunner::sampleStochasticDraftProposalOnDeviceDeferred */
+        bool sampleStochasticDraftProposalOnDeviceDeferred(DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        /** @copydoc IInferenceRunner::deviceStochasticTargetSampleProducerSlot */
+        DeviceStochasticTargetSampleSlotHandle deviceStochasticTargetSampleProducerSlot(int slot) override;
+        /** @copydoc IInferenceRunner::deviceStochasticTargetSampleBroadcastDestinationSlot */
+        DeviceStochasticTargetSampleSlotHandle deviceStochasticTargetSampleBroadcastDestinationSlot(int slot) override;
+        /** @copydoc IInferenceRunner::recordStochasticTargetSampleSlotReadyFromDevice */
+        bool recordStochasticTargetSampleSlotReadyFromDevice(int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = true) override;
+        /** @copydoc IInferenceRunner::stageStochasticDraftTokensForDeviceVerification */
+        bool stageStochasticDraftTokensForDeviceVerification(const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0) override;
+        /** @copydoc IInferenceRunner::stageStochasticTargetTokenForDeviceSampling */
+        bool stageStochasticTargetTokenForDeviceSampling(int32_t target_token,
+            int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishForcedDeviceResidentConditionToken */
+        bool publishForcedDeviceResidentConditionToken(int32_t token,
+            int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishDeviceResidentConditionTokenToTargetSampleSlot */
+        bool publishDeviceResidentConditionTokenToTargetSampleSlot(const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::sampleStochasticDistributionOnDevice */
+        int sampleStochasticDistributionOnDevice(DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        /** @copydoc IInferenceRunner::sampleStochasticDistributionOnDeviceDeferred */
+        bool sampleStochasticDistributionOnDeviceDeferred(DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        /** @copydoc IInferenceRunner::prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken */
+        const void * prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsOnDevice */
+        bool verifyStochasticDistributionsOnDevice(int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override;
+        /** @copydoc IInferenceRunner::verifyStochasticProbabilityRowOnDevice */
+        bool verifyStochasticProbabilityRowOnDevice(int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_logical_position,
+            DeviceSpeculativeVerifyResult *out) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsBatchOnDevice */
+        bool verifyStochasticDistributionsBatchOnDevice(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsBatchOutcomeOnDevice */
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken */
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsBatchOutcomeOnDeviceResident */
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceResident(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident */
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeOutcomeHandle *out_handle,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsRequestBatchOutcomesOnDevice */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDevice(const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
+        /** @copydoc IInferenceRunner::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /** @copydoc IInferenceRunner::observeDeviceGenerationDispatchTicket */
+        bool observeDeviceGenerationDispatchTicket(sampling_math::DeviceGenerationDispatchTicket *out_ticket) override;
+        /** @copydoc IInferenceRunner::beginHostScheduledDeviceGenerationAdvance */
+        bool beginHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t *out_fragment_count) override;
+        /** @copydoc IInferenceRunner::submitHostScheduledDeviceGenerationFragment */
+        bool submitHostScheduledDeviceGenerationFragment(const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t fragment_index) override;
+        /** @copydoc IInferenceRunner::finishHostScheduledDeviceGenerationAdvance */
+        bool finishHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket) override;
+        /** @copydoc IInferenceRunner::submitHostScheduledDeviceGenerationAdvance */
+        bool submitHostScheduledDeviceGenerationAdvance(const sampling_math::DeviceGenerationDispatchTicket &ticket) override;
+        /** @copydoc IInferenceRunner::copyDeviceSpeculativeOutcomesToHostForDiagnostics */
+        bool copyDeviceSpeculativeOutcomesToHostForDiagnostics(const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
+
+        /** @copydoc IInferenceRunner::beginDeviceResidentGeneration */
+        bool beginDeviceResidentGeneration(const DeviceGenerationAdmissionRequest &request)  override;
+        /** @copydoc IInferenceRunner::deviceGenerationExecutionPolicy */
+        DeviceGenerationExecutionPolicy deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology topology) const noexcept override;
+        /** @copydoc IInferenceRunner::materializeDeviceResidentGeneration */
+        bool materializeDeviceResidentGeneration(int request_count, int draft_depth, DeviceGenerationLoopTopology topology, DeviceGenerationSamplingMode sampling_mode)  override;
+        /** @copydoc IInferenceRunner::prepareDeviceResidentGenerationContinuation */
+        bool prepareDeviceResidentGenerationContinuation(DeviceGenerationSamplingMode sampling_mode)  override;
+        /** @copydoc IInferenceRunner::launchDeviceResidentGeneration */
+        bool launchDeviceResidentGeneration()  override;
+        /** @copydoc IInferenceRunner::finishDeviceResidentGeneration */
+        bool finishDeviceResidentGeneration(DeviceGenerationTerminalResult *result)  override;
+        /** @copydoc IInferenceRunner::forwardGroupedMTPVerifierWithDeviceTokenIds */
+        bool forwardGroupedMTPVerifierWithDeviceTokenIds(const int *token_shadow, const void *token_ids_device, int seq_len)  override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceResidentLogicalState */
+        bool advanceMTPMainConditionFromDeviceResidentLogicalState(int32_t token_shadow, const DeviceResidentLogicalSequenceStateHandle &logical_state, MTPConditionForwardPurpose purpose, int request_index)  override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
+        bool advanceMTPMainConditionFromDeviceTargetSample(int32_t token_shadow, int target_sample_slot, MTPConditionForwardPurpose purpose)  override;
+        /** @copydoc IInferenceRunner::publishAcceptedMTPSpecStateBatchFromDeviceOutcome */
+        bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(const DeviceSpeculativePublicationRequest &request, std::string *error)  override;
+        /** @copydoc IInferenceRunner::advanceOrdinaryMainConditionFromDeviceResidentLogicalState */
+        bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(int32_t token_shadow, const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index)  override;
+        /** @copydoc IInferenceRunner::mtpVerifierRowCapability */
+        MTPVerifierRowCapability mtpVerifierRowCapability() const override;
+
+        /** @brief Immutable completed original source observation, never scheduler-ticket cadence. */
+        struct OriginalRankGenerationTerminal
+        {
+            uint32_t abi = 1; ///< Fixed terminal metadata contract.
+            uint64_t request_generation = 0; ///< Exact original request/reset authority.
+            uint64_t command_id = 0; ///< Exact original command, rejecting stale observations.
+            int admission_base = -1; ///< Completed request's immutable initial KV provenance.
+            int admission_budget = 0; ///< Original response admission, not a live device counter.
+            int published_state_commit_count = -1; ///< Actual terminal controller publication count.
+            int cached_tokens = -1; ///< Actual completed tail KV observation.
+            sampling_math::DeviceGenerationLeadingRowDisposition next_leading_row_disposition =
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+            bool model_stopped = false; ///< Actual terminal controller outcome.
+        };
+        /** @return Whether this real rank must service the original tail's generation command. */
+        bool originalRankGenerationFollower() const noexcept;
+        /** @brief Bind original process-local maintenance notifications before command admission.
+         * @param sink Existing OR coalescing notification authority, never a second placement policy.
+         * @throws std::logic_error For duplicate binding or an active original command.
+         */
+        void bindOriginalRankRetiredDecodeProgressSink(MoEOverlayRetiredDecodeProgressSink sink);
+
+        /** @return Whether this real rank owns the admitted original source generation service. */
+        bool originalRankGenerationSource() const noexcept { return rank_service_ready_ && is_pipeline_tail_; }
+
+        /** @return Existing original source request/reset epoch, never a service-owned counter. */
+        uint64_t originalRankRequestGeneration() const;
+        /** @brief Project request and command ordering from the original terminal source authority.
+         * @param command_id Source OR's existing monotonic inference command identifier.
+         * @return Immutable command identity without observing live device state.
+         * @throws std::logic_error For absent source ownership or incomplete placement authority.
+         */
+        MoEOverlayInferenceCommandIdentity originalRankCommandIdentity(uint64_t command_id) const;
+        /** @brief Begin one source-owned command and both directed rank-channel admissions.
+         * @param command Existing OR inference-command identity and source placement epoch.
+         * @param admission_base Original completed prefill/previous-terminal planning boundary.
+         * @return True after immutable command publication, without mutable device observations.
+         */
+        bool beginOriginalRankGenerationCommand(const MoEOverlayInferenceCommandIdentity &command, int admission_base, DeviceGenerationSamplingMode sampling);
+        /** @brief Service immutable admission/tickets, then validate and return actual source terminal accounting.
+         * @param terminal Receives completed source publication/KV/leading disposition only.
+         * @param error Receives the first protocol/native/independent-KV failure.
+         * @return True after exact local native retirement and directed-channel retirement.
+         */
+        bool serviceOriginalRankGenerationCommand(OriginalRankGenerationTerminal *terminal, std::string *error);
+        /** @brief Complete the original source command only from actual terminal accounting.
+         * @param model_stopped Source result for a command which needed no resident controller.
+         * @return True after all graph slots and native endpoint owners retire.
+         */
+        bool completeOriginalRankGenerationCommand(bool model_stopped,
+            sampling_math::DeviceGenerationLeadingRowDisposition terminal_leading);
+        /** @brief Cancel both directed channels before publishing fatal protocol termination. */
+        void abortOriginalRankGenerationCommand() noexcept;
+
+        /** @brief Check original local stages against their retained prefill family.
+         * @param seq_len Positive logical prompt/suffix length, excluding padding.
+         * @return Whether every real local runner accepts that retained schedule.
+         */
+        bool supportsPrefillChunkSchedule(int seq_len) const override;
+        /** @brief Submit only real local participants through their original captured rank edges.
+         * @param tokens Immutable prompt/suffix input, shared as request input only.
+         * @param seq_len Logical live rows, never transport capacity.
+         * @param policy Original root-owned chunk geometry and prefix offset.
+         * @param pad_token_id Original admitted graph padding token.
+         * @param allow_padded_execution Explicit physical-graph padding admission.
+         * @return Whether all local stage owners submitted the complete schedule.
+         */
+        bool forwardPrefillChunkSchedule(const int *tokens, int seq_len,
+            const PrefillChunkSchedulerPolicy &policy, int pad_token_id, bool allow_padded_execution) override;
+    private:
         Config config_;
         GlobalPPRankPlan rank_plan_;
+        /** @brief Actual directed channel owners, never foreign process contexts/cursors. */
+        struct RankBoundaryChannels
+        {
+            std::shared_ptr<CapturedTransferChannel> activation;
+            std::shared_ptr<CapturedTransferChannel> metadata;
+        };
+        std::shared_ptr<CapturedTransferRankSession> rank_transfer_session_; ///< OR retains the outer retirement owner.
+        std::vector<RankBoundaryChannels> rank_boundaries_;
+        std::vector<std::unique_ptr<PipelineForwardGraphEdges>> rank_forward_edges_; ///< DGOs retire before these installed pointers.
+        /** Original successful hosted family, retained through all request resets. */
+        std::optional<ServingGraphFamilyMaterializationPlan> hosted_serving_family_plan_;
+        std::optional<ServingGraphFamilyMaterializationPlan> rank_port_family_;
+
+        // The cohort explicitly retires borrowed parents in the destructor body,
+        // then survives the original DGO registry so its installed edge owners
+        // remain live while those graph/cache owners destroy their recordings.
+        /** @brief Freeze source/follower lanes from the exact original topology/session. */
+        void prepareOriginalRankGenerationService();
+        /** @brief Publish one complete exact-row body to every follower before local enqueue. */
+        bool publishOriginalRankTransaction(MoEOverlayInferenceGraphRole role, int rows, int depth);
+        /** @brief Join all original follower receipts after authenticated source completion. */
+        bool retireOriginalRankTransaction(uint64_t scheduler_frontier);
+        /** @brief Admit both existing channel directions under the original command identity. */
+        void beginOriginalRankChannelInvocations();
+        /** @brief Retire both existing channel directions after original native endpoint joins. */
+        bool finishOriginalRankChannelInvocations();
+        /** @brief Broadcast one immutable admission before any original follower graph submission. */
+        bool publishOriginalRankAdmission(const DeviceGenerationAdmissionRequest &request);
+        /** @return Exact local original tail; execution on a follower is a fatal ownership error. */
+        IInferenceRunner &generationTail();
+        /** @return Read-only original tail authority for capability/state observations. */
+        const IInferenceRunner &generationTail() const;
+        std::array<uint8_t, 12> rank_tail_capabilities_{}; ///< Source-authenticated static graph capabilities only.
+        MTPVerifierRowCapability rank_tail_verifier_capability_; ///< Actual source capability, frozen before request admission.
+        DeviceGenerationSamplingMode rank_generation_sampling_mode_ = DeviceGenerationSamplingMode::Greedy;
+        // This owner constructs native MPI publishers itself. Retain that exact
+        // type so terminal publication reads each protocol's authenticated epoch.
+        std::vector<std::shared_ptr<MoEOverlayInferenceTransactionPublisher>> rank_publishers_;
+        std::vector<MoEOverlayPublishedInferenceTransaction> rank_pending_transactions_;
+        std::vector<std::vector<MoEOverlayPublishedInferenceTransaction>> rank_deferred_transactions_; ///< Bounded real native-completion leases per original follower lane.
+        std::size_t rank_transaction_slot_capacity_ = 0; ///< Cold protocol capacity, never a model-state mirror.
+        /** @brief Query ready receipts, or join only at bounded ring reuse / outer command terminal. */
+        bool progressOriginalRankTransactions(bool terminal);
+
+        std::unique_ptr<MoEOverlayInferenceTransactionFollower> rank_transaction_follower_;
+        std::optional<MoEOverlayInferenceCommandIdentity> rank_active_command_;
+        std::optional<OriginalRankGenerationTerminal> rank_terminal_observation_;
+        int rank_response_admission_base_ = -1; ///< Immutable response-ledger origin after any preceding scalar conditions.
+        int rank_admission_base_ = -1;
+        int rank_admission_budget_ = 0;
+        int rank_graph_capacity_rows_ = 0;
+        int rank_draft_capacity_ = 0;
+        bool rank_service_ready_ = false;
+        bool rank_admission_published_ = false;
+        bool rank_channels_admitted_ = false;
+        bool rank_transaction_pending_ = false;
+        uint64_t rank_retired_decode_scheduler_frontier_ = 0; ///< Authenticated immutable-ticket cadence only; never terminal state accounting.
+        MoEOverlayRetiredDecodeProgressSink rank_retired_decode_progress_sink_; ///< Original OR maintenance notification, not a policy/controller owner.
+
+        std::unique_ptr<PipelineDeviceGeneration> rank_generation_;
 
         // Per-rank local stage execution (owned)
         StageRunnerRegistry stage_runners_;

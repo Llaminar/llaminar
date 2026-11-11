@@ -125,14 +125,14 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                     for (size_t field = 0; field < 4; ++field)
                         ASSERT_TRUE(backend->hostToDevice(banks[field]->gpu_data_ptr(), setup_guard.data(),
                             sizeof(setup_guard), device.gpu_ordinal(), stream));
-                    ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context));
+                    ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context, stream));
                     const auto *const retained_wire = Peer::publicationTransportIdentity(owner);
                     ASSERT_NE(retained_wire, nullptr);
                     const auto expected_order = tail ? PipelineForwardGraphEdges::PublicationOrder::CommitThenExchange
                                                      : PipelineForwardGraphEdges::PublicationOrder::ExchangeThenCommit;
                     ASSERT_EQ(edges.preparedPublication(wire), expected_order);
                     // A second preparation is local reuse, not another collective wave.
-                    ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context));
+                    ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context, stream));
                     EXPECT_EQ(Peer::publicationTransportIdentity(owner), retained_wire);
                     EXPECT_EQ(edges.preparedPublication(wire), expected_order);
                     for (size_t field = 0; field < 4; ++field)
@@ -144,7 +144,7 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                     }
                     auto foreign_wire = wire;
                     foreign_wire.healthy = word(7);
-                    EXPECT_THROW(Peer::capturePublicationTransport(owner, edges, foreign_wire, *execution, context), std::logic_error);
+                    EXPECT_THROW(Peer::capturePublicationTransport(owner, edges, foreign_wire, *execution, context, stream), std::logic_error);
                     const IGPUGraphCapture *previous_publication = nullptr;
                     for (const int width : {2, 3, 4, 16})
                     for (const int limit : {width, width - 1})
@@ -271,7 +271,7 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                     owner_storage.reset();
                     EXPECT_FALSE(edges.preparedPublication(wire));
                     DeviceGraphExecutor unused_executor;
-                    EXPECT_THROW(edges.materializePublicationTransport(wire, unused_executor, *execution, context), std::logic_error)
+                    EXPECT_THROW(edges.materializePublicationTransport(wire, unused_executor, *execution, context, stream), std::logic_error)
                         << "A retired participant cannot resurrect capture against an old arena";
                     passed = !::testing::Test::HasFailure();
                 });

@@ -71,4 +71,14 @@ struct ProjectionPipelineTiming
  */
 void runProjectionPipelineFixture(DeviceId first, int participants,
     const ProjectionPipelineFixtureConfig &config = {}, ProjectionPipelineTiming *timing = nullptr);
+/**
+ * @brief Execute on an already selected original owner, without another MPI setup exchange.
+ * @param selected Exact unique physical members selected by originalRankLocalReplay.
+ * @param config Geometry and declared participant order; ordering permutes this selected set.
+ * @param timing Optional interval result owned by the executing rank.
+ * Caller keeps all original ranks in the surrounding declaration/retirement consensus.
+ */
+void runProjectionPipelineFixtureOnCohort(const std::vector<DeviceId> &selected,
+    const ProjectionPipelineFixtureConfig &config, ProjectionPipelineTiming *timing = nullptr);
+
 }

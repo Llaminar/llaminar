@@ -2499,6 +2499,15 @@ namespace llaminar2
              * dependency rather than masquerading as a parent import.
              */
             std::unordered_set<BufferId> prior_child_writes;
+            if (segment_cache.prior_child_input_authority)
+            {
+                // Only the closed original transport composer can mint this proof.
+                // The local consumer contract remains unchanged and all other
+                // inputs still need a producer in this graph or live ready bytes.
+                const auto &proof = *segment_cache.prior_child_input_authority;
+                proof.require(graph, segment_cache.capture_device, segment_cache.capture_stream);
+                prior_child_writes.insert(proof.inputs().begin(), proof.inputs().end());
+            }
             for (auto &segment : segment_cache.segments)
             {
                 if (!segment.capturable)

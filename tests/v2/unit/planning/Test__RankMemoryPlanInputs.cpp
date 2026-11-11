@@ -12,6 +12,8 @@
  * projection aggregates their storage into the single rank-local host allocator.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "fixtures/backends/OriginalRankLocalNativeCohort.h"
+#include "planning/PipelineTransferMemory.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
@@ -28,8 +30,10 @@
 #include "backends/NativeAuxiliaryResourceCatalog.h"
 #include <gtest/gtest.h>
 #include <limits>
+#include <array>
 #include <algorithm>
 #include <vector>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -412,31 +416,72 @@ TEST(RankMemoryPlanInputs, AdaptiveCeilingAndNotInitialDepthOwnsCapacity)
     }
 }
 
+/** @test Native PP transport preserves each singleton/TP domain's layers, shards and exact byte endpoints. */
 TEST(RankMemoryPlanInputs, PipelineTensorDomainsKeepTheirExactLayerIntervals)
 {
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const auto &widths : {std::vector<int>{2, 2}, std::vector<int>{1, 2},
+            std::vector<int>{2, 1}, std::vector<int>{1, 2, 1}})
     {
-        Fixture fixture(backend, 4);
+        int participants = 0;
+        for (const int width : widths) participants += width;
+        Fixture fixture(backend, participants);
         const auto devices = fixture.plan.local_tp_devices;
         fixture.plan.local_tp_devices.clear();
-        fixture.plan.local_pp_devices = {devices[0], devices[2]};
-        fixture.plan.local_pp_layer_boundaries = {0, 2, 4};
-        fixture.plan.local_pp_stage_tp_info = {
-            {.devices = {devices[0], devices[1]}},
-            {.devices = {devices[2], devices[3]}}};
-        const auto configs = buildRankMemoryPlanInputs(fixture.request());
-        ASSERT_EQ(configs.size(), 4u);
-        for (int participant = 0; participant < 4; ++participant)
+        fixture.plan.local_pp_layer_boundaries = widths.size() == 2
+            ? std::vector<int>{0, 2, 4} : std::vector<int>{0, 1, 3, 4};
+        std::size_t offset = 0;
+        for (const int width : widths)
         {
-            const auto &cfg = configs[participant];
-            EXPECT_EQ(cfg.first_layer, (participant / 2) * 2);
-            EXPECT_EQ(cfg.last_layer, (participant / 2) * 2 + 1);
-            EXPECT_EQ(cfg.owns_embedding, participant < 2);
-            EXPECT_EQ(cfg.shard_index, participant % 2);
-            EXPECT_FALSE(cfg.local_pipeline_backend.has_value());
-            ASSERT_TRUE(cfg.tensor_parallel_assignment);
-            EXPECT_EQ(cfg.tensor_parallel_assignment->device, DeviceId(backend, participant));
+            RankExecutionPlan::LocalPPStageTPInfo stage;
+            stage.devices.assign(devices.begin() + offset, devices.begin() + offset + width);
+            fixture.plan.local_pp_devices.push_back(stage.devices.front());
+            fixture.plan.local_pp_stage_tp_info.push_back(std::move(stage));
+            offset += width;
         }
+        const auto configs = buildRankMemoryPlanInputs(fixture.request());
+        ASSERT_EQ(configs.size(), static_cast<std::size_t>(participants));
+        std::size_t config_index = 0, endpoint_sum = 0;
+        for (std::size_t stage = 0; stage < widths.size(); ++stage)
+        for (int shard = 0; shard < widths[stage]; ++shard)
+        {
+            SCOPED_TRACE(::testing::Message() << static_cast<int>(backend)
+                << " stages=" << widths.size() << " stage=" << stage << " shard=" << shard);
+            const auto &cfg = configs[config_index];
+            EXPECT_EQ(cfg.device, devices[config_index].toLocalDeviceId());
+            EXPECT_EQ(cfg.first_layer, fixture.plan.local_pp_layer_boundaries[stage]);
+            EXPECT_EQ(cfg.last_layer, fixture.plan.local_pp_layer_boundaries[stage + 1] - 1);
+            EXPECT_EQ(cfg.owns_embedding, stage == 0);
+            EXPECT_EQ(cfg.shard_index, shard);
+            EXPECT_EQ(cfg.total_shards, widths[stage]);
+            ASSERT_TRUE(cfg.local_pipeline_backend);
+            EXPECT_EQ(*cfg.local_pipeline_backend, backend == DeviceType::CUDA
+                ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+            EXPECT_TRUE(cfg.captured_pipeline_boundaries.empty());
+            EXPECT_FALSE(cfg.pipeline_native_activation_fanout);
+            EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
+            // Every stage member receives adjacent activation/metadata edges.
+            // Only its actual leader sends the peer stage's individual rows.
+            std::size_t endpoints = std::size_t(stage > 0) + std::size_t(stage + 1 < widths.size());
+            if (shard == 0)
+            {
+                if (stage > 0) endpoints += widths[stage - 1];
+                if (stage + 1 < widths.size()) endpoints += widths[stage + 1];
+            }
+            EXPECT_EQ(cfg.native_pipeline_byte_endpoints, endpoints);
+            endpoint_sum += cfg.native_pipeline_byte_endpoints;
+            if (widths[stage] > 1)
+            {
+                ASSERT_TRUE(cfg.tensor_parallel_assignment);
+                EXPECT_EQ(cfg.tensor_parallel_assignment->device, cfg.device);
+            }
+            else EXPECT_FALSE(cfg.tensor_parallel_assignment);
+            ++config_index;
+        }
+        std::size_t expected_endpoint_sum = 0;
+        for (std::size_t stage = 1; stage < widths.size(); ++stage)
+            expected_endpoint_sum += 2u * (widths[stage - 1] + widths[stage]);
+        EXPECT_EQ(endpoint_sum, expected_endpoint_sum);
         fixture.plan.local_pp_layer_boundaries.pop_back();
         EXPECT_THROW(buildRankMemoryPlanInputs(fixture.request()), std::invalid_argument);
     }
@@ -684,8 +729,25 @@ TEST(RankMemoryPlanInputs, CapturedPipelineChannelsFollowDomainsNotDeviceOrdinal
             if (!leader) EXPECT_TRUE(cfg.captured_pipeline_boundaries.empty());
             else EXPECT_EQ(cfg.captured_pipeline_boundaries, std::vector{source
                 ? PipelineBoundarySide::EarlierDomain : PipelineBoundarySide::LaterDomain});
-            EXPECT_EQ(cfg.associated_host_memory.has_value(), source && leader);
+            EXPECT_EQ(cfg.pipeline_native_activation_fanout, !source && width > 1);
+            EXPECT_EQ(cfg.associated_host_memory.has_value(), (source && leader) || (!source && width > 1));
         }
+        // Remove only the new typed bank contribution to authenticate its exact
+        // incremental physical quote. Channel/payload/graph geometry stays fixed.
+        auto old_configs = configs;
+        for (auto &cfg : old_configs) cfg.pipeline_native_activation_fanout = false;
+        const auto actual = MemoryPlanner::plan(fixture.model, configs);
+        const auto original = MemoryPlanner::plan(fixture.model, old_configs);
+        const auto totals = [](const auto &plan, bool host) {
+            size_t bytes = 0;
+            for (const auto &bom : plan.physicalPlan().resources())
+                if (bom.resource().device.is_cpu() == host)
+                    bytes += bom.bytes(PhysicalMemoryOwner::ActivationTransportStaging);
+            return bytes;
+        };
+        const size_t members = width > 1 ? size_t(width) : 0;
+        EXPECT_EQ(totals(actual, false) - totals(original, false), members * PipelineTransferMemory::fanoutDeviceBytes());
+        EXPECT_EQ(totals(actual, true) - totals(original, true), members * PipelineTransferMemory::fanoutHostBytes());
     }
 }
 
@@ -1423,4 +1485,105 @@ TEST(RankMemoryPlanInputs, AddressedSharedOwnersRetainOriginalReadersEveryDegree
                 EXPECT_EQ(inputs[coordinate].ngram_execution_policy->gpu_adaptive.placement,policy.gpu_adaptive.placement);
             }
         }
+}
+
+/** @test Original MPI membership is independent of native width, permutation and physical NUMA labels. */
+TEST(OriginalRankLocalNativeCohort, PreservesOriginalRanksPermutationsAndWidths)
+{
+    for (const int world : {1, 2, 5})
+        for (const int width : {1, 2, 3, 4, 8, 17})
+        {
+            SCOPED_TRACE(::testing::Message() << "world=" << world << " width=" << width);
+            ClusterInventory inventory;
+            inventory.world_size = world;
+            inventory.ranks.resize(world);
+            for (int rank = 0; rank < world; ++rank)
+            {
+                inventory.ranks[rank].rank = rank;
+                inventory.ranks[rank].cpu.numa_node = 31 + rank * 7;
+            }
+            const int rank = world - 1;
+            auto &owner = inventory.ranks[rank];
+            std::vector<DeviceId> devices;
+            for (int index = 0; index < width; ++index)
+            {
+                DeviceInfo gpu;
+                gpu.type = DeviceType::ROCm;
+                gpu.local_device_id = 4 + index * 3;
+                gpu.uuid = "original-uuid-" + std::to_string(index);
+                gpu.numa_node = owner.cpu.numa_node;
+                owner.gpus.push_back(gpu);
+                devices.push_back(DeviceId::rocm(gpu.local_device_id));
+            }
+            std::reverse(devices.begin(), devices.end());
+            const auto original = devices;
+            const auto *borrow = &test::requireOriginalRankLocalNativeCohort(
+                inventory, rank, world, owner.cpu.numa_node, devices);
+            EXPECT_EQ(borrow, &owner);
+            EXPECT_EQ(borrow->rank, rank);
+            EXPECT_EQ(inventory.ranks.size(), static_cast<std::size_t>(world));
+            EXPECT_EQ(devices, original);
+        }
+}
+
+/** @test Visibility, duplicate physical aliases and changed CPU bindings cannot authorize native work. */
+TEST(OriginalRankLocalNativeCohort, RejectsForeignRankNUMAOrdinalUUIDAndIncompleteMembership)
+{
+    ClusterInventory inventory;
+    inventory.world_size = 2;
+    inventory.ranks.resize(2);
+    inventory.ranks[0].rank = 0;
+    inventory.ranks[0].cpu.numa_node = 43;
+    auto &owner = inventory.ranks[1];
+    owner.rank = 1;
+    owner.cpu.numa_node = 19;
+    for (int index = 0; index < 2; ++index)
+    {
+        DeviceInfo gpu;
+        gpu.type = DeviceType::CUDA;
+        gpu.local_device_id = index * 7 + 3;
+        gpu.numa_node = 19;
+        gpu.uuid = "original-cuda-" + std::to_string(index);
+        owner.gpus.push_back(gpu);
+    }
+    const std::array devices{DeviceId::cuda(10), DeviceId::cuda(3)};
+    const auto admit = [&](const ClusterInventory &candidate, int rank = 1, int world = 2, int numa = 19) {
+        return &test::requireOriginalRankLocalNativeCohort(candidate, rank, world, numa, devices);
+    };
+    ASSERT_NO_THROW((void)admit(inventory));
+    EXPECT_THROW((void)admit(inventory, -1), std::invalid_argument);
+    EXPECT_THROW((void)admit(inventory, 2), std::invalid_argument);
+    EXPECT_THROW((void)admit(inventory, 1, 1), std::invalid_argument);
+    EXPECT_THROW((void)admit(inventory, 1, 0), std::invalid_argument);
+    EXPECT_THROW((void)admit(inventory, 1, 2, -1), std::invalid_argument);
+    EXPECT_THROW((void)admit(inventory, 1, 2, 43), std::invalid_argument);
+    auto changed = inventory;
+    changed.ranks[1].rank = 0;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[0].rank = 1;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks.pop_back();
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[1].cpu.numa_node = -1;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[1].cpu.type = DeviceType::CUDA;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    for (const int numa : {-1, 43})
+    {
+        changed = inventory; changed.ranks[1].gpus[0].numa_node = numa;
+        EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    }
+    changed = inventory; changed.ranks[1].gpus[0].uuid.clear();
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[1].gpus[1].uuid = changed.ranks[1].gpus[0].uuid;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[1].gpus.push_back(changed.ranks[1].gpus[0]);
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    changed = inventory; changed.ranks[1].gpus[0].local_device_id = 99;
+    EXPECT_THROW((void)admit(changed), std::invalid_argument);
+    const std::array duplicates{devices[0], devices[0]};
+    EXPECT_THROW((void)test::requireOriginalRankLocalNativeCohort(inventory, 1, 2, 19, duplicates), std::invalid_argument);
+    const std::array host{DeviceId::cpu()};
+    EXPECT_THROW((void)test::requireOriginalRankLocalNativeCohort(inventory, 1, 2, 19, host), std::invalid_argument);
+    EXPECT_THROW((void)test::requireOriginalRankLocalNativeCohort(inventory, 1, 2, 19, {}), std::invalid_argument);
 }

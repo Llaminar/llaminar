@@ -31,9 +31,10 @@ namespace llaminar2
      * @brief Number and ownership scope of model contexts consumed by a runner.
      *
      * Ordinary OrchestrationRunner instances are constructed independently on
-     * every MPI rank, including legacy global/NodeLocal TP and PP plans. Named
-     * domains and topology trees instead compose multiple rank authorities and
-     * cannot consume one unqualified rank-local context.
+     * every MPI rank, including global/NodeLocal TP, PP and named-domain plans.
+     * Every local stage borrows that rank's one admitted model context. Remote
+     * execution edges do not add local model authorities. Topology-tree lowering
+     * remains unsupported and has no rank-local context construction contract.
      */
     enum class RunnerModelAuthorityScope
     {

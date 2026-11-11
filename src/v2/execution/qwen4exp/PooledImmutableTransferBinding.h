@@ -11,83 +11,90 @@
 #include "transfer/CapturedTransferChannel.h"
 #include <variant>
 #include <atomic>
+#include "collective/LocalTPContext.h"
 
 namespace llaminar2::qwen4exp {
 class PooledImmutableDirectedTransport;
-/** @brief Same-PMA static operands and native receipts for one original native cohort protocol, with no live admission ledger. */
+/**
+ * @brief Same-PMA metadata for the original native transport population.
+ *
+ * Transport membership includes storage-only endpoints independently of model
+ * reader membership. One exact CPU root holds the owner and a trailing endpoint
+ * record for every actual member; no fixed GPU-count capacity or parallel ledger
+ * exists. Graph bindings borrow scalar offsets and the original revocable context.
+ */
 class PooledImmutableNativeCompletionStorage final {
 public:
-    /** @brief Inline immutable original participants; the PMA-owned object prices this complete bounded container. */
-    using Participants=std::array<std::optional<PreparedGPUContextUsePermit>,kMaximumPooledNativeParticipants>;
-    /** @brief Optional original local frames; pure readers supply their real ReaderPhase frame at bind. */
-    using Frames=std::array<std::optional<PooledNativeCompletionFrame>,kMaximumPooledNativeParticipants>;
-    /** @brief Price only the original immutable operand/receipt backing.
-     * @param host Original source host resource. @param participants Complete original native resources in coordinate order.
-     * @param layout Exact original edge/message declaration.
-     * @return Typed PMA contribution; LocalTP retains its own communicator resources. */
+    /** @brief Cold construction inputs; final records move into the admitted root. */
+    using Participants=std::vector<std::optional<PreparedGPUContextUsePermit>>;
+    /** @brief Pure readers supply their actual ReaderPhase frame when binding. */
+    using Frames=std::vector<std::optional<PooledNativeCompletionFrame>>;
+    /** @brief Price the exact owner, actual endpoint records and operand/receipt roots. */
     static PhysicalMemoryPlan memoryBOM(PhysicalMemoryResource host,
         std::span<const PhysicalMemoryResource> participants, PooledNativeCompletionLayout layout);
-    /** @return Original Rank-issued communicator/cohort, retained without a reverse strong model edge. */
-    const std::shared_ptr<const Qwen4ExpReplicatedPLECohort>& cohort() const { requireCurrent(); return cohort_; }
-    /** @return Original actual communicator coordinate, never physical allocator order. */
+    /** @return Checked borrow of the actual native communicator, never a model-reader alias. */
+    NativeLocalTPContextUse context() const {requireCurrent();return cohort_.acquire();}
+    /** @return Original actual native coordinate, independent of logical reader order. */
     int coordinate(DeviceId device) const;
-    /** @return Same original prepared worker/PMA generation for a native participant. */
+    /** @return Same prepared worker/PMA generation of one native participant. */
     const PreparedGPUContextUsePermit& original(DeviceId device) const;
-    /** @return Immutable original borrow retained through abort; obtaining new native admission after abort is forbidden. */
-    NativeCompletionAuthority authority(DeviceId device) const { return authorities_[coordinate(device)]; }
-    /** @brief Authenticate original worker generations, native context and same PMA ownership. */
+    /** @return The original completion authority retained through native abort. */
+    NativeCompletionAuthority authority(DeviceId device) const {return participants_[coordinate(device)].authority;}
+    /** @brief Authenticate original context, worker generations and exact physical roots. */
     void requireCurrent() const;
-    /** @return Original storage-backed prefix completion, never a host snapshot of interval/error/count. */
+    /** @brief Bind the declared counted edge to its own source or reader frame. */
     PooledImmutableNativeTransfer counted(PooledImmutableNativeTransfer binding,
         PooledNativeCountedMessage message, PooledNativeTransferSpan extent,
         std::optional<PooledNativeCompletionFrame> frame = {}) const;
-    /**
-     * @brief Bind MissKeys to an explicit original request lane, never a default response frame.
-     * @param binding Original fixed endpoint on this same native cohort.
-     * @param extent Exact original UInt64 request byte publication.
-     * @param frame Actual original request identity/error authority.
-     * @return Counted endpoint retaining this same completion storage.
-     */
+    /** @brief Bind compact miss keys to the actual request lane and its error authority. */
     PooledImmutableNativeTransfer countedRequest(PooledImmutableNativeTransfer binding,
         PooledNativeTransferSpan extent, PooledNativeRequestCompletionFrame frame) const;
+    /** @brief Retire endpoint aliases before native context and backing ownership. */
+    ~PooledImmutableNativeCompletionStorage();
 private:
     friend class PooledImmutableDirectedTransport;
-    /**
-     * @brief Match the counted endpoint to this same original metadata bank.
-     * @param binding Original native endpoint, not another equal-sized cohort.
-     * @return Exact coordinate after cohort/control-block, worker and PMA validation.
-     * @throws std::exception For retired/foreign ownership or stale generation.
-     */
+    friend class PooledImmutableTransferChannel;
+    friend class PooledImmutableTransferBinding;
+    /** @brief One actual endpoint's immutable declaration and exact physical owners. */
+    struct Participant final {
+        std::optional<PreparedGPUContextUsePermit> original;
+        std::optional<PooledNativeCompletionFrame> frame;
+        NativeCompletionAuthority authority;
+        std::size_t receipt_bytes=0;
+        bool positive_owner=false,reader=false;
+        PhysicalMemoryAllocationLease receipt_claim;
+        std::shared_ptr<DeviceTransferBuffer> receipt;
+    };
+    /** @return Exact aligned trailing-record offset in the sole admitted CPU root. */
+    static std::size_t participantOffset();
+    /** @return Checked owner-plus-record payload extent, independent of GPU capacity. */
+    static std::size_t objectPayloadBytes(std::size_t degree);
+    /** @brief Reconstruct immutable declaration for cold binding only; replay never allocates. */
+    PooledNativeCompletionLayout declaration() const;
+    /** @brief Reject a counted endpoint from another native context or PMA generation. */
     int requireOriginalBinding(const PooledImmutableNativeTransfer& binding) const;
-    /** @brief Revoke original caller bindings only after enclosing parent/cache retirement; storage releases with its final borrower. */
-    void retireOriginalRuntime() const noexcept { retired_.store(true, std::memory_order_release); }
-    /** @brief Materialize only exact admitted roots using original prepared workers before capture. */
+    /** @brief Revoke callers after original enclosing parents have retired. */
+    void retireOriginalRuntime() const noexcept {retired_.store(true,std::memory_order_release);}
+    /** @brief Materialize exact admitted roots on their original prepared workers. */
     static std::shared_ptr<const PooledImmutableNativeCompletionStorage> create(
-        std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
-        Participants participants,
-        Frames frames,
-        PooledNativeCompletionLayout layout);
-    /** @brief Retain the same original owners after all cold validation/allocation succeeds. */
-    PooledImmutableNativeCompletionStorage(std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
-        Participants participants,
-        Frames frames, PooledNativeCompletionLayout layout,
-        std::array<NativeCompletionAuthority, kMaximumPooledNativeParticipants> authorities,
-        PhysicalMemoryAllocationLease mappedClaim, std::array<PhysicalMemoryAllocationLease, kMaximumPooledNativeParticipants> receiptClaims,
-        std::shared_ptr<MappedHostTransferRegion> operands,
-        std::array<std::shared_ptr<DeviceTransferBuffer>, kMaximumPooledNativeParticipants> receipts)
-        : cohort_(std::move(cohort)), participants_(std::move(participants)), frames_(std::move(frames)), layout_(layout), authorities_(std::move(authorities)),
-          mapped_claim_(std::move(mappedClaim)), receipt_claims_(std::move(receiptClaims)),
-          operands_(std::move(operands)), receipts_(std::move(receipts)) {}
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort_;
-    Participants participants_;
-    Frames frames_;
-    PooledNativeCompletionLayout layout_;
-    std::array<NativeCompletionAuthority, kMaximumPooledNativeParticipants> authorities_;
-    mutable std::atomic<bool> retired_{false}; ///< Host lifetime only, never a model/protocol execution state.
+        NativeLocalTPContextBorrow cohort,std::unique_ptr<LocalTPContext> ownedContext,
+        Participants participants,Frames frames,PooledNativeCompletionLayout layout);
+    /** @brief Attach the trailing span before construction of each endpoint record. */
+    PooledImmutableNativeCompletionStorage(NativeLocalTPContextBorrow cohort,
+        std::unique_ptr<LocalTPContext> ownedContext,std::span<Participant> participants,
+        const PooledNativeCompletionLayout& layout)
+        :owned_context_(std::move(ownedContext)),cohort_(std::move(cohort)),participants_(participants),
+         coordinator_(layout.coordinator()),profile_(layout.readerProfile()),
+         operand_bytes_(layout.operandBytes()),operand_allocation_bytes_(layout.operandAllocationBytes()) {}
+    std::unique_ptr<LocalTPContext> owned_context_; ///< Absent only when borrowing the exact original compute communicator.
+    NativeLocalTPContextBorrow cohort_;
+    std::span<Participant> participants_; ///< In the same CPUStorageRoot as this object, never an independent allocation.
+    std::size_t coordinator_,constructed_=0;
+    PooledNativeReaderMessageProfile profile_;
+    std::size_t operand_bytes_,operand_allocation_bytes_;
+    mutable std::atomic<bool> retired_{false}; ///< Host lifetime only; no model state.
     PhysicalMemoryAllocationLease mapped_claim_;
-    std::array<PhysicalMemoryAllocationLease, kMaximumPooledNativeParticipants> receipt_claims_;
     std::shared_ptr<MappedHostTransferRegion> operands_;
-    std::array<std::shared_ptr<DeviceTransferBuffer>, kMaximumPooledNativeParticipants> receipts_;
 };
 
 /** @brief Same original storage/stream/count binding under one capture-frozen transport law. */
@@ -117,6 +124,8 @@ public:
     CapturedTransferEndpoint role() const noexcept;
     /** @return True only for the original native communicator binding. */
     bool nativeCollective() const noexcept;
+    /** @return Revocable original native recording authority, absent only on the mapped contract. */
+    std::optional<NativeLocalTPContextBorrow> originalNativeContext() const;
     /** @brief Bind only an original UINT64 publication before capture. */
     PooledImmutableTransferBinding withDeviceCounted(std::shared_ptr<TensorBase> root,
         std::size_t offset, PooledNativeCountedMessage message) const;

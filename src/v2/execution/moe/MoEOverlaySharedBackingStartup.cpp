@@ -103,7 +103,9 @@ MPISessionOwner::SharedFile establishMoEOverlaySharedBacking(
     std::span<const int> participants,const std::string &basename,std::uint64_t bytes)
 {
     const auto *topology=context.topology();
-    if((epoch.kind!=MoEOverlaySharedBackingKind::ActivationRows && epoch.kind!=MoEOverlaySharedBackingKind::DeviceControllerFabric) ||
+    if((epoch.kind!=MoEOverlaySharedBackingKind::ActivationRows && epoch.kind!=MoEOverlaySharedBackingKind::DeviceControllerFabric &&
+        epoch.kind!=MoEOverlaySharedBackingKind::PlanningHostDevice &&
+        epoch.kind!=MoEOverlaySharedBackingKind::PipelineActivation) ||
        !topology || !epoch.node_namespace || !epoch.generation || !bytes || basename.empty() || basename.size()>255 ||
        creator<0 || creator>=context.world_size() || participants.empty() ||
        !std::is_sorted(participants.begin(),participants.end()) || participants.front()<0 ||

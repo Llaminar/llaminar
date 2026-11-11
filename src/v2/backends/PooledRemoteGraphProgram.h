@@ -1,6 +1,6 @@
 /**
  * @file PooledRemoteGraphProgram.h
- * @brief Closed source-authored remote-owner graph scope, distinct from model/source graphs.
+ * @brief Closed source-authored mapped-flat and native-General storage-owner contracts.
  *
  * Only the actual directed-owner builder authors this descriptor. Its portable
  * dispatch signature covers the ordered native launch/publication recipe and
@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <string>
 #include <optional>
+#include <variant>
 #include "PeerAccessCoverage.h"
 namespace llaminar2 {
 namespace qwen4exp {class PooledImmutableDirectedOwnerProgram;}
@@ -82,4 +83,37 @@ private:
     PooledRemoteGraphGeometry geometry_;
     PooledRemoteGraphProgramClass class_;
 };
+/**
+ * @brief Closed native-library storage-owner semantics under existing General admission.
+ *
+ * The source builder alone creates this declaration. It has no portable flat
+ * limits, installed mapped-host class or user-supplied resource allowance.
+ */
+class PooledNativeOwnerGraphProgram final {
+public:
+    /** @return Complete original source/owner placement and immutable protocol geometry. */
+    const PooledRemoteGraphGeometry& geometry()const noexcept{return geometry_;}
+    /** @return Compiled semantic recipe identity, never native-library kernel counts. */
+    const std::array<std::uint8_t,32>& semanticSignature()const noexcept{return semantic_;}
+    /** @return Immutable source geometry and semantic identity for serial-slot reuse. */
+    std::uint64_t captureIdentity()const noexcept;
+    bool operator==(const PooledNativeOwnerGraphProgram&)const=default;
+private:
+    friend class qwen4exp::PooledImmutableDirectedOwnerProgram;
+    /** @brief Only the source-authored native recipe constructs a General storage declaration. */
+    PooledNativeOwnerGraphProgram(PooledRemoteGraphGeometry,std::array<std::uint8_t,32>);
+    PooledRemoteGraphGeometry geometry_;
+    std::array<std::uint8_t,32> semantic_;
+};
+/** @brief Exactly one mapped-flat or native-General contract for one original storage definition. */
+using PooledStorageOwnerProgram=std::variant<PooledRemoteGraphProgram,PooledNativeOwnerGraphProgram>;
+/** @return Original geometry shared by the two explicit admission contracts. */
+inline const PooledRemoteGraphGeometry& pooledStorageOwnerGeometry(const PooledStorageOwnerProgram& program){
+    return std::visit([](const auto& original)->const PooledRemoteGraphGeometry&{return original.geometry();},program);
+}
+/** @return Exact typed source identity without projecting native work into mapped flat limits. */
+inline std::uint64_t pooledStorageOwnerIdentity(const PooledStorageOwnerProgram& program)noexcept{
+    return std::visit([](const auto& original){return original.captureIdentity();},program);
+}
+
 }

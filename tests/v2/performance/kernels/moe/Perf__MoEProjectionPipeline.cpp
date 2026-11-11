@@ -11,6 +11,7 @@
  */
 #include <gtest/gtest.h>
 #include "utils/MoEProjectionPipelineFixture.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include <cstdio>
 
 namespace llaminar2::test
@@ -21,8 +22,9 @@ class MoEProjectionPipelinePerf : public ::testing::TestWithParam<int> {};
 #ifdef HAVE_ROCM
 TEST_P(MoEProjectionPipelinePerf, ROCm2)
 {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &selected) {
     ProjectionPipelineTiming timing;
-    runProjectionPipelineFixture(DeviceId::rocm(0), 2, {
+    runProjectionPipelineFixtureOnCohort(selected, {
         .geometry = {.experts = 256, .width = 2048, .intermediate = 512, .top_k = 8},
         .rows = {GetParam()}, .format = "IQ2_S/IQ4_NL", .timing_warmups = 5, .timing_samples = 31}, &timing);
     ASSERT_FALSE(HasFailure());
@@ -30,6 +32,7 @@ TEST_P(MoEProjectionPipelinePerf, ROCm2)
         "median_us=%.3f,p10_us=%.3f,p90_us=%.3f,unsharded_compute_us=%.3f,compute_ratio=%.4f,byte_exact=1\n",
         GetParam(), timing.median_us, timing.p10_us, timing.p90_us,
         timing.unsharded_compute_us, timing.unsharded_compute_us / timing.median_us);
+    });
 }
 #endif
 #ifdef HAVE_ROCM
@@ -45,8 +48,9 @@ TEST_P(MoEProjectionPipelinePerf, ROCm2)
  */
 void measureA1Geometry(const std::string &format)
 {
+    originalRankLocalReplay(DeviceType::ROCm, 4, [&](const auto &selected) {
     ProjectionPipelineTiming timing;
-    runProjectionPipelineFixture(DeviceId::rocm(0), 4, {
+    runProjectionPipelineFixtureOnCohort(selected, {
         .geometry = {.experts = 512, .width = 2560, .intermediate = 640, .top_k = 10},
         .rows = {1}, .format = format,
         .exchange = ProjectionExchangeProof::DeviceCounted,
@@ -56,10 +60,11 @@ void measureA1Geometry(const std::string &format)
     ASSERT_FALSE(::testing::Test::HasFailure());
     ASSERT_TRUE(timing.counted_extent_checks);
     std::printf("A1_GEOMETRY_PROJECTION_PIPELINE,scope=synthetic_fixture,ROCm,participants=4,rows=1,experts=512,"
-        "width=2560,intermediate=640,top_k=10,source=%s,ordinal_members=0:1:2:3,exchange=device_counted,"
+        "width=2560,intermediate=640,top_k=10,source=%s,ordinal_members=%d:%d:%d:%d,exchange=device_counted,"
         "median_us=%.3f,p10_us=%.3f,p90_us=%.3f,unsharded_compute_us=%.3f,byte_exact=1,"
         "useful_packet_extents_checked=1,primitive_link_byte_receipt=unavailable,model_weights=0\n",
-        format.c_str(), timing.median_us, timing.p10_us, timing.p90_us, timing.unsharded_compute_us);
+        format.c_str(), selected[0].ordinal, selected[1].ordinal, selected[2].ordinal, selected[3].ordinal, timing.median_us, timing.p10_us, timing.p90_us, timing.unsharded_compute_us);
+    });
 }
 
 /** @brief Same A1 geometry with a legal original 32-column Q8 source. */

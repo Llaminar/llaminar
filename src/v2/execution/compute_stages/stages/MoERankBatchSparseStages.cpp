@@ -12,6 +12,7 @@
 
 #include "MoERankBatchSparseStages.h"
 #include "../../moe/MoEOverlayCanonicalHostReturn.h"
+#include "../../moe/MoEExpertShardCohort.h"
 #include "../../moe/MoEOverlayHostDispatchRows.h"
 #include "../../moe/MoEOverlayHostRowWork.h"
 
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -32,6 +34,50 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Authenticate untargeted routes against their original CPU shard cohort.
+         * @param output Live dispatch descriptor retaining its immutable residency lease.
+         * @param tier Routes consumed by this rank-batch stage.
+         * @param key Original layer and rank-pair coordinates.
+         * @param participants Exact target rank's graph-bound participant group.
+         * @return Whether every route belongs to the same authentic CPU joint cohort.
+         */
+        bool authenticatesJointRankBatch(const MoEExpertDispatchOutput& output,
+            const MoEExpertTierDispatch& tier, const MoEOverlayRankBatchKey& key,
+            std::span<const int> participants)
+        {
+            if (!output.residency_lease)
+                return false;
+            const auto& snapshot = **output.residency_lease;
+            if (!snapshot.valid() || snapshot.epoch != output.residency_epoch ||
+                snapshot.ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+                return false;
+            const auto& owners = snapshot.placementOwnerMap();
+            const MoEExpertShardCohort* cohort = nullptr;
+            for (const auto& entry : tier.entries)
+            {
+                const auto* placement = owners.placementFor(key.layer_idx, entry.expert_id);
+                if (entry.destination_participant >= 0 || !placement || !placement->resident ||
+                    placement->tier_idx != tier.tier_index || !placement->shard_cohort ||
+                    (cohort && cohort != placement->shard_cohort.get()))
+                    return false;
+                cohort = placement->shard_cohort.get();
+            }
+            if (!cohort || cohort->source().layer_idx != key.layer_idx)
+                return false;
+            // Each original CPU fragment needs the same useful routes. The
+            // graph's target set must be exactly the cohort subset on that rank.
+            const auto members = cohort->participants();
+            return std::count_if(members.begin(), members.end(), [&](const auto& member) {
+                return member.world_rank == key.target_world_rank;
+            }) == std::ssize(participants) &&
+                std::all_of(participants.begin(), participants.end(), [&](int participant) {
+                    return std::any_of(members.begin(), members.end(), [&](const auto& member) {
+                        return member.world_rank == key.target_world_rank && member.participant_id == participant;
+                    });
+                });
+        }
+
         /** @brief Validate that a rank-batch boundary is executing on a CPU context. */
         bool validateHostBoundary(
             IDeviceContext *ctx,
@@ -345,7 +391,8 @@ namespace llaminar2
         const float *hidden,
         int logical_seq_len,
         size_t participant_index,
-        uint64_t residency_epoch)
+        uint64_t residency_epoch,
+        bool original_joint_cohort)
     {
         if (participant_index >= outbound_rows_.size() || !hidden ||
             logical_seq_len <= 0)
@@ -384,13 +431,13 @@ namespace llaminar2
         outbound.live_entry_count = 0;
         outbound.entry_offsets_host[0] = 0;
 
+        const auto targets_participant = [&](const MoEExpertDispatchEntry& entry)
+        {
+            return original_joint_cohort ? entry.route_weight != 0.0f
+                : entry.destination_participant == participant;
+        };
         const size_t expected_entries = static_cast<size_t>(std::count_if(
-            tier.entries.begin(),
-            tier.entries.end(),
-            [participant](const MoEExpertDispatchEntry &entry)
-            {
-                return entry.destination_participant == participant;
-            }));
+            tier.entries.begin(), tier.entries.end(), targets_participant));
         if (expected_entries > outbound.entry_capacity)
         {
             LOG_ERROR("[MoERankBatchDispatchStage] Participant " << participant
@@ -405,7 +452,7 @@ namespace llaminar2
             const size_t row_begin = entry_cursor;
             for (const auto &entry : row_entries)
             {
-                if (entry.destination_participant != participant)
+                if (!targets_participant(entry))
                 {
                     continue;
                 }
@@ -507,15 +554,14 @@ namespace llaminar2
                 LOG_ERROR("[MoERankBatchDispatchStage] Source dispatch descriptor or residency epoch is invalid");
                 return false;
             }
-            if (std::any_of(
-                    tier->entries.begin(),
-                    tier->entries.end(),
-                    [](const MoEExpertDispatchEntry &entry)
-                    {
-                        return entry.destination_participant < 0;
-                    }))
+            const bool original_joint_cohort = std::any_of(
+                tier->entries.begin(), tier->entries.end(), [](const auto& entry) {
+                    return entry.destination_participant < 0;
+                });
+            if (original_joint_cohort && !authenticatesJointRankBatch(
+                    *params_.dispatch_output, *tier, runtime_key, params_.participant_ids))
             {
-                LOG_ERROR("[MoERankBatchDispatchStage] Rank batching requires explicitly participant-targeted routes");
+                LOG_ERROR("[MoERankBatchDispatchStage] Untargeted routes require their exact original CPU joint cohort");
                 return false;
             }
 
@@ -567,7 +613,8 @@ namespace llaminar2
                         hidden,
                         logical_seq_len,
                         index,
-                        params_.dispatch_output->residency_epoch))
+                        params_.dispatch_output->residency_epoch,
+                        original_joint_cohort))
                 {
                     return false;
                 }

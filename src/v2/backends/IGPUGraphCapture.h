@@ -25,6 +25,7 @@ namespace llaminar2
 {
 
     class IGPUGraphCapture;
+    class RetainedParticipantGraphExecutable;
     class PhysicalMemoryAuthority;
 
     /**
@@ -1016,6 +1017,20 @@ namespace llaminar2
         virtual const char *backendName() const = 0;
 
     protected:
+        friend class RetainedParticipantGraphExecutable;
+        /**
+         * @brief Import a retained graph-only child at the exact active stream frontier.
+         * @param child Same-device sealed native definition with a parent-held lifetime borrow.
+         * @return True after the native child is the stream's complete new dependency frontier.
+         * @note The retained owner authenticates the borrow before entering capture. Failure
+         * requires discarding this recording after closing the active native interval.
+         */
+        [[nodiscard]] virtual bool appendActiveCaptureChild(const IGPUGraphCapture &child)
+        {
+            (void)child;
+            return false;
+        }
+
         /**
          * @brief Require a flat native kernel/copy/memset-only graph.
          * @param error Receives the first forbidden or unreadable native node.

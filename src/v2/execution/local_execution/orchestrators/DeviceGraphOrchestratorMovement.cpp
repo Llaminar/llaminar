@@ -69,7 +69,9 @@ namespace llaminar2
             .state = MoEOptimizationLifecycleState::Active,
             .activity = MoEOptimizationActivityState::DeviceOwned,
             .published_movement_waves = native_moe_movement_archive_ ? native_moe_movement_archive_->totals().transactions : 0,
-            .completed_movement = native_moe_movement_archive_ ? native_moe_movement_archive_->totals() : MoEOptimizationMovementTotals{}};
+            .completed_movement = native_moe_movement_archive_ ? native_moe_movement_archive_->totals() : MoEOptimizationMovementTotals{},
+            .completed_decision_windows = native_moe_movement_archive_ ? native_moe_movement_archive_->completedDecisionWindows() : 0,
+            .last_decision = native_moe_movement_archive_ ? native_moe_movement_archive_->lastDecision() : std::nullopt};
     }
 
     MoEOptimizationMovementLedger DeviceGraphOrchestrator::moeOptimizationMovementLedger() const
@@ -119,7 +121,7 @@ namespace llaminar2
         auto &archive = *native_moe_movement_archive_;
         const auto first_publication = archive.ledger().device_publications.size();
         const auto first_edge = archive.observe(request_epoch, generation,
-            controller.movement_journal, waves, edges);
+            controller.movement_journal, waves, edges, controller.completed_decision);
 
         // Mirror only newly archived completed records. Repeated terminal
         // observations cannot double count; disabling telemetry changes no

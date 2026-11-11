@@ -8,6 +8,7 @@
  * This is a component experiment, not a whole-model throughput certificate.
  */
 #include "utils/MoERouterOwnedExchangeFixture.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdio>
@@ -18,11 +19,12 @@ namespace
     /** @brief Report median paired graph intervals, never sum overlapping GPUs. */
     void measure(llaminar2::DeviceId first, int participants)
     {
+        llaminar2::test::originalRankLocalReplay(first.type, static_cast<size_t>(participants), [&](const auto &selected) {
         for (const auto [capacity, rows] : {std::pair{64, 64}, {128, 128}, {256, 256},
                  {512, 448}, {512, 512}, {512, 64}})
         {
             llaminar2::test::MoERouterOwnedExchangeTiming timing;
-            llaminar2::test::proveMoERouterOwnedExchange(first, participants, capacity, 2048, 256, {rows}, &timing);
+            llaminar2::test::proveMoERouterOwnedExchangeOnCohort(selected, capacity, 2048, 256, {rows}, &timing);
             ASSERT_EQ(timing.replicated_us.size(), 9u);
             ASSERT_EQ(timing.distributed_us.size(), 9u);
             for (size_t sample = 0; sample < timing.replicated_us.size(); ++sample)
@@ -35,6 +37,7 @@ namespace
                 first.is_cuda() ? "CUDA" : "ROCm", participants, capacity, rows, timing.replicated_us[4],
                 timing.distributed_us[4], timing.replicated_us[4] / timing.distributed_us[4]);
         }
+        });
     }
 }
 #ifdef HAVE_CUDA

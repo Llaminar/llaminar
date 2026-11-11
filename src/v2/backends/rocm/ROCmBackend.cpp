@@ -29,11 +29,15 @@
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
+#include "../../transfer/PipelineActivationFanoutProtocol.h"
 #include "../../transfer/CapturedTransferKernelPlan.h"
 #include "../../transfer/CapturedTransferChannelBatch.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
+#include "../../collective/NativeCountedAllGatherFrame.h"
+#include "../../collective/NativePipelineByteFrame.h"
+#include "../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -504,6 +508,53 @@ namespace llaminar2
     // ====================================================================
     // Memory Transfer Operations
     // ====================================================================
+
+    bool ROCmBackend::validateNativeCountedAllGatherFrame(void *memory,std::size_t degree,
+        ncclLlaminarCompletionAuthority original,int device_id,void *stream)
+    {
+        const auto native=requireExplicitStream(stream,"validateNativeCountedAllGatherFrame");
+        if(!memory || !degree || !original.abortFlag || !original.deviceCommunicator || !setDevice(device_id))return false;
+        ::llaminar2::validateNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,original);
+        return hipGetLastError()==hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+        std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing)
+    {
+        const auto native=requireExplicitStream(stream,"enqueueNativeCountedAllGatherFrame");
+        if(!memory || !degree || !table || !admission ||
+           (outgoing && reinterpret_cast<std::uintptr_t>(outgoing) % alignof(unsigned long long)) || !setDevice(device_id))return false;
+        if(preparation==NativeCountedAllGatherPreparation::Initialize) {
+            if(isGraphCaptureActive() || outgoing)return false;
+            hipFuncAttributes attributes{};
+            if(hipFuncGetAttributes(&attributes,reinterpret_cast<const void *>(::llaminar2::prepareNativeCountedAllGatherFrame))!=hipSuccess ||
+               hipFuncGetAttributes(&attributes,reinterpret_cast<const void *>(::llaminar2::validateNativeCountedAllGatherFrame))!=hipSuccess)return false;
+            return hipMemsetAsync(memory,0,NativeCountedAllGatherLayout(degree).bytes(),native)==hipSuccess;
+        }
+        if(preparation!=NativeCountedAllGatherPreparation::Advance)return false;
+        ::llaminar2::prepareNativeCountedAllGatherFrame<<<1u,1u,0u,native>>>(memory,degree,table,admission,outgoing);
+        return hipGetLastError()==hipSuccess;
+    }
+
+    bool ROCmBackend::enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+        NativePipelineByteOperation operation, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "enqueueNativePipelineByteFrame");
+        if (!invocation.valid() || !setDevice(device_id)) return false;
+        if (operation == NativePipelineByteOperation::Initialize) {
+            if (isGraphCaptureActive()) return false;
+            hipFuncAttributes attributes{};
+            if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::prepareNativePipelineByteFrame)) != hipSuccess ||
+                hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(::llaminar2::validateNativePipelineByteFrame)) != hipSuccess) return false;
+            return hipMemsetAsync(invocation.memory, 0, NativeCountedAllGatherLayout(1).bytes(), native) == hipSuccess;
+        }
+        if (operation == NativePipelineByteOperation::Prepare)
+            ::llaminar2::prepareNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else if (operation == NativePipelineByteOperation::Validate)
+            ::llaminar2::validateNativePipelineByteFrame<<<1u, 1u, 0u, native>>>(invocation);
+        else return false;
+        return hipGetLastError() == hipSuccess;
+    }
 
     bool ROCmBackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
@@ -4614,7 +4665,7 @@ namespace llaminar2
             // Include memory diagnostics in the error message
             size_t free_bytes = 0, total_bytes = 0;
             (void)hipMemGetInfo(&free_bytes, &total_bytes);  // diagnostic-only; OK if it fails
-            LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device "
+            LOG_ERROR("[ROCmBackend] Native device allocation failed for " << bytes << " bytes on device "
                                                             << device_id << ": " << hipGetErrorString(err)
                                                             << " (free: " << (free_bytes / (1024 * 1024))
                                                             << " MB, total: " << (total_bytes / (1024 * 1024)) << " MB)");
@@ -5031,6 +5082,7 @@ namespace llaminar2
         int request_row_capacity,
         int bucket_seq_len,
         int pad_token_id,
+        bool require_exact_rows,
         int device_id,
         void *stream,
         void *out_token_ids_device,
@@ -5058,6 +5110,7 @@ namespace llaminar2
             request_row_capacity,
             bucket_seq_len,
             static_cast<int32_t>(pad_token_id),
+            require_exact_rows,
             static_cast<int32_t *>(out_token_ids_device),
             static_cast<int32_t *>(out_position_ids_device),
             static_cast<int32_t *>(out_real_rows_device),
@@ -6047,15 +6100,6 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmBackend::enableCapturedTransferPeerAccess(int device_id, int peer_device_id)
-    {
-        if (device_id < 0 || peer_device_id < 0 || device_id == peer_device_id) return false;
-        if (hipSetDevice(device_id) != hipSuccess) return false;
-        const auto status = hipDeviceEnablePeerAccess(peer_device_id, 0);
-        if (status == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); return true; }
-        return status == hipSuccess;
-    }
-
     bool ROCmBackend::prepareCapturedTransferChannelKernels(
         int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
     {
@@ -6063,7 +6107,8 @@ namespace llaminar2
             return false;
         *timeout_ticks = 0;
         hipFuncAttributes attributes{};
-        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
+        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(pipelineActivationFanoutValidationKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<true>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<false>)) != hipSuccess ||
             hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<true>)) != hipSuccess ||
@@ -6077,6 +6122,15 @@ namespace llaminar2
         *timeout_ticks = rocmServiceWallClockRateKHz(rocmHardwareMetadata().at(device_id)) *
             static_cast<std::uint64_t>(timeout_ms);
         return prepareMappedHostCopyKernels(device_id);
+    }
+
+    bool ROCmBackend::enqueuePipelineActivationFanoutValidation(
+        const PipelineActivationFanoutValidation &binding, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueuePipelineActivationFanoutValidation");
+        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        hipLaunchKernelGGL(pipelineActivationFanoutValidationKernel, dim3(1), dim3(1), 0, native, binding);
+        return hipGetLastError() == hipSuccess;
     }
 
     bool ROCmBackend::enqueueCapturedTransferChannel(

@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "MoEOverlayCapacityAdmission.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "MoEOverlayPhysicalProjectionPieces.h"
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
 #include <optional>
@@ -90,6 +91,9 @@ using MoEOverlayPhysicalLaneCounts=std::map<MoEOverlayPhysicalLaneKey,size_t>;
  */
 struct MoEOverlayPhysicalLaneDemandPlan {
     size_t maximum_concurrent_cycles=0;
+    int original_rank=-1; ///< Original owner of the immutable local GPU classification.
+    std::map<DeviceId,size_t> original_execution_streams; ///< SAME admitted shared pool population, not per-layer/event counts.
+    std::map<std::pair<DeviceId,DeviceId>,bool> direct_gpu_edges; ///< Original source/destination choices, including false.
     MoEOverlayPhysicalLaneCounts migration_pieces;
     MoEOverlayPhysicalLaneCounts setup_ports;
     /** @return Required capacity of each single existing pool, without double charging shared ports. */
@@ -428,4 +432,106 @@ inline MoEOverlayRemoteProjectionLaneBudget remoteMoEOverlayProjectionLaneBudget
     if(!result.projectionOperationCount())throw std::overflow_error("Remote physical piece budget overflow");
     return result;
 }
+/**
+ * @brief Read one original discovery-position peer fact without probing a backend.
+ * @param inventory Original rank's immutable published GPU rows and directed matrices.
+ * @param accessor Device that would address the allocation.
+ * @param allocation Original allocation owner.
+ * @return Exact directed fact, or unavailable for missing/partial/ambiguous observations.
+ */
+inline std::optional<bool> originalMoEOverlayDirectedPeerAccess(const RankInventory& inventory,DeviceId accessor,DeviceId allocation)
+{
+    if(!accessor.is_gpu() || accessor.type!=allocation.type)return std::nullopt;
+    const auto& matrix=accessor.is_cuda()?inventory.p2p_cuda:inventory.p2p_rocm;
+    const auto count=accessor.is_cuda()?inventory.p2p_cuda_count:inventory.p2p_rocm_count;
+    int a=-1,b=-1,rows=0;
+    for(const auto& gpu:inventory.gpus)if(gpu.type==accessor.type){
+        if(gpu.local_device_id==accessor.ordinal){if(a>=0)return std::nullopt;a=rows;}
+        if(gpu.local_device_id==allocation.ordinal){if(b>=0)return std::nullopt;b=rows;}
+        ++rows;
+    }
+    if(count<=0 || count!=rows || matrix.size()!=size_t(count)*size_t(count) || a<0 || b<0)return std::nullopt;
+    return matrix[size_t(a)*size_t(count)+size_t(b)];
+}
+
+/**
+ * @brief Classify the exact direct GPU lane with one original directed access observation.
+ * @param source Original allocation owner.
+ * @param destination Original executor/consumer.
+ * @param query Passive destination-to-source capability lookup; it must not probe hardware.
+ * @return True only for same-device or explicitly observed same-backend access.
+ * @throws std::runtime_error For missing same-backend directed capability evidence.
+ */
+template<class Query> bool observedMoEOverlayDirectGpuPeer(DeviceId source,DeviceId destination,Query&& query)
+{
+    if(!source.is_gpu() || !destination.is_gpu() || source.type!=destination.type)return false;
+    if(source==destination)return true;
+    const auto observed=query(destination,source);
+    if(!observed.has_value())throw std::runtime_error("Original physical GPU lane has no directed peer observation");
+    return *observed;
+}
+/**
+ * @brief Freeze original local GPU choices into an existing exact physical lane declaration.
+ * @param plan Pure configured piece/port declaration, not a live allocator.
+ * @param rank Original local owner.
+ * @param query Original immutable directed capability lookup.
+ * @throws std::exception For duplicate publication, missing evidence or invalid rank.
+ */
+template<class Query> void bindOriginalMoEOverlayGpuChoices(MoEOverlayPhysicalLaneDemandPlan& plan,int rank,Query&& query)
+{
+    if(rank<0 || plan.original_rank!=-1 || !plan.direct_gpu_edges.empty())
+        throw std::invalid_argument("Physical GPU lane declaration requires one original rank publication");
+    plan.original_rank=rank;
+    for(const auto& [key,count]:plan.materializedCounts())
+        if(count && key.kind==MoEOverlayPhysicalLaneKind::LocalDevice && key.world_rank==rank &&
+            key.source.is_gpu() && key.destination.is_gpu())
+            plan.direct_gpu_edges.try_emplace({key.source,key.destination},
+                observedMoEOverlayDirectGpuPeer(key.source,key.destination,query));
+}
+/**
+ * @brief Authenticate retained original geometry and peer choices before any native creator.
+ * @param admitted SAME source-owned immutable declaration retained by capacity admission.
+ * @param actual Actual original model/participant piece geometry, with no live ownership decisions.
+ * @param rank Original materializing owner.
+ * @param query Existing cached runtime facts, used only to validate the original choice.
+ * @throws std::invalid_argument For missing/foreign geometry or a changed original classification.
+ * @throws std::runtime_error For absent directed observations.
+ */
+template<class Query> void requireOriginalMoEOverlayGpuDemand(const MoEOverlayPhysicalLaneDemandPlan* admitted,
+    const MoEOverlayPhysicalLaneDemandPlan& actual,int rank,Query&& query)
+{
+    if(!admitted || admitted->original_rank!=rank || admitted->maximum_concurrent_cycles!=actual.maximum_concurrent_cycles ||
+        admitted->migration_pieces!=actual.migration_pieces || admitted->setup_ports!=actual.setup_ports ||
+        admitted->original_execution_streams!=actual.original_execution_streams)
+        throw std::invalid_argument("Physical GPU lane materialization differs from its original admitted declaration");
+    auto observed=actual;
+    bindOriginalMoEOverlayGpuChoices(observed,rank,query);
+    if(observed.direct_gpu_edges!=admitted->direct_gpu_edges)
+        throw std::invalid_argument("Physical GPU lane peer choice changed after original admission");
+}
+/** @param plan Retained original declaration.
+ * @param source Exact allocation owner.
+ * @param destination Exact executor.
+ * @return Original choice; cached runtime facts cannot reselect it.
+ * @throws std::logic_error For an edge absent from original physical incidence. */
+inline bool admittedMoEOverlayDirectGpuPeer(const MoEOverlayPhysicalLaneDemandPlan& plan,DeviceId source,DeviceId destination)
+{
+    const auto edge=plan.direct_gpu_edges.find({source,destination});
+    if(edge==plan.direct_gpu_edges.end())throw std::logic_error("Physical GPU edge was not admitted by its original source");
+    return edge->second;
+}
+/** @param plan Original rank-bound piece/port declaration and peer choices.
+ * @return Exact peer-transfer event-owner population per actual destination, independent of stream count.
+ * @throws std::exception For missing original choices or count overflow. */
+inline std::map<DeviceId,size_t> originalMoEOverlayPeerEventCounts(const MoEOverlayPhysicalLaneDemandPlan& plan)
+{
+    if(plan.original_rank<0)throw std::invalid_argument("Peer event incidence requires its original rank");
+    std::map<DeviceId,size_t> result;
+    for(const auto& [key,count]:plan.materializedCounts())
+        if(count && key.kind==MoEOverlayPhysicalLaneKind::LocalDevice && key.world_rank==plan.original_rank &&
+            key.source.is_gpu() && key.destination.is_gpu() && admittedMoEOverlayDirectGpuPeer(plan,key.source,key.destination))
+            result[key.destination]=checkedMoEOverlayLaneAdd(result[key.destination],count);
+    return result;
+}
+
 }

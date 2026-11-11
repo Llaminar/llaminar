@@ -23,6 +23,7 @@
  */
 
 #pragma once
+#include "planning/ExecutionRankMembership.h"
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
@@ -1154,17 +1155,32 @@ namespace llaminar2::test::parity::qwen2
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
                 MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-                if (world_size != 1)
+                const auto* selected=dynamic_cast<const MPIContext*>(mpi_ctx_.get());
+                const auto* membership=selected?selected->executionMembership():nullptr;
+                if (membership)
                 {
-                    if (productionParityCampaignEnabled())
-                    {
-                        FAIL() << "Production LOCAL TP/PP campaign requires -np 1 (got "
-                               << world_size << ")";
-                    }
-                    GTEST_SKIP() << "LOCAL TP/PP test must run with -np 1 (got " << world_size << ")";
+                    // The exact selected context was authenticated by its
+                    // observed fixture before the legacy configuration exists.
+                    ASSERT_EQ(membership->discoverySize(),world_size);
+                    ASSERT_EQ(membership->executionRank(rank),0);
+                    ASSERT_EQ(selected->rank(),0);
+                    ASSERT_EQ(selected->world_size(),1);
+                    ASSERT_EQ(cfg().mpi_ranks,1);
+                    ASSERT_NE(selected->communicator(),MPI_COMM_NULL);
                 }
-
-                mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+                else
+                {
+                    if (world_size != 1)
+                    {
+                        if (productionParityCampaignEnabled())
+                        {
+                            FAIL() << "Production LOCAL TP/PP campaign requires -np 1 (got "
+                                   << world_size << ")";
+                        }
+                        GTEST_SKIP() << "LOCAL TP/PP test must run with -np 1 (got " << world_size << ")";
+                    }
+                    mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+                }
             }
             // MPI setup for cross-rank (NodeLocal or Global, requires multiple ranks)
             else if (cfg().is_cross_rank())

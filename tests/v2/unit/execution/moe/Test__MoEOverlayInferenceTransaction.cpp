@@ -3219,6 +3219,244 @@ namespace llaminar2::test
                   MoEOverlayInferenceAdmissionStatus::Rejected);
     }
 
+    /** Original condition policies select distinct bodies despite identical scalar geometry. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageConditionTicketRolesAreExact)
+    {
+        for (const auto purpose : kMTPConditionForwardPurposes)
+        {
+            const auto role = moeOverlayPipelineConditionGraphRole(purpose);
+            EXPECT_NE(role, MoEOverlayInferenceGraphRole::MainDecode);
+            EXPECT_EQ(moeOverlayPipelineConditionForwardPurpose(role), purpose);
+            auto owner = protocol();
+            const auto active = command();
+            ASSERT_TRUE(owner.beginCommand(active));
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                topology(), active, 1, 50, active.initial_placement_epoch, role, 1, 1, 1);
+            ASSERT_TRUE(ticket.valid());
+            const auto accepted = owner.accept(ticket);
+            ASSERT_TRUE(accepted.accepted()) << accepted.error;
+            completeSlot(owner, accepted, ticket);
+            for (const auto invalid : {MoEOverlayInferenceGraphRole::MainDecode,
+                    MoEOverlayInferenceGraphRole::MTPGroupedVerifier, MoEOverlayInferenceGraphRole::MTPDraft,
+                    MoEOverlayInferenceGraphRole::None})
+                EXPECT_THROW((void)moeOverlayPipelineConditionForwardPurpose(invalid), std::invalid_argument);
+        }
+        EXPECT_NE(moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose::SpeculativeContinuation),
+            moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose::CommittedSerialToken));
+        EXPECT_THROW((void)moeOverlayPipelineConditionGraphRole(static_cast<MTPConditionForwardPurpose>(255)), std::invalid_argument);
+    }
+
+    /** @test Recorded command roles retain placement authority across FORCE, MTP and reset. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStagePlacementAuthorityCommandReplay)
+    {
+        using Kind = MoEOverlayInferencePlacementIdentityKind;
+        using Role = MoEOverlayInferenceGraphRole;
+        struct Step
+        {
+            Role role; ///< Authored captured transaction role.
+            int depth; ///< Original verifier depth; negative for scalar work.
+        };
+        // These records preserve the original scheduler ordering and exact
+        // physical verifier width. Dynamic MTP changes depth, never authority.
+        const std::array<std::vector<Step>, 4> traces{{
+            {{Role::GenerationAdmission, -1}, {Role::MainDecode, -1}, {Role::MainDecode, -1}},
+            {{Role::GenerationAdmission, -1}, {Role::OrdinaryForwardOnly, -1}},
+            {{Role::MTPConditionSpeculativeContinuation, -1}, {Role::GenerationAdmission, -1},
+             {Role::MTPGroupedVerifier, 3}, {Role::MTPGroupedVerifier, 3}},
+            {{Role::MTPConditionCommittedSerialToken, -1}, {Role::GenerationAdmission, -1},
+             {Role::MTPGroupedVerifier, 1}, {Role::MTPGroupedVerifier, 15},
+             {Role::MTPGroupedVerifier, 2}, {Role::MTPGroupedVerifier, 3}},
+        }};
+        for (const auto kind : {Kind::RetainedGraph, Kind::ResidencyEpoch, Kind::ControllerPlacementEpoch})
+        {
+            const MoEOverlayInferenceTransactionProtocol::Config configuration{
+                .topology = topology(), .slot_count = moeOverlayInferenceTransactionSlotCount(15),
+                .max_request_count = 1, .max_rows_per_request = 16, .max_mtp_draft_depth = 15};
+            MoEOverlayInferenceTransactionProtocol source(configuration), follower(configuration);
+            for (const uint64_t request : {9u, 10u})
+            {
+                for (size_t lane = 0; lane < traces.size(); ++lane)
+                {
+                    const MoEOverlayInferenceCommandIdentity active{
+                        .request_generation = request, .command_id = lane + 1,
+                        .initial_placement_epoch = kind == Kind::ResidencyEpoch ? 41u : 0u,
+                        .placement_identity_kind = kind};
+                    ASSERT_TRUE(active.valid());
+                    ASSERT_TRUE(source.beginCommand(active));
+                    // Production binds original outer provenance before receiving
+                    // its first ticket, including a scalar MTP condition.
+                    ASSERT_TRUE(follower.beginCommand(active));
+                    uint64_t ordinal = 1;
+                    uint64_t epoch = active.initial_placement_epoch;
+                    for (const auto step : traces[lane])
+                    {
+                        if (kind != Kind::RetainedGraph && ordinal > 1) ++epoch;
+                        const int rows = step.depth < 0 ? 1 : step.depth + 1;
+                        const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+                            configuration.topology, active, ordinal++, 0, epoch,
+                            step.role, 1, rows, rows, step.depth);
+                        ASSERT_TRUE(ticket.valid());
+                        EXPECT_EQ(ticket.commandIdentity().placement_identity_kind, kind);
+                        EXPECT_EQ(ticket.placement_epoch, epoch);
+                        completeSlot(source, source.accept(ticket), ticket);
+                        completeSlot(follower, follower.accept(ticket), ticket);
+                        EXPECT_EQ(source.currentPlacementEpoch(), epoch);
+                        EXPECT_EQ(follower.currentPlacementEpoch(), epoch);
+                    }
+                    const auto terminal = makeMoEOverlayInferenceTerminalTicket(
+                        configuration.topology, active, ordinal, epoch,
+                        MoEOverlayInferenceTransactionAction::Complete);
+                    EXPECT_EQ(source.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+                    EXPECT_EQ(follower.accept(terminal).status, MoEOverlayInferenceAdmissionStatus::Complete);
+                    EXPECT_FALSE(source.beginCommand(active)) << "Completed command identities remain stale";
+                    EXPECT_FALSE(follower.beginCommand(active));
+                }
+            }
+        }
+    }
+
+    /** @test Initial zero needs explicit graph/controller authority; absent ownership cannot select it. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStagePlacementAuthorityRejectsMissingOrSwitchedIdentity)
+    {
+        using Kind = MoEOverlayInferencePlacementIdentityKind;
+        auto missing = command(9, 1, 0);
+        EXPECT_FALSE(missing.valid());
+        EXPECT_THROW((void)makeMoEOverlayInferenceExecutionTicket(topology(), missing, 1, 0, 0,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1), std::invalid_argument);
+        auto retained = missing;
+        retained.placement_identity_kind = Kind::RetainedGraph;
+        ASSERT_TRUE(retained.valid());
+        auto invented_epoch = retained;
+        invented_epoch.initial_placement_epoch = 1;
+        EXPECT_FALSE(invented_epoch.valid());
+        auto initial_controller = missing;
+        initial_controller.placement_identity_kind = Kind::ControllerPlacementEpoch;
+        ASSERT_TRUE(initial_controller.valid()) << "A real controller begins at its canonical zero version";
+        const auto initial_controller_ticket = makeMoEOverlayInferenceExecutionTicket(topology(), initial_controller,
+            1, 0, 0, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        EXPECT_TRUE(initial_controller_ticket.valid());
+        auto unknown = retained;
+        unknown.placement_identity_kind = static_cast<Kind>(99);
+        EXPECT_FALSE(unknown.valid());
+        for (const auto admitted : {retained, command(9, 1, 41), initial_controller})
+        {
+            auto follower = protocol();
+            ASSERT_TRUE(follower.beginCommand(admitted));
+            const auto other = admitted.placement_identity_kind == Kind::RetainedGraph ? command(9, 1, 41) : retained;
+            const auto switched = makeMoEOverlayInferenceExecutionTicket(topology(), other, 1, 0,
+                other.initial_placement_epoch, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+            ASSERT_TRUE(switched.valid());
+            const auto rejected = follower.accept(switched);
+            EXPECT_FALSE(rejected.accepted());
+            EXPECT_NE(rejected.error.find("placement authority"), std::string::npos);
+        }
+        auto old_wire = makeMoEOverlayInferenceExecutionTicket(topology(), retained, 1, 0, 0,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        old_wire.abi_version = 6;
+        EXPECT_FALSE(old_wire.valid());
+        auto residency = protocol();
+        ASSERT_TRUE(residency.beginCommand(command(9, 1, 41)));
+        const auto advanced = makeMoEOverlayInferenceExecutionTicket(topology(), command(9, 1, 41), 1, 0, 42,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        completeSlot(residency, residency.accept(advanced), advanced);
+        const auto regressed = makeMoEOverlayInferenceExecutionTicket(topology(), command(9, 1, 41), 2, 0, 41,
+            MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        EXPECT_FALSE(residency.accept(regressed).accepted());
+    }
+
+    /** Replay the actual protocol across no-controller conditions, explicit admission and sampler-free commits. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageOriginalRankAdmissionAndForwardOnlyReplay)
+    {
+        const auto active = command();
+        for (const auto final_role : {MoEOverlayInferenceGraphRole::MainDecode,
+                 MoEOverlayInferenceGraphRole::OrdinaryForwardOnly})
+        {
+            // Reset and repeat the same recorded transaction order under a new
+            // command identity. A condition never aliases a response-loop body.
+            auto owner = protocol();
+            for (unsigned replay = 0; replay != 3; ++replay)
+            {
+                auto request = active;
+                request.command_id += replay;
+                ASSERT_TRUE(owner.beginCommand(request));
+                uint64_t ordinal = 0;
+                for (const auto role : {MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken,
+                         MoEOverlayInferenceGraphRole::GenerationAdmission, final_role})
+                {
+                    const auto ticket = makeMoEOverlayInferenceExecutionTicket(topology(), request,
+                        ++ordinal, 50, request.initial_placement_epoch, role, 1, 1, 1);
+                    ASSERT_TRUE(ticket.valid());
+                    const auto accepted = owner.accept(ticket);
+                    ASSERT_TRUE(accepted.accepted()) << accepted.error;
+                    completeSlot(owner, accepted, ticket);
+                    EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+                    EXPECT_THROW((void)moeOverlayPipelineConditionForwardPurpose(
+                        role == MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken ?
+                            MoEOverlayInferenceGraphRole::OrdinaryForwardOnly : role), std::invalid_argument);
+                }
+                const auto terminal = makeMoEOverlayInferenceTerminalTicket(topology(), request,
+                    ordinal + 1, request.initial_placement_epoch, MoEOverlayInferenceTransactionAction::Complete);
+                const auto completed = owner.accept(terminal);
+                ASSERT_EQ(completed.status, MoEOverlayInferenceAdmissionStatus::Complete) << completed.error;
+                EXPECT_EQ(owner.state(), MoEOverlayInferenceProtocolState::Complete);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
+    /** Unsupported old ABIs and padded/no-sampling policies fail before any native enqueue. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageOriginalRankMetadataRejectsAmbiguousReplay)
+    {
+        for (const auto role : {MoEOverlayInferenceGraphRole::GenerationAdmission,
+                 MoEOverlayInferenceGraphRole::OrdinaryForwardOnly})
+        {
+            const auto recorded = makeMoEOverlayInferenceExecutionTicket(topology(), command(),
+                1, 50, command().initial_placement_epoch, role, 1, 1, 1);
+            ASSERT_TRUE(recorded.valid());
+            for (int mutation = 0; mutation != 5; ++mutation)
+            {
+                auto invalid = recorded;
+                if (mutation == 0) invalid.abi_version = 5;
+                if (mutation == 1) invalid.physical_rows_per_request = 2;
+                if (mutation == 2) invalid.logical_rows_per_request = 2;
+                if (mutation == 3) invalid.draft_depth = 1;
+                if (mutation == 4) invalid.sidecar_depth = 0;
+                EXPECT_FALSE(invalid.valid());
+                auto owner = protocol();
+                ASSERT_TRUE(owner.beginCommand(command()));
+                EXPECT_EQ(owner.accept(invalid).status, MoEOverlayInferenceAdmissionStatus::Rejected);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
+    /** Legacy/contradictory tickets fail before slot publication; old role values remain unchanged. */
+    TEST(Test__MoEOverlayInferenceTransaction, PipelineStageConditionTicketsRejectAmbiguousGeometryAndABI)
+    {
+        EXPECT_EQ(static_cast<unsigned>(MoEOverlayInferenceGraphRole::MainDecode), 2u);
+        EXPECT_EQ(static_cast<unsigned>(MoEOverlayInferenceGraphRole::MTPGroupedVerifier), 4u);
+        const auto active = command();
+        for (const auto purpose : kMTPConditionForwardPurposes)
+        {
+            const auto role = moeOverlayPipelineConditionGraphRole(purpose);
+            const auto ticket = makeMoEOverlayInferenceExecutionTicket(topology(), active, 1, 50, 41, role, 1, 1, 1);
+            for (int mutation = 0; mutation != 5; ++mutation)
+            {
+                auto invalid = ticket;
+                if (mutation == 0) invalid.abi_version = 4u;
+                if (mutation == 1) invalid.logical_rows_per_request = 2;
+                if (mutation == 2) invalid.physical_rows_per_request = 2;
+                if (mutation == 3) invalid.draft_depth = 1;
+                if (mutation == 4) invalid.sidecar_depth = 0;
+                EXPECT_FALSE(invalid.valid());
+                auto owner = protocol();
+                ASSERT_TRUE(owner.beginCommand(active));
+                EXPECT_EQ(owner.accept(invalid).status, MoEOverlayInferenceAdmissionStatus::Rejected);
+                EXPECT_EQ(owner.inFlightSlotCount(), 0u);
+            }
+        }
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          GeometryBuildersRejectInvalidRoleAndDepthCombinations)
     {

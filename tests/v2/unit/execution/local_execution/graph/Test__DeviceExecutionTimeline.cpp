@@ -9,6 +9,7 @@
  */
 
 #include "execution/local_execution/graph/DeviceExecutionTimeline.h"
+#include "execution/local_execution/orchestrators/PipelineDeviceGeneration.h"
 #include "mocks/MockBackend.h"
 
 #include <gtest/gtest.h>
@@ -19,6 +20,108 @@
 
 namespace llaminar2::test
 {
+    /** @test Native original-rank ACKs retain exact producer identity without model-state consumption. */
+    TEST(Test__DeviceExecutionTimeline, OriginalPipelineProducerReceiptRecordsOnlyOriginalNativeCompletion)
+    {
+        using Receipt = PipelineDeviceGeneration::RankTransactionTerminal;
+        using Role = MoEOverlayInferenceGraphRole;
+        for (const auto device : {DeviceId::cuda(1), DeviceId::rocm(2)})
+        {
+            MockBackend backend(device.type);
+            void *const publication_stream = reinterpret_cast<void *>(0x81000);
+            void *const completion_event = reinterpret_cast<void *>(0x82000);
+            for (const auto role : {Role::MainDecode, Role::MTPConditionSpeculativeContinuation,
+                                   Role::MTPConditionCommittedSerialToken, Role::MTPGroupedVerifier})
+                for (const uint64_t request : {9u, 10u})
+                {
+                    backend.resetAll();
+                    const Receipt receipt{.stream = publication_stream, .workspace = 7, .session = request, .role = role};
+                    ASSERT_TRUE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                        backend, device, completion_event, receipt, 7, request));
+                    const auto records = backend.getEventRecords();
+                    ASSERT_EQ(records.size(), 1u);
+                    EXPECT_EQ(records[0].type, MockBackend::EventRecord::RECORD);
+                    EXPECT_EQ(records[0].event, completion_event);
+                    EXPECT_EQ(records[0].stream, publication_stream);
+                    EXPECT_EQ(records[0].device_id, device.ordinal);
+                    EXPECT_EQ(backend.getEventWaitCount(), 0u);
+                    EXPECT_EQ(backend.getH2DCount(), 0u);
+                    EXPECT_EQ(backend.getD2HCount(), 0u);
+                    EXPECT_EQ(backend.getSyncCount(), 0u);
+                    EXPECT_EQ(backend.getStreamSyncCount(), 0u);
+                }
+            backend.resetAll();
+            const Receipt original{.stream = publication_stream, .workspace = 7, .session = 9,
+                .role = Role::MTPGroupedVerifier};
+            const auto reject = [&](Receipt receipt) {
+                std::string error;
+                EXPECT_FALSE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                    backend, device, completion_event, receipt, 7, 9, &error));
+                EXPECT_FALSE(error.empty());
+                EXPECT_TRUE(backend.getEventRecords().empty());
+            };
+            for (void *stream : std::array<void *, 3>{nullptr, reinterpret_cast<void *>(1), reinterpret_cast<void *>(2)})
+            {
+                auto invalid = original; invalid.stream = stream; reject(invalid);
+            }
+            auto stale_workspace = original; ++stale_workspace.workspace; reject(stale_workspace);
+            auto stale_request = original; ++stale_request.session; reject(stale_request);
+            auto duplicate = original; duplicate.recorded = true; reject(duplicate);
+            for (const auto role : {Role::None, Role::GenerationAdmission, Role::MainPrefill,
+                                   Role::MTPDraft, static_cast<Role>(255)})
+            {
+                auto invalid = original; invalid.role = role; reject(invalid);
+            }
+            EXPECT_FALSE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                backend, device, nullptr, original, 7, 9));
+            const auto foreign = device.is_cuda() ? DeviceId::rocm(device.ordinal) : DeviceId::cuda(device.ordinal);
+            EXPECT_FALSE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                backend, foreign, completion_event, original, 7, 9));
+            EXPECT_FALSE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                backend, device, completion_event, original, 0, 9));
+            EXPECT_FALSE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                backend, device, completion_event, original, 7, 0));
+            EXPECT_TRUE(backend.getEventRecords().empty());
+        }
+    }
+
+    /** @test Accepted state flows to its real controller; ACK and final host observation remain distinct. */
+    TEST(Test__DeviceExecutionTimeline, OriginalPipelinePublicationAckAndControllerKeepExactRoles)
+    {
+        const auto accepted = DeviceEventEdge::at(DeviceTimelinePoint::AcceptedSpecPublicationReady)
+            .from(DeviceTimelineRole::AcceptedStatePublication);
+        EXPECT_FALSE(accepted.to(DeviceTimelineRole::HostResultBridge).validForConsumption());
+        ASSERT_TRUE(accepted.to(DeviceTimelineRole::DeviceGenerationController).validForConsumption());
+        for (const auto device : {DeviceId::cuda(1), DeviceId::rocm(2)})
+        {
+            MockBackend backend(device.type);
+            void *const producer = reinterpret_cast<void *>(0x91000);
+            void *const controller = reinterpret_cast<void *>(0x92000);
+            void *const bridge = reinterpret_cast<void *>(0x93000);
+            void *const publication = reinterpret_cast<void *>(0x94000);
+            void *const ack = reinterpret_cast<void *>(0x95000);
+            void *const terminal = reinterpret_cast<void *>(0x96000);
+            ASSERT_TRUE(accepted.publish(backend, device, publication, producer));
+            const PipelineDeviceGeneration::RankTransactionTerminal receipt{
+                .stream = producer, .workspace = 7, .session = 9,
+                .role = MoEOverlayInferenceGraphRole::MTPGroupedVerifier};
+            ASSERT_TRUE(PipelineDeviceGeneration::recordOriginalRankProducerCompletion(
+                backend, device, ack, receipt, 7, 9));
+            EXPECT_EQ(backend.getEventWaitCount(), 0u) << "ACK observes its original producer only";
+            ASSERT_TRUE(accepted.to(DeviceTimelineRole::DeviceGenerationController)
+                .enqueuePublishedWait(backend, device, publication, controller));
+            const auto completed = DeviceEventEdge::at(DeviceTimelinePoint::DeviceGenerationStateReady)
+                .from(DeviceTimelineRole::DeviceGenerationController);
+            ASSERT_TRUE(completed.publish(backend, device, terminal, controller));
+            ASSERT_TRUE(completed.to(DeviceTimelineRole::HostResultBridge)
+                .enqueuePublishedWait(backend, device, terminal, bridge));
+            EXPECT_EQ(backend.getEventRecordCount(), 3u);
+            EXPECT_EQ(backend.getEventWaitCount(), 2u);
+            EXPECT_EQ(backend.getSyncCount(), 0u);
+            EXPECT_EQ(backend.getStreamSyncCount(), 0u);
+        }
+    }
+
     TEST(Test__DeviceExecutionTimeline, ManifestCoversEveryTimelinePointExactlyOnce)
     {
         const auto &manifest = deviceExecutionTimelineManifest();
@@ -178,6 +281,36 @@ namespace llaminar2::test
                 .from(DeviceTimelineRole::MainForwardGraph)
                 .to(DeviceTimelineRole::DeviceGenerationController)
                 .validForConsumption());
+    }
+
+    /** @test Retained generation parents join the exact durable maintenance event without host synchronization. */
+    TEST(Test__DeviceExecutionTimeline, RetainedPipelineParentConsumesMaintenancePublication)
+    {
+        const auto edge = DeviceEventEdge::at(DeviceTimelinePoint::MoERebalanceMaintenanceReady)
+            .from(DeviceTimelineRole::MoERebalanceMaintenance)
+            .to(DeviceTimelineRole::DeviceGenerationController);
+        ASSERT_TRUE(edge.validForConsumption());
+        for (const auto device : {DeviceId::cuda(1), DeviceId::rocm(2)})
+        {
+            MockBackend backend(device.type);
+            void *const event = reinterpret_cast<void *>(0x82000);
+            void *const stream = reinterpret_cast<void *>(0x83000);
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                backend.resetAll();
+                ASSERT_TRUE(edge.enqueuePublishedWait(backend, device, event, stream));
+                const auto records = backend.getEventRecords();
+                ASSERT_EQ(records.size(), 1u);
+                EXPECT_EQ(records.front().event, event);
+                EXPECT_EQ(records.front().stream, stream);
+                EXPECT_EQ(records.front().device_id, device.ordinal);
+                EXPECT_EQ(backend.getEventWaitCount(), 1u);
+                EXPECT_EQ(backend.getH2DCount(), 0u);
+                EXPECT_EQ(backend.getD2HCount(), 0u);
+                EXPECT_EQ(backend.getSyncCount(), 0u);
+                EXPECT_EQ(backend.getStreamSyncCount(), 0u);
+            }
+        }
     }
 
     /** @test Headless pipeline graphs order their own state without a sampler. */

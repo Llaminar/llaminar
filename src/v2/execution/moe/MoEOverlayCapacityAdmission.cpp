@@ -302,6 +302,19 @@ namespace llaminar2
         return result;
     }
 
+    std::map<DeviceId,std::size_t> MoEOverlayCapacityAdmission::executionStreamCounts(
+        const MoERoutedExpertPlacementPlan &plan,int world_rank,std::size_t maximum_execution_streams)
+    {
+        if(world_rank<0 || !maximum_execution_streams)
+            throw std::invalid_argument("Movement execution streams require an original rank and positive width");
+        std::map<DeviceId,std::size_t> result;
+        for(const auto& member:boundParticipants(plan))if(member.world_rank==world_rank && member.device.is_gpu()) {
+            auto& count=result[member.device];
+            count=checkedAdd(count,maximum_execution_streams,"original shared execution stream population");
+        }
+        return result;
+    }
+
     std::vector<MoEOverlayTransferStagingCharge>
     MoEOverlayCapacityAdmission::transferStagingBOM(
         const MoERoutedExpertPlacementPlan &plan,

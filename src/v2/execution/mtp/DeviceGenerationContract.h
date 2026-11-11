@@ -76,6 +76,33 @@ private:
     return static_cast<int>(maximum);
 }
 
+/** @brief Exact depth interval executed by one admitted speculative parent. */
+struct DeviceGenerationSpeculativeDepthRange
+{
+    int minimum = 0; ///< First executable branch depth.
+    int maximum = 0; ///< Last executable branch depth, equal to minimum for a pinned policy.
+    bool operator==(const DeviceGenerationSpeculativeDepthRange &) const = default;
+};
+
+/**
+ * @brief Project immutable policy into its exact retained speculative branch interval.
+ * @param policy Existing complete device-generation policy, never live selector state.
+ * @return Dynamic min/max or the Fixed/Observe initial-depth singleton; nullopt
+ * for invalid, ordinary or sampler-free policies.
+ *
+ * Fixed and Observe execute their pinned initial width even when Observe owns
+ * wider observation bounds. Initial family binding and continued-response
+ * authentication use the same projection, without changing policy or recapture.
+ */
+[[nodiscard]] inline std::optional<DeviceGenerationSpeculativeDepthRange>
+deviceGenerationSpeculativeDepthRange(const sampling_math::DeviceGenerationPolicy &policy) noexcept
+{
+    if (!policy.valid() || policy.isOrdinary() || policy.isForwardOnly()) return std::nullopt;
+    return policy.mode == sampling_math::DeviceGenerationPolicyMode::Dynamic ?
+        DeviceGenerationSpeculativeDepthRange{policy.minimum_depth, policy.maximum_depth} :
+        DeviceGenerationSpeculativeDepthRange{policy.initial_depth, policy.initial_depth};
+}
+
 /**
  * @brief Complete immutable policy installed at one GPU request admission.
  *

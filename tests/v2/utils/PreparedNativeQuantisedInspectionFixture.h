@@ -6,9 +6,12 @@
  * backend supplies its actual checked all-node graph observer. Inspection uses
  * the original production weight loader and retains joined graph/source/storage
  * owners; no source payload readback or materialization is introduced.
+ * The original MPI inventory chooses the one genuine NUMA-local GPU owner;
+ * other original ranks participate only in declaration and retirement.
  */
 #pragma once
 #include "backends/BackendManager.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "GpuPreparedGemmHarness.h"
@@ -34,7 +37,7 @@ inline auto sourceIdentity(const ITensorGemm &kernel)
 }
 /**
  * @brief Verify passive absence and resident metadata under the actual native recording API.
- * @param device Exact backend endpoint, selected by the owning context worker.
+ * @param requested Native backend selector; the original inventory supplies the actual local device.
  * @tparam Engine Concrete original GPU adapter; its source constructor remains unprepared.
  * @tparam NativeNodeCount Backend-specific checked all-node inspection; no kernel-only projection is accepted.
  * @param native_node_count Exact native graph API observer, compiled in the one owning backend TU.
@@ -45,8 +48,10 @@ inline auto sourceIdentity(const ITensorGemm &kernel)
  * assertion/exception unwind, including graph inspection failure.
  */
 template<class Engine, class NativeNodeCount>
-void provePassiveInspection(DeviceId device, NativeNodeCount native_node_count)
+void provePassiveInspection(DeviceId requested, NativeNodeCount native_node_count)
 {
+    originalRankLocalReplay(requested.type, 1, [&](const auto &selected) {
+    const DeviceId device = selected.front();
     auto &context = GPUDeviceContextPool::instance().getContext(device);
     context.submitAndWait([&] {
         auto *backend = getBackendFor(device); auto *stream = context.defaultStream();
@@ -57,7 +62,7 @@ void provePassiveInspection(DeviceId device, NativeNodeCount native_node_count)
         ASSERT_NE(prepared.kernel, nullptr);
         auto graph = context.createGraphCapture(stream); ASSERT_NE(graph, nullptr);
         /** @brief Retire the exact native stream before any prepared, graph or source owner. */
-        struct Join { IBackend *backend; void *stream; ~Join() { (void)backend->synchronizeStream(stream, 0); } } join{backend,stream};
+        struct Join { IBackend *backend; void *stream; int ordinal; ~Join() { (void)backend->synchronizeStream(stream, ordinal); } } join{backend,stream,device.ordinal};
         ASSERT_FALSE(unprepared.weights_converted());
         const auto unprepared_source_before = sourceIdentity(unprepared);
         const auto prepared_source_before = sourceIdentity(*prepared.kernel);
@@ -69,7 +74,7 @@ void provePassiveInspection(DeviceId device, NativeNodeCount native_node_count)
         absent.n = 999;
         ASSERT_FALSE(unprepared.inspectPreparedNativeQuantisedMatrixDesc(absent));
         EXPECT_EQ(descriptorIdentity(absent), descriptorIdentity(DeviceNativeQuantisedMatrixDesc{}));
-        ASSERT_TRUE(backend->synchronizeStream(stream, 0));
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
         {
             ScopedBackendGraphCapture recording(context, *graph, "passive prepared metadata has no native work");
             ASSERT_TRUE(recording.begin());
@@ -92,6 +97,7 @@ void provePassiveInspection(DeviceId device, NativeNodeCount native_node_count)
         ASSERT_TRUE(prepared.kernel->inspectPreparedNativeQuantisedMatrixDesc(final));
         EXPECT_EQ(descriptorIdentity(final), descriptorIdentity(resident));
         EXPECT_FALSE(unprepared.weights_converted());
+    });
     });
 }
 } // namespace llaminar2::test::prepared_native_inspection

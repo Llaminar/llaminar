@@ -149,6 +149,7 @@ class PairedMetadataPolicy(str, Enum):
     """Bound metadata location only; reference payload containment never changes."""
     CANONICAL_ROOT = "canonical_root_manifest"
     SOURCE_BOUND_DIAGNOSTIC = "source_bound_external_diagnostic_manifest"
+    SOURCE_BOUND_OBSERVED_PIPELINE = "source_bound_complete_observed_pipeline_manifest"
 
 
 
@@ -231,6 +232,12 @@ class PairedCorpusSelection:
         require(type(record) is dict and record.get('model_parity_schema') == 1 and
                 type(exact) is str and '.ProductionParity/' in exact,
                 'Paired acceptance needs one original registered ProductionParity cell')
+        runtime=record.get('runtime',{})
+        if runtime.get('configuration_policy')=='observed_pipeline_binding_required_v1':
+            raise ValueError('Paired observer needs its completed original pipeline binding')
+        if 'observed_pipeline_binding' in record:
+            from model_parity_inventory import require_observed_pipeline_document
+            require_observed_pipeline_document(record)
         pair = record.get('paired_workload')
         require(type(pair) is dict and set(pair) == {'schema','policy','certification_eligible','role',
                 'case_id','source_fields','accuracy','benchmark','arithmetic'} and type(pair['schema']) is int and pair['schema']==2 and
@@ -283,6 +290,23 @@ class PairedCorpusSelection:
                     'Paired workload must be the exact approved corpus manifest, not a searched generation')
             corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'])
         else:
+            if metadata_policy == PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE:
+                require('observed_pipeline_binding' in record,
+                        'Complete adapted metadata requires its authenticated original observed pipeline')
+                # from_export already validates the actual observed source document
+                # above. The old root manifest remains the authority for every
+                # source, prompt, Pending teacher, reset and reference declaration;
+                # adaptation may replace only the explicit topology inventory.
+                original_path = (root/'manifest.json').resolve(strict=True)
+                original_pin = identity(original_path)
+                require(original_path.is_file() and 0 < original_pin[3] <= 16*1024*1024,
+                        'Original adapted corpus metadata exceeds bounded extent')
+                original = json.loads(original_path.read_bytes())
+                require(identity(original_path) == original_pin and
+                        {k:v for k,v in documents['workload'].items() if k != 'topologies'} ==
+                        {k:v for k,v in original.items() if k != 'topologies'},
+                        'Adapted pipeline metadata changed original source, histories or references')
+                pins[str(original_path)] = original_pin
             # Only the source-owned paired document selects this bounded metadata.
             # load_corpus retains original-root containment for every reference byte.
             corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'],manifest_path=paths['workload'])
@@ -427,6 +451,11 @@ class CorpusExecution:
                 'Native observer executable proof differs from launched binary')
         require(raw.get('actual_owner') and type(raw.get('path_records')) is list,
                 'Missing actual original owner/path evidence')
+        observed_pipeline = self.paired is not None and 'observed_pipeline_binding' in self.paired.record
+        if observed_pipeline:
+            from model_parity_inventory import require_observed_pipeline_runtime, require_observed_pipeline_terminal
+            require_observed_pipeline_runtime(self.paired.record,raw.get('observed_pipeline_binding'))
+            require_observed_pipeline_terminal(raw,perf['records'])
         metrics = corpus_v2.score_observation(self.corpus,payload/'logits.json')
         runner.write_json(output/'metrics.json', metrics)
         summary = corpus_v2.summarize(self.corpus['manifest'],metrics,self.baseline,self.approval,calibration=self.calibration,absolute_pilot=self.absolute_pilot)
@@ -436,6 +465,9 @@ class CorpusExecution:
             numerical_summary=summary,observations_complete=True,production_path=raw['proofs'],
             native_identity=raw['native_identity'],actual_owner=raw['actual_owner'],path_records=raw['path_records'],
             reset_byte_equal=metrics['proofs']['reset_byte_equal'],driver_window_clean=True)
+        if observed_pipeline:
+            result.update(observed_pipeline_binding=raw['observed_pipeline_binding'],
+                          fixed_native_pipeline_terminal=raw['fixed_native_pipeline_terminal'])
         if 'reset_pair' in metrics:
             result['reset_pair'] = metrics['reset_pair']
         if self.absolute_pilot is not None:

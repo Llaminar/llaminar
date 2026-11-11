@@ -22,6 +22,8 @@
 #include "Qwen4ExpParityTestBase.h"
 #include "Qwen4ExpNgramAdmissionCases.h"
 #include "Qwen4ExpSourceAdmission.h"
+#include "Qwen4ExpObservedPipelineCases.h"
+#include "Qwen4ExpObservedPipelineAdmission.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
 #include "Qwen4ExpSharedContinuationMTPSourceCases.h"
 #include "Qwen4ExpCPUJointParityCases.h"
@@ -48,6 +50,101 @@
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen4exp;
+
+/**
+ * @brief Bind observed QFN cells before the original fixture enters model or MPI execution.
+ *
+ * Existing fixed-address cells continue through the same base lifecycle.
+ * Inactive discovery ranks never create a parity context, runner or GPU graph.
+ */
+template<class Derived>
+class Qwen4ExpObservedPipelineParityFixture
+    :public Qwen4ExpConfigDrivenParityTest<Derived>,public ModelParityCaseParameter {
+    using Base=Qwen4ExpConfigDrivenParityTest<Derived>;
+public:
+    /** @return Bound runtime case on observed ranks, otherwise the original parameter. */
+    const ModelParityCase& modelParityCase() const {
+        return observed_?observed_->boundCase():ModelParityCaseParameter::modelParityCase();
+    }
+
+    /** @return Compatibility configuration built only after original inventory binding. */
+    const TestConfig& getTestConfig() const {
+        if(!observed_)return ModelParityCaseParameter::getTestConfig();
+        if(!bound_config_)bound_config_=modelParityCase().toTestConfig();
+        return *bound_config_;
+    }
+
+protected:
+    /** @brief Enter the existing numerical lifecycle only on the selected original owner. */
+    void SetUp() override {
+        const auto& original=ModelParityCaseParameter::modelParityCase();
+        if(original.topology.needsObservedPipelineBinding()) {
+            ASSERT_NO_THROW(observed_.emplace(original));
+            ASSERT_NO_THROW(observed_->authenticate());
+            if(!observed_->execution())return;
+            Base::mpi_ctx_=observed_->execution();
+        }
+        Base::SetUp();
+    }
+
+    /** @brief Retire active production resources before the original discovery join. */
+    void TearDown() override {
+        if(!observed_) {
+            Base::TearDown();
+            return;
+        }
+        const bool active=bool(observed_->execution());
+        std::exception_ptr failure;
+        if(active) {
+            try {Base::TearDown();} catch(...) {failure=std::current_exception();}
+            Base::mpi_ctx_.reset();
+        }
+        const bool complete=observed_->complete(!failure&&!Base::HasFailure()&&!Base::IsSkipped());
+        const auto output=Base::getResultsDir()/"observed-pipeline"/("rank-"+std::to_string(observed_->discoveryRank()));
+        std::filesystem::create_directories(output);
+        ASSERT_NO_FATAL_FAILURE(observed_->writeReceipt(output,"parity_work_succeeded",complete));
+        if(active && complete) {
+            // Reuse the canonical lossless configuration exporter only after
+            // actual original binding and the ordinary numerical lifecycle.
+            std::ostringstream declaration,configuration;
+            PrintTo(ModelParityCaseParameter::modelParityCase(),&declaration);
+            PrintTo(observed_->boundCase(),&configuration);
+            const auto* test=::testing::UnitTest::GetInstance()->current_test_info();
+            ASSERT_TRUE(test);
+            const nlohmann::json exported={{"schema",1},
+                {"exact_cell",std::string(test->test_suite_name())+"."+test->name()},
+                {"declaration",nlohmann::json::parse(declaration.str())},
+                {"configuration",nlohmann::json::parse(configuration.str())}};
+            std::ofstream file(output/"observed-pipeline-config.json");
+            ASSERT_TRUE(file.is_open());
+            file<<exported.dump()<<'\n';file.flush();ASSERT_TRUE(file.good());
+        }
+        EXPECT_TRUE(complete)<<"Original QFN parity work failed before selected retirement";
+        if(failure)std::rethrow_exception(failure);
+    }
+
+    /** @return Whether this original rank runs the existing GTest body. */
+    bool executesQwen4ExpBody() const noexcept {return !observed_ || bool(observed_->execution());}
+
+    /** @return Borrow the same exact selected MPI context when constructing the runner. */
+    std::shared_ptr<IMPIContext> freshParityMPIContext() const override {
+        return observed_?observed_->execution():Base::freshParityMPIContext();
+    }
+
+    /** @return Actual selected entry GPU, retaining its observed device ordinal. */
+    DeviceId getDevice() override {
+        return observed_?modelParityCase().topology.participants.front().address.toLocalDeviceId():Base::getDevice();
+    }
+
+    /** @return The same selected owner used for original local execution. */
+    DeviceId getDeviceForRank() override {
+        return observed_?getDevice():Base::getDeviceForRank();
+    }
+
+private:
+    std::optional<Qwen4ExpObservedPipelineBinding> observed_;
+    mutable std::optional<TestConfig> bound_config_;
+};
 
 /** @brief One canonical production fixture per exact expanded matrix cell. */
 class Qwen4ExpMainParityTest
@@ -93,7 +190,7 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotNumerical, Qwen4ExpLocalHotNumericalTes
 
 /** @brief Functional byte replay uses the existing active cases, without another matrix producer. */
 class Qwen4ExpMTPExactReplayTest
-    : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpMTPExactReplayTest>, public ModelParityCaseParameter {
+    : public Qwen4ExpObservedPipelineParityFixture<Qwen4ExpMTPExactReplayTest> {
 protected:
     /** @return Native byte proof; existing reference headers size snapshots, without download/scoring. */
     MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
@@ -120,11 +217,13 @@ protected:
 };
 
 /** @test Original native condition/verifier inputs, snapshots and reset/reuse, without HF acceptance. */
-TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay(); }
+TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) {
+    if(executesQwen4ExpBody())runQwen4ExpMTPExactReplay();
+}
 
 /** @brief Public ordinary generation on the original source, followed by real reset/reuse. */
 class Qwen4ExpOrdinaryGenerationTest
-    : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>, public ModelParityCaseParameter {
+    : public Qwen4ExpObservedPipelineParityFixture<Qwen4ExpOrdinaryGenerationTest> {
     using Base=Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>;
     std::optional<Qwen4ExpOrdinaryGenerationWorkload> ordinary_workload_;
 protected:
@@ -188,7 +287,9 @@ protected:
     }
 };
 /** @test Actual complete captured ordinary generation and original-owner reuse; no numerical certificate. */
-TEST_P(Qwen4ExpOrdinaryGenerationTest, NativeGeneration) { runOrdinaryGeneration(); }
+TEST_P(Qwen4ExpOrdinaryGenerationTest, NativeGeneration) {
+    if(executesQwen4ExpBody())runOrdinaryGeneration();
+}
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetOrdinaryGenerationCandidate,Qwen4ExpOrdinaryGenerationTest,
     ::testing::ValuesIn(qwen4ExpOwnerSubsetOrdinaryGenerationCases()),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
@@ -1018,3 +1119,53 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotRefinedBudgetNumerical, Qwen4ExpLocalHo
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpLocalHotRefinedBudgetNumerical",
         qwen4ExpLocalHotRefinedBudgetCandidates())),
     [](const auto& info) { return info.param.testName(); });
+
+/** @test Real-source rank-local TP domains linked by original cross-rank activation ownership. */
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCrossRankPipelineFullStage,Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qwen4ExpCrossRankPipelineOrdinaryCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+/** @test Public real-GGUF generation followed by original request reset/reuse. */
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCrossRankPipelineOrdinary,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpCrossRankPipelineOrdinaryCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+/** @test Fixed1/fixed3/dynamic serial/grouped bytes; real-source evidence is qualified independently. */
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCrossRankPipelineMTPExact,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpCrossRankPipelineMTPExactCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+/** @brief Real original-inventory pipeline source request; no numerical setup or fake GPU address. */
+class Qwen4ExpObservedPipelineSourceAdmissionTest
+    :public ::testing::Test,public Qwen4ExpSourceAdmissionParameter {};
+/** @test Original MPI/NUMA/UUID projection followed by full ordinary prepared/captured source admission. */
+TEST_P(Qwen4ExpObservedPipelineSourceAdmissionTest,CandidateSourceAdmission) {
+    withQwen4ExpObservedPipelineAdmission(modelParityCase(),[](const auto& bound,const auto& execution) {
+        admitQwen4ExpSource(bound,Qwen4ExpSourceRecreationProof::FromOriginalRoles,{},execution);
+    });
+}
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50PipelineSourceCandidate,Qwen4ExpObservedPipelineSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpObservedMI50PipelineSourceCases())),
+    [](const auto& info){return info.param.testName();});
+
+
+/** @brief Observed main-model numerical campaign with the original full reference policy. */
+class Qwen4ExpObservedPipelineMainParityTest
+    :public Qwen4ExpObservedPipelineParityFixture<Qwen4ExpObservedPipelineMainParityTest> {};
+
+/** @test Original numerical, prefix and graph evidence through the selected Q7 pipeline. */
+TEST_P(Qwen4ExpObservedPipelineMainParityTest,ProductionParity) {
+    if(executesQwen4ExpBody())runQwen4ExpProductionParityCampaign();
+}
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMSourceCandidate,Qwen4ExpObservedPipelineSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpObservedMI50FixedVRAMSourceCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMOrdinary,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpObservedMI50FixedVRAMCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMFullStage,Qwen4ExpObservedPipelineMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpObservedMI50FixedVRAMFullStage",
+        qwen4ExpObservedMI50FixedVRAMCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMExact,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpObservedMI50FixedVRAMExactCases()),
+    [](const auto& info){return info.param.testName();});

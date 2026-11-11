@@ -12,9 +12,9 @@
 #include <limits>
 namespace llaminar2::qwen4exp {
 std::shared_ptr<RetainedParticipantGraphExecutable> PooledImmutableSourcePreparedStorage::acquireOriginalRemoteDefinition(
-    const PooledRemoteGraphProgram& program,void* stream)
+    const PooledStorageOwnerProgram& program,void* stream)
 {
-    const auto& g=program.geometry();const auto coordinate=g.coordinate;
+    const auto& g=pooledStorageOwnerGeometry(program);const auto coordinate=g.coordinate;
     if(!prepared_workers_ || prepared_workers_->rootIdentity()!=captureIdentity() ||
        coordinate>=geometry_.originalOwners().size() || coordinate>=prepared_workers_->owners().size() ||
        g.coordinator!=geometry_.allocator() || g.owner!=geometry_.originalOwners()[coordinate].allocator() ||
@@ -29,14 +29,14 @@ std::shared_ptr<RetainedParticipantGraphExecutable> PooledImmutableSourcePrepare
     // The holder separately rejects surviving runner aliases before rearming.
     return remote_definition_slots_->acquire(captureIdentity(),original,stream,program);
 }
-void PooledImmutableSourcePreparedStorage::releaseOriginalRemoteDefinition(const PooledRemoteGraphProgram& program,
+void PooledImmutableSourcePreparedStorage::releaseOriginalRemoteDefinition(const PooledStorageOwnerProgram& program,
     const std::shared_ptr<RetainedParticipantGraphExecutable>& owner)
 {
     if(!prepared_workers_ || prepared_workers_->rootIdentity()!=captureIdentity() || !remote_definition_slots_)
         throw std::logic_error("Remote definition retirement lost its original source slot holder");
     remote_definition_slots_->release(captureIdentity(),program,owner);
 }
-void PooledImmutableSourcePreparedStorage::abandonOriginalRemoteDefinition(const PooledRemoteGraphProgram& program,
+void PooledImmutableSourcePreparedStorage::abandonOriginalRemoteDefinition(const PooledStorageOwnerProgram& program,
     const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::exception_ptr failure)
 {
     if(!remote_definition_slots_)throw std::logic_error("Failed source definition has no original slot holder");

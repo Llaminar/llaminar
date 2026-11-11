@@ -185,7 +185,7 @@ class CorpusExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);output=root/'cell'
             args=SimpleNamespace(binary=root/'observer',keep_logits=False)
-            a=SimpleNamespace(topology={'id':'fixture','expected_config':{'configuration':{'mpi_procs':2 if distributed else 1}}},devices=['cpu:0'],backends=['cpu'],environment={},
+            a=SimpleNamespace(paired=None,topology={'id':'fixture','expected_config':{'configuration':{'mpi_procs':2 if distributed else 1}}},devices=['cpu:0'],backends=['cpu'],environment={},
                 prepare=Mock(return_value=(root/'workload',[])),score=Mock())
             if distributed:
                 args.mpi_rankfile=root/'original.rankfile';args.mpi_rankfile.write_text('rank 0=localhost slot=0:0-27\nrank 1=localhost slot=1:0-27\n')
@@ -281,7 +281,7 @@ class CorpusExecutionTests(unittest.TestCase):
                 + 'code=p.wait();sys.exit(1)\n')
             native.chmod(0o700)
             args=SimpleNamespace(binary=native,keep_logits=False,mpi_rankfile=rankfile)
-            a=SimpleNamespace(topology={'id':'host-process-fixture','expected_config':{'configuration':{'mpi_procs':2}}},
+            a=SimpleNamespace(paired=None,topology={'id':'host-process-fixture','expected_config':{'configuration':{'mpi_procs':2}}},
                 devices=['cpu:0'],backends=['cpu'],environment={},prepare=Mock(return_value=(root/'workload',['--mpi-procs','2'])),score=Mock())
             sample=dict(errors=[],cells={'canary':{'errors':[]}},filesystems={'output':{'available_bytes':10**9}})
             def observe_resources(unused):
@@ -631,6 +631,82 @@ class PairedCorpusExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'policy'):
                 adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy='untyped')
 
+    def test_complete_observed_external_metadata_preserves_original_history_and_reference_authority(self):
+        """Actual document checks admit a new topology, never a shortened reference workload."""
+        import model_parity_inventory as inventory
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            external=root/'external-manifest.json'
+            external.write_bytes((root/'manifest.json').read_bytes())
+            original=copy.deepcopy(c['manifest'])
+            original['topologies'][0]['canonical_cell']='Synthetic.ProductionParity/OriginalOtherTopology'
+            (root/'manifest.json').write_text(json.dumps(original))
+            record['paired_workload']['accuracy']['workload']['path']=str(external)
+            record['observed_pipeline_binding']={'synthetic':'not a native receipt'}
+            policy=adapter.PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE
+            with patch.object(inventory,'require_observed_pipeline_document') as owner, \
+                 patch.object(adapter.corpus_v2,'load_corpus',return_value=c) as load:
+                selected=adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy=policy)
+                owner.assert_called_once_with(record)
+                self.assertEqual(load.call_args.kwargs['manifest_path'],external)
+                self.assertEqual(load.call_args.args[0],root)
+                self.assertIn(str(root/'manifest.json'),selected.pins)
+                self.assertEqual(selected.documents['pilot'],absolute_pilot(c['manifest']))
+            # Only topology inventory may differ from the original corpus owner.
+            for field in ('source','histories','reference','reset_control','vocabulary'):
+                foreign=copy.deepcopy(c['manifest']);foreign[field]=None
+                external.write_text(json.dumps(foreign))
+                record['paired_workload']['accuracy']['workload']['sha256']=adapter.hashlib.sha256(external.read_bytes()).hexdigest()
+                with self.subTest(field=field), \
+                     patch.object(inventory,'require_observed_pipeline_document'), \
+                     patch.object(adapter.corpus_v2,'load_corpus') as load, \
+                     self.assertRaisesRegex(ValueError,'changed original'):
+                    adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy=policy)
+                load.assert_not_called()
+
+    def test_complete_observed_external_metadata_rejects_missing_or_failed_owner(self):
+        """External metadata cannot turn an unresolved or forged owner into admission."""
+        import model_parity_inventory as inventory
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            policy=adapter.PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE
+            with patch.object(adapter.corpus_v2,'load_corpus') as load, \
+                 self.assertRaisesRegex(ValueError,'authenticated original'):
+                adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy=policy)
+            load.assert_not_called()
+            record['observed_pipeline_binding']={'synthetic':'invalid'}
+            with patch.object(inventory,'require_observed_pipeline_document',side_effect=ValueError('original owner rejected')), \
+                 patch.object(adapter.corpus_v2,'load_corpus') as load, \
+                 self.assertRaisesRegex(ValueError,'original owner rejected'):
+                adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy=policy)
+            load.assert_not_called()
+
+    def test_complete_observed_selection_requires_full_receipt_and_chooses_external_policy(self):
+        """The source-bound branch remains downstream of full-only observed admission."""
+        import model_parity_inventory as inventory
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            (root/'matrix').write_text('synthetic metadata, never executable')
+            (root/'observer').write_text('synthetic metadata, never executable')
+            args=AbsolutePilotExecutionTests().args(root,None)
+            args.corpus_catalog=None;args.paired_cell=exact
+            args.prerequisites_report=root/'complete-required-not-a-receipt'
+            args.diagnostic_focused_prerequisites_report=None
+            args.paired_observed_pipeline_artifacts=root/'original-artifacts'
+            selection=SimpleNamespace(pins={},paths={'catalog':root/'catalog'},topology={'id':'fixture'})
+            with patch.object(inventory,'discover',return_value=[(SimpleNamespace(name='original'),exact,record)]), \
+                 patch.object(inventory,'matrix_binary',return_value=root/'matrix'), \
+                 patch.object(inventory,'bind_observed_pipeline_artifacts',return_value=record), \
+                 patch.object(adapter.PairedCorpusSelection,'from_export',return_value=selection) as choose:
+                runner.select_paired_corpus(args)
+            self.assertIs(choose.call_args.kwargs['metadata_policy'],
+                          adapter.PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE)
+            args.diagnostic_focused_prerequisites_report=root/'focused'
+            args.prerequisites_report=None;args.corpus_catalog=None;args.topology_id=None;args.absolute_pilot=None
+            with patch.object(inventory,'discover') as discover,self.assertRaisesRegex(ValueError,'complete current'):
+                runner.select_paired_corpus(args)
+            discover.assert_not_called()
+
     def selection(self,root,c,exact,record):
         with patch.object(adapter.corpus_v2,'load_corpus',return_value=c):
             return adapter.PairedCorpusSelection.from_export(exact,record,root,root)
@@ -841,6 +917,73 @@ class PairedCorpusExecutionTests(unittest.TestCase):
             self.assertEqual(args.absolute_pilot,root/'pilot.json')
             self.assertIsNone(args.baseline_report)
             self.assertIn(str(root/'matrix'),args._paired_selection.pins)
+
+class ObservedPipelineMatchedLaunchTests(unittest.TestCase):
+    """Validate original launch documents across independently owned build files."""
+
+    def launches(self,root):
+        """Create actual stat-pinned toy helper files without launching any process."""
+        owners=[];launches=[]
+        for mode in ('integration','release'):
+            directory=root/mode;directory.mkdir()
+            binary=directory/'application';binary.write_text('toy metadata only')
+            helper=directory/'llaminar_mpi_session';helper.write_text(mode+' toy executable metadata')
+            helper.chmod(0o700);owners.append(binary)
+            launches.append(dict(schema='llaminar.original-mpi-rankfile-launch.v1',world_size=2,
+                rankfile=dict(path='/original/rankfile',stat=['same-original-rankfile']),
+                session_launcher=dict(path=str(helper),stat=list(adapter.identity(helper))),
+                mpi_launcher=dict(path='/original/mpirun',stat=['same-original-mpi']),
+                binding='core',overlap_policy='strict',performance_comparison_eligible=True))
+        return owners,launches
+
+    def test_distinct_build_helpers_keep_the_identical_original_mpi_contract(self):
+        """Different actual helper identities pass without pretending to be one executable."""
+        from run_model_parity_benchmarks import require_matched_original_launch
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);owners,launches=self.launches(root)
+            for repetition in range(3):
+                pins=require_matched_original_launch(*launches,panel_binary=owners[0],release_binary=owners[1])
+                self.assertEqual(len(pins),2)
+                self.assertNotEqual(launches[0]['session_launcher'],launches[1]['session_launcher'])
+                for launch in launches:
+                    path=launch['session_launcher']['path']
+                    self.assertEqual(list(pins[path]),launch['session_launcher']['stat'])
+
+    def test_changed_placement_transport_or_overlap_contract_fails(self):
+        """Every non-helper field remains exact, including complete rankfile/MPI identities."""
+        from run_model_parity_benchmarks import require_matched_original_launch
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);owners,launches=self.launches(root)
+            mutations=[lambda x:x.update(world_size=1),lambda x:x.update(binding='socket'),
+                lambda x:x.update(overlap_policy='relaxed'),lambda x:x.update(performance_comparison_eligible=False),
+                lambda x:x['rankfile'].update(path='/foreign/rankfile'),
+                lambda x:x['rankfile'].update(stat=['foreign-rankfile']),
+                lambda x:x['mpi_launcher'].update(path='/foreign/mpirun'),
+                lambda x:x['mpi_launcher'].update(stat=['foreign-mpi']),
+                lambda x:x.update(unrecognized='extra')]
+            for mutate in mutations:
+                current=copy.deepcopy(launches[1]);mutate(current)
+                with self.subTest(mutation=mutate),self.assertRaisesRegex(ValueError,'changed its paired MPI'):
+                    require_matched_original_launch(launches[0],current,panel_binary=owners[0],release_binary=owners[1])
+
+    def test_stale_helper_or_foreign_build_owner_fails(self):
+        """Each helper must belong to its own binary and retain its separately recorded stat."""
+        from run_model_parity_benchmarks import require_matched_original_launch
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);owners,launches=self.launches(root)
+            for index in (0,1):
+                bad=copy.deepcopy(launches)
+                bad[index]['session_launcher']=copy.deepcopy(bad[1-index]['session_launcher'])
+                with self.subTest(owner=index),self.assertRaisesRegex(ValueError,'escaped its original binary'):
+                    require_matched_original_launch(*bad,panel_binary=owners[0],release_binary=owners[1])
+                bad=copy.deepcopy(launches)
+                bad[index]['session_launcher']['stat'][-1]+=1
+                with self.subTest(stale=index),self.assertRaisesRegex(ValueError,'changed after admission'):
+                    require_matched_original_launch(*bad,panel_binary=owners[0],release_binary=owners[1])
+            helper=Path(launches[0]['session_launcher']['path']);helper.write_text('changed actual original helper')
+            with self.assertRaisesRegex(ValueError,'changed after admission'):
+                require_matched_original_launch(*launches,panel_binary=owners[0],release_binary=owners[1])
+
 
 class DeclaredBenchmarkRepresentationTests(unittest.TestCase):
     """Source document/argv spelling only, with no model or acceptance fabrication."""

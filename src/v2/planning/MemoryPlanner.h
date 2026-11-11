@@ -51,6 +51,7 @@ struct MoERoutedExpertPlacementPlan;
     class RetainedHostServiceDeclarations;
 class RetainedHostServiceBudgetProjection;
 struct ClusterInventory;
+class DeviceCountedAllGatherTopology;
 
 namespace test {struct MemoryPlannerOrderingReplayAccess;}
 
@@ -346,12 +347,14 @@ struct DevicePlanConfig
     int total_shards = 1;
     /** Actual rank-declared topology provenance; None cannot authorize fixed-head serving. */
     ImmutableRowTableTPTopology ngram_tp_topology = ImmutableRowTableTPTopology::None;
+    /** Checked original pipeline fixed source, including storage-only model devices. */
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> ngram_fixed_head_pipeline;
 
     /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-    /// Canonical observed topology for the optional rank-local compact projection transport.
-    std::optional<PeerAccessCoverage> projection_peer_access;
+    /// Immutable original per-edge routes; their canonical quote is the only projection transport BOM.
+    std::shared_ptr<const DeviceCountedAllGatherTopology> projection_exchange_topology;
     /** Original inventory observation for explicitly declared mapped pooled transport. */
     std::optional<PeerAccessCoverage> ngram_gpu_peer_access;
     /** Original coordinator-to-compute-reader observations, independent of storage edges. */
@@ -375,6 +378,11 @@ struct DevicePlanConfig
 
     /** Adjacent heterogeneous edges owned by this domain leader, never by TP nonleaders. */
     std::vector<PipelineBoundarySide> captured_pipeline_boundaries;
+    /** Actual receiving TP member's original live-prefix fanout bank, independent of channel leadership. */
+    bool pipeline_native_activation_fanout = false;
+    bool native_pipeline_maintenance_budget = false; ///< Original all-stage MTP cadence demand; separate derived scalar storage only.
+    int hosted_pipeline_activation_rows = 0; ///< Exact admitted row capacity of the sole original-rank hosted bank; zero declares no bank.
+    std::size_t native_pipeline_byte_endpoints = 0; ///< Actual incident completed-byte frames on this GPU; no payload storage.
 
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.

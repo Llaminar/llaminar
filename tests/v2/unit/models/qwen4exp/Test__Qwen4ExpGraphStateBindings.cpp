@@ -268,7 +268,7 @@ TEST(Qwen4ExpGraphStateBindings, PLEVerifierContextRejectsForeignRolesAndPhasesB
 } // namespace llaminar2::test
 
 namespace llaminar2::test {
-/** @brief Unsupported early roles fail before source acquisition or graph mutation. */
+/** @brief Unqualified invocation roles and incomplete shapes fail before source acquisition or graph mutation. */
 TEST(Qwen4ExpGraphStateBindings, EarlyCurrentCandidateRejectsUnsupportedRolesBeforeSourceWork){
     for(unsigned shape=0;shape<3;++shape)for(auto role:{ForwardExecutionRole::MainInference,
         ForwardExecutionRole::MTPCondition,ForwardExecutionRole::GroupedMTPVerifier}){
@@ -280,7 +280,15 @@ TEST(Qwen4ExpGraphStateBindings, EarlyCurrentCandidateRejectsUnsupportedRolesBef
         input.seq_len=1;input.batch_size=1;input.execution_role=role;input.execution_phase=ForwardExecutionPhase::Decode;
         ComputeGraph graph;
         try{(void)Qwen4ExpPLEProjectionTestPeer::prefix(owner,input,shape,graph);FAIL()<<"Unsupported early role accepted";}
-        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("ordinary complete"),std::string::npos);}
+        catch(const std::invalid_argument& error){
+            // This owner has neither grouped-verifier nor scalar-condition
+            // policy. Main inference passes the role guard and must instead
+            // reject its incomplete shape before requesting admitted sources.
+            const auto expected=role==ForwardExecutionRole::MainInference
+                ? "complete single-request local GPU invocation"
+                : "original main, scalar condition or grouped verifier invocation policy";
+            EXPECT_NE(std::string(error.what()).find(expected),std::string::npos)<<error.what();
+        }
         EXPECT_EQ(graph.size(),0u);EXPECT_FALSE(graph.retainedStorageBoundary());
     }
 }

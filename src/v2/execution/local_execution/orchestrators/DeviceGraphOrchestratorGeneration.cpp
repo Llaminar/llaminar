@@ -582,12 +582,14 @@ OrdinaryForwardRetentionKind DeviceGraphOrchestrator::ordinaryForwardRetentionKi
 
 std::optional<DeviceGraphOrchestrator::OrdinaryGenerationForward>
 DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
-    const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error)
+    const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error, OrdinaryForwardPurpose purpose)
 {
     const auto fail = [&](const std::string &reason) -> std::optional<OrdinaryGenerationForward> {
         if (error) *error = reason;
         return std::nullopt;
     };
+    if (purpose != OrdinaryForwardPurpose::OutputGeneratingDecode && purpose != OrdinaryForwardPurpose::ForwardOnlyCondition)
+        return fail("Unknown resident forward semantic purpose");
     // Resolve the requested ownership before preparing any model nodes. A
     // failed native export never selects the hosted arm.
     const auto admitted = ordinaryForwardRetentionKind();
@@ -614,10 +616,12 @@ DeviceGraphOrchestrator::materializeOrdinaryGenerationForward(
         static_cast<int32_t *>(request_position_ids_dev_)};
     input.position_policy = ForwardPositionPolicy::ExplicitRows;
     input.execution_role = ForwardExecutionRole::MainInference;
+    input.state_transaction = purpose == OrdinaryForwardPurpose::ForwardOnlyCondition
+        ? ForwardStateTransaction::ForwardOnlyCondition : ForwardStateTransaction::Ordinary;
     input.execution_phase = ForwardExecutionPhase::Decode;
     input.sparse_query_execution_program = sparseQueryForwardProgram(input.execution_phase);
     input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
-    if (pipeline_forward_edges_ && !pipeline_forward_edges_->hasHeterogeneousBoundary())
+    if (pipeline_forward_edges_ && !pipeline_forward_edges_->hasDomainBoundary())
         input.pipeline_activation_ownership = ForwardPipelineActivationOwnership::NativeGenerationParent;
     input.batch_size = input.seq_len = input.real_seq_len = 1;
     input.position_offset = input.token_offset = 1;
@@ -718,7 +722,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
             moe_overlay_epoch_execution_binding_.arena->deviceId() != state_.device_id ||
             moe_overlay_epoch_execution_binding_.request_slot >=
                 moe_overlay_epoch_execution_binding_.arena->requestSlotCapacity() ||
-            (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary()) ||
+            (pipeline_forward_edges_ && pipeline_forward_edges_->hasDomainBoundary()) ||
             usesParticipantLocalDeviceMoERebalanceController())
             return fail("Native no-peer pipeline tail has no exact epoch, scope or parent ownership");
         const auto &config = graph_builder_->config();
@@ -749,7 +753,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
             (!pp_stage_config_->has_embedding && !pipeline_tail &&
              !pipeline_domain_tail))) ||
         (pipeline_domain_tail &&
-            (!pipeline_forward_edges_ || !pipeline_forward_edges_->hasHeterogeneousBoundary())) ||
+            (!pipeline_forward_edges_ || !pipeline_forward_edges_->hasDomainBoundary())) ||
         expert_overlay !=
             static_cast<bool>(moe_overlay_epoch_execution_binding_))
         return fail("Ordinary generation requires an admitted scalar sampler and an exact local, pipeline-tail, or ExpertOverlay composition");

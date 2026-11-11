@@ -98,6 +98,7 @@ public:
     ~SnapshotAdmissionGeometryProbe() override
     {
         restoreParityEnvOverrides();
+        PerfStatsCollector::reset();
     }
     /** @brief This probe is manually scoped and never registered as a model fixture. */
     void TestBody() override {}
@@ -107,13 +108,16 @@ public:
      * @brief Install original source-owned keys and an explicit inactive serving ladder.
      * @param rows Authored real prompt row count.
      * @param replay Optional already-validated frozen history.
+     * @param native_cap Optional exact pipeline's original public serving cap.
      */
-    void configure(int rows, std::optional<FrozenParityHistoryReplay> replay = std::nullopt)
+    void configure(int rows, std::optional<FrozenParityHistoryReplay> replay = std::nullopt,
+                   std::optional<int> native_cap = std::nullopt)
     {
         config_.token_ids.assign(static_cast<std::size_t>(rows), 1);
         config_.graph_snapshot_policy = qwen4exp::qwen4ExpProductionDefinition(
             qwen4exp::Qwen4ExpParityTopology::CPU).graph_snapshot_policy;
         frozen_history_replay_ = std::move(replay);
+        native_cap_ = native_cap;
         setScopedParityEnvOverride("LLAMINAR_PRODUCTION_PARITY", "0");
         setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "64");
         setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
@@ -122,6 +126,13 @@ public:
     /** @brief Expose the production pre-admission transaction, not a mirrored resolver. */
     using ParityTestBase::beginProductionParitySnapshotAdmission;
     using ParityTestBase::configureExactProductionParityPrefillGraphBucket;
+    /** @brief Scope collection for actual host-only native replay counter bodies. */
+    void enablePrefillEvidence()
+    {
+        setScopedParityEnvOverride("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        setScopedParityEnvOverride("LLAMINAR_PERF_STATS_JSON", "1");
+        PerfStatsCollector::reset();
+    }
     /** @return Effective diagnostic capacity from the same current startup inventory. */
     int retainedRows() const
     {
@@ -130,6 +141,13 @@ public:
     }
     /** @return Existing source-owned complete checkpoint policy, unchanged by geometry setup. */
     const ParityGraphSnapshotPolicy &snapshotPolicy() const { return config_.graph_snapshot_policy; }
+
+protected:
+    /** @return The typed public capacity from the original fixture input. */
+    std::optional<int> productionParityRetainedPrefillCap() const override { return native_cap_; }
+
+private:
+    std::optional<int> native_cap_;
 };
 
 /** @brief Parse a metadata request; no source or reference owner is granted. */
@@ -371,6 +389,127 @@ TEST(FrozenParityHistoryReplay, ProductionServingBucketRejectsExactLiveAndMissin
     value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
     EXPECT_THROW((void)checked(value).servingPrefillCapture(), std::invalid_argument);
 }
+/** @test The complete nine-row history uses its admitted 8+1 family on every selected GPU. */
+TEST(FrozenParityHistoryReplay, SelectedFixedPipelineRequiresOriginalExactChunkReplays)
+{
+    MetadataOwner owner;
+    auto value = descriptor(owner);
+    value["prompt_ids"] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto config = OrchestrationConfig::defaults();
+    config.n_threads = 2;
+    config.mpi_procs = 2;
+    config.planning_mode = OrchestrationPlanningMode::Apply;
+    config.execution_rank_selection = ExecutionRankSelection({1});
+    config.prefill_max_bucket_size = 64;
+    config.ngram_table_policy = {.storage = ImmutableRowStoragePreference::VRAM,
+                                  .distribution = ImmutableRowTableDistribution::FixedHeadSharded};
+    config.pp_stage_definitions = {{0, "entry", 0, 23}, {1, "tail", 24, 47}};
+    value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+    const auto replay = checked(value);
+    EXPECT_EQ(replay.requestedCPUWorkers(), 2);
+    EXPECT_NO_THROW(replay.requireCanonicalConfiguration(config));
+    auto wrong_owner = config;
+    wrong_owner.execution_rank_selection = ExecutionRankSelection({0});
+    EXPECT_THROW(replay.requireCanonicalConfiguration(wrong_owner), std::invalid_argument);
+    wrong_owner.execution_rank_selection.reset();
+    EXPECT_THROW(replay.requireCanonicalConfiguration(wrong_owner), std::invalid_argument);
+
+    const auto requested = replay.servingPrefillCapture();
+    EXPECT_EQ(requested.bucket_rows, prefillGraphBucketSizes(64));
+    EXPECT_EQ(requested.minimum_rows, std::min(64, kDefaultPrefillGraphMinBucketSize));
+    EXPECT_EQ(requested.selected_rows, 0);
+
+    SnapshotAdmissionGeometryProbe probe;
+    probe.configure(9, std::nullopt, 64);
+    ASSERT_NO_FATAL_FAILURE(probe.beginProductionParitySnapshotAdmission());
+    EXPECT_EQ(probe.retainedRows(), 64);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, requested.bucket_rows);
+
+    const auto entry = GlobalDeviceAddress::rocm(2, 1, "observed");
+    const auto member = GlobalDeviceAddress::rocm(4, 1, "observed");
+    const auto tail = GlobalDeviceAddress::rocm(6, 1, "observed");
+    RankExecutionPlan plan;
+    plan.local_pp_devices = {entry, tail};
+    plan.local_pp_stage_tp_info = {{.devices = {entry, member}}, {.devices = {tail}}};
+    plan.runtime.overlay_prefill_schedule = {.graph_row_capacity = 32,
+                                             .bucket_rows = exactPrefillGraphWidths(32)};
+    probe.enablePrefillEvidence();
+    const auto publish = [](const std::string &device, int rows, std::initializer_list<std::uint64_t> words) {
+        PerfStatsCollector::addCounterWithSequence("forward_graph", "prefill_graph_phase", 1, words,
+            "prefill", device, {{"capture_phase", "replay"}, {"real_token_count", std::to_string(rows)},
+                                {"bucket_seq_len", std::to_string(rows)}});
+    };
+    const std::vector<std::string> devices{"ROCm:2", "ROCm:4", "ROCm:6"};
+    for (const auto &device : devices)
+    {
+        publish(device, 8, {0, 0, 8});
+        publish(device, 1, {1, 8, 9});
+    }
+    auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const auto proof = replay.servingPrefillEvidence(records, true, &plan);
+    EXPECT_EQ(proof.at("capture_mode"), "production_exact_retained");
+    EXPECT_EQ(proof.at("bucket_rows"), exactPrefillGraphWidths(32));
+    EXPECT_EQ(proof.at("logical_rows"), 9);
+    EXPECT_EQ(proof.at("physical_rows"), 9);
+    EXPECT_EQ(proof.at("chunks"), json::array({{{"token_offset", 0}, {"logical_rows", 8}, {"physical_rows", 8}},
+                                              {{"token_offset", 8}, {"logical_rows", 1}, {"physical_rows", 1}}}));
+    EXPECT_EQ(proof.at("native_devices"), json::array({"ROCm:2", "ROCm:4", "ROCm:6"}));
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true), std::invalid_argument);
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, false, &plan), std::invalid_argument);
+    const auto tail_chunk = std::find_if(records.begin(), records.end(), [](const auto &record) {
+        return record.device == "ROCm:6" && record.tags.at("bucket_seq_len") == "1";
+    });
+    ASSERT_NE(tail_chunk, records.end());
+    const auto original = *tail_chunk;
+    tail_chunk->tags["capture_phase"] = "materialized_without_launch";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    tail_chunk->tags["bucket_seq_len"] = "8";
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    tail_chunk->sequence_minimum_words = tail_chunk->sequence_maximum_words = {1, 7, 8};
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+    *tail_chunk = original;
+    records.push_back(original);
+    EXPECT_THROW((void)replay.servingPrefillEvidence(records, true, &plan), std::invalid_argument);
+
+    // Four equal-width steps retain identical extrema under an interior swap
+    // or duplicate. The original digest must catch both despite that collision.
+    value["prompt_ids"] = std::vector<int>(129, 1);
+    const auto repeated = checked(value);
+    const auto publish_repeated = [&](bool reorder, bool duplicate) {
+        PerfStatsCollector::reset();
+        for (const auto &device : devices)
+        {
+            const bool changed = device == devices.back();
+            publish(device, 32, {0, 0, 32});
+            if (changed && reorder)
+            {
+                publish(device, 32, {2, 64, 96});
+                publish(device, 32, {1, 32, 64});
+            }
+            else
+            {
+                publish(device, 32, {1, 32, 64});
+                if (changed && duplicate)
+                    publish(device, 32, {1, 32, 64});
+                else
+                    publish(device, 32, {2, 64, 96});
+            }
+            publish(device, 32, {3, 96, 128});
+            publish(device, 1, {4, 128, 129});
+        }
+        return PerfStatsCollector::snapshot({"forward_graph"});
+    };
+    const auto repeated_proof = repeated.servingPrefillEvidence(publish_repeated(false, false), true, &plan);
+    ASSERT_EQ(repeated_proof.at("chunks").size(), 5u);
+    EXPECT_EQ(repeated_proof.at("logical_rows"), 129);
+    EXPECT_THROW((void)repeated.servingPrefillEvidence(publish_repeated(true, false), true, &plan),
+                 std::invalid_argument);
+    EXPECT_THROW((void)repeated.servingPrefillEvidence(publish_repeated(false, true), true, &plan),
+                 std::invalid_argument);
+}
+
 /** @test Explicit workers change only the public runner field and reject socket budgets. */
 TEST(FrozenParityHistoryReplay, ExplicitWorkersRejectNarrowedOrBoundExecution)
 {

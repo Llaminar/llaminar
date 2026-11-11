@@ -7,6 +7,10 @@
  * request controls may change within the unchanged admitted capacity envelope.
  * Complete runtime handoff borrows the original immutable admission after exact plan
  * validation; participant factories retain their existing geometry checks.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "PreparedWeightAuthorityIdentity.h"
 #include "execution/config/RuntimeConfig.h"
@@ -21,6 +25,7 @@
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "utils/DebugEnv.h"
 #include <sstream>
+#include <iomanip>
 
 namespace llaminar2
 {
@@ -259,6 +264,9 @@ namespace llaminar2
             << config.max_seq_len << ','
             << debugEnv().execution.prefill_graph_max_cached_buckets
             << ',';
+        if (config.ngram_table_policy.isFixedHeadSharded())
+            out << "prefill_cache_limit_explicit="
+                << debugEnv().execution.prefill_graph_max_cached_buckets_explicit << ',';
         append_optional_bytes(config.max_gpu_memory_mb);
         append_optional_bytes(config.max_cpu_memory_mb);
         append_string(config.activation_precision);
@@ -312,6 +320,26 @@ namespace llaminar2
 
     namespace
     {
+        /** @brief Encode the original global stage declaration without mutable runtime observations. */
+        void appendGlobalPipeline(std::ostream &out, const std::optional<GlobalPPTopology> &global)
+        {
+            if (!global) return; // Preserve existing local prepared identities.
+            out << "global-stage-ownership-v1/" << global->world_size << '/' << global->total_layers << '/';
+            for (const auto &stage : global->stages)
+            {
+                out << stage.stage_id << ',' << stage.first_layer << ',' << stage.last_layer << ','
+                    << stage.has_embedding << ',' << stage.has_lm_head << ',' << stage.owning_rank << ','
+                    << stage.is_global_tp << ',' << static_cast<int>(stage.inner_mode) << ','
+                    << static_cast<int>(stage.backend) << '/' << stage.domain_name.size() << ':' << stage.domain_name;
+                for (const auto &device : stage.devices)
+                    out << '/' << device.hostname.size() << ':' << device.hostname << ','
+                        << static_cast<int>(device.device_type) << ',' << device.device_ordinal << ',' << device.numa_node;
+                out << "/weights";
+                for (const auto weight : stage.tp_weights) out << ',' << std::hexfloat << weight << std::defaultfloat;
+                out << ';';
+            }
+        }
+
         /** @brief Append one global interval and its complete capacity-affecting policy. */
         void appendPipelineStage(std::ostream &out, const ResolvedMoEPipelineStage &stage)
         {
@@ -333,6 +361,7 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "pipeline-expert-authority-v1/" << topology.pipelineStages().size() << '/';
+        appendGlobalPipeline(out, topology.globalPipeline());
         for (const auto &stage : topology.pipelineStages()) appendPipelineStage(out, stage);
         return out.str();
     }
@@ -341,6 +370,7 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "pipeline-expert-authority-v1/" << admission.stages().size() << '/';
+        appendGlobalPipeline(out, admission.globalPipeline());
         for (const auto &stage : admission.stages()) appendPipelineStage(out, stage.topology());
         return out.str();
     }

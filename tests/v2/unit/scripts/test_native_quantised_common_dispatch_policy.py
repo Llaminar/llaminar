@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_native_quantised_common_dispatch_policy.py
+#  @brief Prove complete typed candidate inventories and exact dispatch-policy evidence.
 """Regression tests for the common NativeQuantised dispatch policy compiler.
 
 Parallel corpus algorithm fixtures declare their visible physical-core count.
@@ -1979,12 +1981,13 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(len(rocm_moe.entries), 12)
         self.assertEqual(len(rocm_decode.entries), 65)
         self.assertEqual(len(cpu_decode.entries), 5)
-        self.assertEqual(len(cpu.entries), 9)
+        self.assertEqual(len(cpu.entries), 10)
         self.assertEqual(
             {entry.config_json["policy"] for entry in cpu.entries},
             {
                 "Pairwise",
                 "WideRows",
+                "OrderedThreeRows",
                 "FullKRowChunkGrid",
                 "FullKTwoRowNbc1",
                 "FullKTwoRowNbc2",
@@ -1994,6 +1997,11 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
                 "FullKTwoRowPairGridNbc8",
             },
         )
+        ordered_three = cpu.resolve("OrderedThreeRows")
+        self.assertEqual(ordered_three.candidate_id,
+                         "cpu.native_quantised.verifier.ordered_three_rows")
+        self.assertEqual(ordered_three.config_json["row_tile"], 3)
+        self.assertEqual(ordered_three.config_json["k_tile_policy"], "inherit_serial_m1")
         self.assertEqual(
             sum(
                 entry.config_json.get("route") == "two_row_pair_grid"

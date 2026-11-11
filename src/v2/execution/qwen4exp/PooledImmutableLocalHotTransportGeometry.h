@@ -125,19 +125,7 @@ public:
             const auto peer=resource(id);if(id==coordinator_)continue;
             out.add(source,PhysicalMemoryOwner::ActivationTransportStaging,sizeof(local_hot_transport::Control));
             out.add(peer,PhysicalMemoryOwner::ActivationTransportStaging,sizeof(local_hot_transport::Control));
-            if(readers_->nativeCollective())continue;
-            // Both directions use original captured channels. Payload roots
-            // above/L1 are original producers; mapped/cursor geometry belongs
-            // to TransferEngine, not copied transport accounting arithmetic.
-            const auto request=CapturedTransferChannel::memoryFor(std::max(keyCapacityBytes(),sizeof(local_hot_transport::RequestHeader)),readers_->payloadStorage(id));
-            const auto result=CapturedTransferChannel::memoryFor(std::max(resultCapacityBytes(),sizeof(local_hot_transport::ResultHeader)),readers_->payloadStorage(id));
-            out.add(peer,PhysicalMemoryOwner::ActivationTransportStaging,request.producer_payload_bytes);
-            out.add(source,PhysicalMemoryOwner::ActivationTransportStaging,result.producer_payload_bytes);
-            for(const auto& channel:{request,result}){
-                out.add(host,PhysicalMemoryOwner::ActivationTransportStaging,channel.mapped_host_bytes);
-                out.add(source,PhysicalMemoryOwner::ActivationTransportStaging,channel.cursor_bytes_per_device);
-                out.add(peer,PhysicalMemoryOwner::ActivationTransportStaging,channel.cursor_bytes_per_device);
-            }
+
         }
         return out.build();
     }

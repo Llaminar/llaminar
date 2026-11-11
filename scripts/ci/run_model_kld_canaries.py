@@ -116,12 +116,14 @@ def retire(process,container):
     if container:subprocess.run(['docker','rm',container],check=True,stdout=subprocess.DEVNULL,timeout=30)
 
 
-def original_local_launch(args, adapter, image, output, native_command, environment):
+def original_local_launch(args, adapter, image, output, native_command, environment, *, prepare_session=True):
     """Select only the existing direct launch or explicitly authored original MPI launch.
 
     The typed corpus config owns MPI population. MPI and production inventory
     own rankfile/NUMA meaning; this function never parses or replans affinity.
     Every launch input remains pinned through original process retirement.
+    A caller with the existing benchmark guardian leaves directory creation
+    to that guardian by passing prepare_session=False.
     """
     rankfile=getattr(args,'mpi_rankfile',None)
     world=1
@@ -148,7 +150,8 @@ def original_local_launch(args, adapter, image, output, native_command, environm
     require(not session_base.exists() and not session_base.is_symlink(),
             'Original MPI session base must be fresh and non-symlink')
     unchanged(pins)
-    session_base.mkdir()
+    if prepare_session:
+        session_base.mkdir()
     command=[str(launcher),'--session-base',str(session_base),'--',str(mpi),'-np',str(world),
              '--rankfile',str(rankfile),'--bind-to',binding,'--report-bindings']
     command+=['--mca','mpi_leave_pinned','1',
@@ -210,6 +213,8 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
             if adapter.topology['expected_config'].get('configuration', {}).get('mpi_procs', 1) > 1:
                 # Passive original fragment/transport evidence; no extra device clocks or probes.
                 env['LLAMINAR_PERF_STATS_FILTER'] += ',moe_overlay,moe_canonical_publication'
+            if adapter.paired is not None and 'observed_pipeline_binding' in adapter.paired.record:
+                env['LLAMINAR_PERF_STATS_FILTER'] += ',immutable_lookup'
             workload_path,engine_argv=adapter.prepare(sys.modules[__name__],args,output,env)
             cell.update(environment=env,workload=str(workload_path),engine_argv=engine_argv)
         require(image is None or getattr(args,'mpi_rankfile',None) is None, 'MPI rankfiles are local diagnostics only')
@@ -314,14 +319,22 @@ def select_paired_corpus(args):
     require(type(args.paired_cell) is str and args.paired_cell and '\0' not in args.paired_cell,
             'Paired acceptance requires a nonempty exact registered cell')
     binary = args.binary.resolve(strict=True)
+    observed=getattr(args,'paired_observed_pipeline_artifacts',None)
+    if observed is not None:
+        require(focused_report is None and args.prerequisites_report is not None,
+            'Observed pipeline pairing requires complete current production prerequisites')
     selected = inventory.discover(SimpleNamespace(build_dir=binary.parent,manifest=None,
         source_revision=args.source_revision,backend='.*',campaign='.*',cell=re.escape(args.paired_cell)),
-        inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused_report is not None else inventory.InventoryScope.ALL)
+        inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused_report is not None or observed is not None else inventory.InventoryScope.ALL)
     require(len(selected)==1 and selected[0][1]==args.paired_cell,
             'Paired acceptance requires exactly one original registered cell')
     campaign, exact, record = selected[0]
+    if observed is not None:
+        record=inventory.bind_observed_pipeline_artifacts(exact,record,observed)
     selection = PairedCorpusSelection.from_export(exact,record,args.corpus_root,ROOT,
-        metadata_policy=PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused_report is not None else PairedMetadataPolicy.CANONICAL_ROOT)
+        metadata_policy=(PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused_report is not None else
+            PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE if observed is not None else
+            PairedMetadataPolicy.CANONICAL_ROOT))
     matrix = inventory.matrix_binary(campaign).resolve(strict=True)
     selection.pins[str(matrix)] = identity(matrix)
     args._paired_selection = selection
@@ -471,6 +484,8 @@ def main(argv=None):
     parser.add_argument('--corpus-root',type=Path);parser.add_argument('--report',type=Path,required=True)
     parser.add_argument('--keep-logits',action='store_true')
     parser.add_argument('--paired-cell',help='One exact source-profiled canonical ProductionParity case; requires current prerequisites')
+    parser.add_argument('--paired-observed-pipeline-artifacts',type=Path,
+        help='Bind the exact paired cell to its completed original-rank numerical artifacts')
     parser.add_argument('--corpus-catalog',type=Path,help='Explicit approved schema2 corpus; local diagnostics only')
     parser.add_argument('--corpus-manifest',type=Path,help='Explicit catalog-bound v2 metadata; references remain inside --corpus-root')
     parser.add_argument('--mpi-rankfile',type=Path,help='Original MPI rankfile for a declared local distributed observer')
@@ -489,8 +504,13 @@ def main(argv=None):
             'Focused prerequisites are an explicit local canonical paired diagnostic only')
     require(args.corpus_manifest is None or (args.corpus_catalog is not None and args.paired_cell is None),
             'Explicit corpus manifest requires v2 explicit catalog; paired document authority is unchanged')
-    require(args.mpi_rankfile is None or (args.binary is not None and args.corpus_catalog is not None),
-            'MPI rankfile requires a local explicit-catalog corpus diagnostic')
+    require(args.paired_observed_pipeline_artifacts is None or args.paired_cell is not None,
+            'Observed pipeline artifacts require one exact local paired cell')
+    require(args.mpi_rankfile is None or (args.binary is not None and
+            (args.corpus_catalog is not None or args.paired_observed_pipeline_artifacts is not None)),
+            'MPI rankfile requires a local distributed corpus diagnostic')
+    require(args.paired_observed_pipeline_artifacts is None or args.mpi_rankfile is not None,
+            'Observed pipeline pairing requires the original discovery MPI rankfile')
     if args.paired_cell is not None:
         select_paired_corpus(args)
     if args.corpus_catalog:

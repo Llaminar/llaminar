@@ -10,6 +10,10 @@
  *
  * @author David Sanftenberg
  * @date 2026-04-11
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #include "HardwareInventory.h"
@@ -209,37 +213,53 @@ namespace llaminar2
 
     ComputeDevice HardwareInventory::cpuDevice(int numa_node) const
     {
-        ComputeDevice cpu{};
-        cpu.type = ComputeBackendType::CPU;
-        cpu.numa_node = numa_node;
-        cpu.supports_bf16 = true;
-        cpu.supports_int8 = true;
-        bool found = false;
-        bool complete_cache = true;
+        if (cpu_numa_devices.empty())
+            throw std::invalid_argument("CPU NUMA observation is incomplete; package labels cannot establish ownership");
         for (const auto &socket : cpu_sockets)
-        {
-            if (numa_node >= 0 && socket.numa_node != numa_node) continue;
-            found = true;
             if (socket.available_memory_bytes > socket.memory_bytes)
                 throw std::invalid_argument("CPU free memory exceeds observed physical capacity");
-            cpu.total_memory_bytes += socket.memory_bytes;
-            cpu.free_memory_bytes += socket.available_memory_bytes;
-            cpu.compute_units += socket.num_threads();
-            if (cpu.name.empty()) cpu.name = socket.model_name;
+        for (const auto &[node, cpu] : cpu_numa_devices)
+            if (node < 0 || cpu.type != ComputeBackendType::CPU || cpu.numa_node != node ||
+                cpu.total_memory_bytes == 0 || cpu.free_memory_bytes > cpu.total_memory_bytes || cpu.compute_units <= 0)
+                throw std::invalid_argument("CPU NUMA observation has contradictory physical geometry");
+        if (numa_node >= 0)
+        {
+            const auto found = cpu_numa_devices.find(numa_node);
+            if (found == cpu_numa_devices.end())
+                throw std::invalid_argument("CPU NUMA locality absent from hardware observation");
+            return found->second;
+        }
+        if (numa_node != -1)
+            throw std::invalid_argument("CPU NUMA locality absent from hardware observation");
+        ComputeDevice combined{};
+        combined.type = ComputeBackendType::CPU; combined.numa_node = -1;
+        combined.supports_bf16 = combined.supports_int8 = true;
+        for (const auto &[node, cpu] : cpu_numa_devices)
+        {
+            if (cpu.free_memory_bytes > cpu.total_memory_bytes ||
+                cpu.total_memory_bytes > std::numeric_limits<size_t>::max() - combined.total_memory_bytes ||
+                cpu.free_memory_bytes > std::numeric_limits<size_t>::max() - combined.free_memory_bytes ||
+                cpu.compute_units > std::numeric_limits<int>::max() - combined.compute_units)
+                throw std::invalid_argument("CPU NUMA observations have invalid aggregate geometry");
+            combined.total_memory_bytes += cpu.total_memory_bytes;
+            combined.free_memory_bytes += cpu.free_memory_bytes;
+            combined.compute_units += cpu.compute_units;
+            if (combined.name.empty()) combined.name = cpu.name;
+        }
+        bool complete = true;
+        for (const auto &socket : cpu_sockets)
+        {
             const auto cache = cpu_last_level_cache_bytes.find(socket.socket_id);
-            if (cache == cpu_last_level_cache_bytes.end() || !cache->second) complete_cache = false;
+            if (cache == cpu_last_level_cache_bytes.end() || !cache->second) complete = false;
             else
             {
-                if (cache->second > std::numeric_limits<size_t>::max() - cpu.last_level_cache_bytes)
+                if (cache->second > std::numeric_limits<size_t>::max() - combined.last_level_cache_bytes)
                     throw std::overflow_error("CPU endpoint aggregate cache overflow");
-                cpu.last_level_cache_bytes += cache->second;
+                combined.last_level_cache_bytes += cache->second;
             }
         }
-        if (!found || numa_node < -1)
-            throw std::invalid_argument("CPU NUMA locality absent from hardware observation");
-        // A partial sum would let a probe fit into an unobserved chiplet's cache.
-        if (!complete_cache) cpu.last_level_cache_bytes = 0;
-        return cpu;
+        if (!complete) combined.last_level_cache_bytes = 0;
+        return combined;
     }
 
     HardwareInventory HardwareInventory::detect()
@@ -250,9 +270,37 @@ namespace llaminar2
 
         // --- CPU sockets ---
         hw.cpu_sockets = detect_cpu_sockets();
+        hw.mpi_core_placement = NUMATopology::observeMPICorePlacement();
         hw.cpu_execution = CPUExecutionGeometry::local();
         for (const auto &socket : hw.cpu_sockets)
             hw.cpu_last_level_cache_bytes.emplace(socket.socket_id, observeCPUSharedCacheBytes(socket.physical_cores));
+        // Package records remain package records. Exact per-NUMA rank resources
+        // come from original CPU membership and the same canonical memory/cache
+        // observers, once at discovery; later admission never probes them again.
+        std::map<int,std::vector<int>> numa_cpus;
+        for (const auto &core : hw.mpi_core_placement)
+            numa_cpus[core.os_numa_node].insert(numa_cpus[core.os_numa_node].end(),
+                core.os_cpu_ids.begin(), core.os_cpu_ids.end());
+        for (const auto &[node, cpus] : numa_cpus)
+        {
+            const auto memory = observeNUMAMemoryCapacity(node);
+            if (!memory.valid() || cpus.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::runtime_error("Canonical CPU NUMA observation has invalid physical geometry");
+            ComputeDevice cpu{};
+            cpu.type = ComputeBackendType::CPU; cpu.numa_node = node;
+            cpu.supports_bf16 = cpu.supports_int8 = true;
+            cpu.total_memory_bytes = memory.total_bytes;
+            cpu.free_memory_bytes = memory.admission_available_bytes;
+            cpu.compute_units = static_cast<int>(cpus.size());
+            cpu.last_level_cache_bytes = observeCPUSharedCacheBytes(cpus);
+            for (const auto &socket : hw.cpu_sockets)
+                if (std::any_of(cpus.begin(), cpus.end(), [&](int id) {
+                        return std::find(socket.physical_cores.begin(), socket.physical_cores.end(), id) != socket.physical_cores.end() ||
+                            std::find(socket.ht_threads.begin(), socket.ht_threads.end(), id) != socket.ht_threads.end();
+                    }))
+                { cpu.name = socket.model_name; break; }
+            hw.cpu_numa_devices.emplace(node, std::move(cpu));
+        }
 
         // --- GPU devices ---
 #ifdef HAVE_CUDA

@@ -22,6 +22,15 @@
 
 namespace llaminar2
 {
+namespace {
+/** @brief Project only this stage's already-retained cadence controller fields. */
+MTPSpeculativeStatePublicationStage::DynamicMoECommitBoundaryBinding originalCommitBoundary(
+    DeviceMoERebalanceGraphControllerState &controller)
+{
+    return {&controller.decode_rounds_committed, &controller.decode_rounds_until_maintenance,
+        &controller.maintenance_due, &controller.decode_boundary_advanced};
+}
+}
     bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(
         const DeviceSpeculativePublicationRequest &request,
         const MTPSpecDecodeMetadataDevicePointers &publication_metadata,
@@ -192,6 +201,13 @@ namespace llaminar2
                     };
         }
 
+        if (pipeline_forward_edges_ && pipeline_forward_edges_->carriesMoECommitEvidence()) {
+            if (params.outcome_meta_device != stochastic_batch_output_meta_dev_ ||
+                params.outcome_meta_stride != sampling_math::kSpeculativeBatchMetaCount)
+                return fail("Pipeline committed-round evidence lost its original tail compact outcome bank");
+            params.pipeline_moe_commit_evidence = MTPSpeculativeStatePublicationStage::PipelineMoECommitEvidence{
+                static_cast<int32_t *>(stochastic_batch_output_meta_dev_), sampling_math::kSpeculativeBatchMetaCount};
+        }
         params.request_count = request.requestCount();
         params.verifier_rows_per_request = verifier_rows_per_request;
         // The compact-outcome path embeds its host clipping limit in the
@@ -458,6 +474,17 @@ namespace llaminar2
         params.accepted_state_counts_device = metadata.accepted_state_counts;
         params.publication_ok_flags_device = metadata.publication_ok_flags;
         params.require_captured_verifier_state = mtpSpecStatePublicationRequiresCapturedStage();
+        if (pipeline_forward_edges_->carriesMoECommitEvidence()) {
+            if (!stochastic_batch_output_meta_dev_)
+                return fail("Pipeline follower has no original compact-field receive bank");
+            params.pipeline_moe_commit_evidence = MTPSpeculativeStatePublicationStage::PipelineMoECommitEvidence{
+                static_cast<int32_t *>(stochastic_batch_output_meta_dev_), sampling_math::kSpeculativeBatchMetaCount};
+            if (usesParticipantLocalDeviceMoERebalanceController()) {
+                auto *controller = deviceMoERebalanceControllerStateDevice(error);
+                if (!controller) return false;
+                params.dynamic_moe_commit_boundary = originalCommitBoundary(*controller);
+            }
+        }
         if (!installMTPStatePublicationGraph(std::move(params), verifier_graph, verifier_signature, error))
             return false;
         // Only the real externally admitted publication can author this borrow.
@@ -599,12 +626,12 @@ namespace llaminar2
         {
             capture_policy.graph_replay_plan_policy =
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition;
-            capture_policy.retained_parent_composer = [edges = cache.pipeline_edges, stage = cache.stage](
-                IGPUGraphCapture &destination, const ComputeGraph &,
-                std::span<const DeviceGraphExecutor::GraphSegmentCache::RetainedCaptureUnitTemplateView> units) {
-                if (units.size() != 1 || !units.front().capture) return false;
-                return edges->composePublication(destination, *units.front().capture, stage->getParams());
-            };
+            if (!cache.publication_composer)
+                cache.publication_composer = cache.pipeline_edges->publicationComposer(
+                    *cache.graph, cache.stage,
+                    arena_ ? arena_->getSharedTensor(BufferId::STOCHASTIC_BATCH_OUTPUT_META) : nullptr,
+                    physical_memory_authority_, generation, gpu_ctx, cache.segment_cache.capture_stream);
+            capture_policy.retained_parent_composer = cache.publication_composer;
         }
 
         cache.graph->reset();

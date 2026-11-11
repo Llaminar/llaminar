@@ -521,9 +521,9 @@ namespace llaminar2
     {
         const auto matches=[](MoEOverlayRouteTarget tag,const MoEOverlayPhysicalProjectionTarget &target) {
             if(tag.isWhole())return target.members.size()==1 && target.members.front().participant_id==tag.word();
-            // Canonical CPU shard cohorts contain 2..8 original participants;
+            // Canonical CPU shard cohorts retain every original source-bounded participant;
             // TP1 is a whole target, never an alias for a one-member cohort.
-            if(!tag.isCPUCohort() || target.members.size()<2 || target.members.size()>8 ||
+            if(!tag.isCPUCohort() || target.members.size()<2 || target.members.size()>static_cast<size_t>(std::numeric_limits<int>::max()) ||
                 std::int64_t(target.tier_idx)!=-std::int64_t(tag.word())-2)return false;
             return std::all_of(target.members.begin(),target.members.end(),[](const auto &member){return member.device.is_cpu();});
         };

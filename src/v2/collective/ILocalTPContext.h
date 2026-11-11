@@ -18,6 +18,7 @@
 #pragma once
 
 #include "LocalTPCaptureSourceDefinition.h"
+#include "NativeLocalTPContextBorrow.h"
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
@@ -26,6 +27,7 @@
 #include "ITPContext.h"
 #include "NativeAllreduceRequestRows.h"
 #include <memory>
+#include <exception>
 #include <cstddef>
 #include <span>
 #include <stdexcept>
@@ -109,6 +111,21 @@ namespace llaminar2
     {
     public:
         ~ILocalTPContext() override = default;
+        /** @return Revocable borrow issued by this exact original context for every public native factory. */
+        [[nodiscard]] NativeLocalTPContextBorrow borrowOriginalNativeContext()const{return native_lifetime_.borrow();}
+        /**
+         * @brief Abort from the failing participant before its future can be hidden behind another blocked participant.
+         * @param preparation Actual original participant cold preparation/capture body.
+         * @throws Original preparation exception after native abort publication. Failed abort is fatal before any storage retires.
+         */
+        template<class Preparation> void prepareOriginalNativeParticipant(Preparation&& preparation) {
+            try{std::forward<Preparation>(preparation)();}
+            catch(...){
+                try{if(!signalNativeCompletionAbort())std::terminate();}
+                catch(...){std::terminate();}
+                throw;
+            }
+        }
 
         /**
          * @brief LOCAL TP is always intra-rank
@@ -981,7 +998,11 @@ namespace llaminar2
             (void)payload;(void)bytes;(void)edge;(void)participant;(void)stream;(void)stage_name;return false;
         }
 
-
+    protected:
+        /** @brief Revoke every issued borrow before derived native teardown; waits only for host submission scopes. */
+        void retireOriginalNativeContextBorrows()noexcept{native_lifetime_.revoke();}
+    private:
+        NativeLocalTPContextLifetime native_lifetime_{*this}; ///< Unique authority, independent of installed fabric ownership.
     };
 
     /**

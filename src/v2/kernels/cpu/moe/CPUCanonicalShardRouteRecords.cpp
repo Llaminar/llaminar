@@ -1,6 +1,10 @@
 /**
  * @file CPUCanonicalShardRouteRecords.cpp
  * @brief Complete compact-record validation followed by the canonical fixed-order combine.
+ *
+ * Participant records/maps remain in their original admitted gather/scratch
+ * roots. An indexed borrowed view reaches the shared reducer without a fixed
+ * descriptor stack array, duplicated values or inference-time allocation.
  */
 #include "CPUCanonicalShardRouteRecords.h"
 #include "../../../execution/moe/CanonicalMoERouteRecord.h"
@@ -13,7 +17,7 @@ namespace llaminar2::cpu::moe {
 bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
     const auto maximum=std::numeric_limits<size_t>::max();
     if (a.rows<0 || a.top_k<=0 || a.columns<=0 || a.original_expert_count<=0 ||
-        a.source_ranges.size()<2 || a.source_ranges.size()>8) return false;
+        a.source_ranges.size()<2 || a.source_ranges.size()>static_cast<size_t>(std::numeric_limits<int>::max())) return false;
     const auto rows=static_cast<size_t>(a.rows),k=static_cast<size_t>(a.top_k),h=static_cast<size_t>(a.columns);
     if (rows>maximum/k || rows*k>maximum/h || rows*k*h>maximum/sizeof(float)) return false;
     const auto slots=rows*k,width=h+1,population=a.source_ranges.size();
@@ -136,7 +140,6 @@ bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
         a.required_route_weights[slot]=a.route_weights[slot]!=0.0f &&
             std::binary_search(a.selected_expert_ids.begin(),a.selected_expert_ids.end(),
                                static_cast<int>(a.route_indices[slot]))?1.0f:0.0f;
-    std::array<CanonicalRouteDownPartialRows,8> banks;
     for (size_t p=0;p<population;++p) {
         const auto range=a.source_ranges[p];
         if (range.record_count>slots || range.record_count>static_cast<size_t>(std::numeric_limits<int32_t>::max())) return false;
@@ -149,10 +152,10 @@ bool combineCanonicalShardRouteRecords(const CanonicalShardRouteRecordArgs &a) {
         }
         for (size_t slot=0;slot<slots;++slot)
             if ((map[slot]>=0)!=(a.required_route_weights[slot]!=0.0f)) return false;
-        banks[p]={records,map};
     }
     if (slots==0) return true;
-    return combineCanonicalRouteDownPartialsOrdered({std::span(banks).first(population),
-        a.combined_route_rows,a.required_route_weights.data(),a.rows,a.top_k,a.columns,preweighted_output});
+    return combineCanonicalRouteDownPartialsOrderedIndexed({{},
+        a.combined_route_rows,a.required_route_weights.data(),a.rows,a.top_k,a.columns,preweighted_output},
+        {a.records,a.source_ranges,a.participant_route_maps});
 }
 } // namespace llaminar2::cpu::moe

@@ -16,8 +16,14 @@
  * Source-qualified query KV intervals come from the same canonical assignment
  * used for weights and graphs; PMA alone accounts their actual physical bytes.
  * Retained graph owners follow declared participant domains and actual PP roles.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "planning/RankMemoryPlanInputs.h"
+#include "execution/global/HostedPipelineActivationStorage.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "backends/NativeContextPreparation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "utils/DebugEnv.h"
@@ -152,17 +158,44 @@ namespace llaminar2
             if (!seen)
                 result.participants_.push_back(physical);
         }
-        // Only one homogeneous device per stage installs a native PP context.
-        // Nested domains and mixed backends retain their explicit boundary path.
+        // A complete homogeneous GPU pipeline retains one native PP context.
+        // Stage-local TP contexts remain separate original compute authorities;
+        // native byte endpoint incidence, not stage count, prices their edges.
         const bool native = devices.front().toLocalDeviceId().is_gpu() &&
             std::all_of(devices.begin(), devices.end(), [&](const auto &device) {
                 return device.device_type == devices.front().device_type;
-            }) && std::all_of(stage_tp.begin(), stage_tp.end(), [](const auto &entry) {
-                return entry.devices.size() <= 1;
+            }) && std::all_of(stage_tp.begin(), stage_tp.end(), [&](const auto &domain) {
+                return std::all_of(domain.devices.begin(), domain.devices.end(), [&](const auto &member) {
+                    return member.device_type == devices.front().device_type;
+                });
             });
         if (native)
             result.native_backend_ = result.participants_.front().is_cuda()
                 ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        const bool nested_native = native && (parent.runtime.ngram_table_policy.isFixedHeadSharded() ||
+            std::any_of(stage_tp.begin(), stage_tp.end(), [](const auto &entry) {
+                return entry.devices.size() > 1;
+            }));
+        if (nested_native) {
+            const auto width = [&](std::size_t index) -> std::size_t {
+                return stage_tp.empty() || stage_tp[index].devices.empty() ? 1 : stage_tp[index].devices.size();
+            };
+            result.native_byte_endpoints_.assign(result.participants_.size(), 0);
+            for (std::size_t member = 0; member < result.participants_.size(); ++member) {
+                auto &count = result.native_byte_endpoints_[member];
+                // Incoming activations and reverse metadata reach every actual consumer.
+                count = std::size_t(stage > 0) + std::size_t(stage + 1 < devices.size());
+                if (member == 0) {
+                    const auto add = [&](std::size_t peers) {
+                        if (peers > std::numeric_limits<std::size_t>::max() - count)
+                            throw std::overflow_error("Native pipeline endpoint incidence overflow");
+                        count += peers;
+                    };
+                    if (stage > 0) add(width(stage - 1));
+                    if (stage + 1 < devices.size()) add(width(stage + 1));
+                }
+            }
+        }
         const auto leader = result.participants_.front();
         const auto cross_backend = [&](size_t peer) {
             const auto other = devices[peer].toLocalDeviceId();
@@ -172,25 +205,89 @@ namespace llaminar2
             result.captured_boundaries_.push_back(PipelineBoundarySide::LaterDomain);
         if (stage + 1 < devices.size() && cross_backend(stage + 1))
             result.captured_boundaries_.push_back(PipelineBoundarySide::EarlierDomain);
+        result.native_activation_fanout_ = members.size() > 1 &&
+            std::find(result.captured_boundaries_.begin(), result.captured_boundaries_.end(),
+                PipelineBoundarySide::LaterDomain) != result.captured_boundaries_.end();
+        return result;
+    }
+
+    PipelineStageTransferMemory PipelineStageTransferMemory::forGlobalStage(
+        const GlobalPPTopology &topology, int world_rank, int stage_id)
+    {
+        if (world_rank < 0 || world_rank >= topology.world_size || !topology.validate().empty())
+            throw std::invalid_argument("Global stage memory requires its complete canonical topology");
+        const auto rank = GlobalPPRankPlanBuilder::build(topology, world_rank);
+        const auto actions = rank.executeStages();
+        const auto found = std::find_if(actions.begin(), actions.end(),
+            [&](const auto *action) { return action->stage_id == stage_id; });
+        if(found==actions.end()) throw std::invalid_argument("Global stage memory requires its original executable action");
+        const auto& local=**found;
+        const bool global_cpu=local.is_global_tp && local.device.isCPU();
+        if((local.is_global_tp && !global_cpu) || (!local.is_global_tp && local.devices.empty()))
+            throw std::invalid_argument("Global stage memory requires original local devices or its actual CPU MPI endpoint");
+        PipelineStageTransferMemory result;
+        result.world_rank_ = world_rank;
+        result.first_layer_ = (*found)->first_layer;
+        result.last_layer_ = (*found)->last_layer;
+        const auto local_members=global_cpu?std::vector<GlobalDeviceAddress>{local.device}:local.devices;
+        for (const auto &member : local_members)
+        {
+            const auto device = member.toLocalDeviceId();
+            if (!device.is_valid() || std::find(result.participants_.begin(), result.participants_.end(), device) !=
+                    result.participants_.end())
+                throw std::invalid_argument("Global stage memory requires distinct physical members");
+            result.participants_.push_back(device);
+        }
+        const bool hosted=std::any_of(topology.stages.begin(),topology.stages.end(),[](const auto& stage){
+            return stage.is_global_tp ? std::any_of(stage.per_rank_devices.begin(),stage.per_rank_devices.end(),[](const auto& d){return d.isCPU();})
+                : std::any_of(stage.devices.begin(),stage.devices.end(),[](const auto& d){return d.isCPU();});
+        });
+        result.hosted_activation_bank_owner_ = hosted &&
+            HostedPipelineActivationStorage::requiresBank(topology, rank) &&
+            !actions.empty() && actions.front()->stage_id == stage_id;
+        // Original global adjacency, not the local action list, owns every
+        // boundary. Only authenticated same-node GPU edges use this mapped
+        // transport; CPU stages retain their separately declared host path.
+        const auto &current = topology.stages.at(static_cast<size_t>(stage_id));
+        const auto gpu_edge = [&](int peer, PipelineBoundarySide side) {
+            const auto &other = topology.stages.at(static_cast<size_t>(peer));
+            if (!result.participants_.front().is_gpu() || other.is_global_tp || other.devices.empty() ||
+                !other.devices.front().toLocalDeviceId().is_gpu()) return;
+            if (current.inner_mode == InnerParallelism::LOCAL_PP || other.inner_mode == InnerParallelism::LOCAL_PP)
+                throw std::invalid_argument("Global captured boundary requires actual single/native TP stage domains");
+            const auto *edge = topology.transferBetween(std::min(stage_id, peer), std::max(stage_id, peer));
+            if (!edge || edge->physicalConnection().locality() == RankConnectionLocality::CrossNode)
+                throw std::invalid_argument("Global captured GPU boundary requires original authenticated node-local ownership");
+            result.captured_boundaries_.push_back(side);
+        };
+        if (stage_id > 0) gpu_edge(stage_id - 1, PipelineBoundarySide::LaterDomain);
+        if (static_cast<size_t>(stage_id + 1) < topology.stages.size())
+            gpu_edge(stage_id + 1, PipelineBoundarySide::EarlierDomain);
+        result.native_activation_fanout_ = result.participants_.size() > 1 &&
+            std::find(result.captured_boundaries_.begin(), result.captured_boundaries_.end(),
+                PipelineBoundarySide::LaterDomain) != result.captured_boundaries_.end();
         return result;
     }
 
     bool PipelineStageTransferMemory::requiresHostMemory(DeviceId device) const noexcept
     {
-        return device == participants_.front() &&
-            std::find(captured_boundaries_.begin(), captured_boundaries_.end(), PipelineBoundarySide::EarlierDomain) !=
-                captured_boundaries_.end();
+        return (hosted_activation_bank_owner_ && device==participants_.front()) || (native_activation_fanout_ &&
+                std::find(participants_.begin(), participants_.end(), device) != participants_.end()) ||
+            (device == participants_.front() &&
+             std::find(captured_boundaries_.begin(), captured_boundaries_.end(), PipelineBoundarySide::EarlierDomain) !=
+                captured_boundaries_.end());
     }
 
-    void PipelineStageTransferMemory::bind(DevicePlanConfig &config) const
+    void PipelineStageTransferMemory::bind(DevicePlanConfig &config, int hosted_row_capacity) const
     {
         if (config.world_rank != world_rank_ || config.first_layer != first_layer_ || config.last_layer != last_layer_ ||
             config.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || config.local_pipeline_backend ||
             config.pipeline_forward_only_graph_owner != PipelineForwardOnlyGraphOwner::None ||
-            !config.captured_pipeline_boundaries.empty() ||
+            !config.captured_pipeline_boundaries.empty() || config.pipeline_native_activation_fanout || config.native_pipeline_byte_endpoints ||
+            config.hosted_pipeline_activation_rows != 0 ||
             std::find(participants_.begin(), participants_.end(), config.device) == participants_.end())
             throw std::invalid_argument("Pipeline transfer memory cannot bind a foreign or already bound device graph");
-        if (requiresHostMemory(config.device) &&
+        if (requiresHostMemory(config.device) && config.device.is_gpu() &&
             (!config.associated_host_memory || !config.associated_host_memory->valid() ||
              config.associated_host_memory->world_rank != world_rank_ || !config.associated_host_memory->device.is_cpu()))
             throw std::invalid_argument("Pipeline mapped channel owner requires its exact physical host authority");
@@ -198,6 +295,17 @@ namespace llaminar2
         // owns a parent even though only its leader owns boundary storage.
         config.pipeline_forward_only_graph_owner = config.device.is_gpu()
             ? PipelineForwardOnlyGraphOwner::Participant : PipelineForwardOnlyGraphOwner::None;
+        config.pipeline_native_activation_fanout = native_activation_fanout_;
+        if(hosted_activation_bank_owner_ && config.device==participants_.front()) {
+            config.hosted_pipeline_activation_rows=hosted_row_capacity>0?hosted_row_capacity:config.activation_seq_len;
+            if(config.hosted_pipeline_activation_rows<=0)
+                throw std::invalid_argument("Hosted pipeline bank requires its exact admitted row capacity");
+        }
+        if (!native_byte_endpoints_.empty()) {
+            const auto member = std::find(participants_.begin(), participants_.end(), config.device) - participants_.begin();
+            config.native_pipeline_byte_endpoints = native_byte_endpoints_.at(member);
+            config.local_pipeline_backend = native_backend_;
+        }
         if (config.device == participants_.front())
         {
             config.local_pipeline_backend = native_backend_;

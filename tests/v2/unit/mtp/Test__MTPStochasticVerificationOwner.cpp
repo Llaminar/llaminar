@@ -4,7 +4,7 @@
  *
  * The installed runner contract is queried exactly as in production. These
  * tests do not emulate GPU arithmetic: backend integration owns that proof.
- * Their purpose is to keep expert-service ranks distinct from vocabulary peers
+ * Their purpose is to keep expert/pipeline service ranks distinct from vocabulary peers
  * and reject incomplete resident verification/publication before execution.
  */
 #include "execution/runner/MTPStochasticVerificationOwner.h"
@@ -122,6 +122,48 @@ namespace llaminar2
                 OwnerRunner(device, MissingOwner::TokenCoordination),
                 MTPRankParticipation::ModelCollectivePeer).empty());
         }
+    }
+
+    /** @test Original pipeline tails retain resident outcomes without full-model MPI participation. */
+    TEST(MTPStochasticVerificationOwner, OriginalPipelineContinuationKeepsRetainedSchedulingAndResidentProof)
+    {
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (const int participants : {1, 2, 4, 8})
+            {
+                const auto plan = localPlan(device, participants);
+                const auto continuation = MTPRankParticipation::OriginalPipelineContinuation;
+                EXPECT_FALSE(mtpRankRequiresModelCollectives(continuation));
+                EXPECT_TRUE(mtpStochasticVerificationOwnerFailure(plan, OwnerRunner(device), continuation).empty());
+                // Pipeline-stage followers exchange retained graph tickets, not
+                // the CPU GlobalTP vocabulary/token coordination protocol.
+                EXPECT_TRUE(mtpStochasticVerificationOwnerFailure(plan,
+                    OwnerRunner(device, MissingOwner::TokenCoordination), continuation).empty());
+                for (const auto missing : {MissingOwner::MirroredHead, MissingOwner::Verifier, MissingOwner::Publisher})
+                    EXPECT_FALSE(mtpStochasticVerificationOwnerFailure(plan,
+                        OwnerRunner(device, missing), continuation).empty());
+                auto global_model_plan = plan;
+                global_model_plan.global_tp_domain_id = 3;
+                global_model_plan.global_tp_domain_size = 2;
+                EXPECT_FALSE(mtpStochasticVerificationOwnerFailure(global_model_plan,
+                    OwnerRunner(device), continuation).empty()) << "A pipeline role cannot waive actual model-TP guards";
+            }
+        EXPECT_FALSE(mtpStochasticVerificationOwnerFailure({}, OwnerRunner(DeviceId::cpu()),
+            MTPRankParticipation::OriginalPipelineContinuation).empty());
+    }
+
+    /** @test One installed-role policy drives verifier ownership, bypass, depth broadcasts and fences. */
+    TEST(MTPStochasticVerificationOwner, OriginalPipelineAndExpertServicesAreNotModelCollectivePeers)
+    {
+        for (const auto role : {MTPRankParticipation::SingleRank,
+                               MTPRankParticipation::ExpertTransactionContinuation,
+                               MTPRankParticipation::ExpertTransactionFollower,
+                               MTPRankParticipation::OriginalPipelineContinuation,
+                               MTPRankParticipation::OriginalPipelineFollower})
+            EXPECT_FALSE(mtpRankRequiresModelCollectives(role));
+        EXPECT_TRUE(mtpRankRequiresModelCollectives(MTPRankParticipation::ModelCollectivePeer));
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+            EXPECT_FALSE(mtpStochasticVerificationOwnerFailure({}, OwnerRunner(device),
+                MTPRankParticipation::OriginalPipelineFollower).empty());
     }
 
     /** @brief An expert follower cannot acquire authority from installed sampler helpers. */

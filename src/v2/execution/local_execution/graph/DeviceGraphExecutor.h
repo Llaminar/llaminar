@@ -28,6 +28,7 @@
 
 #pragma once
 #include "IRetainedGraphParticipants.h"
+#include "RetainedParentInputAuthority.h"
 #include "OriginalSlotCaptureTerminals.h"
 #include "backends/NativeOrderingEventGroup.h"
 
@@ -57,6 +58,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <type_traits>
 
 namespace llaminar2
 {
@@ -1810,6 +1812,7 @@ namespace llaminar2
             std::shared_ptr<ParticipantSourceBinding> participant_source_binding;
             std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_preparation_stream; ///< Revoked before this cache releases its actual stream.
             std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_auxiliary_preparation; ///< Exact finite-body scope, revoked after native retirement and before stream teardown.
+            std::shared_ptr<const RetainedParentInputAuthority> prior_child_input_authority; ///< Original wire source outlives its composed native parent.
             std::unique_ptr<IGPUGraphCapture> retained_parent_capture; ///< Sole executable for a topology-composed transaction.
             RetainedComposedParentReplayPlan retained_composed_parent_replay; ///< Frozen identity/publication plan for @ref retained_parent_capture.
             const void *auxiliary_branch_authority = nullptr; ///< Stable owner identity embedded in every captured branch node.
@@ -1870,6 +1873,7 @@ namespace llaminar2
                   participant_source_binding(std::move(other.participant_source_binding)),
                   participant_preparation_stream(std::move(other.participant_preparation_stream)),
                   participant_auxiliary_preparation(std::move(other.participant_auxiliary_preparation)),
+                  prior_child_input_authority(std::move(other.prior_child_input_authority)),
                   retained_parent_capture(
                       std::move(other.retained_parent_capture)),
                   retained_composed_parent_replay(
@@ -1969,6 +1973,7 @@ namespace llaminar2
                     original_storage_attachment = std::move(other.original_storage_attachment);
                     participant_preparation_stream = std::move(other.participant_preparation_stream);
                     participant_auxiliary_preparation = std::move(other.participant_auxiliary_preparation);
+                    prior_child_input_authority = std::move(other.prior_child_input_authority);
                     retained_parent_capture =
                         std::move(other.retained_parent_capture);
                     retained_composed_parent_replay =
@@ -2218,6 +2223,7 @@ namespace llaminar2
                 if(participant_preparation_stream)participant_preparation_stream->retire();
                 participant_preparation_stream.reset();
                 retained_parent_capture.reset();
+                prior_child_input_authority.reset();
                 participant_source_binding.reset();
                 segments.clear();
                 evidence_family = 0;
@@ -2515,11 +2521,35 @@ namespace llaminar2
          * synchronize, allocate replay-time storage, or mutate the source cache.
          * Returning true requires a non-empty, uninstantiated destination graph.
          */
-        using RetainedParentCompositionHook = std::function<bool(
-            IGPUGraphCapture &destination,
-            const ComputeGraph &graph,
-            std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView>
-                units)>;
+        class RetainedParentCompositionHook final
+        {
+        public:
+            using Function = std::function<bool(IGPUGraphCapture &, const ComputeGraph &,
+                std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView>)>;
+            /** @brief Empty hooks carry neither a composer nor input authority. */
+            RetainedParentCompositionHook() = default;
+            /** @brief Ordinary topology composers cannot grant prior-child input authority. */
+            template<class F> requires (!std::is_same_v<std::remove_cvref_t<F>, RetainedParentCompositionHook> &&
+                std::is_constructible_v<Function, F>)
+            RetainedParentCompositionHook(F &&function) : function_(std::forward<F>(function)) {}
+            /** @return Whether a concrete topology composer is present. */
+            explicit operator bool() const noexcept { return bool(function_) || bool(closed_function_); }
+            /** @brief Compose the exact recorded children; a closed proof validates its original owner again. */
+            bool operator()(IGPUGraphCapture &destination, const ComputeGraph &graph,
+                std::span<const GraphSegmentCache::RetainedCaptureUnitTemplateView> units) const
+            {
+                if (authority_) authority_->require(graph, authority_->device(), destination.executionStream());
+                return (closed_function_ ? *closed_function_ : function_)(destination, graph, units);
+            }
+            /** @return Closed transport proof, absent for every ordinary callback. */
+            const std::shared_ptr<const RetainedParentInputAuthority>& inputAuthority() const noexcept { return authority_; }
+        private:
+            friend class PipelineForwardGraphEdges;
+            friend struct test::PipelinePublicationCaptureReplayAccess; ///< Recorded interface replay, no production authority constructor.
+            std::shared_ptr<const RetainedParentInputAuthority> authority_; ///< Outlives the callable's native source borrow.
+            Function function_;
+            std::shared_ptr<const Function> closed_function_; ///< Original cold pipeline callback; replay copies only its immutable owner.
+        };
 
         /**
          * @brief Execute a cached GPU graph replay plan.

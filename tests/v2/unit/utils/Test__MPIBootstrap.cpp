@@ -13,6 +13,7 @@
 #include "utils/DebugEnv.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
+#include "backends/HardwareInventory.h"
 #include "config/ExecutionDomainDefinition.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationConfigDocument.h"
@@ -24,6 +25,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <array>
+#include "utils/NUMATopology.h"
 
 namespace
 {
@@ -70,7 +73,9 @@ namespace
             2,
             argv,
             config,
-            topology);
+            topology,
+            llaminar2::MPIBootstrapArgumentPolicy::FilterLaunchArguments,
+            config.numa_mapping ? "/fixture/original-observed-numa.rankfile" : "");
     }
 
     /** @return Whether the constructed command contains an exact argument. */
@@ -472,4 +477,168 @@ TEST(Test__MPIBootstrap, PortableOpenMPPlacementPreservesRankLocalWorkerGeometry
     MPILaunchConfig invalid;
     invalid.omp_places.clear();
     EXPECT_THROW(MPIBootstrap::configureOpenMPPlacement(invalid), std::invalid_argument);
+}
+
+/** @test Typed original observations preserve sparse nodes and actual logical indices at the MPI boundary. */
+TEST(Test__MPIBootstrap, ObservedNUMAMappingPreservesSparseMembershipAndOriginalArguments)
+{
+    using namespace llaminar2;
+    for (const auto &observed : {std::vector<MPICorePlacement>{{9,4,{101,501}}},
+        std::vector<MPICorePlacement>{{4,7,{103,503}},{42,11,{301,701}}},
+        std::vector<MPICorePlacement>{{3,2,{107}},{11,8,{129,131}},{70,19,{901,903,905}}}})
+    {
+        std::vector<int> selected;
+        for (const auto &core : observed) selected.push_back(core.os_numa_node);
+        MPILaunchConfig launch;
+        launch.numa_mapping = MPINUMAMapping::fromObservedPlacement(observed, selected);
+        launch.num_procs = static_cast<int>(selected.size());
+        launch.bind_to_socket = launch.map_by_socket = false;
+        std::vector<std::string> arguments{"original-native-owner", "--gtest_filter=Exact/OriginalBody"};
+        std::vector<char *> argv;for (auto &argument : arguments) argv.push_back(argument.data());
+        const auto command = MPIBootstrap::buildMPIRunCommand(argv.size(), argv.data(), launch, {},
+            MPIBootstrapArgumentPolicy::PreserveOriginalArguments, "/fixture/original-observed-numa.rankfile");
+        const auto value = [&](const std::string &option) -> std::string {
+            const auto found = std::find(command.begin(), command.end(), option);
+            EXPECT_NE(found, command.end());
+            return found == command.end() || std::next(found) == command.end() ? "" : *std::next(found);
+        };
+        EXPECT_EQ(value("-np"), std::to_string(selected.size()));
+        EXPECT_EQ(value("--rankfile"), "/fixture/original-observed-numa.rankfile");
+        EXPECT_EQ(std::count(command.begin(), command.end(), "--rankfile"), 1);
+        EXPECT_FALSE(contains(command, "--map-by"));
+        EXPECT_FALSE(contains(command, "--cpu-set"));
+        EXPECT_FALSE(contains(command, "--bind-to"));
+        EXPECT_EQ(value("rmaps_rank_file_physical"), "0");
+        EXPECT_EQ(value("hwloc_base_use_hwthreads_as_cpus"), "0");
+        EXPECT_EQ(std::count(launch.numa_mapping->rankFileContents().begin(),
+            launch.numa_mapping->rankFileContents().end(), '\n'), selected.size());
+        EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(argv.size(),argv.data(),launch,{}),std::invalid_argument);
+        EXPECT_EQ(command.back(), arguments.back());
+        auto wrong = launch; wrong.num_procs = launch.num_procs + 1;
+        EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(argv.size(),argv.data(),wrong,{}),std::invalid_argument);
+        wrong=launch;wrong.hostfile="original-hostfile";
+        EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(argv.size(),argv.data(),wrong,{}),std::invalid_argument);
+        wrong=launch;wrong.map_by_socket=true;
+        EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(argv.size(),argv.data(),wrong,{}),std::invalid_argument);
+    }
+}
+
+/** @test OS NUMA/PU labels cannot masquerade as logical cores or erase partial/contradictory observations. */
+TEST(Test__MPIBootstrap, ObservedNUMAMappingConvertsNonmatchingOSAndLogicalIndices)
+{
+    using namespace llaminar2;
+    const std::vector<MPICorePlacement> actual{
+        {42,7,{301,701}}, {4,11,{103,503}}, {42,2,{305,705}}, {99,19,{901,1001}}};
+    const auto logical=NUMATopology::logicalMPICoresForNUMANodes(actual,std::array{42,4});
+    EXPECT_EQ(logical.at(42),(std::vector<int>{2,7})); EXPECT_EQ(logical.at(4),(std::vector<int>{11}));
+    MPILaunchConfig launch;
+    launch.numa_mapping=MPINUMAMapping::fromObservedPlacement(actual,std::array{42,4});
+    launch.num_procs=2;launch.bind_to_socket=launch.map_by_socket=false;
+    const auto command=buildCommand(launch,{});
+    const auto where=std::find(command.begin(),command.end(),"--rankfile");
+    ASSERT_NE(where,command.end());ASSERT_NE(std::next(where),command.end());
+    EXPECT_EQ(*std::next(where),"/fixture/original-observed-numa.rankfile");
+    EXPECT_EQ(launch.numa_mapping->rankFileContents(),"rank 0=localhost slot=11\nrank 1=localhost slot=2,7\n");
+    EXPECT_EQ(launch.numa_mapping->rankFileContents().find("301"),std::string::npos);
+    EXPECT_EQ(launch.numa_mapping->rankFileContents().find("701"),std::string::npos);
+    EXPECT_EQ(std::find(command.begin(),command.end(),"301"),command.end());
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement({},std::array{42}),std::invalid_argument);
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(actual,std::array{8}),std::invalid_argument);
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(actual,std::array{42,42}),std::invalid_argument);
+    auto invalid=actual;invalid.back().logical_core_index=7;
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(invalid,std::array{42}),std::invalid_argument);
+    invalid=actual;invalid.back().os_cpu_ids={301};
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(invalid,std::array{42}),std::invalid_argument);
+    invalid=actual;invalid.back().os_numa_node=-1;
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(invalid,std::array{42}),std::invalid_argument);
+    invalid=actual;invalid.back().os_cpu_ids.clear();
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(invalid,std::array{42}),std::invalid_argument);
+}
+
+/** @test Native parser truncation is rejected before an incomplete physical binding can launch. */
+TEST(Test__MPIBootstrap, ObservedNUMAMappingRejectsNativeRankfileTruncation)
+{
+    using namespace llaminar2;
+    std::vector<MPICorePlacement> sparse;
+    for (int core = 0; core < 40; ++core)
+        sparse.push_back({42, core * 2, {1000 + core}});
+    EXPECT_THROW((void)MPINUMAMapping::fromObservedPlacement(sparse, std::array{42}), std::invalid_argument);
+    MPILaunchConfig regular;
+    char program[] = "original-owner"; char *argv[]{program};
+    EXPECT_THROW((void)MPIBootstrap::buildMPIRunCommand(1, argv, regular, {},
+        MPIBootstrapArgumentPolicy::PreserveOriginalArguments, "/unowned/undeclared.rankfile"), std::invalid_argument);
+}
+
+/** @test One package may expose multiple exact nodes; missing facts never become guessed ownership. */
+TEST(Test__MPIBootstrap, ObservedNUMAMappingRequiresExactCPUResourceFacts)
+{
+    using namespace llaminar2;
+    HardwareInventory hardware;
+    hardware.cpu_sockets={{.socket_id=0,.numa_node=4,.physical_cores={103,301},
+        .memory_bytes=100,.available_memory_bytes=60}};
+    hardware.cpu_last_level_cache_bytes={{0,32u<<20}};
+    EXPECT_THROW((void)hardware.cpuDevice(4),std::invalid_argument);
+    EXPECT_THROW((void)hardware.cpuDevice(),std::invalid_argument);
+    hardware.cpu_numa_devices={
+        {4,{.type=ComputeBackendType::CPU,.numa_node=4,.total_memory_bytes=100,.free_memory_bytes=60,
+            .compute_units=2,.last_level_cache_bytes=32u<<20}},
+        {42,{.type=ComputeBackendType::CPU,.numa_node=42,.total_memory_bytes=200,.free_memory_bytes=170,
+            .compute_units=2,.last_level_cache_bytes=32u<<20}}};
+    EXPECT_EQ(hardware.cpuDevice(42).total_memory_bytes,200u);
+    EXPECT_EQ(hardware.cpuDevice(42).numa_node,42);
+    EXPECT_EQ(hardware.cpuDevice().total_memory_bytes,300u);
+    EXPECT_EQ(hardware.cpuDevice().compute_units,4);
+    EXPECT_EQ(hardware.cpuDevice().last_level_cache_bytes,32u<<20);
+    EXPECT_THROW((void)hardware.cpuDevice(17),std::invalid_argument);
+    hardware.cpu_numa_devices.at(42).numa_node=4;
+    EXPECT_THROW((void)hardware.cpuDevice(4),std::invalid_argument);
+    hardware.cpu_numa_devices.at(42).numa_node=42;
+    hardware.cpu_numa_devices.at(42).free_memory_bytes=201;
+    EXPECT_THROW((void)hardware.cpuDevice(42),std::invalid_argument);
+}
+
+/**
+ * @test Local rankfiles name their allocation without a relative-host dependency.
+ * Repeated one/two/three-rank construction retains exact observed core lists;
+ * neither ordinary local nor hostfile launch inherits this local-only option.
+ */
+TEST(Test__MPIBootstrap, ObservedNUMAMappingNamesLocalHostInRankfile)
+{
+    using namespace llaminar2;
+    const std::vector<MPICorePlacement> observed{{4,0,{100}},{42,2,{200}},{70,4,{300}}};
+    const std::array all_nodes{4,42,70};
+    for (const size_t count : {2u,1u,3u,2u})
+    {
+        MPILaunchConfig launch;
+        launch.numa_mapping = MPINUMAMapping::fromObservedPlacement(observed,
+            std::span<const int>(all_nodes.data(),count));
+        launch.num_procs = static_cast<int>(count);
+        launch.bind_to_socket = launch.map_by_socket = false;
+        const auto original_rankfile = launch.numa_mapping->rankFileContents();
+        const auto command = buildCommand(launch,{});
+        const auto rankfile = std::find(command.begin(),command.end(),"--rankfile");
+        ASSERT_NE(rankfile,command.end());
+        EXPECT_FALSE(contains(command,"--host"));
+        EXPECT_EQ(std::count(command.begin(),command.end(),"--rankfile"),1);
+        const auto ranks = std::find(command.begin(),command.end(),"-np");
+        ASSERT_NE(ranks,command.end()); ASSERT_NE(std::next(ranks),command.end());
+        EXPECT_EQ(*std::next(ranks),std::to_string(count));
+        EXPECT_EQ(launch.numa_mapping->rankFileContents(),original_rankfile);
+        EXPECT_EQ(std::count(original_rankfile.begin(),original_rankfile.end(),'\n'),count);
+        EXPECT_NE(original_rankfile.find("rank 0=localhost slot=0\n"),std::string::npos);
+        EXPECT_EQ(original_rankfile.find("+n"),std::string::npos);
+        EXPECT_FALSE(contains(command,"--hostfile"));
+        EXPECT_FALSE(contains(command,"--oversubscribe"));
+        EXPECT_FALSE(contains(command,"--map-by"));
+        EXPECT_FALSE(contains(command,"--cpu-set"));
+    }
+    MPILaunchConfig ordinary;
+    EXPECT_FALSE(contains(buildCommand(ordinary,{}),"--host"));
+    ordinary.hostfile = "/cluster/original hosts";
+    const auto cluster = buildCommand(ordinary,{});
+    EXPECT_FALSE(contains(cluster,"--host"));
+    EXPECT_FALSE(contains(cluster,"--rankfile"));
+    const auto hostfile = std::find(cluster.begin(),cluster.end(),"--hostfile");
+    ASSERT_NE(hostfile,cluster.end()); ASSERT_NE(std::next(hostfile),cluster.end());
+    EXPECT_EQ(*std::next(hostfile),ordinary.hostfile);
 }

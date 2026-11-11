@@ -21,6 +21,10 @@
  *
  * @author David Sanftenberg
  * @date January 2026
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
@@ -63,6 +67,8 @@
 namespace llaminar2
 {
     class GlobalTPContext;
+    class CapturedTransferRankSession;
+    enum class MTPRankParticipation;
 
     struct MoEOverlayParticipantGraphRunnerConfig;
     enum class MoEOverlayParticipantGraphOwnership : std::uint8_t;
@@ -267,6 +273,17 @@ namespace llaminar2
          * An admission-only lifetime must be shut down before full preparation.
          */
         bool initialize() override;
+        /**
+         * @brief Observe the original runner's status for one locally owned global pipeline stage.
+         * @param stage_id Authored global stage identifier.
+         * @return Passive leaf observation, or absence for a nonlocal stage or another runner kind.
+         */
+        std::optional<MoEOptimizationStatus> localPipelineStageOptimizationStatus(int stage_id) const;
+
+        /** @return Borrowed stage preparation authority while initialized; never a reusable context export. */
+        const MoEPipelinePreparedPlan *pipelinePreparedPlanForDiagnostics() const noexcept
+        { return isInitialized() ? moe_pipeline_prepared_plan_.get() : nullptr; }
+
         /**
          * @brief Validate admission without publishing inference readiness.
          * @return Whether planning and memory admission completed successfully.
@@ -1030,6 +1047,12 @@ namespace llaminar2
          */
         void printStartupBanner(FILE *stream = stderr);
 
+        /** @brief Project MTP participation from installed original transaction owners.
+         * @return Exact pipeline/expert service role, otherwise the full-model MPI participation.
+         * Original GPU stage followers never become vocabulary peers from world size alone.
+         */
+        MTPRankParticipation mtpRankParticipation() const;
+
         bool shouldUseMTPDecode() const;
         /**
          * @brief Validate active MTP depth and installed verifier ownership.
@@ -1693,6 +1716,9 @@ namespace llaminar2
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 
+        // The original all-rank channel session encloses runner/graph/alias
+        // destruction; explicit shutdown closes peer mappings before PMA release.
+        std::shared_ptr<CapturedTransferRankSession> rank_pipeline_transfer_session_;
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
 

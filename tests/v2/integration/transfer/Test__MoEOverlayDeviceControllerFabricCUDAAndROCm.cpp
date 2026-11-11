@@ -2,16 +2,19 @@
  * @file Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.cpp
  * @brief Real-device proof of the topology-wide mapped controller fabric.
  *
- * Two synthetic node-local MPI ranks construct the production POSIX channel
- * concurrently. Rank zero owns two CUDA participants and rank one owns four
- * ROCm participants. Both driver families register their process-local mapping
- * only after the group-owner first-touch rendezvous. Exact-stream copies then
- * prove byte visibility in both directions without a device/stream synchronize.
+ * Two original MPI ranks construct the production POSIX channel. The frozen
+ * startup inventory assigns the complete CUDA2 and ROCm4 cohorts to their real
+ * NUMA owners. Each process registers and executes only its local GPU aliases;
+ * real MPI authenticates setup, and only completed diagnostic evidence crosses
+ * ranks. This is focused native kernel/protocol coverage, not a full-model or
+ * full production orchestration certificate. Exact-stream copies prove both
+ * owner directions without a device/stream synchronize.
  * Restoration regressions seed accumulated placement drift, then require every
  * captured repair wave to respect the same per-layer capacity as optimization.
- * Paired mock ranks deliver real startup declaration/ACK packets through an
- * explicit replay link; production file authentication and exact live extents
- * remain authoritative before either native backend registers its mapping.
+ * Production file authentication, group-owner first-touch, declaration/ACK
+ * packets and exact live extents remain authoritative before either native
+ * backend registers its mapping. Adversarial traces retain their original
+ * policy, geometry and ordering while local terminal rows feed global oracles.
  */
 
 #include "backends/BackendManager.h"
@@ -32,9 +35,11 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
-#include "mocks/MockMPIContext.h"
-#include "fixtures/mpi/OwnedSharedBackingReplay.h"
-#include "mocks/MockMPITopology.h"
+#include "utils/MPIContext.h"
+#include "planning/RankHardwareOwnership.h"
+#include "../../utils/OriginalControllerFabricObservation.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
+#include <mpi.h>
 #include "utils/ScopedGPUStream.h"
 
 #include "MoEOverlayDeviceRuntimePublicationFixture.h"
@@ -55,6 +60,10 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <iostream>
+#include <set>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
@@ -62,22 +71,163 @@ namespace llaminar2::test
 {
     namespace
     {
-        /**
-         * @brief Bind a same-node endpoint to its pair-owned real startup packet link.
-         * @param rank Synthetic endpoint rank.
-         * @param startup_link Shared packet delivery retained by both endpoints.
-         * @return Topology-authenticated context for the real declaration/ACK protocol.
-         */
-        std::shared_ptr<MockMPIContext> context(
-            int rank,
-            const std::shared_ptr<OwnedSharedBackingReplayLink> &startup_link)
+        /** Abort asymmetric native test failures before a peer can wait on a vanished endpoint. */
+        class OriginalRankFailureGuard final : public ::testing::EmptyTestEventListener
         {
-            auto result = std::make_shared<OwnedSharedBackingReplayContext>(rank, 2);
-            result->bind(startup_link);
-            result->set_topology(
-                MockMPITopology::createSimple(
-                    rank, /*world_size=*/2, /*ranks_per_node=*/2));
+        public:
+            /** @brief Preserve the original assertion diagnostic and terminate both native owners. */
+            void OnTestPartResult(const ::testing::TestPartResult &result) override
+            {
+                if (!result.fatally_failed()) return;
+                std::cerr << "Original controller fabric native failure: " << result.summary() << '\n';
+                const auto mpi = MPIContextFactory::global();
+                if (mpi) MPI_Abort(mpi->communicator(), 1);
+            }
+        };
+
+        /** @return The original two-rank process/session authority for this native suite. */
+        std::shared_ptr<IMPIContext> originalContext()
+        {
+            const auto mpi = MPIContextFactory::global();
+            if (!mpi || mpi->world_size() != 2 || !mpi->clusterInventory())
+                throw std::runtime_error("Controller fabric replay requires the original two-rank inventory");
+            static const bool guarded = [] {
+                ::testing::UnitTest::GetInstance()->listeners().Append(new OriginalRankFailureGuard);
+                return true;
+            }();
+            (void)guarded;
+            return mpi;
+        }
+
+        /**
+         * @brief Identify one complete native cohort without changing visibility or NUMA affinity.
+         * @param family Exact backend family.
+         * @param count Complete fixture cohort, never reduced to available hardware.
+         * @return Original owner and immutable inventory-authenticated device addresses.
+         */
+        std::pair<int, std::vector<GlobalDeviceAddress>> originalCohort(DeviceType family, int count)
+        {
+            const auto mpi = originalContext();
+            std::pair<int, std::vector<GlobalDeviceAddress>> result{-1, {}};
+            for (const auto &rank : mpi->clusterInventory()->ranks)
+            {
+                std::vector<GlobalDeviceAddress> devices;
+                std::set<std::string> identities;
+                for (const auto &gpu : rank.gpus)
+                    if (gpu.type == family && rankOwnsGPUDevice(rank, gpu))
+                    {
+                        if (gpu.uuid.empty() || !identities.insert(gpu.uuid).second)
+                            throw std::runtime_error("Controller replay requires unique original GPU UUIDs");
+                        devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                            {family, gpu.local_device_id}, rank.hostname, gpu.numa_node));
+                    }
+                if (devices.size() < static_cast<std::size_t>(count)) continue;
+                if (result.first != -1)
+                    throw std::runtime_error("Controller fabric cohort has more than one original NUMA owner");
+                devices.resize(static_cast<std::size_t>(count));
+                result = {rank.rank, std::move(devices)};
+            }
+            if (result.first == -1)
+                throw std::runtime_error("Controller fabric requires its complete original CUDA2/ROCm4 cohorts");
             return result;
+        }
+
+        /** @return Whether this process owns a participant; remote aliases are never constructed. */
+        bool ownsParticipant(const MoEExpertOwnerParticipant &participant)
+        {
+            return participant.world_rank == originalContext()->rank();
+        }
+
+        /**
+         * @brief Admit an exact terminal wire extent before multiplication or MPI narrowing.
+         * @param rows Actual diagnostic row count, never allocation capacity.
+         * @return Byte count representable by the original MPI int-count ABI.
+         * @throws std::overflow_error For an unrepresentable immutable observation.
+         */
+        template<class T> int terminalByteCount(std::size_t rows)
+        {
+            constexpr auto limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+            if (rows > limit / sizeof(T))
+                throw std::overflow_error("Controller terminal wire row extent exceeds the MPI count ABI");
+            return static_cast<int>(rows * sizeof(T));
+        }
+
+        /**
+         * @brief Admit the next exact terminal wire displacement without signed overflow.
+         * @param total Previously authenticated total bytes.
+         * @param bytes Next participant's authenticated byte extent.
+         * @return Exact combined bytes in the MPI displacement ABI.
+         * @throws std::overflow_error For a negative or unrepresentable count/displacement.
+         */
+        int terminalByteTotal(int total, int bytes)
+        {
+            if (total < 0 || bytes < 0 || bytes > std::numeric_limits<int>::max() - total)
+                throw std::overflow_error("Controller terminal wire total exceeds the MPI displacement ABI");
+            return total + bytes;
+        }
+
+        /**
+         * @brief Publish one completed diagnostic object from its genuine producer.
+         * @param value Terminal observation; never used to schedule device execution.
+         * @param owner Original MPI rank whose event completed before this call.
+         */
+        template<class T> void terminalBroadcast(T &value, int owner)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            const auto mpi = originalContext();
+            if (MPI_Bcast(&value, terminalByteCount<T>(1), MPI_BYTE, owner, mpi->communicator()) != MPI_SUCCESS)
+                throw std::runtime_error("Controller terminal evidence publication failed");
+        }
+
+        /**
+         * @brief Gather only actual completed diagnostic rows from every original owner.
+         * @param local Exact live terminal rows, with no unused allocation capacity.
+         * @return Original-rank ordered diagnostic rows. No returned value drives a GPU action.
+         */
+        template<class T> std::vector<T> terminalGather(const std::vector<T> &local)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            const auto mpi = originalContext();
+            const int bytes = terminalByteCount<T>(local.size());
+            std::vector<int> counts(static_cast<std::size_t>(mpi->world_size()));
+            mpi->allgather_bytes(&bytes, counts.data(), sizeof(bytes));
+            std::vector<int> offsets(counts.size());
+            int total = 0;
+            for (std::size_t rank = 0; rank < counts.size(); ++rank)
+            {
+                if (counts[rank] < 0 || static_cast<std::size_t>(counts[rank]) % sizeof(T) != 0)
+                    throw std::runtime_error("Controller terminal evidence has incompatible row extent");
+                offsets[rank] = total;
+                total = terminalByteTotal(total, counts[rank]);
+            }
+            std::vector<T> result(static_cast<std::size_t>(total) / sizeof(T));
+            if (MPI_Allgatherv(local.data(), bytes, MPI_BYTE, result.data(), counts.data(),
+                    offsets.data(), MPI_BYTE, mpi->communicator()) != MPI_SUCCESS)
+                throw std::runtime_error("Controller terminal evidence collection failed");
+            return result;
+        }
+
+        /** @brief Publish the exact live extent of one completed diagnostic vector. */
+        template<class T> void terminalBroadcastVector(std::vector<T> &rows, int owner)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            std::uint64_t count = rows.size();
+            terminalBroadcast(count, owner);
+            if (count > std::numeric_limits<std::size_t>::max() || count > rows.max_size())
+                throw std::overflow_error("Controller terminal vector row extent is not locally representable");
+            const int bytes = terminalByteCount<T>(static_cast<std::size_t>(count));
+            rows.resize(static_cast<std::size_t>(count));
+            const auto mpi = originalContext();
+            if (MPI_Bcast(rows.data(), bytes, MPI_BYTE,
+                    owner, mpi->communicator()) != MPI_SUCCESS)
+                throw std::runtime_error("Controller terminal vector publication failed");
+        }
+
+        /** @brief Sum one completed diagnostic counter, never a device policy input. */
+        template<class T> void terminalSum(T &value)
+        {
+            const auto rows = terminalGather(std::vector<T>{value});
+            value = std::accumulate(rows.begin(), rows.end(), T{});
         }
 
         /** Build one homogeneous rank-local GPU domain. */
@@ -96,13 +246,10 @@ namespace llaminar2::test
             result.owner_rank = world_rank;
             result.routed_compute_policy =
                 RoutedExpertComputePolicy::Apportioned;
-            for (int ordinal = 0; ordinal < count; ++ordinal)
-            {
-                result.participants.push_back(
-                    type == DeviceType::CUDA
-                        ? GlobalDeviceAddress::cuda(ordinal)
-                        : GlobalDeviceAddress::rocm(ordinal));
-            }
+            const auto cohort = originalCohort(type, count);
+            if (world_rank != cohort.first)
+                throw std::runtime_error("Controller domain names a foreign original cohort owner");
+            result.participants = cohort.second;
             return result;
         }
 
@@ -126,8 +273,10 @@ namespace llaminar2::test
                                                   : DeviceType::CUDA;
             const int continuation_count = cuda_continuation ? 2 : 4;
             const int secondary_count = cuda_continuation ? 4 : 2;
-            const int continuation_rank = cuda_continuation ? 0 : 1;
-            const int secondary_rank = cuda_continuation ? 1 : 0;
+            const int continuation_rank = originalCohort(continuation_type, continuation_count).first;
+            const int secondary_rank = originalCohort(secondary_type, secondary_count).first;
+            if (continuation_rank == secondary_rank)
+                throw std::runtime_error("Controller CUDA and ROCm cohorts must have distinct original ranks");
             MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
             plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
@@ -172,16 +321,19 @@ namespace llaminar2::test
                 {.layer = 0, .routed_expert_tier = routed_expert_tier},
                 {.layer = 1, .routed_expert_tier = routed_expert_tier},
             };
+            const auto mpi = originalContext();
+            std::vector<int> node_ids(static_cast<std::size_t>(mpi->world_size()), -1);
+            for (const auto &rank : mpi->clusterInventory()->ranks)
+                node_ids.at(static_cast<std::size_t>(rank.rank)) = rank.node_id;
             auto resolved = resolveMoEOverlayDeviceControllerTopology(
-                plan,
-                MoEExpertOwnerMap::build(plan),
-                {.world_rank_node_ids = std::array<int, 2>{7, 7}});
-            // Mock topology namespaces are stable across processes. Salt the
-            // synthetic topology so a killed prior test cannot own this name.
-            resolved.topology_fingerprint ^=
-                static_cast<std::uint64_t>(::getpid()) << 17u;
-            if (resolved.topology_fingerprint == 0u)
-                resolved.topology_fingerprint = 1u;
+                plan, MoEExpertOwnerMap::build(plan), {.world_rank_node_ids = node_ids});
+            // All ranks use the same original session namespace. A killed older
+            // process cannot leave a mapping in this fresh rank-zero namespace.
+            std::uint64_t namespace_id = static_cast<std::uint64_t>(::getpid());
+            if (MPI_Bcast(&namespace_id, sizeof(namespace_id), MPI_BYTE, 0, mpi->communicator()) != MPI_SUCCESS)
+                throw std::runtime_error("Controller replay namespace publication failed");
+            resolved.topology_fingerprint ^= namespace_id << 17u;
+            if (resolved.topology_fingerprint == 0u) resolved.topology_fingerprint = 1u;
             return std::make_shared<const MoEOverlayDeviceControllerTopology>(
                 std::move(resolved));
         }
@@ -194,8 +346,7 @@ namespace llaminar2::test
          * its own state-machine tests; this suite targets device policy/RCU.
          */
         void publishSyntheticEconomy(
-            MoEOverlayNodeLocalDeviceControllerFabric &first_rank,
-            MoEOverlayNodeLocalDeviceControllerFabric &second_rank,
+            MoEOverlayNodeLocalDeviceControllerFabric &fabric,
             const MoEOverlayDeviceControllerTopology &resolved,
             std::uint32_t layer_count,
             ExpertHistogramProductionSourceMask economy_sources =
@@ -271,13 +422,12 @@ namespace llaminar2::test
                 },
             };
             ASSERT_TRUE(profiles.valid());
-            auto &publisher = first_rank.ownsEconomyPublication()
-                                  ? first_rank
-                                  : second_rank;
-            ASSERT_TRUE(publisher.ownsEconomyPublication());
-            publisher.publishCertifiedEconomyProfiles(profiles);
-            ASSERT_TRUE(first_rank.economyProfilesPublished());
-            ASSERT_TRUE(second_rank.economyProfilesPublished());
+            if (fabric.ownsEconomyPublication())
+                fabric.publishCertifiedEconomyProfiles(profiles);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!fabric.economyProfilesPublished() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            ASSERT_TRUE(fabric.economyProfilesPublished());
         }
 
         /** Poll one exact event without blocking the device or stream. */
@@ -302,115 +452,75 @@ namespace llaminar2::test
         }
 
         /**
-         * Write one mapped range on a producer and consume it through another
-         * backend's alias into ordinary VRAM, using exact terminal events only.
+         * @brief Complete diagnostic copies on their original observation stream.
+         * @param backend Actual native endpoint authority.
+         * @param device Exact local device.
+         * @param stream Existing explicit observation stream, outside graph execution.
+         * @param event Existing terminal event, rerecorded after these copies.
+         * @return Fresh completion proof for this observation, never an earlier ready recording.
          */
-        bool proveVisibility(
-            IBackend *producer,
-            int producer_ordinal,
-            void *producer_alias,
-            IBackend *consumer,
-            int consumer_ordinal,
-            const void *consumer_alias,
-            int byte_pattern,
-            std::string *error)
+        bool completeTerminalObservation(IBackend *backend, DeviceId device, void *stream, void *event)
+        {
+            return backend && stream && event && backend->recordEvent(event, device.ordinal, stream) &&
+                await(backend, event, device.ordinal, std::chrono::seconds(5));
+        }
+
+        /**
+         * @brief Write/read one shared range through its two genuine owner-local GPU aliases.
+         * @param local Exact binding owned by this original process.
+         * @param producer_family Native family producing this one diagnostic payload.
+         * @param offset Same frozen-layout byte offset in each registered process mapping.
+         * @param byte_pattern Original byte oracle.
+         * @param error Exact endpoint failure diagnostic.
+         * @return Both original owners completed their native terminal and bytes matched.
+         * Only the terminal producer receipt crosses MPI; remote GPU pointers never do.
+         */
+        bool proveVisibility(const MoEOverlayDeviceControllerParticipantBinding &local,
+            DeviceType producer_family, std::size_t offset, int byte_pattern, std::string *error)
         {
             constexpr std::size_t kBytes = 64u;
-            void *producer_stream = producer->createStream(producer_ordinal);
-            void *consumer_stream = consumer->createStream(consumer_ordinal);
-            void *producer_event = producer->createEvent(producer_ordinal);
-            void *consumer_event = consumer->createEvent(consumer_ordinal);
-            void *consumer_vram = consumer->allocate(kBytes, consumer_ordinal);
-            const auto cleanup = [&]
+            auto *backend = local.device.is_cuda() ? getCUDABackend() : getROCmBackend();
+            const auto ordinal = local.device.ordinal;
+            ScopedGPUStream stream(local.device);
+            const auto destroy_event = [backend, ordinal](void *event)
+                { if (event) backend->destroyEvent(event, ordinal); };
+            std::unique_ptr<void, decltype(destroy_event)> event(backend->createEvent(ordinal), destroy_event);
+            if (!stream.get() || !event)
             {
-                if (producer_event)
-                    producer->destroyEvent(producer_event, producer_ordinal);
-                if (consumer_event)
-                    consumer->destroyEvent(consumer_event, consumer_ordinal);
-                if (producer_stream)
-                    producer->destroyStream(
-                        producer_stream, producer_ordinal);
-                if (consumer_stream)
-                    consumer->destroyStream(
-                        consumer_stream, consumer_ordinal);
-                if (consumer_vram)
-                    consumer->free(consumer_vram, consumer_ordinal);
-            };
-            if (!producer_stream || !consumer_stream || !producer_event ||
-                !consumer_event || !consumer_vram)
-            {
-                if (error)
-                    *error = "could not allocate explicit streams/events/VRAM";
-                cleanup();
+                if (error) *error = "Original mapped visibility endpoint has no exact stream/event";
                 return false;
             }
-            if (!producer->memset(
-                    producer_alias,
-                    byte_pattern,
-                    kBytes,
-                    producer_ordinal,
-                    producer_stream) ||
-                !producer->recordEvent(
-                    producer_event,
-                    producer_ordinal,
-                    producer_stream) ||
-                !await(
-                    producer,
-                    producer_event,
-                    producer_ordinal,
-                    std::chrono::seconds(5)))
+            const bool producer = local.device.type == producer_family;
+            bool success = true;
+            if (producer)
+                success = backend->memset(local.mapped_base_device + offset, byte_pattern, kBytes,
+                    ordinal, stream.get()) && backend->recordEvent(event.get(), ordinal, stream.get()) &&
+                    await(backend, event.get(), ordinal, std::chrono::seconds(5));
+            const auto producer_owner = originalCohort(producer_family, producer_family == DeviceType::CUDA ? 2 : 4).first;
+            terminalBroadcast(success, producer_owner);
+            if (!success)
             {
-                if (error)
-                    *error = "mapped producer write did not complete";
-                cleanup();
+                if (error) *error = "Original mapped visibility producer terminal failed";
                 return false;
             }
-            if (!consumer->deviceCopyAsync(
-                    consumer_vram,
-                    consumer_alias,
-                    kBytes,
-                    consumer_ordinal,
-                    consumer_stream) ||
-                !consumer->recordEvent(
-                    consumer_event,
-                    consumer_ordinal,
-                    consumer_stream) ||
-                !await(
-                    consumer,
-                    consumer_event,
-                    consumer_ordinal,
-                    std::chrono::seconds(5)))
+            if (!producer)
             {
-                if (error)
-                    *error = "mapped consumer read did not complete";
-                cleanup();
-                return false;
+                void *vram = backend->allocate(kBytes, ordinal);
+                std::array<std::uint8_t, kBytes> observed{};
+                success = vram && backend->deviceCopyAsync(vram, local.mapped_base_device + offset,
+                    kBytes, ordinal, stream.get()) && backend->recordEvent(event.get(), ordinal, stream.get()) &&
+                    await(backend, event.get(), ordinal, std::chrono::seconds(5)) &&
+                    backend->deviceToHost(observed.data(), vram, observed.size(), ordinal, stream.get());
+                const bool observed_complete = completeTerminalObservation(backend, local.device, stream.get(), event.get());
+                success = observed_complete && success;
+                if (vram) backend->free(vram, ordinal);
+                success = success && std::all_of(observed.begin(), observed.end(),
+                    [byte_pattern](std::uint8_t value) { return value == static_cast<std::uint8_t>(byte_pattern); });
             }
-
-            std::array<std::uint8_t, kBytes> observed{};
-            if (!consumer->deviceToHost(
-                    observed.data(),
-                    consumer_vram,
-                    observed.size(),
-                    consumer_ordinal,
-                    consumer_stream))
-            {
-                if (error)
-                    *error = "terminal evidence copy failed";
-                cleanup();
-                return false;
-            }
-            const bool matches = std::all_of(
-                observed.begin(),
-                observed.end(),
-                [byte_pattern](std::uint8_t value)
-                {
-                    return value == static_cast<std::uint8_t>(byte_pattern);
-                });
-            if (!matches && error)
-                *error = "cross-backend mapped bytes disagreed";
-            cleanup();
-            return matches;
+            const auto results = terminalGather(std::vector<std::uint8_t>{success ? std::uint8_t{1} : std::uint8_t{0}});
+            const bool complete = std::all_of(results.begin(), results.end(), [](auto value) { return value == 1; });
+            if (!complete && error) *error = "Original cross-backend mapped terminal bytes disagreed";
+            return complete;
         }
 
         /** Terminal device evidence for one complete cross-vendor epoch. */
@@ -872,62 +982,30 @@ namespace llaminar2::test
             return complete;
         }
 
-        /** @return Every participant binding in immutable global-id order. */
+        /** @return Original process-local participants in immutable global-id order. */
         std::vector<MoEOverlayDeviceControllerParticipantBinding>
-        allParticipantBindings(
-            const MoEOverlayNodeLocalDeviceControllerFabric &cuda_rank,
-            const MoEOverlayNodeLocalDeviceControllerFabric &rocm_rank)
+        localParticipantBindings(const MoEOverlayNodeLocalDeviceControllerFabric &fabric)
         {
             std::vector<MoEOverlayDeviceControllerParticipantBinding> result;
-            result.reserve(6u);
-            for (const int participant : cuda_rank.localParticipantIds())
-                result.push_back(cuda_rank.participantBinding(participant));
-            for (const int participant : rocm_rank.localParticipantIds())
-                result.push_back(rocm_rank.participantBinding(participant));
-            std::sort(
-                result.begin(),
-                result.end(),
-                [](const auto &left, const auto &right)
-                {
-                    return left.participant_id < right.participant_id;
-                });
+            for (const int participant : fabric.localParticipantIds())
+                result.push_back(fabric.participantBinding(participant));
+            std::sort(result.begin(), result.end(), [](const auto &left, const auto &right)
+                { return left.participant_id < right.participant_id; });
             return result;
         }
 
-        /**
-         * @return Every locally owned group-root transport lane in group order.
-         *
-         * Discovering roots from participant metadata keeps the proof valid if
-         * either backend owns the continuation domain or if a later topology
-         * adds more same-node groups.
-         */
+        /** @return Only this original process's owned physical transport lanes. */
         std::vector<MoEOverlayDeviceControllerTransportBinding>
-        allTransportBindings(
-            const MoEOverlayNodeLocalDeviceControllerFabric &cuda_rank,
-            const MoEOverlayNodeLocalDeviceControllerFabric &rocm_rank)
+        localTransportBindings(const MoEOverlayNodeLocalDeviceControllerFabric &fabric)
         {
             std::vector<MoEOverlayDeviceControllerTransportBinding> result;
-            const std::array<const MoEOverlayNodeLocalDeviceControllerFabric *,
-                             2>
-                fabrics = {&cuda_rank, &rocm_rank};
-            for (const auto *fabric : fabrics)
+            for (const int participant : fabric.localParticipantIds())
             {
-                for (const int participant : fabric->localParticipantIds())
-                {
-                    const auto binding =
-                        fabric->participantBinding(participant);
-                    if (binding.group_root)
-                        result.push_back(
-                            fabric->transportBinding(binding.group_id));
-                }
+                const auto binding = fabric.participantBinding(participant);
+                if (binding.group_root) result.push_back(fabric.transportBinding(binding.group_id));
             }
-            std::sort(
-                result.begin(),
-                result.end(),
-                [](const auto &left, const auto &right)
-                {
-                    return left.group_id < right.group_id;
-                });
+            std::sort(result.begin(), result.end(), [](const auto &left, const auto &right)
+                { return left.group_id < right.group_id; });
             return result;
         }
 
@@ -1082,10 +1160,10 @@ namespace llaminar2::test
          * Exercise one complete controller transaction without an intermediate
          * host policy wait, copy, or policy-state read.
          *
-         * The leader queues its complete dependency chain first. Kernels that
-         * depend on the ROCm group spin only inside their tiny mapped-control
-         * block, leaving the host free to submit the follower chain. Both GPU
-         * streams then advance through system-scope release/acquire edges.
+         * Each original owner queues only its local participant chains. The
+         * sole leader publishes through the mapped system-scope protocol;
+         * independent original followers consume that same device authority.
+         * No host phase broadcast or remote GPU binding schedules progress.
          * Independent group-local workers consume only the immutable command
          * bytes and publish physical readiness; they never read histograms or
          * author policy. The caller finally observes all participant terminal
@@ -1094,6 +1172,7 @@ namespace llaminar2::test
         bool runControllerTransaction(
             IBackend *cuda,
             IBackend *rocm,
+            const MoEOverlayDeviceControllerTopology &resolved_topology,
             const std::vector<MoEOverlayDeviceControllerParticipantBinding>
                 &participant_bindings,
             const std::vector<MoEOverlayDeviceControllerTransportBinding>
@@ -1109,13 +1188,20 @@ namespace llaminar2::test
 
             if (error)
                 error->clear();
-            if (!cuda || !rocm || participant_bindings.empty() || !evidence)
+            if (participant_bindings.empty() || !evidence)
             {
                 if (error)
                     *error = "controller transaction received incomplete resources";
                 return false;
             }
             *evidence = {};
+
+            for (const auto &binding : participant_bindings)
+            {
+                const auto &participant = resolved_topology.participants.at(binding.participant_id);
+                if (!ownsParticipant(participant) || binding.device != participant.device)
+                    throw std::runtime_error("Controller transaction received a foreign original GPU alias");
+            }
 
             // Reject malformed authority topology before allocating any GPU
             // resource. This also makes the cleanup path independent of which
@@ -1127,8 +1213,11 @@ namespace llaminar2::test
                 {
                     return binding.authority_leader;
                 });
+            const auto expected_local_groups = std::count_if(resolved_topology.groups.begin(),
+                resolved_topology.groups.end(), [](const auto &group)
+                    { return group.root_world_rank == originalContext()->rank(); });
             const bool transport_geometry_valid =
-                transport_bindings.size() == layout.groups.size() &&
+                transport_bindings.size() == static_cast<std::size_t>(expected_local_groups) &&
                 std::all_of(
                     transport_bindings.begin(),
                     transport_bindings.end(),
@@ -1143,11 +1232,13 @@ namespace llaminar2::test
                     {
                         return left.group_id >= right.group_id;
                     }) == transport_bindings.end();
-            if (leader_count != 1 || !transport_geometry_valid)
+            const int leader_owner = resolved_topology.leader_world_rank;
+            const auto expected_local_leaders = originalContext()->rank() == leader_owner ? 1 : 0;
+            if (leader_count != expected_local_leaders || !transport_geometry_valid)
             {
                 if (error)
                 {
-                    *error = leader_count != 1
+                    *error = leader_count != expected_local_leaders
                                  ? "controller transaction requires exactly one authority leader"
                                  : "controller transaction received incomplete or unordered transport roots";
                 }
@@ -1246,7 +1337,7 @@ namespace llaminar2::test
                 }
             };
             const bool endpoints_complete =
-                leader && leader_start && policy_device &&
+                (!leader || (leader_start && policy_device)) &&
                 std::all_of(
                     endpoints.begin(),
                     endpoints.end(),
@@ -1304,7 +1395,7 @@ namespace llaminar2::test
                 .packed_weight_bytes =
                     dynamic ? 4096u * command_count : 0u,
             };
-            if (!leader->backend->hostToDevice(
+            if (leader && (!leader->backend->hostToDevice(
                      policy_device,
                      &policy,
                      sizeof(policy),
@@ -1320,7 +1411,7 @@ namespace llaminar2::test
                 !leader->backend->recordEvent(
                     leader_start,
                     leader->binding.device.ordinal,
-                    leader->stream))
+                    leader->stream)))
             {
                 if (error)
                     *error = "could not publish the setup-only policy fixture";
@@ -1377,63 +1468,67 @@ namespace llaminar2::test
                         .load(std::memory_order_acquire));
             }
 
-            bool submitted =
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::BeginTransaction) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::
-                        PublishParticipantSnapshot) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::PublishGroupSnapshot);
-            submitted = submitted &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::PublishCommand) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::AcknowledgePrepared) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::BeginCommit) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::AcknowledgePublished) &&
-                enqueue(
-                    *leader,
-                    MoEOverlayDeviceControllerAction::PublishAdmission);
-            if (dynamic)
+            bool submitted = true;
+            if (leader)
             {
+                submitted = enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::BeginTransaction) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::
+                            PublishParticipantSnapshot) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::PublishGroupSnapshot);
                 submitted = submitted &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::BeginDynamicRetirement) &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::AcknowledgeRetired) &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::CompleteDynamicRetirement);
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::PublishCommand) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::AcknowledgePrepared) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::BeginCommit) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::AcknowledgePublished) &&
+                    enqueue(
+                        *leader,
+                        MoEOverlayDeviceControllerAction::PublishAdmission);
+                if (dynamic)
+                {
+                    submitted = submitted &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::BeginDynamicRetirement) &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::AcknowledgeRetired) &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::CompleteDynamicRetirement);
+                }
+                else if (!static_check)
+                {
+                    submitted = submitted &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::BeginLLEPRestore) &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::AcknowledgeLLEPRestored) &&
+                                enqueue(
+                                    *leader,
+                                    MoEOverlayDeviceControllerAction::CompleteLLEPRestore);
+                }
+                submitted = submitted && leader->backend->recordEvent(
+                                                 leader->terminal,
+                                                 leader->binding.device.ordinal,
+                                                 leader->stream);
+
             }
-            else if (!static_check)
-            {
-                submitted = submitted &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::BeginLLEPRestore) &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::AcknowledgeLLEPRestored) &&
-                            enqueue(
-                                *leader,
-                                MoEOverlayDeviceControllerAction::CompleteLLEPRestore);
-            }
-            submitted = submitted && leader->backend->recordEvent(
-                                             leader->terminal,
-                                             leader->binding.device.ordinal,
-                                             leader->stream);
 
             // Submit every independent participant only after the complete
             // leader chain is queued. A synchronous launch on either backend
@@ -1688,57 +1783,119 @@ namespace llaminar2::test
                 return false;
             }
 
-            bool copied = leader->backend->eventElapsedTimeMs(
-                              leader_start,
-                              leader->terminal,
-                              leader->binding.device.ordinal,
-                              &evidence->leader_elapsed_ms) &&
-                          leader->backend->deviceToHost(
-                              &evidence->controller,
-                              leader->binding.controller,
-                              sizeof(evidence->controller),
-                              leader->binding.device.ordinal,
-                              leader->stream) &&
-                          leader->backend->deviceToHost(
-                              &evidence->command,
-                              leader->binding.command,
-                              sizeof(evidence->command),
-                              leader->binding.device.ordinal,
-                              leader->stream) &&
-                          leader->backend->deviceToHost(
-                              &evidence->policy,
-                              policy_device,
-                              sizeof(evidence->policy),
-                              leader->binding.device.ordinal,
-                              leader->stream);
-            evidence->commands.resize(evidence->command.command_count);
-            if (copied && !evidence->commands.empty())
+            (void)terminalGather(std::vector<std::uint8_t>{1});
+            bool copied = true;
+            if (leader)
             {
-                copied = leader->backend->deviceToHost(
-                    evidence->commands.data(),
-                    leader->binding.command_entries,
-                    evidence->commands.size() *
-                        sizeof(MoEOverlayDeviceMovementCommand),
-                    leader->binding.device.ordinal,
-                    leader->stream);
+                copied = leader->backend->eventElapsedTimeMs(
+                                  leader_start,
+                                  leader->terminal,
+                                  leader->binding.device.ordinal,
+                                  &evidence->leader_elapsed_ms) &&
+                              leader->backend->deviceToHost(
+                                  &evidence->controller,
+                                  leader->binding.controller,
+                                  sizeof(evidence->controller),
+                                  leader->binding.device.ordinal,
+                                  leader->stream) &&
+                              leader->backend->deviceToHost(
+                                  &evidence->command,
+                                  leader->binding.command,
+                                  sizeof(evidence->command),
+                                  leader->binding.device.ordinal,
+                                  leader->stream) &&
+                              leader->backend->deviceToHost(
+                                  &evidence->policy,
+                                  policy_device,
+                                  sizeof(evidence->policy),
+                                  leader->binding.device.ordinal,
+                                  leader->stream);
+                const bool headers_complete = completeTerminalObservation(leader->backend,
+                    leader->binding.device, leader->stream, leader->terminal);
+                if (!copied || !headers_complete)
+                    throw std::runtime_error("Controller terminal header observation did not complete");
+                if (evidence->command.command_count > layout.header.command_capacity)
+                    throw std::runtime_error("Controller terminal command observation exceeds its admitted capacity");
+                evidence->commands.resize(evidence->command.command_count);
+                if (copied && !evidence->commands.empty())
+                {
+                    copied = leader->backend->deviceToHost(
+                        evidence->commands.data(),
+                        leader->binding.command_entries,
+                        evidence->commands.size() *
+                            sizeof(MoEOverlayDeviceMovementCommand),
+                        leader->binding.device.ordinal,
+                        leader->stream);
+                }
+                for (std::size_t group = 0u;
+                     copied && group < evidence->groups.size(); ++group)
+                {
+                    const auto offset = static_cast<std::size_t>(
+                        layout.groups.at(group).group_record_offset);
+                    copied = leader->backend->deviceToHost(
+                        &evidence->groups[group],
+                        leader->binding.mapped_base_device + offset,
+                        sizeof(evidence->groups[group]),
+                        leader->binding.device.ordinal,
+                        leader->stream);
+                }
+                const bool payload_complete = completeTerminalObservation(leader->backend,
+                    leader->binding.device, leader->stream, leader->terminal);
+                if (!copied || !payload_complete)
+                    throw std::runtime_error("Controller terminal payload observation did not complete");
             }
-            for (std::size_t group = 0u;
-                 copied && group < evidence->groups.size(); ++group)
-            {
-                const auto offset = static_cast<std::size_t>(
-                    layout.groups.at(group).group_record_offset);
-                copied = leader->backend->deviceToHost(
-                    &evidence->groups[group],
-                    leader->binding.mapped_base_device + offset,
-                    sizeof(evidence->groups[group]),
-                    leader->binding.device.ordinal,
-                    leader->stream);
-            }
+            terminalBroadcast(evidence->controller, leader_owner);
+            terminalBroadcast(evidence->command, leader_owner);
+            terminalBroadcast(evidence->policy, leader_owner);
+            terminalBroadcast(evidence->groups, leader_owner);
+            terminalBroadcast(evidence->leader_elapsed_ms, leader_owner);
+            terminalBroadcastVector(evidence->commands, leader_owner);
+            terminalSum(evidence->transport_groups_acquired);
+            terminalSum(evidence->transport_groups_prepared);
+            terminalSum(evidence->transport_groups_published);
+            terminalSum(evidence->transport_groups_retired);
+            terminalSum(evidence->transport_groups_restored);
             if (!copied && error)
                 *error = "terminal controller evidence copy failed";
             cleanup();
             return copied;
         }
+
+        /** Pointer-free descriptor observation, created only after its native terminal. */
+        struct TerminalExpertObservation : DeviceMoEPortableExpertRuntimeState
+        {
+            std::int32_t overlay_route_participant = 0;
+            bool weights_ready = false;
+            bool descriptor_unchanged = false;
+            /** @return Original owner's exact native descriptor readiness predicate. */
+            [[nodiscard]] bool weightsReady() const noexcept { return weights_ready; }
+        };
+
+        /** Exact live expert rows and scalar identity of one completed bank. */
+        struct TerminalBankObservation
+        {
+            std::uint32_t epoch = 0;
+            std::uint32_t expert_count = 0;
+            std::vector<TerminalExpertObservation> experts;
+        };
+
+        /** Terminal diagnostic only; no pointer-bearing execution table crosses MPI. */
+        struct TerminalRuntimeObservation
+        {
+            std::uint32_t active_bank = 0;
+            std::uint32_t active_epoch = 0;
+            std::array<TerminalBankObservation, kDeviceMoEOverlayEpochBankCount> banks;
+        };
+
+        /** Pointer-free terminal epoch scalars; the original arena parent address remains local. */
+        struct TerminalEpochControlObservation
+        {
+            std::array<std::uint64_t, kDeviceMoEOverlayEpochBankCount> bank_epochs{};
+            std::array<std::uint64_t, kDeviceMoEOverlayEpochBankCount> bank_readers{};
+            std::uint64_t acquisitions_in_flight = 0;
+            std::array<std::uint32_t, kDeviceMoEOverlayEpochBankCount> bank_states{};
+            std::uint64_t published_selector = 0;
+        };
 
         /** Terminal proof for one topology-wide inactive-bank construction. */
         struct RuntimeCandidateApplyEvidence
@@ -1750,8 +1907,8 @@ namespace llaminar2::test
             /** Terminal copy of the device-owned committed hysteresis ledger. */
             std::vector<std::uint64_t> economy_last_moved;
             std::vector<MoEOverlayDeviceRuntimeApplyStatus> apply_statuses;
-            std::vector<std::vector<DeviceMoELayerRuntime>> runtime_layers;
-            std::vector<DeviceMoEOverlayEpochControl> epoch_controls;
+            std::vector<std::vector<TerminalRuntimeObservation>> runtime_layers;
+            std::vector<TerminalEpochControlObservation> epoch_controls;
             std::vector<DeviceMoEOverlayEpochStatus> epoch_statuses;
             std::vector<MoEOverlayDeviceControllerParticipantRecord>
                 participant_records;
@@ -1821,7 +1978,7 @@ namespace llaminar2::test
 
             if (error)
                 error->clear();
-            if (!cuda || !rocm || !evidence || participant_bindings.empty() ||
+            if (!evidence || participant_bindings.empty() ||
                 transport_bindings.empty() ||
                 fixtures.size() != participant_bindings.size())
             {
@@ -1830,6 +1987,13 @@ namespace llaminar2::test
                 return false;
             }
             *evidence = {};
+            for (const auto &binding : participant_bindings)
+            {
+                const auto &participant = topology.participants.at(binding.participant_id);
+                if (!ownsParticipant(participant) || binding.device != participant.device)
+                    throw std::runtime_error("Runtime publication received a foreign original GPU alias");
+            }
+
             const bool prepared_context_restore =
                 options.objective ==
                 RuntimeCandidateApplyObjective::PreparedContextRestore;
@@ -2036,7 +2200,8 @@ namespace llaminar2::test
                 cleanup();
                 return false;
             }
-            if (!leader || !policy_device ||
+            if ((static_cast<bool>(leader) != (originalContext()->rank() == topology.leader_world_rank)) ||
+                (leader && !policy_device) ||
                 !std::all_of(
                     endpoints.begin(),
                     endpoints.end(),
@@ -2213,34 +2378,37 @@ namespace llaminar2::test
                 }
                 return ready;
             };
-            // Submit dependency wavefronts across every participant. HIP may
+            // Submit dependency wavefronts across every local participant. HIP may
             // apply backpressure when a later command is enqueued behind a
             // live mapped-memory wait. Giving every producer its turn before
             // group-root waits makes that impossible without introducing a
             // host observation or serial synchronization.
-            bool captured = false;
-            auto &author_worker = GPUDeviceContextPool::instance().getContext(
-                leader->binding.device);
-            author_worker.submitAndWait([&]
+            bool captured = !leader;
+            if (leader)
             {
-                author_graph = author_worker.createGraphCapture(leader->stream);
-                if (!author_graph || !author_graph->beginCapture())
-                    return;
-                const bool nodes = enqueue_action(*leader, author_action) &&
-                    enqueue_action(*leader, MoEOverlayDeviceControllerAction::PublishCommand) &&
-                    enqueue_action(*leader, MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision);
-                // End capture even when a launch was rejected so its scope
-                // cannot leak into cleanup or another test on this worker.
-                const bool ended = author_graph->endCapture();
-                captured = nodes && ended && author_graph->instantiate();
-            });
+                auto &author_worker = GPUDeviceContextPool::instance().getContext(
+                    leader->binding.device);
+                author_worker.submitAndWait([&]
+                {
+                    author_graph = author_worker.createGraphCapture(leader->stream);
+                    if (!author_graph || !author_graph->beginCapture())
+                        return;
+                    const bool nodes = enqueue_action(*leader, author_action) &&
+                        enqueue_action(*leader, MoEOverlayDeviceControllerAction::PublishCommand) &&
+                        enqueue_action(*leader, MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision);
+                    // End capture even when a launch was rejected so its scope
+                    // cannot leak into cleanup or another test on this worker.
+                    const bool ended = author_graph->endCapture();
+                    captured = nodes && ended && author_graph->instantiate();
+                });
+            }
             if (!captured)
             {
                 append_error("runtime apply could not capture its complete author epoch");
                 cleanup();
                 return false;
             }
-            bool submitted = enqueue_action(
+            bool submitted = !leader || enqueue_action(
                 *leader,
                 MoEOverlayDeviceControllerAction::BeginTransaction);
             for (auto &endpoint : endpoints)
@@ -2261,10 +2429,11 @@ namespace llaminar2::test
                             PublishGroupSnapshot);
                 }
             }
-            submitted = submitted && author_graph->launchOnStream(leader->stream);
+            submitted = submitted && (!leader || author_graph->launchOnStream(leader->stream));
 
             struct TransportResult
             {
+                MoEOverlayDeviceTransportCommandBatch batch;
                 bool transfers_submitted = false;
                 bool moves_weights = false;
                 bool prepared = false;
@@ -2317,6 +2486,7 @@ namespace llaminar2::test
                                 protocol.fail();
                                 return;
                             }
+                            result.batch = acquired.batch;
                             std::atomic_ref<bool>(result.moves_weights)
                                 .store(
                                     acquired.batch.movesWeights(),
@@ -2562,6 +2732,26 @@ namespace llaminar2::test
                 }
             }
 
+            const auto topology_readers_ready = [&]
+            {
+                for (std::size_t index = 0; index < transport_bindings.size(); ++index)
+                    if (!MoEOverlayDeviceTransportProtocol(transport_bindings[index])
+                            .runtimeReadersReady(transport_results[index].batch)) return false;
+                return true;
+            };
+            const auto await_topology_readers = [&]
+            {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    if (topology_readers_ready()) return true;
+                    if (transport_bindings.front().controller->state == static_cast<std::uint32_t>(
+                            MoEOverlayDeviceControllerState::Error)) return false;
+                    std::this_thread::yield();
+                }
+                return false;
+            };
+
             if (options.exercise_reader_grace_period && submitted &&
                 !observed_no_movement)
             {
@@ -2625,13 +2815,14 @@ namespace llaminar2::test
                                 AcknowledgePrepared));
                     }
                 }
+                if (leader)
                 note_submission(enqueue_action(
                     *leader,
                     MoEOverlayDeviceControllerAction::BeginCommit));
 
                 // Every participant joins the mapped commit edge before its
-                // local RCU state is mutated. Submit each phase topology-wide
-                // so no driver's queue backpressure can strand a peer producer.
+                // local RCU state is mutated. Submit each local producer wave;
+                // device receipts join original owners without host phase messages.
                 if (!observed_no_movement)
                 {
                     for (auto &endpoint : endpoints)
@@ -2663,14 +2854,16 @@ namespace llaminar2::test
                                 AcknowledgePublished));
                     }
                 }
+                if (leader)
                 note_submission(enqueue_action(
                     *leader,
                     MoEOverlayDeviceControllerAction::PublishAdmission));
+                if (leader)
                 note_submission(enqueue_action(
                     *leader,
                     MoEOverlayDeviceControllerAction::
                         BeginDynamicRetirement));
-                if (options.exercise_reader_grace_period)
+                if (options.exercise_reader_grace_period && leader)
                 {
                     // This event is a test-only witness that global admission
                     // moved before the independent inference streams run.
@@ -2712,7 +2905,7 @@ namespace llaminar2::test
                 if (options.exercise_reader_grace_period && submitted &&
                     !observed_no_movement)
                 {
-                    const bool admission_ready = await(
+                    const bool admission_ready = !leader || await(
                         leader->backend,
                         leader->admission_event,
                         leader->binding.device.ordinal,
@@ -2815,15 +3008,7 @@ namespace llaminar2::test
                     }
                     const bool readiness_complete = await_retirement_wave(
                         "topology retirement-readiness publication");
-                    const bool all_readers_ready = readiness_complete &&
-                        std::all_of(
-                            endpoints.begin(),
-                            endpoints.end(),
-                            [initial_epoch](const Endpoint &endpoint)
-                            {
-                                return endpoint.host_lifecycle->retirement_ready_epoch ==
-                                    initial_epoch;
-                            });
+                    const bool all_readers_ready = readiness_complete && await_topology_readers();
                     submitted = submitted && all_readers_ready;
 
                     /* Begin one synthetic E+1 admission after every E
@@ -2904,15 +3089,7 @@ namespace llaminar2::test
                     while (std::chrono::steady_clock::now() <
                            readiness_deadline)
                     {
-                        topology_ready = std::all_of(
-                            endpoints.begin(),
-                            endpoints.end(),
-                            [initial_epoch](const Endpoint &endpoint)
-                            {
-                                return std::atomic_ref<const std::uint64_t>(
-                                           endpoint.host_lifecycle->retirement_ready_epoch)
-                                           .load(std::memory_order_acquire) == initial_epoch;
-                            });
+                        topology_ready = topology_readers_ready();
                         if (topology_ready)
                             break;
                         const auto controller_state =
@@ -2961,6 +3138,7 @@ namespace llaminar2::test
                                 AcknowledgeRetired));
                     }
                 }
+                if (leader)
                 note_submission(enqueue_action(
                     *leader,
                     MoEOverlayDeviceControllerAction::
@@ -3298,52 +3476,73 @@ namespace llaminar2::test
                 return false;
             }
 
-            bool copied = leader->backend->deviceToHost(
-                              &evidence->controller,
-                              leader->binding.controller,
-                              sizeof(evidence->controller),
-                              leader->binding.device.ordinal,
-                              leader->stream) &&
-                leader->backend->deviceToHost(
-                    &evidence->command,
-                    leader->binding.command,
-                    sizeof(evidence->command),
-                    leader->binding.device.ordinal,
-                    leader->stream) &&
-                leader->backend->deviceToHost(
-                    &evidence->policy,
-                    policy_device,
-                    sizeof(evidence->policy),
-                    leader->binding.device.ordinal,
-                    leader->stream);
-            evidence->commands.resize(evidence->command.command_count);
-            if (copied && !evidence->commands.empty())
+            (void)terminalGather(std::vector<std::uint8_t>{1});
+            bool copied = true;
+            if (leader)
             {
                 copied = leader->backend->deviceToHost(
-                    evidence->commands.data(),
-                    leader->binding.command_entries,
-                    evidence->commands.size() *
-                        sizeof(MoEOverlayDeviceMovementCommand),
-                    leader->binding.device.ordinal,
-                    leader->stream);
+                                  &evidence->controller,
+                                  leader->binding.controller,
+                                  sizeof(evidence->controller),
+                                  leader->binding.device.ordinal,
+                                  leader->stream) &&
+                    leader->backend->deviceToHost(
+                        &evidence->command,
+                        leader->binding.command,
+                        sizeof(evidence->command),
+                        leader->binding.device.ordinal,
+                        leader->stream) &&
+                    leader->backend->deviceToHost(
+                        &evidence->policy,
+                        policy_device,
+                        sizeof(evidence->policy),
+                        leader->binding.device.ordinal,
+                        leader->stream);
+                const bool headers_complete = completeTerminalObservation(leader->backend,
+                    leader->binding.device, leader->stream, leader->terminal);
+                if (!copied || !headers_complete)
+                    throw std::runtime_error("Controller terminal header observation did not complete");
+                if (evidence->command.command_count > transport_bindings.front().command_capacity)
+                    throw std::runtime_error("Controller terminal command observation exceeds its admitted capacity");
+                evidence->commands.resize(evidence->command.command_count);
+                if (copied && !evidence->commands.empty())
+                {
+                    copied = leader->backend->deviceToHost(
+                        evidence->commands.data(),
+                        leader->binding.command_entries,
+                        evidence->commands.size() *
+                            sizeof(MoEOverlayDeviceMovementCommand),
+                        leader->binding.device.ordinal,
+                        leader->stream);
+                }
+                evidence->economy_last_moved.resize(
+                    // Geometry is read through the explicit host transport view,
+                    // never through the leader's GPU-only capture aliases.
+                    static_cast<std::size_t>(transport_bindings.front().layout->num_layers) *
+                    transport_bindings.front().layout->num_experts);
+                if (copied)
+                {
+                    copied = leader->backend->deviceToHost(
+                        evidence->economy_last_moved.data(),
+                        leader->binding.economy_last_moved,
+                        evidence->economy_last_moved.size() *
+                            sizeof(std::uint64_t),
+                        leader->binding.device.ordinal,
+                        leader->stream);
+                }
+                const bool payload_complete = completeTerminalObservation(leader->backend,
+                    leader->binding.device, leader->stream, leader->terminal);
+                if (!copied || !payload_complete)
+                    throw std::runtime_error("Controller terminal payload observation did not complete");
             }
-            evidence->economy_last_moved.resize(
-                // Geometry is read through the explicit host transport view,
-                // never through the leader's GPU-only capture aliases.
-                static_cast<std::size_t>(transport_bindings.front().layout->num_layers) *
-                transport_bindings.front().layout->num_experts);
-            if (copied)
-            {
-                copied = leader->backend->deviceToHost(
-                    evidence->economy_last_moved.data(),
-                    leader->binding.economy_last_moved,
-                    evidence->economy_last_moved.size() *
-                        sizeof(std::uint64_t),
-                    leader->binding.device.ordinal,
-                    leader->stream);
-            }
+            terminalBroadcast(evidence->controller, topology.leader_world_rank);
+            terminalBroadcast(evidence->command, topology.leader_world_rank);
+            terminalBroadcast(evidence->policy, topology.leader_world_rank);
+            terminalBroadcastVector(evidence->commands, topology.leader_world_rank);
+            terminalBroadcastVector(evidence->economy_last_moved, topology.leader_world_rank);
             evidence->apply_statuses.resize(fixtures.size());
-            evidence->runtime_layers.resize(fixtures.size());
+            std::vector<std::vector<DeviceMoELayerRuntime>> local_runtime_layers(fixtures.size());
+            std::vector<DeviceMoEOverlayEpochControl> local_epoch_controls(fixtures.size());
             evidence->epoch_controls.resize(fixtures.size());
             evidence->epoch_statuses.resize(fixtures.size());
             for (std::size_t index = 0u;
@@ -3352,9 +3551,12 @@ namespace llaminar2::test
             {
                 copied = fixtures[index]->copyEvidence(
                     &evidence->apply_statuses[index],
-                    &evidence->runtime_layers[index],
-                    &evidence->epoch_controls[index],
+                    &local_runtime_layers[index],
+                    &local_epoch_controls[index],
                     &evidence->epoch_statuses[index]);
+                if (!copied)
+                    throw std::runtime_error("Original participant terminal observation did not complete: participant=" +
+                        std::to_string(fixtures[index]->participantId()));
             }
             for (const auto &binding : transport_bindings)
             {
@@ -3366,103 +3568,190 @@ namespace llaminar2::test
                     binding.participant_records +
                         binding.participant_record_count);
             }
+            // Local native copies retain their real pointers solely for the
+            // original descriptor-byte oracle. Wire observations contain only
+            // live expert rows and semantic scalars, never a remote GPU alias.
+            struct LayerRow
+            {
+                int participant;
+                std::uint32_t layer;
+                std::uint32_t active_bank;
+                std::uint32_t active_epoch;
+                std::array<std::uint32_t, kDeviceMoEOverlayEpochBankCount> epochs;
+                std::array<std::uint32_t, kDeviceMoEOverlayEpochBankCount> counts;
+            };
+            struct ExpertRow
+            {
+                int participant;
+                std::uint32_t layer;
+                std::uint32_t bank;
+                std::uint32_t expert;
+                TerminalExpertObservation observation;
+            };
+            std::vector<int> local_ids;
+            std::vector<LayerRow> local_layers;
+            std::vector<ExpertRow> local_experts;
+            for (std::size_t index = 0; index < fixtures.size(); ++index)
+            {
+                const int id = fixtures[index]->participantId();
+                local_ids.push_back(id);
+                for (std::size_t layer = 0; layer < local_runtime_layers[index].size(); ++layer)
+                {
+                    const auto &runtime = local_runtime_layers[index][layer];
+                    LayerRow row{id, static_cast<std::uint32_t>(layer), runtime.active_bank, runtime.active_epoch, {}, {}};
+                    for (std::uint32_t bank = 0; bank < kDeviceMoEOverlayEpochBankCount; ++bank)
+                    {
+                        const auto &source = runtime.banks[bank];
+                        if (source.expert_count > kDeviceMoEMaxExperts)
+                            throw std::runtime_error("Terminal bank has a foreign expert extent");
+                        row.epochs[bank] = source.epoch;
+                        row.counts[bank] = source.expert_count;
+                        for (std::uint32_t expert = 0; expert < source.expert_count; ++expert)
+                        {
+                            const auto &descriptor = source.experts[expert];
+                            TerminalExpertObservation observation{};
+                            observation.logical_expert_id = descriptor.logical_expert_id;
+                            observation.owner_participant = descriptor.owner_participant;
+                            observation.local_slot = descriptor.local_slot;
+                            observation.flags = descriptor.flags;
+                            observation.local_compute = source.local_compute_mask[expert];
+                            observation.replica_role = source.replica_role[expert];
+                            observation.resident_participant_mask = source.resident_participant_mask[expert];
+                            observation.overlay_route_participant = source.overlay_route_participant[expert];
+                            observation.weights_ready = descriptor.weightsReady();
+                            observation.descriptor_unchanged = std::memcmp(&descriptor,
+                                &runtime.banks[0].experts[expert], sizeof(descriptor)) == 0;
+                            local_experts.push_back({id, static_cast<std::uint32_t>(layer), bank, expert, observation});
+                        }
+                    }
+                    local_layers.push_back(row);
+                }
+            }
+            for (std::size_t index = 0; index < local_epoch_controls.size(); ++index)
+            {
+                const auto &source = local_epoch_controls[index];
+                auto &observed = evidence->epoch_controls[index];
+                std::copy_n(source.bank_epochs, kDeviceMoEOverlayEpochBankCount, observed.bank_epochs.begin());
+                std::copy_n(source.bank_readers, kDeviceMoEOverlayEpochBankCount, observed.bank_readers.begin());
+                std::copy_n(source.bank_states, kDeviceMoEOverlayEpochBankCount, observed.bank_states.begin());
+                observed.acquisitions_in_flight = source.acquisitions_in_flight;
+                observed.published_selector = source.published_selector;
+            }
+            const auto ids = terminalGather(local_ids);
+            const auto statuses = terminalGather(evidence->apply_statuses);
+            const auto controls = terminalGather(evidence->epoch_controls);
+            const auto epochs = terminalGather(evidence->epoch_statuses);
+            const auto layers = terminalGather(local_layers);
+            const auto experts = terminalGather(local_experts);
+            const auto records = terminalGather(evidence->participant_records);
+            const auto layer_count = transport_bindings.front().layout->num_layers;
+            if (ids.size() != topology.participants.size() || statuses.size() != ids.size() ||
+                controls.size() != ids.size() || epochs.size() != ids.size() ||
+                layers.size() != ids.size() * layer_count || records.size() != ids.size())
+                throw std::runtime_error("Controller terminal participant evidence is incomplete");
+            evidence->apply_statuses.resize(ids.size());
+            evidence->epoch_controls.resize(ids.size());
+            evidence->epoch_statuses.resize(ids.size());
+            evidence->runtime_layers.resize(ids.size());
+            evidence->participant_records.resize(ids.size());
+            std::vector<bool> seen(ids.size());
+            for (std::size_t index = 0; index < ids.size(); ++index)
+            {
+                const auto id = static_cast<std::size_t>(ids[index]);
+                if (id >= ids.size() || seen[id])
+                    throw std::runtime_error("Controller terminal participant identity is duplicated or foreign");
+                seen[id] = true;
+                evidence->apply_statuses[id] = statuses[index];
+                evidence->epoch_controls[id] = controls[index];
+                evidence->epoch_statuses[id] = epochs[index];
+                evidence->runtime_layers[id].resize(layer_count);
+            }
+            std::size_t expected_experts = 0;
+            std::vector<bool> seen_layers(ids.size() * layer_count);
+            std::vector<std::size_t> expert_offsets(ids.size() * layer_count * kDeviceMoEOverlayEpochBankCount);
+            for (const auto &row : layers)
+            {
+                const auto layer_key = static_cast<std::size_t>(row.participant) * layer_count + row.layer;
+                if (row.layer >= layer_count || seen_layers.at(layer_key))
+                    throw std::runtime_error("Controller terminal layer identity is duplicated or foreign");
+                seen_layers[layer_key] = true;
+                auto &runtime = evidence->runtime_layers.at(row.participant).at(row.layer);
+                runtime.active_bank = row.active_bank;
+                runtime.active_epoch = row.active_epoch;
+                for (std::size_t bank = 0; bank < runtime.banks.size(); ++bank)
+                {
+                    runtime.banks[bank].epoch = row.epochs[bank];
+                    runtime.banks[bank].expert_count = row.counts[bank];
+                    runtime.banks[bank].experts.resize(row.counts[bank]);
+                    expert_offsets.at(layer_key * kDeviceMoEOverlayEpochBankCount + bank) = expected_experts;
+                    expected_experts += row.counts[bank];
+                }
+            }
+            if (experts.size() != expected_experts)
+                throw std::runtime_error("Controller terminal expert evidence has an incomplete live extent");
+            std::vector<bool> seen_experts(expected_experts);
+            for (const auto &row : experts)
+            {
+                auto &bank = evidence->runtime_layers.at(row.participant).at(row.layer).banks.at(row.bank);
+                if (row.expert >= bank.experts.size())
+                    throw std::runtime_error("Controller terminal expert identity is foreign");
+                const auto offset = expert_offsets.at((static_cast<std::size_t>(row.participant) * layer_count +
+                    row.layer) * kDeviceMoEOverlayEpochBankCount + row.bank) + row.expert;
+                if (seen_experts.at(offset))
+                    throw std::runtime_error("Controller terminal expert identity is duplicated");
+                seen_experts[offset] = true;
+                bank.experts.at(row.expert) = row.observation;
+            }
+            std::vector<bool> seen_records(ids.size());
+            for (const auto &record : records)
+            {
+                if (seen_records.at(record.participant_id))
+                    throw std::runtime_error("Controller terminal lifecycle identity is duplicated");
+                seen_records[record.participant_id] = true;
+                evidence->participant_records.at(record.participant_id) = record;
+            }
+            terminalSum(evidence->transport_groups_prepared);
+            terminalSum(evidence->transport_groups_published);
+            terminalSum(evidence->transport_groups_retired);
+            terminalSum(evidence->old_epoch_readers_acquired);
+            terminalSum(evidence->new_epoch_readers_completed);
+            terminalSum(evidence->retirement_readiness_deferrals_observed);
+            terminalSum(evidence->old_epoch_readers_released);
+            terminalSum(evidence->post_readiness_acquisition_guards);
             if (!copied && error)
                 *error = "terminal runtime candidate evidence copy failed";
             cleanup();
             return copied;
         }
 
-        /** Both synthetic rank-local views of one production controller mapping. */
-        struct ControllerFabricPair
-        {
-            std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-            std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        };
-
         /**
-         * @brief Construct both rank views concurrently so first-touch precedes registration.
-         * @param resolved_topology Immutable production-shaped device topology.
-         * @param policy_input Exact mapped snapshot and command geometry.
-         * @param first_model_layer Global layer represented by compact row zero.
-         * @return Fully registered CUDA/ROCm fabric pair.
+         * @brief Construct only this original rank's fabric and GPU registrations.
+         * @param resolved_topology Same immutable inventory-derived topology on both ranks.
+         * @param policy_input Setup-only replay input, never a live model-state mirror.
+         * @param first_model_layer Exact global layer origin.
+         * @return Original owner-local mapping; real MPI authenticates first-touch and ACKs.
          */
-        ControllerFabricPair makeControllerFabricPair(
-            std::shared_ptr<const MoEOverlayDeviceControllerTopology>
-                resolved_topology,
+        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> makeLocalControllerFabric(
+            std::shared_ptr<const MoEOverlayDeviceControllerTopology> resolved_topology,
             const MoEOverlayDevicePlacementPolicyInput &policy_input,
             int first_model_layer = 0)
         {
-            ControllerFabricPair result;
-            std::exception_ptr cuda_error;
-            std::exception_ptr rocm_error;
-            const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-            const auto config = [&](int rank)
-            {
-                return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                    .mpi_ctx = context(rank, startup_link),
-                    .topology = resolved_topology,
-                    .num_layers = policy_input.num_layers,
-                    .num_experts = policy_input.num_experts,
+            return std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
+                MoEOverlayNodeLocalDeviceControllerFabric::Config{
+                    .mpi_ctx = originalContext(), .topology = std::move(resolved_topology),
+                    .num_layers = policy_input.num_layers, .num_experts = policy_input.num_experts,
                     .command_capacity = policy_input.command_capacity,
                     .initial_durable_epoch = policy_input.base_epoch,
-                    .payload_bytes_per_layer =
-                        policy_input.payload_bytes_per_layer,
+                    .payload_bytes_per_layer = policy_input.payload_bytes_per_layer,
                     .initial_owner_participants = initialOwners(policy_input),
-                    .minimum_window_activations =
-                        policy_input.minimum_window_activations,
-                    .maximum_cycles_per_wave =
-                        policy_input.maximum_cycles_per_wave,
-                    .dynamic_imbalance_threshold_per_mille =
-                        policy_input.dynamic_imbalance_threshold_per_mille,
-                    .dynamic_minimum_improvement_per_mille =
-                        policy_input.dynamic_minimum_improvement_per_mille,
-                    .dynamic_maximum_cycles_per_layer =
-                        policy_input.dynamic_maximum_cycles_per_layer,
-                    .dynamic_maximum_commands_per_wave =
-                        policy_input.dynamic_maximum_commands_per_wave,
+                    .minimum_window_activations = policy_input.minimum_window_activations,
+                    .maximum_cycles_per_wave = policy_input.maximum_cycles_per_wave,
+                    .dynamic_imbalance_threshold_per_mille = policy_input.dynamic_imbalance_threshold_per_mille,
+                    .dynamic_minimum_improvement_per_mille = policy_input.dynamic_minimum_improvement_per_mille,
+                    .dynamic_maximum_cycles_per_layer = policy_input.dynamic_maximum_cycles_per_layer,
+                    .dynamic_maximum_commands_per_wave = policy_input.dynamic_maximum_commands_per_wave,
                     .first_model_layer = first_model_layer,
-                };
-            };
-            std::thread cuda_builder(
-                [&]
-                {
-                    try
-                    {
-                        result.cuda_rank = std::make_unique<
-                            MoEOverlayNodeLocalDeviceControllerFabric>(
-                            config(0));
-                    }
-                    catch (...)
-                    {
-                        cuda_error = std::current_exception();
-                    }
                 });
-            std::thread rocm_builder(
-                [&]
-                {
-                    try
-                    {
-                        result.rocm_rank = std::make_unique<
-                            MoEOverlayNodeLocalDeviceControllerFabric>(
-                            config(1));
-                    }
-                    catch (...)
-                    {
-                        rocm_error = std::current_exception();
-                    }
-                });
-            cuda_builder.join();
-            rocm_builder.join();
-            if (cuda_error)
-                std::rethrow_exception(cuda_error);
-            if (rocm_error)
-                std::rethrow_exception(rocm_error);
-            if (!result.cuda_rank || !result.rocm_rank)
-            {
-                throw std::runtime_error(
-                    "controller fabric pair construction returned an empty rank view");
-            }
-            return result;
         }
 
         /**
@@ -3621,7 +3910,8 @@ namespace llaminar2::test
                         binding_.participant_id],
                     sizeof(*arrival),
                     binding_.device.ordinal,
-                    maintenance_stream_);
+                    maintenance_stream_) && completeTerminalObservation(backend_, binding_.device,
+                        maintenance_stream_, maintenance_event_);
             }
 
             /** Publish a new topology admission through the authority alias. */
@@ -3657,7 +3947,8 @@ namespace llaminar2::test
                            arena_->requestStatus(0u),
                            sizeof(*status),
                            binding_.device.ordinal,
-                           maintenance_stream_);
+                           maintenance_stream_) && completeTerminalObservation(backend_, binding_.device,
+                        maintenance_stream_, maintenance_event_);
             }
 
             /** Copy the complete mapped barrier through this endpoint's alias. */
@@ -3669,7 +3960,8 @@ namespace llaminar2::test
                     binding_.inference_epoch_record,
                     sizeof(*record),
                     binding_.device.ordinal,
-                    maintenance_stream_);
+                    maintenance_stream_) && completeTerminalObservation(backend_, binding_.device,
+                        maintenance_stream_, maintenance_event_);
             }
 
             /** @return Immutable global participant id. */
@@ -3754,23 +4046,21 @@ namespace llaminar2::test
     {
         IBackend *const backend = type == DeviceType::CUDA
             ? getCUDABackend() : getROCmBackend();
-        if (!backend || !getCUDABackend() || !getROCmBackend() ||
-            getCUDABackend()->deviceCount() < 2 ||
-            getROCmBackend()->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         const auto policy_input = adversarialPolicyInput();
         ASSERT_GE(resolved_topology->participants.size(), 5u);
-        ASSERT_EQ(resolved_topology->participants[2].world_rank, 1);
-        ASSERT_EQ(resolved_topology->participants[3].world_rank, 1);
-        ASSERT_EQ(resolved_topology->participants[4].world_rank, 1);
+        ASSERT_EQ(resolved_topology->participants[2].world_rank, originalCohort(DeviceType::ROCm, 4).first);
+        ASSERT_EQ(resolved_topology->participants[3].world_rank, originalCohort(DeviceType::ROCm, 4).first);
+        ASSERT_EQ(resolved_topology->participants[4].world_rank, originalCohort(DeviceType::ROCm, 4).first);
 
         const auto participant = type == DeviceType::CUDA ? 0u : 2u;
-        auto fabrics = makeControllerFabricPair(resolved_topology, policy_input, first_model_layer);
-        auto &fabric = type == DeviceType::CUDA ? *fabrics.cuda_rank : *fabrics.rocm_rank;
+        auto local_fabric = makeLocalControllerFabric(resolved_topology, policy_input, first_model_layer);
+        if (!ownsParticipant(resolved_topology->participants[participant])) return;
+        ASSERT_TRUE(backend);
+        auto &fabric = *local_fabric;
         const auto transport_binding = fabric.transportBinding(
             resolved_topology->groupForParticipant(participant)->group_id);
         MoEOverlayDeviceTransportProtocol protocol(transport_binding);
@@ -3926,19 +4216,31 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
          CaptureMetadataUsesFrozenLayoutForEveryParticipant)
     {
+        const auto max_bytes = std::numeric_limits<int>::max();
+        const auto max_words = static_cast<std::size_t>(max_bytes) / sizeof(std::uint64_t);
+        EXPECT_EQ(terminalByteCount<std::uint64_t>(0), 0);
+        EXPECT_EQ(terminalByteCount<std::uint64_t>(max_words), static_cast<int>(max_words * sizeof(std::uint64_t)));
+        EXPECT_THROW((terminalByteCount<std::uint64_t>(max_words + 1)), std::overflow_error);
+        EXPECT_EQ(terminalByteTotal(max_bytes - 1, 1), max_bytes);
+        EXPECT_THROW(terminalByteTotal(max_bytes, 1), std::overflow_error);
+        EXPECT_THROW(terminalByteTotal(0, -1), std::overflow_error);
         auto *const cuda = getCUDABackend();
         auto *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
         const auto resolved = topology();
         const auto input = adversarialPolicyInput();
-        auto fabrics = makeControllerFabricPair(resolved, input);
+        auto local_fabric = makeLocalControllerFabric(resolved, input);
+        std::uint32_t verified = 0;
         for (const auto &participant : resolved->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             SCOPED_TRACE(participant.participant_id);
-            auto &fabric = participant.device.is_cuda()
-                ? *fabrics.cuda_rank : *fabrics.rocm_rank;
+            auto &fabric = *local_fabric;
             const auto binding = fabric.participantBinding(participant.participant_id);
+            EXPECT_EQ(participant.world_rank, originalContext()->rank());
+            EXPECT_EQ(binding.device, participant.device);
+            EXPECT_TRUE(ownsParticipant(participant));
             const auto captured = binding.deviceBinding();
             EXPECT_EQ(captured.topology_fingerprint, resolved->topology_fingerprint);
             EXPECT_EQ(captured.layout, binding.layout);
@@ -3966,7 +4268,11 @@ namespace llaminar2::test
             params.binding = binding;
             params.binding.capture_metadata.role_flags ^= 1u;
             EXPECT_FALSE(stage.hasSameCaptureIdentity(params));
+            ++verified;
         }
+        EXPECT_EQ(verified, local_fabric->localParticipantIds().size());
+        terminalSum(verified);
+        EXPECT_EQ(verified, resolved->participants.size());
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
@@ -4009,52 +4315,57 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         for (const DeviceType authority_type : {DeviceType::CUDA, DeviceType::ROCm})
         {
             SCOPED_TRACE(authority_type == DeviceType::CUDA ? "CUDA authority" : "ROCm authority");
             const auto resolved = topology(authority_type);
             const auto input = adversarialPolicyInput();
-            auto fabrics = makeControllerFabricPair(resolved, input);
-            auto &authority_fabric = authority_type == DeviceType::CUDA
-                                         ? *fabrics.cuda_rank : *fabrics.rocm_rank;
-            const auto binding = authority_fabric.participantBinding(
-                resolved->leader_participant_id);
-            const auto transports = allTransportBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
-            ASSERT_TRUE(binding.authority_leader);
+            auto local_fabric = makeLocalControllerFabric(resolved, input);
+            auto &authority_fabric = *local_fabric;
+            const bool owns_leader = originalContext()->rank() == resolved->leader_world_rank;
+            MoEOverlayDeviceControllerParticipantBinding binding;
+            if (owns_leader) binding = authority_fabric.participantBinding(resolved->leader_participant_id);
+            const auto transports = localTransportBindings(*local_fabric);
+            if (owns_leader) ASSERT_TRUE(binding.authority_leader);
             ASSERT_FALSE(transports.empty());
             IBackend *const backend = authority_type == DeviceType::CUDA ? cuda : rocm;
-            const int ordinal = binding.device.gpu_ordinal();
-            auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(binding.device);
-            ScopedGPUStream stream(binding.device);
+            const int ordinal = owns_leader ? binding.device.gpu_ordinal() : -1;
+            std::unique_ptr<IMoEKernel> kernel;
+            std::unique_ptr<ScopedGPUStream> stream;
             const auto destroy_event = [backend, ordinal](void *event) {
                 if (event) backend->destroyEvent(event, ordinal);
             };
-            std::unique_ptr<void, decltype(destroy_event)> terminal(
-                backend->createEvent(ordinal), destroy_event);
+            std::unique_ptr<void, decltype(destroy_event)> terminal(nullptr, destroy_event);
             std::unique_ptr<IGPUGraphCapture> graph;
-            ASSERT_TRUE(kernel && stream.get() && terminal);
-            auto &worker = GPUDeviceContextPool::instance().getContext(binding.device);
-            bool captured = false;
-            worker.submitAndWait([&] {
-                graph = worker.createGraphCapture(stream.get());
-                if (!graph || !graph->beginCapture()) return;
-                const MoEKernelLaunchContext launch{.stream = stream.get()};
-                const bool nodes = kernel->runMoEOverlayDeviceControllerAction(launch, {
-                    .binding = binding.deviceBinding(),
-                    .action = MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision,
-                }) && kernel->runMoEOverlayDeviceControllerAction(launch, {
-                    .binding = binding.deviceBinding(),
-                    .action = MoEOverlayDeviceControllerAction::BeginTransaction,
-                    .transaction_kind = MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
-                    .demand_phase = MoEOverlayDeviceDemandPhase::Decode,
+            if (owns_leader)
+            {
+                kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(binding.device);
+                stream = std::make_unique<ScopedGPUStream>(binding.device);
+                terminal.reset(backend->createEvent(ordinal));
+                ASSERT_TRUE(kernel && stream->get() && terminal);
+                auto &worker = GPUDeviceContextPool::instance().getContext(binding.device);
+                bool captured = false;
+                worker.submitAndWait([&] {
+                    graph = worker.createGraphCapture(stream->get());
+                    if (!graph || !graph->beginCapture()) return;
+                    const MoEKernelLaunchContext launch{.stream = stream->get()};
+                    const bool nodes = kernel->runMoEOverlayDeviceControllerAction(launch, {
+                        .binding = binding.deviceBinding(),
+                        .action = MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision,
+                    }) && kernel->runMoEOverlayDeviceControllerAction(launch, {
+                        .binding = binding.deviceBinding(),
+                        .action = MoEOverlayDeviceControllerAction::BeginTransaction,
+                        .transaction_kind = MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                        .demand_phase = MoEOverlayDeviceDemandPhase::Decode,
+                    });
+                    const bool ended = graph->endCapture();
+                    captured = nodes && ended && graph->instantiate();
                 });
-                const bool ended = graph->endCapture();
-                captured = nodes && ended && graph->instantiate();
-            });
-            ASSERT_TRUE(captured);
+                ASSERT_TRUE(captured);
+            }
 
             auto *controller = const_cast<MoEOverlayDeviceControllerSharedHeader *>(transports[0].controller);
             auto *command = const_cast<MoEOverlayDeviceControllerCommandHeader *>(transports[0].command);
@@ -4073,6 +4384,9 @@ namespace llaminar2::test
                     .command_digest = moeOverlayCommandDigestSeed(0u),
                     .demand_phase = static_cast<std::uint32_t>(MoEOverlayDeviceDemandPhase::Prefill),
                 };
+                bool native_terminal = false;
+                if (owns_leader)
+                {
                 *command = sealed;
                 controller->transaction_kind = sealed.kind;
                 controller->transaction_demand_phase = sealed.demand_phase;
@@ -4083,9 +4397,14 @@ namespace llaminar2::test
                 std::atomic_ref(controller->state).store(
                     static_cast<std::uint32_t>(MoEOverlayDeviceControllerState::PreparingFollowers),
                     std::memory_order_release);
-                ASSERT_TRUE(graph->launchOnStream(stream.get()));
-                ASSERT_TRUE(backend->recordEvent(terminal.get(), ordinal, stream.get()));
-                ASSERT_TRUE(await(backend, terminal.get(), ordinal, std::chrono::seconds(5)));
+                ASSERT_TRUE(graph->launchOnStream(stream->get()));
+                ASSERT_TRUE(backend->recordEvent(terminal.get(), ordinal, stream->get()));
+                native_terminal = await(backend, terminal.get(), ordinal, std::chrono::seconds(5));
+                ASSERT_TRUE(native_terminal);
+
+                }
+                terminalBroadcast(native_terminal, resolved->leader_world_rank);
+                ASSERT_TRUE(native_terminal);
 
                 ASSERT_EQ(controller->error_code, 0u);
                 EXPECT_EQ(controller->completed_transaction, transaction);
@@ -4108,6 +4427,8 @@ namespace llaminar2::test
                     EXPECT_EQ(observed, transaction + 1u);
                     EXPECT_EQ(phase, MoEOverlayDeviceDemandPhase::Decode);
                 }
+                const auto delayed_receipts = terminalGather(std::vector<std::uint64_t>{command->transaction_id});
+                for (const auto receipt : delayed_receipts) EXPECT_EQ(receipt, transaction);
             }
         }
     }
@@ -4309,11 +4630,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology(continuation_type);
         const bool observation_only = geometry == PricedPolicyGeometry::FullModelObservation;
@@ -4359,26 +4677,24 @@ namespace llaminar2::test
                 ASSERT_GT(expected.evidence.same_priority_moves, 0u);
         }
 
-        auto fabrics = makeControllerFabricPair(
+        auto local_fabric = makeLocalControllerFabric(
             resolved_topology, policy_input);
         publishSyntheticEconomy(
-            *fabrics.cuda_rank,
-            *fabrics.rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers,
             economy_sources,
             phase_prices,
             transfer_cost_ns);
-        const auto participant_bindings = allParticipantBindings(
-            *fabrics.cuda_rank, *fabrics.rocm_rank);
-        const auto transport_bindings = allTransportBindings(
-            *fabrics.cuda_rank, *fabrics.rocm_rank);
+        const auto participant_bindings = localParticipantBindings(*local_fabric);
+        const auto transport_bindings = localTransportBindings(*local_fabric);
 
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding = std::find_if(
@@ -4416,7 +4732,7 @@ namespace llaminar2::test
                 .complete_epoch = true,
                 .expect_no_movement = observation_only})) << error;
         ASSERT_EQ(observed.policy.accepted_cycles, observation_only ? 0u : 2u);
-        ASSERT_EQ(observed.participant_records.size(), fixtures.size());
+        ASSERT_EQ(observed.participant_records.size(), resolved_topology->participants.size());
         for (const auto &record : observed.participant_records)
         {
             EXPECT_NE(record.observed_action,
@@ -4527,11 +4843,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         const auto policy_input = adversarialPolicyInput();
@@ -4543,92 +4856,27 @@ namespace llaminar2::test
         ASSERT_GT(expected.evidence.demotions, 0u);
         ASSERT_GT(expected.evidence.same_priority_moves, 0u);
 
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto fabric_config = [&](int rank)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank, startup_link),
-                .topology = resolved_topology,
-                .num_layers = policy_input.num_layers,
-                .num_experts = policy_input.num_experts,
-                .command_capacity = policy_input.command_capacity,
-                .initial_durable_epoch = policy_input.base_epoch,
-                .payload_bytes_per_layer =
-                    policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
-                .minimum_window_activations =
-                    policy_input.minimum_window_activations,
-                .maximum_cycles_per_wave =
-                    policy_input.maximum_cycles_per_wave,
-                .dynamic_imbalance_threshold_per_mille =
-                    policy_input.dynamic_imbalance_threshold_per_mille,
-                .dynamic_minimum_improvement_per_mille =
-                    policy_input.dynamic_minimum_improvement_per_mille,
-                .dynamic_maximum_cycles_per_layer =
-                    policy_input.dynamic_maximum_cycles_per_layer,
-                .dynamic_maximum_commands_per_wave =
-                    policy_input.dynamic_maximum_commands_per_wave,
-            };
-        };
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(0));
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(1));
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
-
-        ASSERT_NE(cuda_rank, nullptr);
-        ASSERT_NE(rocm_rank, nullptr);
+        auto local_fabric = makeLocalControllerFabric(resolved_topology, policy_input);
         publishSyntheticEconomy(
-            *cuda_rank,
-            *rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers);
         const auto participant_bindings =
-            allParticipantBindings(*cuda_rank, *rocm_rank);
+            localParticipantBindings(*local_fabric);
         const auto transport_bindings =
-            allTransportBindings(*cuda_rank, *rocm_rank);
+            localTransportBindings(*local_fabric);
         ASSERT_EQ(
             participant_bindings.size(),
-            resolved_topology->participants.size());
+            local_fabric->localParticipantIds().size());
         ASSERT_EQ(
-            transport_bindings.size(), resolved_topology->groups.size());
+            localTransportBindings(*local_fabric).size(), 1u);
 
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding_it = std::find_if(
@@ -4812,20 +5060,20 @@ namespace llaminar2::test
         }
         EXPECT_EQ(
             observed.transport_groups_prepared,
-            transport_bindings.size());
+            resolved_topology->groups.size());
         EXPECT_EQ(
             observed.transport_groups_published,
-            transport_bindings.size());
+            resolved_topology->groups.size());
         EXPECT_EQ(
             observed.transport_groups_retired,
-            transport_bindings.size());
+            resolved_topology->groups.size());
 
-        ASSERT_EQ(observed.apply_statuses.size(), fixtures.size());
-        ASSERT_EQ(observed.runtime_layers.size(), fixtures.size());
-        ASSERT_EQ(observed.epoch_controls.size(), fixtures.size());
-        ASSERT_EQ(observed.epoch_statuses.size(), fixtures.size());
+        ASSERT_EQ(observed.apply_statuses.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.runtime_layers.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.epoch_controls.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.epoch_statuses.size(), resolved_topology->participants.size());
         for (std::size_t participant = 0u;
-             participant < fixtures.size();
+             participant < resolved_topology->participants.size();
              ++participant)
         {
             const auto &apply = observed.apply_statuses[participant];
@@ -4961,11 +5209,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         const auto policy_input = adversarialPolicyInput();
@@ -4975,23 +5220,21 @@ namespace llaminar2::test
                 policy_input);
         ASSERT_TRUE(expected_dynamic.hasMovement());
 
-        auto fabrics = makeControllerFabricPair(
+        auto local_fabric = makeLocalControllerFabric(
             resolved_topology, policy_input);
         publishSyntheticEconomy(
-            *fabrics.cuda_rank,
-            *fabrics.rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers);
-        const auto participant_bindings = allParticipantBindings(
-            *fabrics.cuda_rank, *fabrics.rocm_rank);
-        const auto transport_bindings = allTransportBindings(
-            *fabrics.cuda_rank, *fabrics.rocm_rank);
+        const auto participant_bindings = localParticipantBindings(*local_fabric);
+        const auto transport_bindings = localTransportBindings(*local_fabric);
 
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding = std::find_if(
@@ -5142,7 +5385,7 @@ namespace llaminar2::test
         EXPECT_EQ(certified.transport_groups_published, 0u);
         EXPECT_EQ(certified.transport_groups_retired, 0u);
 
-        ASSERT_EQ(certified.runtime_layers.size(), fixtures.size());
+        ASSERT_EQ(certified.runtime_layers.size(), resolved_topology->participants.size());
         for (std::uint32_t layer = 0u;
              layer < policy_input.num_layers;
              ++layer)
@@ -5157,7 +5400,7 @@ namespace llaminar2::test
                     expert];
                 std::uint32_t active_owner_count = 0u;
                 for (std::size_t fixture_index = 0u;
-                     fixture_index < fixtures.size();
+                     fixture_index < resolved_topology->participants.size();
                      ++fixture_index)
                 {
                     const auto &runtime =
@@ -5177,7 +5420,7 @@ namespace llaminar2::test
                         continue;
                     ++active_owner_count;
                     EXPECT_EQ(
-                        fixtures[fixture_index]->participantId(),
+                        static_cast<int>(fixture_index),
                         static_cast<int>(expected_owner));
                     EXPECT_EQ(
                         descriptor.logical_expert_id,
@@ -5206,10 +5449,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
         const auto resolved = topology(authority_backend);
         constexpr std::uint32_t cycles_per_layer = 7u;
         const auto participants = static_cast<std::uint32_t>(resolved->participants.size());
@@ -5246,12 +5487,13 @@ namespace llaminar2::test
                     live.collected_state[moved * plane + layer * prepared.num_experts + expert] = word;
                 }
             }
-            auto fabrics = makeControllerFabricPair(resolved, prepared);
-            const auto bindings = allParticipantBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
-            const auto transports = allTransportBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
+            auto local_fabric = makeLocalControllerFabric(resolved, prepared);
+            const auto bindings = localParticipantBindings(*local_fabric);
+            const auto transports = localTransportBindings(*local_fabric);
             std::vector<std::unique_ptr<MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
             for (const auto &participant : resolved->participants)
             {
+            if (!ownsParticipant(participant)) continue;
                 const auto binding = std::find_if(bindings.begin(), bindings.end(),
                     [&participant](const auto &entry)
                     { return entry.participant_id == participant.participant_id; });
@@ -5323,14 +5565,14 @@ namespace llaminar2::test
                 for (std::uint32_t expert = 0u; expert < prepared.num_experts; ++expert)
                 {
                     std::uint32_t owner_count = 0u;
-                    for (std::size_t p = 0u; p < fixtures.size(); ++p)
+                    for (std::size_t p = 0u; p < resolved->participants.size(); ++p)
                     {
                         const auto &runtime = observed.runtime_layers.at(p).at(layer);
                         ASSERT_LT(runtime.active_bank, kDeviceMoEOverlayEpochBankCount);
                         const auto &descriptor = runtime.banks[runtime.active_bank].experts[expert];
                         if (!hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::LocalCompute)) continue;
                         ++owner_count;
-                        EXPECT_EQ(fixtures[p]->participantId(), targets[layer * prepared.num_experts + expert]);
+                        EXPECT_EQ(static_cast<int>(p), targets[layer * prepared.num_experts + expert]);
                         EXPECT_TRUE(descriptor.weightsReady());
                     }
                     EXPECT_EQ(owner_count, 1u);
@@ -5355,11 +5597,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         auto policy_input = adversarialPolicyInput();
@@ -5370,85 +5609,20 @@ namespace llaminar2::test
                 policy_input);
         ASSERT_FALSE(expected.hasMovement());
 
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto fabric_config = [&](int rank)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank, startup_link),
-                .topology = resolved_topology,
-                .num_layers = policy_input.num_layers,
-                .num_experts = policy_input.num_experts,
-                .command_capacity = policy_input.command_capacity,
-                .initial_durable_epoch = policy_input.base_epoch,
-                .payload_bytes_per_layer =
-                    policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
-                .minimum_window_activations =
-                    policy_input.minimum_window_activations,
-                .maximum_cycles_per_wave =
-                    policy_input.maximum_cycles_per_wave,
-                .dynamic_imbalance_threshold_per_mille =
-                    policy_input.dynamic_imbalance_threshold_per_mille,
-                .dynamic_minimum_improvement_per_mille =
-                    policy_input.dynamic_minimum_improvement_per_mille,
-                .dynamic_maximum_cycles_per_layer =
-                    policy_input.dynamic_maximum_cycles_per_layer,
-                .dynamic_maximum_commands_per_wave =
-                    policy_input.dynamic_maximum_commands_per_wave,
-            };
-        };
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(0));
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(1));
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
-
-        ASSERT_NE(cuda_rank, nullptr);
-        ASSERT_NE(rocm_rank, nullptr);
+        auto local_fabric = makeLocalControllerFabric(resolved_topology, policy_input);
         publishSyntheticEconomy(
-            *cuda_rank,
-            *rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers);
         const auto participant_bindings =
-            allParticipantBindings(*cuda_rank, *rocm_rank);
+            localParticipantBindings(*local_fabric);
         const auto transport_bindings =
-            allTransportBindings(*cuda_rank, *rocm_rank);
+            localTransportBindings(*local_fabric);
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding = std::find_if(
@@ -5507,7 +5681,7 @@ namespace llaminar2::test
         EXPECT_EQ(observed.transport_groups_retired, 0u);
 
         for (std::size_t participant = 0u;
-             participant < fixtures.size();
+             participant < resolved_topology->participants.size();
              ++participant)
         {
             EXPECT_EQ(
@@ -5544,11 +5718,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         const auto policy_input = adversarialPolicyInput();
@@ -5557,87 +5728,23 @@ namespace llaminar2::test
                 policy_input);
         ASSERT_TRUE(expected.hasMovement());
 
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto fabric_config = [&](int rank)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank, startup_link),
-                .topology = resolved_topology,
-                .num_layers = policy_input.num_layers,
-                .num_experts = policy_input.num_experts,
-                .command_capacity = policy_input.command_capacity,
-                .initial_durable_epoch = policy_input.base_epoch,
-                .payload_bytes_per_layer =
-                    policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
-                .minimum_window_activations =
-                    policy_input.minimum_window_activations,
-                .maximum_cycles_per_wave =
-                    policy_input.maximum_cycles_per_wave,
-                .dynamic_imbalance_threshold_per_mille =
-                    policy_input.dynamic_imbalance_threshold_per_mille,
-                .dynamic_minimum_improvement_per_mille =
-                    policy_input.dynamic_minimum_improvement_per_mille,
-                .dynamic_maximum_cycles_per_layer =
-                    policy_input.dynamic_maximum_cycles_per_layer,
-                .dynamic_maximum_commands_per_wave =
-                    policy_input.dynamic_maximum_commands_per_wave,
-            };
-        };
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(0));
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(1));
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
-        ASSERT_NE(cuda_rank, nullptr);
-        ASSERT_NE(rocm_rank, nullptr);
+        auto local_fabric = makeLocalControllerFabric(resolved_topology, policy_input);
 
         publishSyntheticEconomy(
-            *cuda_rank,
-            *rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers);
 
         const auto participant_bindings =
-            allParticipantBindings(*cuda_rank, *rocm_rank);
+            localParticipantBindings(*local_fabric);
         const auto transport_bindings =
-            allTransportBindings(*cuda_rank, *rocm_rank);
+            localTransportBindings(*local_fabric);
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding_it = std::find_if(
@@ -5692,14 +5799,14 @@ namespace llaminar2::test
         EXPECT_EQ(observed.controller.commit_transaction, 0u);
         EXPECT_EQ(
             observed.transport_groups_prepared,
-            transport_bindings.size());
+            resolved_topology->groups.size());
         EXPECT_EQ(observed.transport_groups_published, 0u);
         EXPECT_EQ(observed.transport_groups_retired, 0u);
 
-        ASSERT_EQ(observed.apply_statuses.size(), fixtures.size());
-        ASSERT_EQ(observed.runtime_layers.size(), fixtures.size());
-        ASSERT_EQ(observed.epoch_controls.size(), fixtures.size());
-        ASSERT_EQ(observed.epoch_statuses.size(), fixtures.size());
+        ASSERT_EQ(observed.apply_statuses.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.runtime_layers.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.epoch_controls.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.epoch_statuses.size(), resolved_topology->participants.size());
         EXPECT_TRUE(std::any_of(
             observed.apply_statuses.begin(),
             observed.apply_statuses.end(),
@@ -5710,7 +5817,7 @@ namespace llaminar2::test
                                               MissingArrival);
             }));
         for (std::size_t participant = 0u;
-             participant < fixtures.size();
+             participant < resolved_topology->participants.size();
              ++participant)
         {
             // Other participants may have completed their inactive-bank copy
@@ -5769,11 +5876,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
         const auto policy_input = adversarialPolicyInput();
@@ -5785,93 +5889,29 @@ namespace llaminar2::test
         ASSERT_GT(expected.evidence.demotions, 0u);
         ASSERT_GT(expected.evidence.same_priority_moves, 0u);
 
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto fabric_config = [&](int rank)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank, startup_link),
-                .topology = resolved_topology,
-                .num_layers = policy_input.num_layers,
-                .num_experts = policy_input.num_experts,
-                .command_capacity = policy_input.command_capacity,
-                .initial_durable_epoch = policy_input.base_epoch,
-                .payload_bytes_per_layer =
-                    policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
-                .minimum_window_activations =
-                    policy_input.minimum_window_activations,
-                .maximum_cycles_per_wave =
-                    policy_input.maximum_cycles_per_wave,
-                .dynamic_imbalance_threshold_per_mille =
-                    policy_input.dynamic_imbalance_threshold_per_mille,
-                .dynamic_minimum_improvement_per_mille =
-                    policy_input.dynamic_minimum_improvement_per_mille,
-                .dynamic_maximum_cycles_per_layer =
-                    policy_input.dynamic_maximum_cycles_per_layer,
-                .dynamic_maximum_commands_per_wave =
-                    policy_input.dynamic_maximum_commands_per_wave,
-            };
-        };
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(0));
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             fabric_config(1));
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
-        ASSERT_NE(cuda_rank, nullptr);
-        ASSERT_NE(rocm_rank, nullptr);
+        auto local_fabric = makeLocalControllerFabric(resolved_topology, policy_input);
 
         publishSyntheticEconomy(
-            *cuda_rank,
-            *rocm_rank,
+            *local_fabric,
             *resolved_topology,
             policy_input.num_layers);
 
         const auto participant_bindings =
-            allParticipantBindings(*cuda_rank, *rocm_rank);
+            localParticipantBindings(*local_fabric);
         const auto transport_bindings =
-            allTransportBindings(*cuda_rank, *rocm_rank);
+            localTransportBindings(*local_fabric);
         ASSERT_EQ(
             participant_bindings.size(),
-            resolved_topology->participants.size());
+            local_fabric->localParticipantIds().size());
         ASSERT_EQ(
-            transport_bindings.size(), resolved_topology->groups.size());
+            localTransportBindings(*local_fabric).size(), 1u);
 
         std::vector<std::unique_ptr<
             MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
         fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             IBackend *const backend =
                 participant.device.type == DeviceType::CUDA ? cuda : rocm;
             const auto binding_it = std::find_if(
@@ -5923,7 +5963,7 @@ namespace llaminar2::test
         EXPECT_EQ(
             observed.controller.placement_layer_cursor,
             expected.evidence.layer_scan_next);
-        EXPECT_EQ(observed.transport_groups_prepared, transport_bindings.size());
+        EXPECT_EQ(observed.transport_groups_prepared, resolved_topology->groups.size());
 
         EXPECT_EQ(observed.policy.command_count, expected.commands.size());
         EXPECT_EQ(
@@ -5985,18 +6025,18 @@ namespace llaminar2::test
                     kMoEOverlayDeviceControllerNeverMovedGeneration;
             })) << "pre-admission preparation mutated committed hysteresis";
 
-        ASSERT_EQ(observed.apply_statuses.size(), fixtures.size());
-        ASSERT_EQ(observed.runtime_layers.size(), fixtures.size());
+        ASSERT_EQ(observed.apply_statuses.size(), resolved_topology->participants.size());
+        ASSERT_EQ(observed.runtime_layers.size(), resolved_topology->participants.size());
         const std::uint32_t expected_flags = toMoEExpertFlags(
             DeviceMoEExpertFlags::Valid |
             DeviceMoEExpertFlags::Resident |
             DeviceMoEExpertFlags::PreferredOwner |
             DeviceMoEExpertFlags::LocalCompute);
         for (std::size_t fixture_index = 0u;
-             fixture_index < fixtures.size();
+             fixture_index < resolved_topology->participants.size();
              ++fixture_index)
         {
-            const auto participant_id = fixtures[fixture_index]->participantId();
+            const auto participant_id = static_cast<int>(fixture_index);
             const auto &participant = resolved_topology->participants.at(
                 static_cast<std::size_t>(participant_id));
             const auto *const local_group =
@@ -6055,25 +6095,22 @@ namespace llaminar2::test
                     if (command_it == observed.commands.end())
                     {
                         EXPECT_EQ(
-                            std::memcmp(
-                                &candidate.experts[expert],
-                                &published.experts[expert],
-                                sizeof(DeviceMoEExpertDescriptor)),
-                            0) << "untouched descriptor changed on participant "
+                            candidate.experts[expert].descriptor_unchanged,
+                            true) << "untouched descriptor changed on participant "
                                << participant_id << ", layer " << layer
                                << ", expert " << expert;
                         EXPECT_EQ(
-                            candidate.local_compute_mask[expert],
-                            published.local_compute_mask[expert]);
+                            candidate.experts[expert].local_compute,
+                            published.experts[expert].local_compute);
                         EXPECT_EQ(
-                            candidate.replica_role[expert],
-                            published.replica_role[expert]);
+                            candidate.experts[expert].replica_role,
+                            published.experts[expert].replica_role);
                         EXPECT_EQ(
-                            candidate.resident_participant_mask[expert],
-                            published.resident_participant_mask[expert]);
+                            candidate.experts[expert].resident_participant_mask,
+                            published.experts[expert].resident_participant_mask);
                         EXPECT_EQ(
-                            candidate.overlay_route_participant[expert],
-                            published.overlay_route_participant[expert]);
+                            candidate.experts[expert].overlay_route_participant,
+                            published.experts[expert].overlay_route_participant);
                         continue;
                     }
 
@@ -6087,7 +6124,7 @@ namespace llaminar2::test
                     ASSERT_NE(destination_group, nullptr);
                     const auto &descriptor = candidate.experts[expert];
                     EXPECT_EQ(
-                        candidate.overlay_route_participant[expert],
+                        candidate.experts[expert].overlay_route_participant,
                         static_cast<std::int32_t>(
                             command.destination_participant));
 
@@ -6100,7 +6137,7 @@ namespace llaminar2::test
                             descriptor.owner_participant,
                             static_cast<std::int32_t>(local_destination));
                         EXPECT_EQ(
-                            candidate.resident_participant_mask[expert],
+                            candidate.experts[expert].resident_participant_mask,
                             1u << local_destination);
                         if (participant_id == static_cast<int>(
                                                   command.destination_participant))
@@ -6115,9 +6152,9 @@ namespace llaminar2::test
                                 static_cast<std::int32_t>(expert));
                             EXPECT_EQ(descriptor.flags, expected_flags);
                             EXPECT_EQ(
-                                candidate.local_compute_mask[expert], 1u);
+                                candidate.experts[expert].local_compute, 1u);
                             EXPECT_EQ(
-                                candidate.replica_role[expert],
+                                candidate.experts[expert].replica_role,
                                 static_cast<std::uint8_t>(
                                     DeviceMoEReplicaRole::Primary));
                         }
@@ -6127,9 +6164,9 @@ namespace llaminar2::test
                             EXPECT_EQ(descriptor.local_slot, -1);
                             EXPECT_EQ(descriptor.flags, 0u);
                             EXPECT_EQ(
-                                candidate.local_compute_mask[expert], 0u);
+                                candidate.experts[expert].local_compute, 0u);
                             EXPECT_EQ(
-                                candidate.replica_role[expert],
+                                candidate.experts[expert].replica_role,
                                 static_cast<std::uint8_t>(
                                     DeviceMoEReplicaRole::None));
                         }
@@ -6141,10 +6178,10 @@ namespace llaminar2::test
                         EXPECT_EQ(descriptor.local_slot, -1);
                         EXPECT_EQ(descriptor.flags, 0u);
                         EXPECT_EQ(
-                            candidate.resident_participant_mask[expert], 0u);
-                        EXPECT_EQ(candidate.local_compute_mask[expert], 0u);
+                            candidate.experts[expert].resident_participant_mask, 0u);
+                        EXPECT_EQ(candidate.experts[expert].local_compute, 0u);
                         EXPECT_EQ(
-                            candidate.replica_role[expert],
+                            candidate.experts[expert].replica_role,
                             static_cast<std::uint8_t>(
                                 DeviceMoEReplicaRole::None));
                     }
@@ -6158,112 +6195,32 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
         const auto resolved_topology = topology();
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_rank;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_rank;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = context(0, startup_link),
-                                                 .topology = resolved_topology,
-                                                 .num_layers = 2u,
-                                                 .num_experts = 16u,
-                                                 .command_capacity = 8u,
-                                                 .initial_durable_epoch = 3u,
-                                             });
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_rank = std::make_unique<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = context(1, startup_link),
-                                                 .topology = resolved_topology,
-                                                 .num_layers = 2u,
-                                                 .num_experts = 16u,
-                                                 .command_capacity = 8u,
-                                                 .initial_durable_epoch = 3u,
-                                             });
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
-        ASSERT_NE(cuda_rank, nullptr);
-        ASSERT_NE(rocm_rank, nullptr);
-        EXPECT_EQ(cuda_rank->localParticipantIds(),
-                  (std::vector<int>{0, 1}));
-        EXPECT_EQ(rocm_rank->localParticipantIds(),
-                  (std::vector<int>{2, 3, 4, 5}));
-
-        const auto cuda_leader = cuda_rank->participantBinding(0);
-        const auto rocm_root = rocm_rank->participantBinding(2);
-        const auto participant_bindings =
-            allParticipantBindings(*cuda_rank, *rocm_rank);
-        const auto transport_bindings =
-            allTransportBindings(*cuda_rank, *rocm_rank);
-        ASSERT_TRUE(cuda_leader.valid());
-        ASSERT_TRUE(rocm_root.valid());
-        EXPECT_TRUE(cuda_leader.authority_leader);
-        EXPECT_TRUE(cuda_leader.group_root);
-        EXPECT_FALSE(rocm_root.authority_leader);
-        EXPECT_TRUE(rocm_root.group_root);
-
-        const auto &rocm_group = rocm_rank->layout().groups.at(1u);
-        void *const cuda_view_of_rocm_snapshot =
-            cuda_leader.mapped_base_device +
-            static_cast<std::size_t>(rocm_group.collected_state_offset);
+        auto local_fabric = std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
+            MoEOverlayNodeLocalDeviceControllerFabric::Config{
+                .mpi_ctx = originalContext(), .topology = resolved_topology,
+                .num_layers = 2u, .num_experts = 16u,
+                .command_capacity = 8u, .initial_durable_epoch = 3u,
+            });
+        const auto participant_bindings = localParticipantBindings(*local_fabric);
+        const auto transport_bindings = localTransportBindings(*local_fabric);
+        const bool cuda_owner = originalContext()->rank() == originalCohort(DeviceType::CUDA, 2).first;
+        EXPECT_EQ(local_fabric->localParticipantIds(), cuda_owner
+            ? (std::vector<int>{0, 1}) : (std::vector<int>{2, 3, 4, 5}));
+        const auto root = local_fabric->participantBinding(cuda_owner ? 0 : 2);
+        ASSERT_TRUE(root.valid());
+        EXPECT_EQ(root.authority_leader, cuda_owner);
+        EXPECT_TRUE(root.group_root);
         std::string error;
-        ASSERT_TRUE(proveVisibility(
-            rocm,
-            /*producer_ordinal=*/0,
-            rocm_root.group_collected_state,
-            cuda,
-            /*consumer_ordinal=*/0,
-            cuda_view_of_rocm_snapshot,
-            0x5a,
-            &error)) << error;
-
-        const auto command_offset = static_cast<std::size_t>(
-            rocm_rank->layout().header.command_entries_offset);
-        const void *const rocm_view_of_cuda_commands =
-            rocm_root.mapped_base_device + command_offset;
-        ASSERT_TRUE(proveVisibility(
-            cuda,
-            /*producer_ordinal=*/0,
-            cuda_leader.command_entries,
-            rocm,
-            /*consumer_ordinal=*/0,
-            rocm_view_of_cuda_commands,
-            0xa6,
-            &error)) << error;
+        ASSERT_TRUE(proveVisibility(root, DeviceType::ROCm,
+            static_cast<std::size_t>(local_fabric->layout().groups.at(1u).collected_state_offset),
+            0x5a, &error)) << error;
+        ASSERT_TRUE(proveVisibility(root, DeviceType::CUDA,
+            static_cast<std::size_t>(local_fabric->layout().header.command_entries_offset),
+            0xa6, &error)) << error;
 
         std::uint64_t expected_epoch = 3u;
         std::uint64_t expected_transaction = 0u;
@@ -6275,9 +6232,10 @@ namespace llaminar2::test
             ASSERT_TRUE(runControllerTransaction(
                 cuda,
                 rocm,
+                *resolved_topology,
                 participant_bindings,
                 transport_bindings,
-                cuda_rank->layout(),
+                local_fabric->layout(),
                 kind,
                 expected_epoch,
                 &evidence,
@@ -6321,19 +6279,19 @@ namespace llaminar2::test
             EXPECT_GT(evidence.leader_elapsed_ms, 0.0F);
             EXPECT_EQ(
                 evidence.transport_groups_acquired,
-                transport_bindings.size());
+                resolved_topology->groups.size());
             const bool moves_weights =
                 kind == MoEOverlayDeviceControllerTransactionKind::
                             DynamicPlacement;
             EXPECT_EQ(
                 evidence.transport_groups_prepared,
-                moves_weights ? transport_bindings.size() : 0u);
+                moves_weights ? resolved_topology->groups.size() : 0u);
             EXPECT_EQ(
                 evidence.transport_groups_published,
-                moves_weights ? transport_bindings.size() : 0u);
+                moves_weights ? resolved_topology->groups.size() : 0u);
             EXPECT_EQ(
                 evidence.transport_groups_retired,
-                moves_weights ? transport_bindings.size() : 0u);
+                moves_weights ? resolved_topology->groups.size() : 0u);
             EXPECT_EQ(evidence.transport_groups_restored, 0u);
             if (moves_weights)
                 EXPECT_GE(evidence.leader_elapsed_ms, 1.0F);
@@ -6370,9 +6328,10 @@ namespace llaminar2::test
         ASSERT_TRUE(runControllerTransaction(
             cuda,
             rocm,
+            *resolved_topology,
             participant_bindings,
             transport_bindings,
-            cuda_rank->layout(),
+            local_fabric->layout(),
             MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
             expected_epoch,
             &collision,
@@ -6405,11 +6364,8 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto policy_input = adversarialPolicyInput();
         for (const DeviceType continuation_type :
@@ -6420,8 +6376,9 @@ namespace llaminar2::test
                     ? "cuda_continuation"
                     : "rocm_continuation");
             const auto resolved_topology = topology(continuation_type);
-            auto fabrics = makeControllerFabricPair(
+            auto local_fabric = makeLocalControllerFabric(
                 resolved_topology, policy_input);
+            if (originalContext()->rank() != resolved_topology->leader_world_rank) continue;
             const auto &continuation_group = resolved_topology->groups.at(
                 static_cast<std::size_t>(
                     resolved_topology->leader_group_id));
@@ -6433,9 +6390,7 @@ namespace llaminar2::test
             IBackend *const continuation_backend =
                 continuation_type == DeviceType::CUDA ? cuda : rocm;
             const auto *const continuation_fabric =
-                continuation_type == DeviceType::CUDA
-                    ? fabrics.cuda_rank.get()
-                    : fabrics.rocm_rank.get();
+                local_fabric.get();
             ASSERT_NE(continuation_fabric, nullptr);
             const std::string initial_diagnostic =
                 continuation_fabric->describeInferenceEpochBarrier();
@@ -6562,80 +6517,24 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto cuda_context = context(0, startup_link);
-        const auto rocm_context = context(1, startup_link);
-        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_fabric;
-        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_fabric;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-
-        // The production constructor is a bilateral first-touch rendezvous;
-        // retain that real concurrent setup rather than substituting host test
-        // pages for either backend.
-        std::thread cuda_builder([&]
-                                 {
-                                     try
-                                     {
-                                         cuda_fabric = std::make_shared<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = cuda_context,
-                                                 .topology = resolved_topology,
-                                                 .num_layers = 2u,
-                                                 .num_experts = 16u,
-                                                 .command_capacity = 8u,
-                                                 .initial_durable_epoch = 3u,
-                                             });
-                                     }
-                                     catch (...)
-                                     {
-                                         cuda_error = std::current_exception();
-                                     }
-                                 });
-        std::thread rocm_builder([&]
-                                 {
-                                     try
-                                     {
-                                         rocm_fabric = std::make_shared<
-                                             MoEOverlayNodeLocalDeviceControllerFabric>(
-                                             MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                                                 .mpi_ctx = rocm_context,
-                                                 .topology = resolved_topology,
-                                                 .num_layers = 2u,
-                                                 .num_experts = 16u,
-                                                 .command_capacity = 8u,
-                                                 .initial_durable_epoch = 3u,
-                                             });
-                                     }
-                                     catch (...)
-                                     {
-                                         rocm_error = std::current_exception();
-                                     }
-                                 });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
+        auto local_fabric = std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
+            MoEOverlayNodeLocalDeviceControllerFabric::Config{
+                .mpi_ctx = originalContext(), .topology = resolved_topology,
+                .num_layers = 2u, .num_experts = 16u,
+                .command_capacity = 8u, .initial_durable_epoch = 3u,
+            });
 
         std::vector<std::unique_ptr<ControllerRuntimeFixture>>
             runtime_fixtures;
-        std::vector<MoEOverlayDeviceControllerRuntimeBinding>
-            cuda_runtime_bindings;
-        std::vector<MoEOverlayDeviceControllerRuntimeBinding>
-            rocm_runtime_bindings;
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding> local_runtime_bindings;
         runtime_fixtures.reserve(resolved_topology->participants.size());
         for (const auto &participant : resolved_topology->participants)
         {
+            if (!ownsParticipant(participant)) continue;
             const auto *const group = resolved_topology
                                           ->groupForParticipant(
                                               participant.participant_id);
@@ -6650,76 +6549,29 @@ namespace llaminar2::test
                     participant.domain_participant_index),
                 static_cast<std::uint32_t>(
                     group->participant_ids.size()));
-            if (participant.world_rank == 0)
-                cuda_runtime_bindings.push_back(fixture->binding());
-            else
-                rocm_runtime_bindings.push_back(fixture->binding());
+            local_runtime_bindings.push_back(fixture->binding());
             runtime_fixtures.push_back(std::move(fixture));
         }
 
-        auto cuda_service = std::make_unique<
-            MoEOverlayDeviceControllerGraphService>(
-            MoEOverlayDeviceControllerGraphService::Config{
-                .mpi_ctx = cuda_context,
-                .topology = resolved_topology,
-                .fabric = cuda_fabric,
-                .runtime_bindings = cuda_runtime_bindings,
-            });
-        auto rocm_service = std::make_unique<
-            MoEOverlayDeviceControllerGraphService>(
-            MoEOverlayDeviceControllerGraphService::Config{
-                .mpi_ctx = rocm_context,
-                .topology = resolved_topology,
-                .fabric = rocm_fabric,
-                .runtime_bindings = rocm_runtime_bindings,
-            });
-        ASSERT_EQ(cuda_service->localGraphCount(), 2u);
-        ASSERT_EQ(rocm_service->localGraphCount(), 4u);
-        ASSERT_TRUE(cuda_service->ownsLeaderGraph());
-        ASSERT_FALSE(rocm_service->ownsLeaderGraph());
-        EXPECT_EQ(
-            cuda_service->state(),
-            MoEOverlayDeviceControllerActivationState::Prepared);
-        EXPECT_EQ(
-            rocm_service->state(),
-            MoEOverlayDeviceControllerActivationState::Prepared);
+        MoEOverlayDeviceControllerGraphService service({
+            .mpi_ctx = originalContext(), .topology = resolved_topology,
+            .fabric = local_fabric, .runtime_bindings = local_runtime_bindings,
+        });
+        ASSERT_EQ(service.localGraphCount(), local_fabric->localParticipantIds().size());
+        ASSERT_EQ(service.ownsLeaderGraph(), originalContext()->rank() == resolved_topology->leader_world_rank);
+        EXPECT_EQ(service.state(), MoEOverlayDeviceControllerActivationState::Prepared);
+        std::string error;
+        ASSERT_TRUE(service.certifyStaticNoMovement(&error)) << error;
+        // Setup certification cannot implicitly activate a service. Both real
+        // owners must preserve Prepared -> Running -> Stopped and reject reuse.
+        EXPECT_EQ(service.state(), MoEOverlayDeviceControllerActivationState::Prepared);
+        service.start();
+        EXPECT_EQ(service.state(), MoEOverlayDeviceControllerActivationState::Running);
+        EXPECT_THROW(service.start(), std::logic_error);
+        const auto drained = service.stopAndDrain();
+        EXPECT_TRUE(drained.valid());
+        EXPECT_EQ(service.state(), MoEOverlayDeviceControllerActivationState::Stopped);
 
-        bool cuda_ok = false;
-        bool rocm_ok = false;
-        std::string cuda_message;
-        std::string rocm_message;
-        std::thread cuda_certifier([&]
-                                   {
-                                       cuda_ok = cuda_service
-                                                     ->certifyStaticNoMovement(
-                                                         &cuda_message);
-                                   });
-        std::thread rocm_certifier([&]
-                                   {
-                                       rocm_ok = rocm_service
-                                                     ->certifyStaticNoMovement(
-                                                         &rocm_message);
-                                   });
-        cuda_certifier.join();
-        rocm_certifier.join();
-        EXPECT_TRUE(cuda_ok) << cuda_message;
-        EXPECT_TRUE(rocm_ok) << rocm_message;
-
-        /*
-         * Static certification is setup work, not implicit service
-         * activation. Mirror the production post-capture edge explicitly and
-         * prove both backend owners reject a second transition.
-         */
-        cuda_service->start();
-        rocm_service->start();
-        EXPECT_EQ(
-            cuda_service->state(),
-            MoEOverlayDeviceControllerActivationState::Running);
-        EXPECT_EQ(
-            rocm_service->state(),
-            MoEOverlayDeviceControllerActivationState::Running);
-        EXPECT_THROW(cuda_service->start(), std::logic_error);
-        EXPECT_THROW(rocm_service->start(), std::logic_error);
     }
 
     /**
@@ -6732,62 +6584,17 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
-            rocm->deviceCount() < 4)
-        {
-            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
-        }
+        (void)originalCohort(DeviceType::CUDA, 2);
+        (void)originalCohort(DeviceType::ROCm, 4);
 
         const auto resolved_topology = topology();
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> cuda_fabric;
-        std::unique_ptr<MoEOverlayNodeLocalDeviceControllerFabric> rocm_fabric;
-        std::exception_ptr cuda_error;
-        std::exception_ptr rocm_error;
-        const auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        const auto make_config = [&](int rank)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = context(rank, startup_link),
-                .topology = resolved_topology,
-                .num_layers = 2u,
-                .num_experts = 16u,
-                .command_capacity = 8u,
-                .initial_durable_epoch = 3u,
+        auto local_fabric = std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
+            MoEOverlayNodeLocalDeviceControllerFabric::Config{
+                .mpi_ctx = originalContext(), .topology = resolved_topology,
+                .num_layers = 2u, .num_experts = 16u,
+                .command_capacity = 8u, .initial_durable_epoch = 3u,
                 .first_model_layer = first_model_layer,
-            };
-        };
-        std::thread cuda_builder([&]
-        {
-            try
-            {
-                cuda_fabric = std::make_unique<
-                    MoEOverlayNodeLocalDeviceControllerFabric>(
-                    make_config(0));
-            }
-            catch (...)
-            {
-                cuda_error = std::current_exception();
-            }
-        });
-        std::thread rocm_builder([&]
-        {
-            try
-            {
-                rocm_fabric = std::make_unique<
-                    MoEOverlayNodeLocalDeviceControllerFabric>(
-                    make_config(1));
-            }
-            catch (...)
-            {
-                rocm_error = std::current_exception();
-            }
-        });
-        cuda_builder.join();
-        rocm_builder.join();
-        if (cuda_error)
-            std::rethrow_exception(cuda_error);
-        if (rocm_error)
-            std::rethrow_exception(rocm_error);
+            });
 
         const auto prove_backend = [resolved_topology, first_model_layer](
             IBackend *backend,
@@ -6931,8 +6738,9 @@ namespace llaminar2::test
             cleanup();
         };
 
-        prove_backend(cuda, *cuda_fabric, DeviceType::CUDA);
-        prove_backend(rocm, *rocm_fabric, DeviceType::ROCm);
+        const auto local_type = resolved_topology->participants.at(
+            static_cast<std::size_t>(local_fabric->localParticipantIds().front())).device.type;
+        prove_backend(local_type == DeviceType::CUDA ? cuda : rocm, *local_fabric, local_type);
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
@@ -6953,11 +6761,10 @@ namespace llaminar2::test
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
-        if (!cuda || !rocm || cuda->deviceCount() < 1 ||
-            rocm->deviceCount() < 1)
-        {
-            GTEST_SKIP() << "Requires one CUDA and one ROCm device";
-        }
+        // Observe the same complete declared session topology as the native
+        // controller replay. Telemetry borrows its participants, never a new
+        // independently selected singleton owner on another NUMA node.
+        const auto observed_topology = topology();
 
         const auto prove_backend = [](IBackend *backend, DeviceId device)
         {
@@ -7087,8 +6894,14 @@ namespace llaminar2::test
             cleanup();
         };
 
-        prove_backend(cuda, DeviceId::cuda(0));
-        prove_backend(rocm, DeviceId::rocm(0));
+        for (const auto family : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            const auto cohort = originalControllerFabricObservation(
+                *originalContext()->clusterInventory(), *observed_topology, family, 1);
+            if (originalContext()->rank() == cohort.first)
+                prove_backend(family == DeviceType::CUDA ? cuda : rocm,
+                    cohort.second.front().toLocalDeviceId());
+        }
     }
 } // namespace llaminar2::test
 

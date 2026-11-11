@@ -159,7 +159,7 @@ std::uint64_t PooledNativeTransferSpan::identity() const noexcept
 }
 
 PooledImmutableNativeTransfer::PooledImmutableNativeTransfer(
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, PreparedGPUContextUsePermit original,
+    NativeLocalTPContextBorrow cohort, PreparedGPUContextUsePermit original,
     CapturedTransferEndpoint side, int producer, int consumer, int participant, CapturedTransferMessage message,
     PooledNativeTransferSpan payload)
     : cohort_(std::move(cohort)), original_(std::move(original)), side_(side), producer_(producer),
@@ -200,24 +200,28 @@ PooledImmutableNativeTransfer& PooledImmutableNativeTransfer::operator=(PooledIm
 }
 
 PooledImmutableNativeTransfer PooledImmutableNativeTransfer::fixed(
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, PreparedGPUContextUsePermit original,
+    NativeLocalTPContextBorrow cohort, PreparedGPUContextUsePermit original,
     CapturedTransferEndpoint side, int producerCoordinate, int consumerCoordinate, CapturedTransferMessage message,
     PooledNativeTransferSpan payload)
 {
-    if (isGraphCaptureActive() || !cohort || !NativeByteEdge(producerCoordinate,consumerCoordinate).contains(cohort->degree(),
-            side==CapturedTransferEndpoint::Producer?producerCoordinate:consumerCoordinate) || !message.key || !message.bytes ||
-        (side != CapturedTransferEndpoint::Producer && side != CapturedTransferEndpoint::Consumer))
-        throw std::invalid_argument("Native pooled transfer requires an original cold addressed fixed declaration");
-    const auto participant = side == CapturedTransferEndpoint::Producer ? producerCoordinate : consumerCoordinate;
-    cohort->requireConsumer(original.device(), participant);
+    const auto participant=side==CapturedTransferEndpoint::Producer?producerCoordinate:consumerCoordinate;
+    NativeCompletionAuthority authority;
+    {
+        const auto use=cohort.acquire();auto& context=use.context();
+        if(isGraphCaptureActive() || !NativeByteEdge(producerCoordinate,consumerCoordinate).contains(context.degree(),participant) ||
+            !message.key || !message.bytes || (side!=CapturedTransferEndpoint::Producer && side!=CapturedTransferEndpoint::Consumer))
+            throw std::invalid_argument("Native pooled transfer requires an original cold addressed fixed declaration");
+        if(context.devices().at(participant).toLocalDeviceId()!=original.device() ||
+            context.backend()!=(original.device().is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL))
+            throw std::invalid_argument("Native pooled endpoint changed its original communicator coordinate/backend");
+        authority=context.nativeCompletionAuthority(participant);
+    }
     payload.require(original.device());
-    if (message.bytes > payload.bytes())
-        throw std::out_of_range("Native pooled message exceeds its original physical subrange");
-    PooledImmutableNativeTransfer result(std::move(cohort), std::move(original), side,
-        producerCoordinate, consumerCoordinate, participant, message, std::move(payload));
-    result.authority_ = result.cohort_->context().nativeCompletionAuthority(participant);
-    if (!result.authority_.valid())
-        throw std::logic_error("Native pooled fixed endpoint lacks its original native communicator authority");
+    if(message.bytes>payload.bytes())throw std::out_of_range("Native pooled message exceeds its original physical subrange");
+    PooledImmutableNativeTransfer result(std::move(cohort),std::move(original),side,
+        producerCoordinate,consumerCoordinate,participant,message,std::move(payload));
+    result.authority_=authority;
+    if(!result.authority_.valid())throw std::logic_error("Native pooled fixed endpoint lacks its original native communicator authority");
     result.requireCurrent();
     result.sealStorage();
     return result;
@@ -250,7 +254,7 @@ PooledImmutableNativeTransfer PooledImmutableNativeTransfer::withCountedFrame(
 {
     requireCurrent();
     if (isGraphCaptureActive() || operand_published_ || extent_ || !operandBacking || !receipts ||
-        layout.degree()!=static_cast<std::size_t>(cohort_->degree()) ||
+        layout.degree()!=static_cast<std::size_t>(cohort_.acquire().context().degree()) ||
         !layout.matchesStorageBytes(operandBacking->sizeBytes(), receipts->sizeBytes(),participant_) ||
         receipts->device() != device())
         throw std::invalid_argument("Counted native pooled binding requires original cold admitted completion roots");
@@ -273,7 +277,9 @@ PooledImmutableNativeTransfer PooledImmutableNativeTransfer::withCountedFrame(
     result.extent_ = std::move(extent);
     result.frame_ = std::move(frame);
     result.nominal_ = nominal;
-    result.layout_ = layout;
+    result.layout_ = PooledNativeCompletionBindingLayout{layout.degree(),layout.coordinator(),
+        layout.operandOffset(nominal,participant_,NativeByteEdge(producer_,consumer_).peer(participant_)),
+        layout.receiptOffset(nominal,participant_,NativeByteEdge(producer_,consumer_).peer(participant_)),layout.readerProfile()};
     result.operands_ = std::move(operandBacking);
     result.receipts_ = std::move(receipts);
     result.sealStorage();
@@ -348,9 +354,13 @@ void* PooledImmutableNativeTransfer::pointer(const PooledNativeTransferSpan& spa
 
 void PooledImmutableNativeTransfer::requireCurrent() const
 {
-    if (!cohort_ || !NativeByteEdge(producer_,consumer_).contains(cohort_->degree(),participant_))
+    const auto use=cohort_.acquire();
+    const auto& context=use.context();
+    if (!NativeByteEdge(producer_,consumer_).contains(context.degree(),participant_))
         throw std::logic_error("Native pooled transfer lost its original addressed owner");
-    cohort_->requireConsumer(device(), participant_);
+    if(context.devices().at(participant_).toLocalDeviceId()!=device() ||
+        context.backend()!=(device().is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL))
+        throw std::logic_error("Native pooled endpoint lost its original communicator coordinate/backend");
     const auto current = GPUDeviceContextPool::instance().retainExistingPreparedContext(device(), original_.memory());
     original_.requireWorker(current.worker());
     if (current.generation() != original_.generation())
@@ -438,13 +448,13 @@ void PooledImmutableNativeTransfer::prepare(void* stream)
         auto* identity = static_cast<std::uint64_t*>(pointer(frameIdentity(), alignof(std::uint64_t)));
         auto* error = static_cast<std::int32_t*>(pointer(frameError(), alignof(std::int32_t)));
         auto* receipt = static_cast<ncclLlaminarByteCompletion*>(receipts_->mutableDeviceData(
-            layout_->receiptOffset(*nominal_,participant_,NativeByteEdge(producer_,consumer_).peer(participant_))));
+            layout_->receipt_offset));
         // The same native three-pointer ABI borrows the purpose-tagged original
         // words directly; request identity never becomes a synthetic pool epoch.
         const ncclLlaminarCompletionOperand operand{identity, identity + 1, identity + 2, error,
             receipt, nullptr, message_.key, frameFailureCode(), 0};
         auto* target = static_cast<std::byte*>(operands_->mutableHostData()) +
-            layout_->operandOffset(*nominal_, participant_,NativeByteEdge(producer_,consumer_).peer(participant_));
+            layout_->operand_offset;
         detail::sealPooledNativeOperand(*reinterpret_cast<ncclLlaminarCompletionOperand*>(target), operand);
     }
     operand_published_ = true;
@@ -456,12 +466,13 @@ void PooledImmutableNativeTransfer::enqueue(void* stream) const
     if (!sealed_ || !operand_published_ || reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
         !original_.worker()->ownsCurrentThread())
         throw std::logic_error("Native pooled enqueue lost its original sealed parent stream/worker");
-    auto& context = cohort_->context();
+    const auto use=cohort_.acquire();
+    auto& context = use.context();
     auto bytes = NativeCollectiveBytes::fixed(message_.bytes);
     if (extent_) {
         const auto* operand = reinterpret_cast<const ncclLlaminarCompletionOperand*>(
             static_cast<std::byte*>(operands_->deviceAlias(device())) +
-            layout_->operandOffset(*nominal_, participant_,NativeByteEdge(producer_,consumer_).peer(participant_)));
+            layout_->operand_offset);
         auto* extent = static_cast<std::uint64_t*>(pointer(*extent_, alignof(std::uint64_t)));
         if (slice_)
             bytes = NativeCollectiveBytes::sourceSlice(static_cast<NativeByteSourceSlice*>(
@@ -487,7 +498,7 @@ NativeReceiveCompletionView PooledImmutableNativeTransfer::completion() const
     if (!sealed_ || !extent_)
         throw std::logic_error("Fixed or unprepared native pooled transfer has no counted receive proof");
     return authority_.receive(
-        static_cast<const ncclLlaminarByteCompletion*>(receipts_->deviceData(layout_->receiptOffset(*nominal_,participant_,NativeByteEdge(producer_,consumer_).peer(participant_)))));
+        static_cast<const ncclLlaminarByteCompletion*>(receipts_->deviceData(layout_->receipt_offset)));
 }
 
 std::uint64_t PooledImmutableNativeTransfer::captureIdentity() const
@@ -495,7 +506,8 @@ std::uint64_t PooledImmutableNativeTransfer::captureIdentity() const
     requireCurrent();
     std::uint64_t value = 1469598103934665603ULL;
     const auto mix = [&](std::uint64_t word) { value = (value ^ word) * 1099511628211ULL; };
-    mix(reinterpret_cast<std::uintptr_t>(&cohort_->context()));
+    const auto use=cohort_.acquire();
+    mix(reinterpret_cast<std::uintptr_t>(&use.context()));
     mix(original_.generation()); mix(static_cast<std::uint64_t>(device().type)); mix(device().ordinal);
     mix(producer_); mix(consumer_); mix(participant_); mix(message_.key); mix(message_.bytes);
     mix(reinterpret_cast<std::uintptr_t>(authority_.binding().abortFlag));
@@ -505,13 +517,13 @@ std::uint64_t PooledImmutableNativeTransfer::captureIdentity() const
     if (extent_) {
         span(*extent_); span(frameIdentity()); span(frameError());
         mix(frame_->index()); mix(static_cast<std::uint64_t>(*nominal_));
-        mix(static_cast<std::uint64_t>(layout_->readerProfile()));
-        mix(layout_->degree()); mix(layout_->coordinator());
+        mix(static_cast<std::uint64_t>(layout_->profile));
+        mix(layout_->degree); mix(layout_->coordinator);
         mix(static_cast<std::uint64_t>(frameFailureCode()));
         mix(reinterpret_cast<std::uintptr_t>(operands_.get()));
         mix(reinterpret_cast<std::uintptr_t>(receipts_.get()));
-        mix(layout_->operandOffset(*nominal_, participant_,NativeByteEdge(producer_,consumer_).peer(participant_)));
-        mix(layout_->receiptOffset(*nominal_,participant_,NativeByteEdge(producer_,consumer_).peer(participant_)));
+        mix(layout_->operand_offset);
+        mix(layout_->receipt_offset);
     }
     if (slice_) span(*slice_);
     mix(source_bytes_); mix(source_origin_); mix(slice_message_);

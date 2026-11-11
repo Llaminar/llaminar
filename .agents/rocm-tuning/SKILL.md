@@ -68,6 +68,16 @@ layout, shape, resource, capture and numerical contracts before installation.
 ROCm kernel tuning must preserve the production execution architecture, not
 trade architecture for an isolated microbenchmark win:
 
+- **Prefer register-resident work.** Keep per-thread reusable operands,
+  accumulators and intermediate results in registers through their consumers.
+  Evaluate layouts, tiling and producer/consumer fusion that remove unnecessary
+  LDS/global-memory staging, reloads and barriers. LDS remains appropriate for
+  measured cooperative reuse and required synchronization. Shorten live ranges
+  and recycle dead registers while preserving independent arithmetic chains
+  and the numerical contract. Inspect final ISA for the actual fused entry and
+  its helpers; qualify VGPR/SGPR pressure, spills, shuffle traffic and wave
+  occupancy on each target. Promote measured production wins under the existing
+  zero-spill policy; increased register residency alone is not a performance result.
 - **No dynamic allocation or deallocation.** Hot-path kernels and launch
   bridges consume persistent workspace bindings. `hipMalloc`,
   `hipMallocAsync`, `hipFree`, container growth, or hidden scratch allocation

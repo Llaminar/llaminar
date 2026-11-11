@@ -9,6 +9,7 @@
 #pragma once
 #include <cstddef>
 #include <span>
+#include <limits>
 namespace llaminar2 {
 /** @brief Original domain participant and its actual contiguous record prefix. */
 struct RootedFloatRecordRange {
@@ -24,7 +25,7 @@ struct RootedFloatRecordRange {
  */
 inline bool validRootedFloatRecordRanges(std::span<const RootedFloatRecordRange> ranges,
                                         size_t records) noexcept {
-    if (ranges.size()<2 || ranges.size()>8) return false;
+    if (ranges.size()<2 || ranges.size()>static_cast<size_t>(std::numeric_limits<int>::max())) return false;
     size_t total=0;
     for (size_t i=0;i<ranges.size();++i) {
         const auto &a=ranges[i];

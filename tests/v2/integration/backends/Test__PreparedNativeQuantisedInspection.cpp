@@ -11,6 +11,7 @@
  * fixtures remain negative defaults and explicit Four controls.
  */
 #include "utils/MoEProjectionPipelineFixture.h"
+#include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "utils/PerfStatsCollector.h"
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
 #include "backends/HardwareInventory.h"
@@ -60,7 +61,7 @@ public:
 };
 /**
  * @brief Run the unchanged complete graph lowerer and assert its source-bound compiled policy.
- * @param participants Explicit physical communicator size; no device ordinal assumptions enter kernel policy.
+ * @param selected_devices Original rank-local physical members; no ordinal assumptions enter kernel policy.
  * @param measured_geometry Require compiled Automatic and select the measured operation tuple.
  * @param measured_format Actual original source family for a measured witness; Q4_K or Q5_K.
  *
@@ -69,8 +70,9 @@ public:
  * separately prove symbols and replay-stable capture counters. No profiler or
  * synthetic timing is part of this regression.
  */
-void proveModelOwnerBinding(int participants, bool measured_geometry = false, const char *measured_format = "Q4_K")
+void proveModelOwnerBindingOnCohort(const std::vector<DeviceId> &selected_devices, bool measured_geometry, const char *measured_format)
 {
+    const int participants = static_cast<int>(selected_devices.size());
     const auto policy = rocm::compiledMoERouteOwnedModelPartitionPolicy();
     if (measured_geometry)
         ASSERT_EQ(policy, rocm::MoERouteOwnedModelPartitionPolicy::Automatic)
@@ -83,18 +85,18 @@ void proveModelOwnerBinding(int participants, bool measured_geometry = false, co
     if (participants==4) config.format=measured_geometry ? measured_format : "Q4_K";
     config.exchange=ProjectionExchangeProof::DeviceCounted;
     config.service_phase=MoEOverlayServicePhaseHint::Decode;
-    runProjectionPipelineFixture(DeviceId::rocm(0), participants, config);
+    runProjectionPipelineFixtureOnCohort(selected_devices, config);
     ASSERT_FALSE(::testing::Test::HasFailure());
     const auto *startup = DeviceManager::instance().hardware();
     ASSERT_NE(startup, nullptr) << "the fixture must retain canonical startup publication";
     // Independent test expectation from original native startup facts, not the
     // production selector under test. Unqualified hardware is a negative case.
     bool measured_hardware = participants == 4;
-    for (int ordinal = 0; ordinal < participants; ++ordinal)
+    for (const auto device : selected_devices)
     {
         int matches = 0;
         for (const auto &entry : startup->rocm_devices)
-            if (entry.type == ComputeBackendType::GPU_ROCM && entry.device_id == ordinal)
+            if (entry.type == ComputeBackendType::GPU_ROCM && entry.device_id == device.ordinal)
             {
                 ++matches;
                 measured_hardware = measured_hardware && entry.compute_capability == 906 &&
@@ -131,10 +133,18 @@ void proveModelOwnerBinding(int participants, bool measured_geometry = false, co
         devices.insert(record.device);
     }
     std::set<std::string> expected_devices;
-    for (int ordinal = 0; ordinal < participants; ++ordinal)
-        expected_devices.insert(DeviceId::rocm(ordinal).toString());
+    for (const auto device : selected_devices)
+        expected_devices.insert(device.toString());
     EXPECT_EQ(devices,expected_devices);
 }
+/** @brief Keep telemetry and independent hardware expectations on the original executing owner. */
+void proveModelOwnerBinding(int participants, bool measured_geometry = false, const char *measured_format = "Q4_K")
+{
+    originalRankLocalReplay(DeviceType::ROCm, static_cast<size_t>(participants), [&](const auto &selected) {
+        proveModelOwnerBindingOnCohort(selected, measured_geometry, measured_format);
+    });
+}
+
 #endif
 } // namespace
 #ifdef HAVE_ROCM

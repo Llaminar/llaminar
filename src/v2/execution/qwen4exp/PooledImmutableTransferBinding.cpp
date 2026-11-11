@@ -20,19 +20,32 @@ bool sourceSliceMessage(PooledNativeCountedMessage message)
     return message == PooledNativeCountedMessage::PinCommands || message == PooledNativeCountedMessage::FreeDecisions ||
         message == PooledNativeCountedMessage::VictimDecisions || message == PooledNativeCountedMessage::ReadRequests;
 }
-/** @return Exact existing CPU allocator request for the retained metadata owner object. */
-std::size_t objectBytes()
-{
-    return CPUStorageRoot<std::byte>(sizeof(PooledImmutableNativeCompletionStorage),
-        PhysicalMemoryOwner::ActivationTransportStaging, DeviceId::cpu()).physicalBytes();
 }
+std::optional<NativeLocalTPContextBorrow> PooledImmutableTransferBinding::originalNativeContext() const
+{
+    if(!nativeCollective())return std::nullopt;
+    if(!completion_)throw std::logic_error("Native pooled binding lost its original completion authority");
+    completion_->requireCurrent();
+    return completion_->cohort_;
+}
+std::size_t PooledImmutableNativeCompletionStorage::participantOffset()
+{
+    constexpr auto alignment=alignof(Participant);
+    return (sizeof(PooledImmutableNativeCompletionStorage)+alignment-1)/alignment*alignment;
+}
+std::size_t PooledImmutableNativeCompletionStorage::objectPayloadBytes(std::size_t degree)
+{
+    if(degree<2 || degree>std::size_t(std::numeric_limits<int>::max()) ||
+        degree>(std::numeric_limits<std::size_t>::max()-participantOffset())/sizeof(Participant))
+        throw std::invalid_argument("Native pooled metadata requires a representable original population");
+    return participantOffset()+degree*sizeof(Participant);
 }
 PhysicalMemoryPlan PooledImmutableNativeCompletionStorage::memoryBOM(PhysicalMemoryResource host,
-    std::span<const PhysicalMemoryResource> participants, PooledNativeCompletionLayout layout)
+    std::span<const PhysicalMemoryResource> participants,PooledNativeCompletionLayout layout)
 {
     if(!host.valid() || host.device!=DeviceId::cpu() || participants.size()!=layout.degree())
         throw std::invalid_argument("Native pooled metadata requires its exact original participant resources");
-    for(std::size_t i=0;i<participants.size();++i){
+    for(std::size_t i=0;i<participants.size();++i) {
         const auto& value=participants[i];
         if(!value.valid() || !value.device.is_gpu() || value.world_rank!=host.world_rank ||
             value.device.type!=participants.front().device.type)
@@ -41,138 +54,155 @@ PhysicalMemoryPlan PooledImmutableNativeCompletionStorage::memoryBOM(PhysicalMem
             throw std::invalid_argument("Native pooled metadata repeats an original physical participant");
     }
     PhysicalMemoryPlanBuilder plan;
-    plan.add(host, PhysicalMemoryOwner::ActivationTransportStaging, objectBytes());
-    plan.add(host, PhysicalMemoryOwner::ActivationTransportStaging,
-        layout.operandAllocationBytes());
-    for (std::size_t i=0;i<participants.size();++i)
-        plan.add(participants[i], PhysicalMemoryOwner::ActivationTransportStaging, layout.receiptBytesPerParticipant(i));
+    plan.add(host,PhysicalMemoryOwner::ActivationTransportStaging,
+        CPUStorageRoot<std::byte>(objectPayloadBytes(layout.degree()),
+            PhysicalMemoryOwner::ActivationTransportStaging,DeviceId::cpu()).physicalBytes());
+    plan.add(host,PhysicalMemoryOwner::ActivationTransportStaging,layout.operandAllocationBytes());
+    for(std::size_t i=0;i<participants.size();++i)
+        plan.add(participants[i],PhysicalMemoryOwner::ActivationTransportStaging,layout.receiptBytesPerParticipant(i));
     return plan.build();
 }
 std::shared_ptr<const PooledImmutableNativeCompletionStorage> PooledImmutableNativeCompletionStorage::create(
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
-    Participants participants,
-    Frames frames, PooledNativeCompletionLayout layout)
+    NativeLocalTPContextBorrow cohort,std::unique_ptr<LocalTPContext> ownedContext,
+    Participants participants,Frames frames,PooledNativeCompletionLayout layout)
 {
-    if (isGraphCaptureActive() || !cohort || std::size_t(cohort->degree())!=layout.degree())
-        throw std::invalid_argument("Native pooled metadata requires its actual cold original addressed cohort");
-    if(!participants[0])throw std::invalid_argument("Native pooled metadata omitted its original participant");
+    if(isGraphCaptureActive() || participants.size()!=layout.degree() || frames.size()!=layout.degree() || !participants[0])
+        throw std::invalid_argument("Native pooled metadata requires its actual cold original population");
     const auto memory=participants[0]->memory();
     if(!memory)throw std::invalid_argument("Native pooled metadata lost its original PMA");
-    std::array<DeviceId,kMaximumPooledNativeParticipants> devices;
-    std::array<NativeCompletionAuthority,kMaximumPooledNativeParticipants> authorities;
-    for(std::size_t i=0;i<layout.degree();++i){
-        if(!participants[i] || participants[i]->memory().get()!=memory.get() ||
-            participants[i]->memory().owner_before(memory) || memory.owner_before(participants[i]->memory()))
-            throw std::invalid_argument("Native pooled metadata changed its original PMA/control block");
-        devices[i]=participants[i]->device();authorities[i]=cohort->context().nativeCompletionAuthority(int(i));
-        cohort->requireConsumer(devices[i],int(i));
-        const auto current=GPUDeviceContextPool::instance().retainExistingPreparedContext(devices[i],memory);
-        participants[i]->requireWorker(current.worker());
-        if(current.generation()!=participants[i]->generation() || participants[i]->worker()->ownsCurrentThread() || !authorities[i].valid())
-            throw std::logic_error("Native pooled metadata lost its original off-worker generation/communicator");
+    {
+        const auto use=cohort.acquire();const auto& context=use.context();
+        if(std::size_t(context.degree())!=layout.degree() || context.devices().size()!=layout.degree() ||
+            (ownedContext && !ownedContext->borrowOriginalNativeContext().sameOriginal(cohort)))
+            throw std::invalid_argument("Native pooled metadata changed its original context ownership");
+        for(std::size_t i=0;i<layout.degree();++i) {
+            if(!participants[i] || participants[i]->memory().get()!=memory.get() ||
+                participants[i]->memory().owner_before(memory) || memory.owner_before(participants[i]->memory()) ||
+                context.devices()[i].toLocalDeviceId()!=participants[i]->device())
+                throw std::invalid_argument("Native pooled metadata changed its original PMA/control block or member");
+            const auto current=GPUDeviceContextPool::instance().retainExistingPreparedContext(participants[i]->device(),memory);
+            participants[i]->requireWorker(current.worker());
+            if(current.generation()!=participants[i]->generation() || participants[i]->worker()->ownsCurrentThread())
+                throw std::logic_error("Native pooled metadata lost its original off-worker generation");
+        }
     }
-    for(std::size_t i=layout.degree();i<participants.size();++i)if(participants[i] || frames[i])
-        throw std::invalid_argument("Native pooled metadata contains a participant outside its original cohort");
-    auto object = CPUStorageRoot<std::byte>(sizeof(PooledImmutableNativeCompletionStorage),
-        PhysicalMemoryOwner::ActivationTransportStaging, DeviceId::cpu(), CPUStoragePlacement::local(),
+    auto backing=CPUStorageRoot<std::byte>(objectPayloadBytes(layout.degree()),
+        PhysicalMemoryOwner::ActivationTransportStaging,DeviceId::cpu(),CPUStoragePlacement::local(),
         CPUStorageInitialization::Uninitialized).allocate(memory);
-    auto mappedClaim = memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
-        layout.operandAllocationBytes());
-    std::array<PhysicalMemoryAllocationLease,kMaximumPooledNativeParticipants> claims;
-    auto operands = TransferEngine::instance().allocateMappedHostRegion(layout.operandBytes(), std::span(devices.data(),layout.degree()));
-    // Only cold immutable metadata is cleared. Later captures must match these
-    // original bindings exactly instead of rebinding an earlier graph's slot.
-    std::memset(operands->mutableHostData(), 0, layout.operandBytes());
-    std::array<std::shared_ptr<DeviceTransferBuffer>,kMaximumPooledNativeParticipants> receipts;
-    for (std::size_t i = 0; i < layout.degree(); ++i) {
-        claims[i] = memory->claimNewAllocation(devices[i], PhysicalMemoryOwner::ActivationTransportStaging,
-            layout.receiptBytesPerParticipant(i));
-        participants[i]->worker()->submitAndWait([&] {
-            receipts[i] = TransferEngine::instance().allocateDeviceTransferBuffer(layout.receiptBytesPerParticipant(i), devices[i]);
+    static_assert(alignof(PooledImmutableNativeCompletionStorage)<=AlignedVector<std::byte>::ALIGNMENT);
+    static_assert(alignof(Participant)<=AlignedVector<std::byte>::ALIGNMENT);
+    auto* address=new(backing.data()) PooledImmutableNativeCompletionStorage(std::move(cohort),std::move(ownedContext),
+        {reinterpret_cast<Participant*>(backing.data()+participantOffset()),layout.degree()},layout);
+    auto result=std::shared_ptr<PooledImmutableNativeCompletionStorage>(address,
+        [storage=std::move(backing)](PooledImmutableNativeCompletionStorage* value)mutable {
+            value->~PooledImmutableNativeCompletionStorage();storage={};
+        });
+    std::vector<DeviceId> devices;devices.reserve(layout.degree());
+    {
+        const auto use=result->cohort_.acquire();auto& context=use.context();
+        for(std::size_t i=0;i<layout.degree();++i) {
+            auto* record=std::construct_at(&result->participants_[i]);++result->constructed_;
+            record->original=std::move(participants[i]);record->frame=std::move(frames[i]);
+            record->authority=context.nativeCompletionAuthority(int(i));
+            record->positive_owner=layout.positiveOwner(i);record->reader=layout.reader(i);
+            record->receipt_bytes=layout.receiptBytesPerParticipant(i);
+            if(!record->authority.valid())throw std::logic_error("Native pooled member lost its completion authority");
+            devices.push_back(record->original->device());
+        }
+    }
+    if(layout.operandBytes()) {
+        result->mapped_claim_=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            layout.operandAllocationBytes());
+        result->operands_=TransferEngine::instance().allocateMappedHostRegion(layout.operandBytes(),devices);
+        // These are immutable cold operands, not live progress or capacity payloads.
+        std::memset(result->operands_->mutableHostData(),0,layout.operandBytes());
+    }
+    for(auto& record:result->participants_)if(record.receipt_bytes) {
+        record.receipt_claim=memory->claimNewAllocation(record.original->device(),
+            PhysicalMemoryOwner::ActivationTransportStaging,record.receipt_bytes);
+        record.original->worker()->submitAndWait([&] {
+            record.receipt=TransferEngine::instance().allocateDeviceTransferBuffer(record.receipt_bytes,record.original->device());
         });
     }
-    static_assert(alignof(PooledImmutableNativeCompletionStorage) <= AlignedVector<std::byte>::ALIGNMENT);
-    auto* address = new(object.data()) PooledImmutableNativeCompletionStorage(std::move(cohort), std::move(participants),
-        std::move(frames), layout, std::move(authorities), std::move(mappedClaim), std::move(claims), std::move(operands), std::move(receipts));
-    return std::shared_ptr<const PooledImmutableNativeCompletionStorage>(address,
-        [storage = std::move(object)](const PooledImmutableNativeCompletionStorage* value) mutable {
-            value->~PooledImmutableNativeCompletionStorage(); storage = {};
-        });
+    result->requireCurrent();return result;
 }
-int PooledImmutableNativeCompletionStorage::coordinate(DeviceId device) const
+PooledImmutableNativeCompletionStorage::~PooledImmutableNativeCompletionStorage()
+{
+    // Native graph borrowers release this shared owner before context destruction.
+    // Each device root dies before its claim, then the single host root retires.
+    while(constructed_)std::destroy_at(&participants_[--constructed_]);
+}
+PooledNativeCompletionLayout PooledImmutableNativeCompletionStorage::declaration()const
+{
+    std::vector<std::uint8_t> positive,readers;positive.reserve(participants_.size());readers.reserve(participants_.size());
+    for(const auto& participant:participants_) {
+        positive.push_back(participant.positive_owner);readers.push_back(participant.reader);
+    }
+    return {participants_.size(),coordinator_,positive,profile_,readers};
+}
+int PooledImmutableNativeCompletionStorage::coordinate(DeviceId device)const
 {
     requireCurrent();
-    for (std::size_t i = 0; i < layout_.degree(); ++i) if (participants_[i]->device() == device) return i;
+    for(std::size_t i=0;i<participants_.size();++i)if(participants_[i].original->device()==device)return int(i);
     throw std::invalid_argument("Native pooled binding is absent from its original communicator membership");
 }
-const PreparedGPUContextUsePermit& PooledImmutableNativeCompletionStorage::original(DeviceId device) const
+const PreparedGPUContextUsePermit& PooledImmutableNativeCompletionStorage::original(DeviceId device)const
+{return *participants_[coordinate(device)].original;}
+void PooledImmutableNativeCompletionStorage::requireCurrent()const
 {
-    return *participants_[coordinate(device)];
-}
-void PooledImmutableNativeCompletionStorage::requireCurrent() const
-{
-    if (retired_.load(std::memory_order_acquire))
+    if(retired_.load(std::memory_order_acquire))
         throw std::logic_error("Native pooled runtime bindings have retired with their original parents");
-    if (!cohort_ || std::size_t(cohort_->degree())!=layout_.degree() || !operands_)
+    const auto use=cohort_.acquire();const auto& context=use.context();
+    if(constructed_!=participants_.size() || std::size_t(context.degree())!=participants_.size() ||
+        context.devices().size()!=participants_.size() || bool(operands_)!=(operand_bytes_!=0) ||
+        (operands_ && (operands_->sizeBytes()!=operand_allocation_bytes_ || mapped_claim_.bytes()!=operand_allocation_bytes_)))
         throw std::logic_error("Native pooled metadata lost its original cohort/backing");
-    const auto memory = participants_[0]->memory();
-    for (std::size_t i = 0; i < layout_.degree(); ++i) {
-        cohort_->requireConsumer(participants_[i]->device(), i);
-        const auto current = GPUDeviceContextPool::instance().retainExistingPreparedContext(participants_[i]->device(), memory);
-        participants_[i]->requireWorker(current.worker());
-        if (current.generation() != participants_[i]->generation() ||
-            participants_[i]->memory().get() != memory.get() || participants_[i]->memory().owner_before(memory) ||
-            memory.owner_before(participants_[i]->memory()) || !receipts_[i] ||
-            receipts_[i]->device() != participants_[i]->device() ||
-            !layout_.matchesStorageBytes(operands_->sizeBytes(), receipts_[i]->sizeBytes(),i) ||
-            mapped_claim_.bytes() != layout_.operandAllocationBytes() ||
-            receipt_claims_[i].bytes() != layout_.receiptBytesPerParticipant(i) ||
-            !operands_->hasDevice(participants_[i]->device()) ||
-            !authorities_[i].valid())
+    const auto memory=participants_[0].original->memory();
+    for(std::size_t i=0;i<participants_.size();++i) {
+        const auto& record=participants_[i];const auto& original=*record.original;
+        const auto current=GPUDeviceContextPool::instance().retainExistingPreparedContext(original.device(),memory);
+        original.requireWorker(current.worker());
+        if(context.devices()[i].toLocalDeviceId()!=original.device() || current.generation()!=original.generation() ||
+            original.memory().get()!=memory.get() || original.memory().owner_before(memory) || memory.owner_before(original.memory()) ||
+            bool(record.receipt)!=(record.receipt_bytes!=0) ||
+            (record.receipt && (record.receipt->device()!=original.device() || record.receipt->sizeBytes()!=record.receipt_bytes ||
+                record.receipt_claim.bytes()!=record.receipt_bytes)) ||
+            (operands_ && !operands_->hasDevice(original.device())) || !record.authority.valid())
             throw std::logic_error("Native pooled metadata changed its original generation/PMA/native resources");
     }
 }
-int PooledImmutableNativeCompletionStorage::requireOriginalBinding(
-    const PooledImmutableNativeTransfer& binding) const
+int PooledImmutableNativeCompletionStorage::requireOriginalBinding(const PooledImmutableNativeTransfer& binding)const
 {
     requireCurrent();
-    if (!binding.cohort_ || binding.cohort_.get() != cohort_.get() ||
-        binding.cohort_.owner_before(cohort_) || cohort_.owner_before(binding.cohort_))
+    if(!binding.cohort_.sameOriginal(cohort_))
         throw std::invalid_argument("Native pooled counted binding belongs to another original cohort");
-    const auto participant = coordinate(binding.device());
-    const auto& original = *participants_[participant];
-    const auto memory = original.memory();
-    if (binding.original_.memory().get() != memory.get() ||
-        binding.original_.memory().owner_before(memory) || memory.owner_before(binding.original_.memory()))
+    const auto participant=coordinate(binding.device());const auto& original=*participants_[participant].original;
+    const auto memory=original.memory();
+    if(binding.original_.memory().get()!=memory.get() || binding.original_.memory().owner_before(memory) ||
+        memory.owner_before(binding.original_.memory()))
         throw std::invalid_argument("Native pooled counted binding changed its original physical authority");
     original.requireWorker(binding.original_.worker());
-    if (binding.original_.generation() != original.generation())
+    if(binding.original_.generation()!=original.generation())
         throw std::logic_error("Native pooled counted binding changed its original worker generation");
     return participant;
 }
-
 PooledImmutableNativeTransfer PooledImmutableNativeCompletionStorage::counted(PooledImmutableNativeTransfer binding,
-    PooledNativeCountedMessage message, PooledNativeTransferSpan extent,
-    std::optional<PooledNativeCompletionFrame> frame) const
+    PooledNativeCountedMessage message,PooledNativeTransferSpan extent,std::optional<PooledNativeCompletionFrame> frame)const
 {
-    const auto participant = requireOriginalBinding(binding);
-    if (!frame) frame = frames_[participant];
-    if (!frame) throw std::invalid_argument("Native pooled completion requires its actual original local frame/error authority");
-    auto result = binding.withPrefix(message, layout_, operands_, receipts_[participant], std::move(extent), std::move(*frame));
-    if (binding.role() == CapturedTransferEndpoint::Consumer && sourceSliceMessage(message))
-        result = result.withReceivedSourceSlice();
+    if(isGraphCaptureActive())throw std::logic_error("Native counted binding must be complete before capture");
+    const auto participant=requireOriginalBinding(binding);
+    if(!frame)frame=participants_[participant].frame;
+    if(!frame)throw std::invalid_argument("Native completion requires its original local frame/error authority");
+    auto result=binding.withPrefix(message,declaration(),operands_,participants_[participant].receipt,std::move(extent),std::move(*frame));
+    if(binding.role()==CapturedTransferEndpoint::Consumer && sourceSliceMessage(message))result=result.withReceivedSourceSlice();
     return result;
 }
-
-PooledImmutableNativeTransfer PooledImmutableNativeCompletionStorage::countedRequest(
-    PooledImmutableNativeTransfer binding, PooledNativeTransferSpan extent,
-    PooledNativeRequestCompletionFrame frame) const
+PooledImmutableNativeTransfer PooledImmutableNativeCompletionStorage::countedRequest(PooledImmutableNativeTransfer binding,
+    PooledNativeTransferSpan extent,PooledNativeRequestCompletionFrame frame)const
 {
-    const auto participant = requireOriginalBinding(binding);
-    // Request completion is always explicit. The optional source/reader pool
-    // frames remain response-only and cannot supply this request identity.
-    return binding.withRequestPrefix(layout_, operands_, receipts_[participant],
-        std::move(extent), std::move(frame));
+    if(isGraphCaptureActive())throw std::logic_error("Native request binding must be complete before capture");
+    const auto participant=requireOriginalBinding(binding);
+    return binding.withRequestPrefix(declaration(),operands_,participants_[participant].receipt,std::move(extent),std::move(frame));
 }
 
 std::uint64_t PooledImmutableTransferBinding::captureIdentity() const
@@ -273,7 +303,7 @@ void PooledImmutableTransferBinding::bindOriginalInvocation(PooledImmutableOwner
     else {
         if (!completion_ || role() != CapturedTransferEndpoint::Consumer || device() != owner.plan().parameters().device)
             throw std::logic_error("Native pooled invocation changed its original consumer/physical owner");
-        owner.bindNativeInvocation(completion_->cohort(), completion_->coordinate(device()));
+        owner.bindNativeInvocation(completion_->cohort_, completion_->coordinate(device()));
     }
 }
 void PooledImmutableTransferBinding::releaseOriginalInvocation(PooledImmutableOwnerPreparedStorage& owner) const
@@ -281,7 +311,7 @@ void PooledImmutableTransferBinding::releaseOriginalInvocation(PooledImmutableOw
     if (const auto* original = std::get_if<CapturedTransferBinding>(&binding_)) owner.releaseInvocationChannel(*original);
     else {
         if (!completion_) throw std::logic_error("Native invocation retirement lost its original metadata owner");
-        owner.releaseNativeInvocation(completion_->cohort(), completion_->coordinate(device()));
+        owner.releaseNativeInvocation(completion_->cohort_, completion_->coordinate(device()));
     }
 }
 PooledImmutableTransferChannel PooledImmutableTransferChannel::native(
@@ -302,7 +332,7 @@ DeviceId PooledImmutableTransferChannel::endpointDevice(CapturedTransferEndpoint
     if (captured_) return captured_->endpointDevice(side);
     if (!native_) throw std::logic_error("Pooled transfer has no original channel owner");
     const int coordinate = side == CapturedTransferEndpoint::Producer ? producer_ : consumer_;
-    return native_->cohort()->context().devices()[coordinate].toLocalDeviceId();
+    return native_->context().context().devices()[coordinate].toLocalDeviceId();
 }
 PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTransferEndpoint side,
     CapturedTransferMessage message, std::shared_ptr<TensorBase> root, std::size_t offset) const
@@ -311,7 +341,7 @@ PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTran
     if (!native_ || !message.fits(maximum_))
         throw std::invalid_argument("Native pooled endpoint exceeds its original directed message envelope");
     const auto device = endpointDevice(side);
-    auto native = PooledImmutableNativeTransfer::fixed(native_->cohort(), native_->original(device), side, producer_, consumer_, message,
+    auto native = PooledImmutableNativeTransfer::fixed(native_->cohort_, native_->original(device), side, producer_, consumer_, message,
         PooledNativeTransferSpan(std::move(root), offset, message.bytes));
     return {std::move(native), native_};
 }
@@ -323,7 +353,7 @@ PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTran
     if (!native_ || !message.fits(maximum_))
         throw std::invalid_argument("Native pooled protocol endpoint exceeds its original message envelope");
     const auto device = endpointDevice(side);
-    auto binding = PooledImmutableNativeTransfer::fixed(native_->cohort(), native_->original(device), side,
+    auto binding = PooledImmutableNativeTransfer::fixed(native_->cohort_, native_->original(device), side,
         producer_, consumer_, message, PooledNativeTransferSpan(std::move(root), offset, message.bytes));
     return {std::move(binding), native_};
 }
@@ -337,7 +367,7 @@ PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTran
     }
     if(!native_ || !message.fits(maximum_))throw std::invalid_argument("Pooled span endpoint has no original bounded transport");
     const auto device=endpointDevice(side);
-    auto binding=PooledImmutableNativeTransfer::fixed(native_->cohort(),native_->original(device),side,
+    auto binding=PooledImmutableNativeTransfer::fixed(native_->cohort_,native_->original(device),side,
         producer_,consumer_,message,span.subspan(0,message.bytes));
     return {std::move(binding),native_};
 }

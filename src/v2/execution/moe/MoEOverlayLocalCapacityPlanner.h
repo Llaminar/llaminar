@@ -8,11 +8,17 @@
  * weights, KV and recurrent state, graph activations, workspaces, and the
  * host-memory authority needed by background transport—against the same typed
  * `(world rank, device)` resources later consumed by capacity admission.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
 
+#include "MoEOverlayActivationBatchInventory.h"
 #include "MoEOverlayActivationChannelPlan.h"
+#include "execution/global/OriginalCPUPipelineProgram.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEExpertOverlayExecutionPlan.h"
@@ -36,6 +42,7 @@
 
 namespace llaminar2
 {
+    class ResolvedRankOrchestration;
     /**
      * @brief Model-specific GPU upload contract priced during auto-capacity.
      *
@@ -120,6 +127,8 @@ namespace llaminar2
             OverlayRankExecutionKind::RelayOnly;
         /** Include CPU authority even when no tier participant computes on CPU. */
         bool require_host_memory_authority = false;
+        /** All original local stages require a native device MTP cadence-bound minimum. */
+        bool native_pipeline_maintenance_budget = false;
         /** Optional hard physical limits; absent means inventory capacity. */
         std::optional<std::size_t> max_gpu_memory_bytes;
         std::optional<std::size_t> max_cpu_memory_bytes;
@@ -131,6 +140,8 @@ namespace llaminar2
         std::size_t activation_graph_family_count = 0;
         /** Original schedule-owned prefill identities used by actual follower cache construction. */
         std::vector<int> activation_prefill_graph_rows;
+        /** Same complete original source/row declaration consumed by actual graph builders. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
         /** Same cold roster passed unchanged to channel layout and follower terminal creators. */
         std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
         /** Exact CPU evidence owners when the frozen Dynamic authority is host-resident. */
@@ -158,6 +169,10 @@ namespace llaminar2
         WeightPrecision weight_precision=WeightPrecision::NATIVE;
         /** Original loader/factory source placement for non-joint CPU components. */
         std::optional<CPUStoragePlacement> native_source_placement;
+        /// Same checked original parent-stage programs, borrowed only throughout this planning transaction.
+        std::span<const OriginalCPUPipelineProgram> original_cpu_pipeline_programs;
+        /// Actual local stage's original program, absent for ordinary single-device/GPU stages.
+        const OriginalCPUPipelineProgram* original_cpu_stage_program=nullptr;
 
     };
 
@@ -172,6 +187,10 @@ namespace llaminar2
         MemoryPlan fixed_memory_plan;
         /** Shared pure topology/BOM also consumed by transport preflight. */
         MoEOverlayActivationChannelPlan activation_channel_plan;
+        /** Immutable source/row authority installed once in the original transport registry. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
+        /** Same source-scoped passive GPU incidence/choice declaration consumed by materialization. */
+        std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_gpu_lane_demand;
         /** Sole admitted aggregate behind every per-resource capacity view. */
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
             physical_memory_admission;
@@ -273,6 +292,16 @@ namespace llaminar2
          * independently. resolvePipelineCapacity must admit their complete aggregate
          * before the runtime publishes a PhysicalMemoryAuthority.
          */
+        /** @brief Price every actual local stage body of a sealed global topology.
+         * @param topology Original rank compiler result, including complete global membership.
+         * @param stages Matching local fixed inputs in canonical action order.
+         * @return Joint local fixed BOM; global activation transport is a separate original owner input.
+         * @throws std::invalid_argument Before pricing a foreign stage/rank/row envelope.
+         */
+        static std::vector<MoEOverlayLocalCapacityPlannerResult> planPipeline(
+            const ResolvedRankOrchestration &topology,
+            std::span<const MoEOverlayLocalCapacityPlannerInput> stages);
+
         [[nodiscard]] static std::vector<MoEOverlayLocalCapacityPlannerResult> planPipeline(
             const RankExecutionPlan &parent,
             std::span<const MoEOverlayLocalCapacityPlannerInput> stages);

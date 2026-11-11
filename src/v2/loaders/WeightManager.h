@@ -1234,6 +1234,16 @@ namespace llaminar2
             CPUPreparedWeightSource source, PhysicalMemoryOwner memory_owner,
             CPUStoragePlacement placement, std::optional<size_t> budget);
 
+        /**
+         * @brief Bind implicit dense CPU source windows to their original TP assignment.
+         * @param requirement Immutable graph plan requirement, possibly already explicitly sliced.
+         * @param tp_config Same original assignment snapshot retained by materialization.
+         * @return Derived exact native range/assembly, or no replacement for an already complete declaration.
+         */
+        std::optional<WeightRequirement> projectCPUDenseTPRequirement(
+            const WeightRequirement &requirement,
+            const std::shared_ptr<const TensorParallelConfig> &tp_config) const;
+
         /** @brief Populate ordinary complete or selected CPU sources through the shared consumer transaction.
          * @param requirement Original source/range/role declaration.
          * @param strategy Same original model identity as the frozen plan.
@@ -1660,6 +1670,7 @@ namespace llaminar2
          * @param name Weight tensor name
          * @param total_size Total size of the dimension to slice
          * @param assignment Device's sharding assignment
+         * @param tp_config Same retained original configuration that supplied the assignment.
          * @param out_start Output: start index for slicing
          * @param out_count Output: count of elements to include
          * @return true if boundaries computed successfully, false on error
@@ -1668,6 +1679,7 @@ namespace llaminar2
             const std::string &name,
             size_t total_size,
             const DeviceShardingAssignment &assignment,
+            const TensorParallelConfig &tp_config,
             size_t &out_start,
             size_t &out_count) const;
 
@@ -1770,7 +1782,19 @@ namespace llaminar2
          * that shard.
          */
         GDNHeadAssignment gdnHeadAssignmentFor(
-            const DeviceShardingAssignment &assignment) const;
+            const DeviceShardingAssignment &assignment, const TensorParallelConfig &tp_config) const;
+
+        /**
+         * @brief Resolve ordered native source rows for an ordinary or linked GDN fused projection.
+         * @param name Canonical original source name.
+         * @param total_rows Full GGUF N extent of the fused source.
+         * @param assignment Exact original participant assignment.
+         * @param tp_config Configuration retained alongside that assignment.
+         * @return Original ordered Q, K and V row intervals.
+         */
+        std::vector<GDNHeadSpan> fusedQKVSourceSpans(
+            const std::string &name, size_t total_rows, const DeviceShardingAssignment &assignment,
+            const std::shared_ptr<const TensorParallelConfig> &tp_config) const;
 
         /**
          * @brief Resolve economical modulo-linked ownership for equal-rank TP.

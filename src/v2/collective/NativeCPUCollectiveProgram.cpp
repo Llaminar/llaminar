@@ -81,15 +81,16 @@ void NativeCPUCollectiveProgram::ProcessUse::retireAfterNativeSplit() {
 NativeCPUCollectiveProgram NativeCPUCollectiveProgram::expertShardRoutePartials(
     int domain, CollectiveBackendType backend, std::vector<Participant> members) {
     if(domain<0 || (backend!=CollectiveBackendType::UPI && backend!=CollectiveBackendType::MPI) ||
-       members.empty() || members.size()>8)
-        throw std::invalid_argument("CPU expert collective requires a one-through-eight-rank explicit MPI/UPI domain");
+       members.empty() || members.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("CPU expert collective requires a representable positive original-rank explicit MPI/UPI domain");
     for(std::size_t i=0;i<members.size();++i) {
         const auto& p=members[i];
         if(p.world_rank<0 || p.address.device_type!=DeviceType::CPU || p.address.device_ordinal!=0 ||
            p.address.numa_node<0 || p.address.hostname.empty())
             throw std::invalid_argument("CPU expert collective requires original rank-local CPU0 and exact NUMA endpoint");
-        for(std::size_t j=0;j<i;++j) if(members[j].world_rank==p.world_rank)
-            throw std::invalid_argument("CPU expert collective repeats an original process rank");
+        for(std::size_t j=0;j<i;++j) if(members[j].world_rank==p.world_rank || (members[j].address.hostname==p.address.hostname &&
+            members[j].address.numa_node==p.address.numa_node))
+            throw std::invalid_argument("CPU expert collective repeats an original process or physical CPU owner");
     }
     return NativeCPUCollectiveProgram(domain,backend,std::move(members));
 }

@@ -54,7 +54,9 @@ if(NOT V2_PERF_TESTS_ONLY)
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
             ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledOriginalSourceSerialSlotRecreation)
-        set(_remote_host_cases StoragePurposeSurvivesFullyReservedModelAndFailedCreation FlatPreparationRejectsForeignAuthorityAndRetainsNativeFailures RecordedOriginalC0ClaimsSealReplayAndSurviveReset RecordedOriginalPositiveClaimsSealReplayAndSurviveReset
+        set(_remote_host_cases SharedNativeChildKeepsExactOriginalOwnerUntilAllParentsRetire
+            NativeGeneralSourceSlotsRetainPurposeAndOriginalIdentity NativeGeneralStorageCannotConsumeModelBudget
+            StoragePurposeSurvivesFullyReservedModelAndFailedCreation FlatPreparationRejectsForeignAuthorityAndRetainsNativeFailures RecordedOriginalC0ClaimsSealReplayAndSurviveReset RecordedOriginalPositiveClaimsSealReplayAndSurviveReset
             WrongSourceAndFlatShapeRejectBeforeNativeInstantiation MissingPlannedBytesAndCreatorPrefixKeepPreciseOriginalOwnership
             ExplicitRawDescriptorUsesSameSealWithoutInventedHostLimit FamilySelectionKeepsExactCaptureAndAdmitsOnlyPlannedInstances)
         foreach(_remote_host_case IN LISTS _remote_host_cases)

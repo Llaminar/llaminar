@@ -86,7 +86,7 @@ public:
         void retireAfterNativeSplit();
         std::unique_ptr<State> state_;
     };
-    /** @brief Authenticate the existing NODE_LOCAL ordered CPU1–CPU8 family, with one split and optional rooted duplicate.
+    /** @brief Authenticate the original NODE_LOCAL ordered CPU participant family, with one split and optional rooted duplicate.
      * @throws std::invalid_argument for unsupported backend, rank population or unknown/fake CPU endpoint.
      */
     [[nodiscard]] static NativeCPUCollectiveProgram expertShardRoutePartials(

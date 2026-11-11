@@ -110,6 +110,8 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        /** @copydoc IGPUGraphCapture::appendActiveCaptureChild */
+        [[nodiscard]] bool appendActiveCaptureChild(const IGPUGraphCapture &child) override;
 
         /** Unique cold recording lifetime, invalidated by reset/re-recording. */
         mutable std::shared_ptr<const void> definition_scope_;

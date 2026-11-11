@@ -1,13 +1,19 @@
 /**
  * @file Test__CPUShardRouteCollective.cpp
  * @brief Adversarial actual compact shard-record reduction, before original top-k weighting.
+ *
+ * Raw nonfinite payloads exercise arithmetic byte preservation with publication
+ * diagnostics explicitly scoped off. Separate cases retain finite-output
+ * rejection and restore the caller's validation policy after every lifetime.
  */
 #include <gtest/gtest.h>
+#include <limits>
 #include "kernels/cpu/moe/CPUCanonicalShardRouteRecords.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
 #include "kernels/cpu/primitives/VectorPrimitives.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "utils/CPUFeatures.h"
+#include "utils/DebugEnv.h"
 #include <cstring>
 #include <omp.h>
 #include <array>
@@ -18,6 +24,21 @@
 using namespace llaminar2;
 using namespace llaminar2::cpu::moe;
 namespace {
+/** @brief Scope only the publication diagnostic for authored nonfinite payloads. */
+class ScopedRouteFiniteValidation final {
+public:
+    /** @brief Save the caller's policy and select the diagnostic under test. */
+    explicit ScopedRouteFiniteValidation(bool enabled)
+        : previous_(mutableDebugEnv().validation.fail_on_nan) {
+        mutableDebugEnv().validation.fail_on_nan=enabled;
+    }
+    /** @brief Restore the caller even when a fatal GTest assertion returns early. */
+    ~ScopedRouteFiniteValidation() {mutableDebugEnv().validation.fail_on_nan=previous_;}
+    ScopedRouteFiniteValidation(const ScopedRouteFiniteValidation&)=delete;
+    ScopedRouteFiniteValidation& operator=(const ScopedRouteFiniteValidation&)=delete;
+private:
+    bool previous_;
+};
 struct Replay {
     static constexpr int H=7,K=3,M=3;
     std::array<float,M*K> indices{64,1,511,64,511,2,1,2,64};
@@ -269,12 +290,49 @@ TEST(CPUShardRouteCollective, FirstPairDirectAddMatchesOriginalBytesAndLiveExten
     }
 }
 
+/** @test Diagnostic selection cannot change finite arithmetic or admit an invalid route weight. */
+TEST(CPUShardRouteCollective, FusedFinalAddPreweightFiniteValidationIsExplicit) {
+    std::array<int32_t,3> slots{0,1,2};
+    std::array<float,3> weights{.5f,.25f,-.5f};
+    std::array<float,6> source{2,4,-6,8,-10,12},output{};
+    const std::array<float,6> expected{1,2,-1.5f,2,5,-6};
+    MoEOverlaySparseRows input;
+    input.row_capacity=input.live_row_count=1;
+    input.entry_capacity=input.live_entry_count=slots.size();
+    input.d_model=2;input.top_k=3;
+    input.original_route_slots_host=slots.data();
+    input.compact_route_slots_host=slots.data();input.route_weights_host=weights.data();
+    for(const bool diagnose:{false,true}) {
+        const ScopedRouteFiniteValidation policy(diagnose);
+        source[2]=-6.0f;output.fill(-991.0f);
+        ASSERT_TRUE(preweightMoEOverlayCanonicalRouteRows(input,source,
+            MoEOverlayCanonicalRouteSourceLayout::originalSlots(),output,
+            MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot));
+        EXPECT_EQ(output,expected);
+        source[2]=std::bit_cast<float>(uint32_t(0x7fc12345u));
+        EXPECT_EQ(preweightMoEOverlayCanonicalRouteRows(input,source,
+            MoEOverlayCanonicalRouteSourceLayout::originalSlots(),output,
+            MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot),!diagnose);
+        EXPECT_TRUE(std::isnan(output[2]));
+    }
+    const ScopedRouteFiniteValidation arithmetic_only(false);
+    weights[0]=std::bit_cast<float>(uint32_t(0x7fc12345u));
+    output.fill(-993.0f);const auto untouched=output;
+    EXPECT_FALSE(preweightMoEOverlayCanonicalRouteRows(input,source,
+        MoEOverlayCanonicalRouteSourceLayout::originalSlots(),output,
+        MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot));
+    EXPECT_EQ(output,untouched);
+}
+
 /**
  * @test Authored compact shard records preserve both original outputs when the
  * worker preweights each completed final-add tile. This is numerical/lifecycle contract
  * coverage, not a recorded route trace, NUMA or captured-consumer certificate.
  */
 TEST(CPUShardRouteCollective, FusedFinalAddPreservesRawAndWeightedBytes) {
+    // The source corpus intentionally includes NaN/Inf. Compare its exact
+    // arithmetic bytes independently of the optional publication diagnostic.
+    const ScopedRouteFiniteValidation arithmetic_only(false);
     const int saved=omp_get_max_threads();
     struct Restore {int value;~Restore(){omp_set_num_threads(value);}} restore{saved};
     // Same source bit corpus as the first-pair control, now reaching the NEW
@@ -438,4 +496,167 @@ TEST(CPUShardRouteCollective, FusedTicketRejectsUnarmedLeaseBeforePayloadWrites)
     EXPECT_FALSE(unarmed.authorizes(ticket,1));
     EXPECT_FALSE(combineAndPublishMoEOverlayCanonicalShardRouteRows(ticket,unarmed,input,a.args()));
     EXPECT_TRUE(std::all_of(a.combined.begin(),a.combined.end(),[](float x){return x==-991;}));
+}
+
+
+/** @test Original CPU host canonical return copies raw live rows and preserves one later weighting authority. */
+TEST(CPUShardRouteCollective, CPUHostCanonicalReturnKeepsOriginalSlotsUnweightedAndCompact)
+{
+    constexpr std::size_t H=7,slots=9,capacity=5;
+    std::array<float,slots*H+1> source{};
+    std::array<float,capacity*H+1> returned;
+    std::array<int32_t,capacity+1> ids;
+    std::array<int32_t,3> original{0,2,6},compact{0,1,4};
+    std::array<float,3> weights{.25F,-.5F,.75F};
+    MoEOverlaySparseRows input;
+    input.d_model=H;input.top_k=3;input.row_capacity=3;input.entry_capacity=3;
+    input.original_route_slots_host=original.data();input.compact_route_slots_host=compact.data();
+    input.route_weights_host=weights.data();input.source_participant=0;input.target_participant=2;
+    MoEOverlayReturnRows output;
+    output.d_model=H;output.layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
+    output.row_capacity=capacity;output.row_ids_host=ids.data();output.output_rows_fp32=returned.data();
+    for(int replay=0;replay<20;++replay) {
+        const std::size_t count=std::array<std::size_t,5>{3,1,0,2,3}[replay%5];
+        input.live_entry_count=count;input.live_row_count=count?3:0;input.residency_epoch=101+replay;
+        input.key=makeMoEOverlayCollectiveKey(9,replay,3,0,0,2,MoEOverlayCollectiveDirection::Dispatch);
+        for(std::size_t i=0;i<source.size();++i) source[i]=float(replay*97+i)*.125F;
+        returned.fill(-719.F);ids.fill(-83);output.live_row_count=capacity;
+        const auto original_source=source;
+        ASSERT_TRUE(copyMoEOverlayCanonicalRouteRowsToHostReturn(input,
+            std::span<const float>(source).first(slots*H),output));
+        EXPECT_EQ(output.key,input.key);EXPECT_EQ(output.residency_epoch,input.residency_epoch);
+        EXPECT_EQ(output.live_row_count,count);EXPECT_EQ(output.source_participant,input.target_participant);
+        EXPECT_EQ(output.target_participant,input.source_participant);EXPECT_EQ(source,original_source);
+        for(std::size_t entry=0;entry<count;++entry) {
+            EXPECT_EQ(ids[entry],original[entry]);
+            EXPECT_EQ(std::memcmp(returned.data()+entry*H,source.data()+std::size_t(original[entry])*H,H*sizeof(float)),0);
+        }
+        for(std::size_t i=count*H;i<returned.size();++i) EXPECT_EQ(returned[i],-719.F);
+        for(std::size_t i=count;i<ids.size();++i) EXPECT_EQ(ids[i],-83);
+    }
+    input.live_row_count=3;input.live_entry_count=3;
+    const auto untouched=returned;const auto untouched_ids=ids;
+    original[1]=original[0];
+    EXPECT_FALSE(copyMoEOverlayCanonicalRouteRowsToHostReturn(input,std::span<const float>(source).first(slots*H),output));
+    EXPECT_EQ(returned,untouched);EXPECT_EQ(ids,untouched_ids);original[1]=2;
+    weights[1]=std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(copyMoEOverlayCanonicalRouteRowsToHostReturn(input,std::span<const float>(source).first(slots*H),output));
+    EXPECT_EQ(returned,untouched);weights[1]=-.5F;
+    output.output_rows_fp32=source.data();
+    EXPECT_FALSE(copyMoEOverlayCanonicalRouteRowsToHostReturn(input,std::span<const float>(source).first(slots*H),output));
+    output.output_rows_fp32=returned.data();output.row_capacity=2;
+    EXPECT_FALSE(copyMoEOverlayCanonicalRouteRowsToHostReturn(input,std::span<const float>(source).first(slots*H),output));
+    EXPECT_EQ(returned,untouched);
+}
+
+/** @test Dynamic original cohort populations keep the identical fixed participant arithmetic order beyond eight. */
+TEST(CPUShardRouteCollective, VariableOriginalCohortsKeepCanonicalAdditionOrderWithoutParticipantCap)
+{
+    for(int population=2;population<=29;++population) {
+        SCOPED_TRACE(population);
+        constexpr int H=7,slots=4;
+        const auto width=canonical_moe_route_record::recordWidth(H);
+        std::vector<float> records(std::size_t(population)*2*width);
+        std::vector<RootedFloatRecordRange> ranges;
+        std::array<float,slots*H+1> raw{},expected{};
+        std::array<float,slots*H+1> weighted{},expected_weighted{};
+        raw.fill(-733.F);expected.fill(-733.F);weighted.fill(-735.F);expected_weighted.fill(-735.F);
+        std::array<int32_t,2> original_slots{0,3},destinations{1,3},experts{0,0};
+        std::array<float,2> weights{.5F,-.75F};
+        for(int p=0;p<population;++p) {
+            for(int r=0;r<2;++r) {
+                // Packed record arrival order differs from immutable route
+                // order. Large cancelling terms expose addition reassociation.
+                const int slot=original_slots[1-r];
+                auto* record=records.data()+(std::size_t(p)*2+r)*width;
+                for(int h=0;h<H;++h) {
+                    const float value=p==0?1.0e20F:p==1?-1.0e20F:
+                        float((p%3)-1)*float((slot+1)*(h+1))*.125F;
+                    record[h]=value;
+                    expected[slot*H+h]=p==0?value:expected[slot*H+h]+value;
+                }
+                ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(record,H,slot));
+            }
+            ranges.push_back({p,std::size_t(p)*2,2});
+        }
+        for(size_t entry=0;entry<original_slots.size();++entry)
+            for(int h=0;h<H;++h)
+                expected_weighted[destinations[entry]*H+h]=expected[original_slots[entry]*H+h]*weights[entry];
+        std::vector<int32_t> maps(size_t(population)*slots);std::array<float,slots> required{};
+        std::array<int,1> selected{0};
+        CanonicalShardRouteRecordArgs args{records,ranges,{}, {},selected,maps,required,
+            std::span<float>(raw).first(slots*H),1,2,2,H,
+            CanonicalShardSparseRouteView{original_slots,experts,weights}};
+        // Both publication shapes share the exact original common arithmetic.
+        for(int replay=0;replay<4;++replay) {
+            raw.fill(-733.F);weighted.fill(-735.F);
+            args.preweighted_output=replay%2?std::optional{CanonicalRoutePreweightedOutput{
+                std::span<float>(weighted).first(slots*H),original_slots,destinations,weights}}:std::nullopt;
+            ASSERT_TRUE(combineCanonicalShardRouteRecords(args));
+            EXPECT_EQ(std::memcmp(raw.data(),expected.data(),sizeof(raw)),0);
+            if(args.preweighted_output)EXPECT_EQ(std::memcmp(weighted.data(),expected_weighted.data(),sizeof(weighted)),0);
+            else for(float value:weighted)EXPECT_EQ(value,-735.F);
+        }
+        // A malformed last original member must fail before either live output
+        // changes, even when all preceding participants are complete.
+        auto* final=records.data()+(std::size_t(population)*2-1)*width;
+        ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(final,H,3));
+        const auto before_raw=raw,before_weighted=weighted;
+        EXPECT_FALSE(combineCanonicalShardRouteRecords(args));
+        EXPECT_EQ(raw,before_raw);EXPECT_EQ(weighted,before_weighted);
+        ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(final,H,0));
+        ASSERT_TRUE(combineCanonicalShardRouteRecords(args)); // Restore the validated caller-owned maps.
+        // The descriptor API remains a valid first-class caller of the SAME
+        // reducer, including variable cohorts and its empty-row contract.
+        std::vector<CanonicalRouteDownPartialRows> banks;
+        for(int p=0;p<population;++p)banks.push_back({
+            std::span<const float>(records).subspan(size_t(p)*2*width,2*width),
+            std::span<const int32_t>(maps).subspan(size_t(p)*slots,slots)});
+        raw.fill(-733.F);
+        ASSERT_TRUE(combineCanonicalRouteDownPartialsOrdered({banks,std::span<float>(raw).first(slots*H),
+            required.data(),2,2,H}));
+        EXPECT_EQ(std::memcmp(raw.data(),expected.data(),sizeof(raw)),0);
+        EXPECT_TRUE(reduceCanonicalRouteDownPartialsOrderedFMA({banks,{},nullptr,nullptr,0,2,H}));
+    }
+}
+
+/** @test Indexed original source boundaries cannot be overwritten by either numerical output. */
+TEST(CPUShardRouteCollective, IndexedOriginalRangeMetadataCannotAliasEitherOutput)
+{
+    std::array<float,4> records{1.F,0.F,2.F,0.F};
+    ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(records.data(),1,0));
+    ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(records.data()+2,1,0));
+    std::array<RootedFloatRecordRange,2> ranges{{{0,0,1},{1,1,1}}};
+    std::array<int32_t,2> maps{0,0};
+    std::array<float,1> required{1.F};
+    std::array<float,2> raw{-711.F,-713.F},weighted{-715.F,-717.F};
+    std::array<int32_t,1> original{0},destination{0};std::array<float,1> factor{.5F};
+    const CanonicalRouteDownIndexedPartialRows indexed{records,ranges,maps};
+    CanonicalRouteDownPartialCombineArgs args{{},std::span<float>(raw).first(1),required.data(),1,1,1,
+        CanonicalRoutePreweightedOutput{std::span<float>(weighted).first(1),original,destination,factor}};
+    ASSERT_TRUE(combineCanonicalRouteDownPartialsOrderedIndexed(args,indexed));
+    EXPECT_EQ(raw,(std::array<float,2>{3.F,-713.F}));
+    EXPECT_EQ(weighted,(std::array<float,2>{1.5F,-717.F}));
+    std::array<std::byte,sizeof(ranges)> before{};
+    std::memcpy(before.data(),ranges.data(),sizeof(ranges));
+    // These are borrowed byte-address aliases only. The validator must reject
+    // before dereferencing/storing through the incompatible floating view.
+    auto* metadata=reinterpret_cast<float*>(&ranges[0].first_record);
+    args.combined_route_rows={metadata,1};
+    const auto saved_weighted=weighted;
+    EXPECT_FALSE(combineCanonicalRouteDownPartialsOrderedIndexed(args,indexed));
+    EXPECT_EQ(std::memcmp(ranges.data(),before.data(),sizeof(ranges)),0);
+    EXPECT_EQ(weighted,saved_weighted);
+    args.combined_route_rows=std::span<float>(raw).first(1);
+    args.preweighted_output->values={metadata,1};
+    const auto saved_raw=raw;
+    EXPECT_FALSE(combineCanonicalRouteDownPartialsOrderedIndexed(args,indexed));
+    EXPECT_EQ(std::memcmp(ranges.data(),before.data(),sizeof(ranges)),0);
+    EXPECT_EQ(raw,saved_raw);
+    // A second-source range alias rejects too; checking only the first
+    // descriptor would leave later tile reads exposed to output mutation.
+    args.preweighted_output.reset();
+    args.combined_route_rows={reinterpret_cast<float*>(&ranges[1].record_count),1};
+    EXPECT_FALSE(combineCanonicalRouteDownPartialsOrderedIndexed(args,indexed));
+    EXPECT_EQ(std::memcmp(ranges.data(),before.data(),sizeof(ranges)),0);
 }

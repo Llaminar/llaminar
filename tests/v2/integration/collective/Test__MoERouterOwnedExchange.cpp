@@ -32,3 +32,16 @@ TEST(MoERouterOwnedExchange, ROCm2) { prove(llaminar2::DeviceId::rocm(0), 2); }
 /** @test More empty/unequal sources and a larger directed exchange fabric. */
 TEST(MoERouterOwnedExchange, ROCm4) { prove(llaminar2::DeviceId::rocm(0), 4); }
 #endif
+
+#ifdef HAVE_CUDA
+/** @test Original local NCCL composition with arbitrary counts, exact payload bytes and retained reset/replay. */
+TEST(NativeCountedAllGather, CUDA2){llaminar2::test::proveNativeCountedAllGather(llaminar2::DeviceId::cuda(0),2);}
+#endif
+#ifdef HAVE_ROCM
+/** @test Actual original local RCCL composition, including all-empty and maximally skewed counts. */
+TEST(NativeCountedAllGather, ROCm2){llaminar2::test::proveNativeCountedAllGather(llaminar2::DeviceId::rocm(0),2);}
+/** @test Four original logical participants without pair-only indexing. */
+TEST(NativeCountedAllGather, ROCm4){llaminar2::test::proveNativeCountedAllGather(llaminar2::DeviceId::rocm(0),4);}
+/** @test Eight original logical participants without a compile-time participant cap. */
+TEST(NativeCountedAllGather, ROCm8){llaminar2::test::proveNativeCountedAllGather(llaminar2::DeviceId::rocm(0),8);}
+#endif

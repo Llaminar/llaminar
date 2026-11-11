@@ -141,6 +141,17 @@ inline void PrintTo(const Qwen4ExpSourceAdmissionCase &cell, std::ostream *out)
         first = false;
     }
     *out << "]";
+    if (cell.topology.observed_native_pipeline)
+    {
+        const auto &request = *cell.topology.observed_native_pipeline;
+        *out << ",\"observed_pipeline_request\":{\"backend\":"
+             << modelParityJsonString(request.backend == DeviceType::CUDA ? "cuda" : "rocm")
+             << ",\"native_isa\":" << modelParityJsonString(request.native_isa) << ",\"stage_sizes\":[";
+        bool first_stage = true;
+        for (const int size : cell.topology.pipeline_stage_sizes)
+        { *out << (first_stage ? "" : ",") << size; first_stage = false; }
+        *out << "]}";
+    }
     const auto socket_members=qwen4ExpCPUJointSocketMembers(cell);
     if(!socket_members.empty()) {
         *out << ",\"cpu_expert_socket_membership\":[";bool first_member=true;
@@ -198,11 +209,14 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
     out << "{\"qfn_source_hardware_schema\":2,\"scope\":\"local-host-all-ranks\",\"devices\":[";
     bool first = true;
     const auto append = [&](const char *backend, int ordinal, int numa, std::size_t total = 0u,
-                            std::optional<int> socket = std::nullopt) {
+                            std::optional<int> socket = std::nullopt,
+                            std::string_view native_isa = {}, std::string_view uuid = {}) {
         out << (first ? "" : ",") << "{\"backend\":" << modelParityJsonString(backend)
             << ",\"ordinal\":" << ordinal << ",\"numa_node\":" << numa;
         if (total) out << ",\"total_memory_bytes\":" << total;
         if (socket) out << ",\"socket_id\":" << *socket;
+        if (!native_isa.empty()) out << ",\"native_isa\":" << modelParityJsonString(std::string(native_isa));
+        if (!uuid.empty()) out << ",\"uuid\":" << modelParityJsonString(std::string(uuid));
         out << '}';
         first = false;
     };
@@ -216,8 +230,30 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
         // this frozen local-host observation names it without ambiguity.
         append("cpu", 0, locality,0u,qwen4ExpOriginalSocketForNUMA(hardware->cpu_sockets,locality));
     }
-    for (const auto &device : hardware->cuda_devices) append("cuda", device.device_id, device.numa_node, device.total_memory_bytes);
-    for (const auto &device : hardware->rocm_devices) append("rocm", device.device_id, device.numa_node, device.total_memory_bytes);
+    for (const auto &device : hardware->cuda_devices) append("cuda", device.device_id, device.numa_node, device.total_memory_bytes,
+        std::nullopt, device.native_isa, device.uuid);
+    for (const auto &device : hardware->rocm_devices) append("rocm", device.device_id, device.numa_node, device.total_memory_bytes,
+        std::nullopt, device.native_isa, device.uuid);
+    out << "],\"directed_peer_access\":[";
+    bool first_edge = true;
+    // DeviceManager owns the frozen startup matrix. Export every directed fact
+    // without probing again or demanding symmetric access for a one-way DMA.
+    const auto append_edges = [&](const auto &devices, DeviceType family, const char *backend) {
+        for (const auto &accessor : devices)
+            for (const auto &peer : devices) {
+                if (accessor.device_id == peer.device_id) continue;
+                const auto available = manager.peerAccessAvailable(
+                    DeviceId(family, accessor.device_id), DeviceId(family, peer.device_id));
+                if (!available.has_value())
+                    throw std::logic_error("QFN source inventory lacks an original directed peer fact");
+                out << (first_edge ? "" : ",") << "{\"backend\":" << modelParityJsonString(backend)
+                    << ",\"accessor\":" << accessor.device_id << ",\"peer\":" << peer.device_id
+                    << ",\"available\":" << (*available ? "true" : "false") << '}';
+                first_edge = false;
+            }
+    };
+    append_edges(hardware->cuda_devices, DeviceType::CUDA, "cuda");
+    append_edges(hardware->rocm_devices, DeviceType::ROCm, "rocm");
     out << "]}\n";
     const auto data = out.str();
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);

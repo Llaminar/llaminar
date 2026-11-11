@@ -417,6 +417,51 @@ TEST(MTPDepthTraceReplay, ResidentTerminalProjectionAbsentAtUnsupportedFrontier)
     EXPECT_EQ(result.at("decisions").size(),5u);
     EXPECT_FALSE(result.contains("controller_terminal_projection"));
 }
+/** @test A tagged resident trace retains the physical lookup layout outside controller replay arithmetic. */
+TEST(MTPDepthTraceReplay, ResidentTerminalProjectionFixedLookupLayout)
+{
+    constexpr auto field="immutable_lookup_observation_mode";
+    auto recorded=request();
+    const auto legacy=replay(recorded);
+    EXPECT_EQ(legacy.at(field),"legacy_unspecified");
+    recorded["capture"][field]="fixed_head_pipeline";
+    // The overlapping native gather and completed receipt words are not
+    // adaptive cache calls/IDs. Preserve them as opaque producer evidence.
+    recorded["initial"]["control"][60]=1;
+    recorded["terminal"]["control"][60]=3;
+    recorded["terminal"]["control"][72]=720;
+    recorded["terminal"]["control"][74]=6;
+    for (int iteration=0; iteration<20; ++iteration) {
+        const auto replayed=replay(recorded);
+        EXPECT_EQ(replayed.at(field),"fixed_head_pipeline");
+        EXPECT_EQ(replayed.at("controller_terminal_projection"),legacy.at("controller_terminal_projection"));
+    }
+    for (const auto wrong : {"fixed_head_standalone","gpu_adaptive","none","legacy_unspecified"}) {
+        auto relabeled=recorded;
+        relabeled["capture"][field]=wrong;
+        EXPECT_THROW((void)replay(relabeled),std::invalid_argument);
+    }
+    auto trailing=recorded;
+    trailing["terminal"]["control"][76]=1;
+    EXPECT_THROW((void)replay(trailing),std::invalid_argument);
+    trailing=recorded;
+    trailing["initial"]["control"][89]=1;
+    EXPECT_THROW((void)replay(trailing),std::invalid_argument);
+    auto cpu=request(true);
+    cpu["capture"][field]="fixed_head_pipeline";
+    EXPECT_THROW((void)replay(cpu),std::invalid_argument);
+
+    auto adaptive=request();
+    adaptive["capture"][field]="gpu_adaptive";
+    adaptive["terminal"]["control"][72]=3;
+    adaptive["terminal"]["control"][89]=1;
+    EXPECT_EQ(replay(adaptive).at(field),"gpu_adaptive");
+    auto standalone=request();
+    standalone["capture"][field]="fixed_head_standalone";
+    standalone["terminal"]["control"][71]=4;
+    EXPECT_EQ(replay(standalone).at(field),"fixed_head_standalone");
+}
+
 /** @test Exact V/Y endpoints preserve carry and exclude a stopped correction from the partial window. */
 TEST(MTPDepthTraceReplay, PublicationV3StopCarryAndPartialWindowRemainExact)
 {
@@ -908,6 +953,12 @@ TEST(MTPDepthTraceReplay, RecordedConfirmationV3TrainPythonReplaysExactObservedB
         EXPECT_FALSE(result.at("economy_claim").get<bool>());
         expected["decisions"]=expandRecordedConfirmationTable(expected.at("decisions"));
         expected["windows"]=expandRecordedConfirmationTable(expected.at("windows"));
+        // Historical producers did not record lookup layout. The current
+        // report must label that absence explicitly, without rewriting the
+        // immutable capture or borrowing a modern physical layout. All saved
+        // controller decisions, windows and terminal fields remain exact.
+        ASSERT_FALSE(input.at("capture").contains("immutable_lookup_observation_mode"));
+        expected["immutable_lookup_observation_mode"]="legacy_unspecified";
         // Only explicit invocation metadata differs from the original baseline.
         for(const auto key:{"status","intent","baseline_validated_by_this_executable","current_compiled_identity"})
             expected[key]=result.at(key);

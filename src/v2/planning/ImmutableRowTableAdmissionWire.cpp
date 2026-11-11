@@ -170,6 +170,8 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
     append(out,Magic);append(out,Version);append(out,count(PhysicalMemoryBOM::ownerCount()));append(out,count(requests.size()));
     for(const auto &request:requests)
     {
+        if (request.input.fixedHeadPipeline())
+            throw std::invalid_argument("Fixed PLE pipeline placement remains on its original rank and cannot enter the cross-rank admission wire");
         request.requested.validate();
         append(out,static_cast<std::uint32_t>(request.requested.storage));
         append(out,static_cast<std::uint32_t>(request.requested.distribution));

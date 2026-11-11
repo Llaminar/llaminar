@@ -10,25 +10,33 @@
 #include "transfer/TransferEngine.h"
 #include <gtest/gtest.h>
 #include <limits>
+#include <stdexcept>
 #include <unistd.h>
 
 using namespace llaminar2;
 
 namespace
 {
-    /** @return Sparse GPU ordinal with deliberately different host/GPU NUMA IDs. */
-    RankInventory inventory()
+    /** @return Distinct original GPU owner and first-touch host on sparse NUMA IDs. */
+    ClusterInventory inventory()
     {
-        RankInventory rank;
-        rank.rank = 3;
-        rank.node_id = 2;
-        rank.cpu.numa_node = 7;
-        rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = 1ull << 30;
-        rank.cpu_cores = 2;
-        for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
-            rank.gpus.push_back({.type = type, .local_device_id = 5, .memory_bytes = 1ull << 30,
-                .free_memory_bytes = 1ull << 30, .uuid = "physical-gpu", .numa_node = 11});
-        return rank;
+        ClusterInventory cluster;
+        cluster.world_size = 5;
+        for (int index = 0; index < cluster.world_size; ++index)
+        {
+            RankInventory rank;
+            rank.rank = index;
+            rank.node_id = 2;
+            rank.cpu.numa_node = index == 3 ? 11 : 7;
+            rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = 1ull << 30;
+            rank.cpu_cores = 2;
+            if (index == 3)
+                for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
+                    rank.gpus.push_back({.type = type, .local_device_id = 5, .memory_bytes = 1ull << 30,
+                        .free_memory_bytes = 1ull << 30, .uuid = "physical-gpu", .numa_node = 11});
+            cluster.ranks.push_back(std::move(rank));
+        }
+        return cluster;
     }
     /** @return Completed synthetic coordinates with distinct mechanisms and directions. */
     PlanningHostDeviceObservations observation(const PlanningHostDeviceRequest &request)
@@ -51,54 +59,72 @@ TEST(PlanningHostDeviceMeasurement, PageGeometryAndPMAUseTheAllocationAuthority)
     EXPECT_EQ(TransferEngine::mappedHostRegionAllocationBytes(page + 1), 2 * page);
     EXPECT_THROW(TransferEngine::mappedHostRegionAllocationBytes(0), std::invalid_argument);
     EXPECT_THROW(TransferEngine::mappedHostRegionAllocationBytes(SIZE_MAX), std::overflow_error);
-    const auto rank = inventory();
+    const auto cluster = inventory();
     for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
     {
         const DeviceId device(type, 5);
-        const auto request = PlanningHostDeviceRequest::fromInventory(rank, device, page + 1);
+        const auto request = PlanningHostDeviceRequest::fromInventory(cluster, {3, device}, {4}, page + 1);
         EXPECT_EQ(request.hostNumaNode(), 7);
         EXPECT_EQ(request.physicalNode(), 2);
-        const PhysicalMemoryResource host{3, DeviceId::cpu(), 1ull << 30, 1ull << 30};
+        const PhysicalMemoryResource host{4, DeviceId::cpu(), 1ull << 30, 1ull << 30};
         const PhysicalMemoryResource gpu{3, device, 1ull << 30, 1ull << 30};
         PhysicalMemoryPlanBuilder builder;
-        PlanningHostDeviceMeasurement::contributeMemory(request, host, gpu, builder);
+        PlanningHostDeviceMeasurement::contributeHostMemory(request, host, builder);
+        PlanningHostDeviceMeasurement::contributeExecutionMemory(request, gpu, builder);
         const auto plan = builder.build();
-        EXPECT_EQ(plan.find({3, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ActivationTransportStaging), 4 * page);
+        EXPECT_EQ(plan.find({4, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ActivationTransportStaging), 4 * page);
         EXPECT_EQ(plan.find({3, device})->bytes(PhysicalMemoryOwner::ActivationTransportStaging), page + 1);
         EXPECT_EQ(plan.find({3, device})->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
             2 * GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         auto wrong = gpu;
         wrong.world_rank = 4;
-        EXPECT_THROW(PlanningHostDeviceMeasurement::contributeMemory(request, host, wrong, builder), std::invalid_argument);
-        EXPECT_THROW(PlanningHostDeviceMeasurement::measure(request, nullptr), std::invalid_argument);
+        EXPECT_THROW(PlanningHostDeviceMeasurement::contributeExecutionMemory(request, wrong, builder), std::invalid_argument);
+        EXPECT_THROW(PlanningHostDeviceMeasurement::collect(request, nullptr, nullptr), std::runtime_error);
+        EXPECT_EQ(request.gpuRank(), 3);
+        EXPECT_EQ(request.hostRank(), 4);
+        auto wrong_host = host;
+        wrong_host.world_rank = 3;
+        EXPECT_THROW(PlanningHostDeviceMeasurement::contributeHostMemory(request, wrong_host, builder), std::invalid_argument);
+        const auto local = PlanningHostDeviceRequest::fromInventory(cluster, {3, device}, {3}, page + 1);
+        EXPECT_EQ(local.hostNumaNode(), 11);
+        EXPECT_EQ(local.gpuRank(), local.hostRank());
+        EXPECT_NE(local.serialize(), request.serialize());
     }
 }
 
 TEST(PlanningHostDeviceMeasurement, MissingIdentityAndInvalidGeometryFailWithoutDeviceWork)
 {
-    for (int defect = 0; defect < 9; ++defect)
+    for (int defect = 0; defect < 14; ++defect)
     {
-        auto rank = inventory();
-        if (defect == 0) rank.rank = -1;
-        if (defect == 1) rank.node_id = -1;
-        if (defect == 2) rank.cpu.numa_node = -2;
-        if (defect == 3) rank.cpu.memory_bytes = 0;
-        if (defect == 4) rank.cpu_cores = 0;
-        if (defect == 5) rank.gpus[0].uuid.clear();
-        if (defect == 6) rank.gpus.push_back(rank.gpus[0]);
-        if (defect == 7) rank.gpus.erase(rank.gpus.begin());
+        SCOPED_TRACE(defect);
+        auto cluster = inventory();
+        if (defect == 0) cluster.ranks[3].rank = -1;
+        if (defect == 1) cluster.ranks[3].node_id = -1;
+        if (defect == 2) cluster.ranks[4].cpu.numa_node = -2;
+        if (defect == 3) cluster.ranks[4].cpu.memory_bytes = 0;
+        if (defect == 4) cluster.ranks[4].cpu_cores = 0;
+        if (defect == 5) cluster.ranks[3].gpus[0].uuid.clear();
+        if (defect == 6) cluster.ranks[3].gpus.push_back(cluster.ranks[3].gpus[0]);
+        if (defect == 7) cluster.ranks[3].gpus.erase(cluster.ranks[3].gpus.begin());
+        if (defect == 9) cluster.ranks[3].cpu.numa_node = 7;
+        if (defect == 10) cluster.ranks[4].node_id = 5;
+        if (defect == 11) cluster.ranks[3].cpu.numa_node = -1;
+        if (defect == 12) cluster.ranks.pop_back();
+        if (defect == 13) cluster.ranks[4].cpu.numa_node = -1;
         const size_t bytes = defect == 8 ? SIZE_MAX : 1051;
-        EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(rank, DeviceId::cuda(5), bytes), std::invalid_argument);
+        EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {3, DeviceId::cuda(5)}, {4}, bytes), std::invalid_argument);
     }
-    const auto rank = inventory();
-    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(rank, DeviceId::cpu(), 1051), std::invalid_argument);
-    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(rank, DeviceId::cuda(5), 0), std::invalid_argument);
-    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(rank, DeviceId::cuda(5), 1), std::invalid_argument);
+    const auto cluster = inventory();
+    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {3, DeviceId::cpu()}, {4}, 1051), std::invalid_argument);
+    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {3, DeviceId::cuda(5)}, {4}, 0), std::invalid_argument);
+    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {3, DeviceId::cuda(5)}, {4}, 1), std::invalid_argument);
+    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {5, DeviceId::cuda(5)}, {4}, 1051), std::invalid_argument);
+    EXPECT_THROW(PlanningHostDeviceRequest::fromInventory(cluster, {3, DeviceId::cuda(5)}, {-1}, 1051), std::invalid_argument);
 }
 
 TEST(PlanningHostDeviceMeasurement, AllEightCoordinatesMustRetainGraphAndByteEvidence)
 {
-    const auto request = PlanningHostDeviceRequest::fromInventory(inventory(), DeviceId::rocm(5), 1051);
+    const auto request = PlanningHostDeviceRequest::fromInventory(inventory(), {3, DeviceId::rocm(5)}, {4}, 1051);
     const auto valid = observation(request);
     EXPECT_NO_THROW(PlanningHostDeviceMeasurement::validate(valid));
     for (int defect = 0; defect < 8; ++defect)

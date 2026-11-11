@@ -18,13 +18,33 @@
  * force results independently prove actual main KV rows from returned tokens
  * and their explicit Pending/Committed disposition, including greedy cases
  * whose coincident output could hide a dropped model row. This is model-free
- * preflight.
+ * preflight. Ordinary cross-vendor cases use the original MPI rank service;
+ * each process constructs only the GPU cohort on its observed NUMA node.
+ * Every worker is born from that rank's original native source, whose same PMA
+ * admits the complete graph/transport BOM before any collective or graph owner
+ * borrows it. Ordinary pool workers cannot certify native TP fanout ownership.
+ * Three-stage cases retain those same two original ranks: one owns distinct
+ * entry/tail CUDA GPUs and the other owns the middle ROCm GPU. Both directed
+ * cross-rank boundaries retain exact backing; the source rank must execute its
+ * local entry follower and terminal graph through continuation and reset.
+ * Adjacent same-backend domains require native composition and are not selected
+ * by this captured cross-vendor fixture.
  */
 #include "PipelineGenerationTestSupport.h"
+#include "../../../utils/ObservedISAPipelinePlacement.h"
+#include "backends/NativeContextPreparation.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include <map>
+#include <set>
 #include <tuple>
+#include <cstdio>
+#include <exception>
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
+#include "planning/RankHardwareOwnership.h"
+#include "planning/PlanningObservedResource.h"
+#include "transfer/CapturedTransferChannel.h"
 
 namespace llaminar2::test
 {
@@ -42,6 +62,7 @@ struct PipelineDomainCase
     int admitted_rows = 256; ///< Exact PMA-selected arena capacity, independent of startup ceiling.
     int initial_depth = 15; ///< Dynamic first transaction; retained capacity remains fifteen.
     bool greedy = false; ///< Explicit sampling axis; existing cases remain stochastic.
+    int stage_count = 2; ///< Three selects distinct CUDA entry/tail GPUs and a remote ROCm middle.
 };
 
 /** @brief Shared numerical fixture with explicit one-, two- and four-member TP domains. */
@@ -137,19 +158,20 @@ protected:
     {
         const auto test = GetParam();
         const bool penalized = request_law == RequestLaw::PresencePenalty;
+        ASSERT_TRUE(test.stage_count == 2 || test.stage_count == 3);
+        if (test.stage_count == 3)
+        {
+            ASSERT_FALSE(test.reverse);
+            ASSERT_EQ(test.width, 1);
+        }
+        const int terminal_domain = test.stage_count - 1;
         const int fixed_depth = penalized ? 1 : 7;
         initCPUBackend(-1);
-        auto *cuda = getCUDABackend();
-        auto *rocm = getROCmBackend();
-        ASSERT_NE(cuda, nullptr);
-        ASSERT_NE(rocm, nullptr);
-        // Four total GPUs are the required hybrid preflight baseline. The
-        // explicitly registered eight-GPU extension reports missing hardware
-        // as skipped; it must never masquerade as a successful execution.
-        if (test.width == 4 && (cuda->deviceCount() < test.width || rocm->deviceCount() < test.width))
-            GTEST_SKIP() << "Requires " << test.width << " CUDA and ROCm devices";
-        ASSERT_GE(cuda->deviceCount(), test.width) << "Required hybrid preflight CUDA participants";
-        ASSERT_GE(rocm->deviceCount(), test.width) << "Required hybrid preflight ROCm participants";
+        const auto mpi = MPIContextFactory::global();
+        ASSERT_TRUE(mpi);
+        ASSERT_EQ(mpi->world_size(), 2);
+        const auto inventory = mpi->clusterInventory();
+        ASSERT_TRUE(inventory);
         struct Startup
         {
             std::optional<std::string> previous;
@@ -190,27 +212,77 @@ protected:
         OrdinaryGraphEvidence evidence("generation,forward_graph,mtp,transfer");
         ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("transfer"))
             << "Zero-copy evidence requires the transfer collection domain";
-        std::vector<std::vector<GlobalDeviceAddress>> members(2);
-        std::vector<std::unique_ptr<LocalTPContext>> contexts(2);
-        std::vector<DevicePlanConfig> inputs;
-        for (int domain = 0; domain < 2; ++domain)
+        // This owner predates every graph, context, arena and table borrower.
+        // Its final reset follows destruction of all those actual native uses.
+        struct OriginalSourceLifetime final
         {
-            const bool is_cuda = bool(domain) == test.reverse;
+            std::shared_ptr<NativeContextPreparation> source;
+            /** @brief Retire only after all later-declared graph/context/storage owners are gone. */
+            ~OriginalSourceLifetime() noexcept
+            {
+                if (!source) return;
+                try { source->retireReleasedContexts(); }
+                catch (...) { std::terminate(); }
+            }
+        } original_source;
+        std::vector<std::vector<GlobalDeviceAddress>> members(test.stage_count);
+        std::vector<std::unique_ptr<LocalTPContext>> contexts(test.stage_count);
+        std::vector<DevicePlanConfig> inputs;
+        // Resolve the full original-world stage demand jointly. A second
+        // individually eligible ROCm owner is legitimate inventory, while this
+        // distributed fixture requires distinct native backend owners and
+        // disjoint devices for repeated stages on the same original owner.
+        std::vector<ObservedNativePipelineStage> request;
+        for(int domain=0;domain<test.stage_count;++domain) {
+            const auto backend=test.stage_count==3
+                ? (domain==1?DeviceType::ROCm:DeviceType::CUDA)
+                : (bool(domain)==test.reverse?DeviceType::CUDA:DeviceType::ROCm);
+            request.push_back({backend,static_cast<std::size_t>(test.width)});
+        }
+        const auto physical=ObservedCrossVendorPipelinePlacement::require(*inventory,request);
+        const auto& owners=physical.owners;
+        ASSERT_EQ(static_cast<std::size_t>(mpi->world_size()),physical.selection().discoveryRanks().size());
+        for(int domain=0;domain<test.stage_count;++domain) {
+            const auto& owner=inventory->getRank(owners[domain]);
+            for(const auto device:physical.stages[domain])
+                members[domain].push_back(GlobalDeviceAddress::fromLocalDeviceId(
+                    device,owner.hostname,owner.cpu.numa_node));
+        }
+        ASSERT_NE(owners[0], owners[1]);
+        if (test.stage_count == 3)
+        {
+            ASSERT_EQ(owners[0], owners[2]);
+            ASSERT_NE(members[0].front().toLocalDeviceId(), members[2].front().toLocalDeviceId());
+        }
+        std::vector<int> local_domains;
+        for (int domain = 0; domain < test.stage_count; ++domain)
+            if (owners[domain] == mpi->rank()) local_domains.push_back(domain);
+        ASSERT_FALSE(local_domains.empty());
+        const bool source = owners.back() == mpi->rank();
+        if (test.stage_count == 3) ASSERT_EQ(local_domains.size(), source ? 2u : 1u);
+        for (int domain = 0; domain < test.stage_count; ++domain)
+        {
+            if (owners[domain] != mpi->rank()) continue;
+            const bool is_cuda = members[domain].front().toLocalDeviceId().is_cuda();
             for (int member = 0; member < test.width; ++member)
             {
-                const int ordinal = test.width - 1 - member;
-                const auto device = is_cuda ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
-                members[domain].push_back(GlobalDeviceAddress::fromLocalDeviceId(device));
+                const auto device = members[domain][member].toLocalDeviceId();
+                const int ordinal = device.ordinal;
                 DevicePlanConfig input;
-                input.world_rank = 0;
+                input.world_rank = mpi->rank();
                 input.device = device;
                 input.first_layer = input.last_layer = domain;
-                auto *backend = getBackendFor(device);
-                input.device_total_bytes = backend->deviceMemoryTotal(ordinal);
-                input.device_free_bytes = backend->deviceMemoryFree(ordinal);
-                input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0, .device = DeviceId::cpu(),
-                    .total_bytes = 1ull << 30, .admission_available_bytes = 1ull << 30};
-                input.device_compute_units = 128;
+                const auto &observed_rank = inventory->getRank(mpi->rank());
+                const auto resource = planningObservedResource(observed_rank, device);
+                const auto observed_gpu = std::find_if(observed_rank.gpus.begin(), observed_rank.gpus.end(),
+                    [&](const auto &gpu) { return gpu.type == device.type && gpu.local_device_id == ordinal; });
+                ASSERT_NE(observed_gpu, observed_rank.gpus.end());
+                input.device_total_bytes = resource.total_bytes;
+                input.device_free_bytes = resource.admission_available_bytes;
+                input.associated_host_memory = planningObservedResource(observed_rank, DeviceId::cpu());
+                input.device_compute_units = observed_gpu->compute_units;
+                input.pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::Participant;
+                input.pipeline_native_activation_fanout = test.width > 1 && domain > 0;
                 input.max_seq_len = 512;
                 input.activation_seq_len = test.admitted_rows;
                 input.mtp_enabled = test.usesMTP();
@@ -222,31 +294,65 @@ protected:
                     {test.admitted_rows},
                     mtp,
                     family,
-                    domain == 0 ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller,
+                    domain != terminal_domain ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller,
                     DeviceGenerationExecutionDomain::HostedBoundary);
                 if (test.width > 1) input.local_tp_backend = is_cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
-                if (!member) input.captured_pipeline_boundaries = {domain
-                    ? PipelineBoundarySide::LaterDomain : PipelineBoundarySide::EarlierDomain};
+                if (!member)
+                {
+                    if (domain > 0) input.captured_pipeline_boundaries.push_back(PipelineBoundarySide::LaterDomain);
+                    if (domain < terminal_domain) input.captured_pipeline_boundaries.push_back(PipelineBoundarySide::EarlierDomain);
+                }
                 inputs.push_back(input);
             }
-            if (test.width > 1)
-                contexts[domain] = std::make_unique<LocalTPContext>(members[domain], std::vector<float>{}, CollectiveBackendType::AUTO);
         }
         ModelMemoryProfile profile;
         profile.architecture = "qwen35";
-        profile.n_layers = test.usesMTP() ? 3 : 2;
+        profile.n_layers = test.stage_count + (test.usesMTP() ? 1 : 0);
         profile.mtp_layer_count = test.usesMTP() ? 1 : 0;
         profile.d_model = profile.head_dim = profile.vocab_size = 32;
         profile.d_ff = 64;
         profile.n_heads = profile.n_kv_heads = 1;
         profile.max_seq_len = 512;
-        auto memory = std::make_shared<PhysicalMemoryAuthority>(
-            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(MemoryPlanner::plan(profile, inputs).physicalPlan()), 0);
+        const auto &original_rank = inventory->getRank(mpi->rank());
+        std::vector<PhysicalMemoryResource> observations{
+            planningObservedResource(original_rank, DeviceId::cpu())};
+        std::vector<DeviceId> selected;
+        for (const auto &input : inputs)
+        {
+            observations.push_back(planningObservedResource(original_rank, input.device));
+            selected.push_back(input.device);
+        }
+        original_source.source = NativeContextPreparation::create(observations, mpi->rank(), selected);
+        const auto memory = original_source.source->memory();
+        for (const auto device : selected)
+        {
+            const auto original = original_source.source->acquire(device);
+            const auto retained = GPUDeviceContextPool::instance().retainExistingPreparedContext(device, memory);
+            retained.requireWorker(original.worker());
+            ASSERT_EQ(original.memory(), memory);
+            ASSERT_EQ(retained.generation(), original.generation());
+            ASSERT_GT(original.generation(), 0u);
+        }
+        original_source.source->freezeForPlanning();
+        for (auto &input : inputs) input.native_context_preparation = original_source.source;
+        const auto certificate = std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
+            MemoryPlanner::plan(profile, inputs).physicalPlan());
+        original_source.source->admitFinal(certificate);
+        ASSERT_EQ(original_source.source->memory(), memory);
+        ASSERT_EQ(memory->admission(), certificate);
+        // Native collectives may now borrow only the already-created original
+        // local workers and the same final model/transport memory authority.
+        if (test.width > 1)
+            for (const int domain : local_domains)
+                contexts[domain] = std::make_unique<LocalTPContext>(members[domain],
+                    std::vector<float>{}, CollectiveBackendType::AUTO);
         std::vector<std::shared_ptr<OrdinaryDGOGraph>> graphs;
         std::vector<DeviceGraphOrchestrator *> participants;
+        std::vector<int> participant_domains; ///< Exact stage identity for each original local leaf.
         std::vector<std::unique_ptr<IInferenceRunner>> domains;
-        for (int domain = 0; domain < 2; ++domain)
+        for (int domain = 0; domain < test.stage_count; ++domain)
         {
+            if (owners[domain] != mpi->rank()) continue;
             if (contexts[domain]) ASSERT_TRUE(contexts[domain]->reserveGraphCaptureBoundaryResources(memory));
             std::vector<std::unique_ptr<IInferenceRunner>> children;
             for (int member = 0; member < test.width; ++member)
@@ -276,14 +382,14 @@ protected:
                 config.mtp_verifier_outcome_ownership = MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
                 config.tp_ctx = contexts[domain].get();
                 config.tp_device_idx = config.local_rank = member;
-                config.lm_head_column_parallel = test.width > 1 && domain == 1;
+                config.lm_head_column_parallel = test.width > 1 && domain == terminal_domain;
                 config.prefix_cache.enabled = false;
                 config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
-                auto graph = std::make_shared<OrdinaryDGOGraph>(config, domain == 0, domain == 1);
+                auto graph = std::make_shared<OrdinaryDGOGraph>(config, domain == 0, domain == terminal_domain);
                 auto owner = DeviceGraphOrchestrator::createForTest({.model_ctx = MockModelContext::createMinimal(),
                     .graph_builder = graph, .physical_memory_authority = memory});
                 FactoryPPStageConfig stage{.first_layer = domain, .last_layer = domain + 1,
-                    .has_embedding = domain == 0, .has_lm_head = domain == 1};
+                    .has_embedding = domain == 0, .has_lm_head = domain == terminal_domain};
                 stage.generation_domain = DeviceGenerationExecutionDomain::HostedBoundary;
                 owner->setPPStageConfig(stage);
                 auto &context = GPUDeviceContextPool::instance().getContext(device);
@@ -294,8 +400,9 @@ protected:
                         {.activation_seq_len = test.admitted_rows}));
                 });
                 ASSERT_FALSE(HasFatalFailure());
-                if (test.usesMTP() && domain == 1) owner->setFrozenWeightSet(makeOrdinaryMTPFrozenWeightSet(*graph, device));
+                if (test.usesMTP() && domain == terminal_domain) owner->setFrozenWeightSet(makeOrdinaryMTPFrozenWeightSet(*graph, device));
                 participants.push_back(owner.get());
+                participant_domains.push_back(domain);
                 graphs.push_back(graph);
                 children.push_back(std::move(owner));
             }
@@ -308,7 +415,7 @@ protected:
                 config.max_seq_len = 512;
                 config.mtp = mtp;
                 config.nested_pp_stage_config = FactoryPPStageConfig{.first_layer = domain, .last_layer = domain + 1,
-                    .has_embedding = domain == 0, .has_lm_head = domain == 1};
+                    .has_embedding = domain == 0, .has_lm_head = domain == terminal_domain};
                 config.nested_pp_stage_config->generation_domain = DeviceGenerationExecutionDomain::HostedBoundary;
                 auto domain_model = MockModelContext::createMinimal();
                 domain_model->setVocabSize(32);
@@ -316,30 +423,148 @@ protected:
                     std::move(children), std::move(contexts[domain]), config));
             }
         }
-        RankOrchestrator::Config rank_config;
-        rank_config.mode = RankOrchestrator::ParallelismMode::PP;
-        rank_config.max_seq_len = 512;
-        rank_config.mtp = mtp;
-        for (int domain = 0; domain < 2; ++domain)
-            rank_config.pp_stages.push_back({.first_layer = domain, .last_layer = domain + 1,
-                .has_embedding = domain == 0, .has_lm_head = domain == 1, .stage_devices = members[domain]});
-        auto model = MockModelContext::createMinimal();
-        model->setVocabSize(32);
-        auto rank = RankOrchestrator::createForTestWithPipelineStages(model, std::move(domains), rank_config);
-        ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch({.prefill_bucket_rows = {test.admitted_rows},
-            .prefill_pad_token_id = 0, .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+
+        std::vector<GlobalPPStageSpec> specifications;
+        for (int domain = 0; domain < test.stage_count; ++domain)
+        {
+            GlobalPPStageSpec stage;
+            stage.stage_id = stage.first_layer = stage.last_layer = domain;
+            stage.domain_name = "ordinary_domain_" + std::to_string(domain);
+            stage.has_embedding = domain == 0;
+            stage.has_lm_head = domain == terminal_domain;
+            stage.owning_rank = owners[domain];
+            stage.inner_mode = test.width > 1 ? InnerParallelism::LOCAL_TP : InnerParallelism::SINGLE_DEVICE;
+            stage.devices = members[domain];
+            stage.backend = members[domain].front().toLocalDeviceId().is_cuda()
+                ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            specifications.push_back(std::move(stage));
+        }
+        GlobalOrchestrator::Config global;
+        global.topology = GlobalPPTopology::build(std::move(specifications), test.stage_count, *inventory);
+        global.rank = mpi->rank();
+        global.world_size = mpi->world_size();
+        global.mpi_ctx = mpi.get();
+        global.original_mpi_ctx = mpi;
+        global.vocab_size = global.d_model = 32;
+        global.architecture_name = "qwen35";
+        const auto local_plan = GlobalPPRankPlanBuilder::build(global.topology, mpi->rank());
+        const auto local_actions = local_plan.executeStages();
+        ASSERT_EQ(local_actions.size(), local_domains.size());
+        ASSERT_EQ(domains.size(), local_domains.size());
+        for (size_t local = 0; local < local_actions.size(); ++local)
+        {
+            ASSERT_EQ(local_actions[local]->stage_id, local_domains[local]);
+            StageRunnerEntry entry;
+            entry.action = *local_actions[local];
+            entry.stage_id = entry.action.stage_id;
+            entry.domain_name = entry.action.domain_name;
+            entry.original_mpi_ctx = mpi;
+            entry.runner = std::move(domains[local]);
+            global.stage_runners.push_back(std::move(entry));
+        }
+        auto pipeline_owner = std::make_unique<GlobalOrchestrator>(std::move(global));
+        auto *pipeline = pipeline_owner.get();
+        pipeline->validateOriginalRankGPUTransportContext(mpi);
+        struct Lifetime final
+        {
+            std::shared_ptr<CapturedTransferRankSession> session;
+            std::unique_ptr<IInferenceRunner> prepared;
+            std::unique_ptr<OrchestrationRunner> runner;
+            std::shared_ptr<IMPIContext> original_context; ///< Exact original owner for fatal asymmetric failure.
+            /** @brief Abort divergent failure before any original-rank cleanup collective. */
+            [[noreturn]] void abortOriginal(const char *diagnostic) const noexcept
+            {
+                std::fprintf(stderr, "Original pipeline fixture rank %d fatal: %s\n",
+                    original_context->rank(), diagnostic);
+                std::fflush(stderr);
+                MPI_Abort(original_context->communicator(), 1);
+                std::terminate();
+            }
+            /** @brief Destroy every native graph/alias before original all-rank backing retirement. */
+            ~Lifetime()
+            {
+                if (::testing::Test::HasFatalFailure())
+                {
+                    const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
+                    if (info)
+                        for (int index = 0; index < info->result()->total_part_count(); ++index)
+                        {
+                            const auto &part = info->result()->GetTestPartResult(index);
+                            if (part.failed()) std::fprintf(stderr, "%s\n", part.message());
+                        }
+                    abortOriginal("GTest fatal failure precedes collective graph retirement");
+                }
+                if (std::uncaught_exceptions())
+                    abortOriginal("exception escaped reporting boundary before collective graph retirement");
+                runner.reset();
+                prepared.reset();
+                session->retireAfterOriginalGraphRelease();
+            }
+        } lifetime{CapturedTransferRankSession::create(mpi), std::move(pipeline_owner), nullptr, mpi};
+        // Catch while Lifetime is still alive. Reporting after its destructor
+        // would hide the original exception inside an unmatched retirement
+        // collective while the peer enters its next public request boundary.
+        try
+        {
+        pipeline->bindOriginalRankGPUTransportSession(mpi, lifetime.session);
+        const ServingGraphFamilyMaterializationPlan serving{
+            .prefill_bucket_rows = {test.admitted_rows}, .prefill_pad_token_id = 0,
+            .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial};
+        // The injected fixture explicitly executes the same public cold binding
+        // and complete family materialization used by production initialization.
+        ASSERT_TRUE(pipeline->materializeServingGraphFamilyWithoutLaunch(serving));
+        ASSERT_TRUE(pipeline->originalRankPipelineReady());
         expectRetainedVerifierSetup(participants, test.usesMTP());
         const auto captured_before_requests = capturedForwardNodes();
         ASSERT_EQ(captured_before_requests.size(), participants.size());
         for (const auto *participant : participants)
             ASSERT_GT(captured_before_requests.at(participant->primaryDeviceId().toString()), 0);
         const auto geometry = PipelineTransferMemory::forRows(32, test.admitted_rows, test.usesMTP() ? 16 : 1);
-        for (size_t i = 0; i < participants.size(); ++i)
-            EXPECT_EQ(memory->claimedBytes(participants[i]->primaryDeviceId(), PhysicalMemoryOwner::ActivationTransportStaging,
-                PhysicalMemoryMaterializationKind::NewAllocation), i % test.width ? 0 : geometry.device_bytes_per_boundary);
+        size_t expected_host_bytes = 0;
+        for (size_t index = 0; index < participants.size(); ++index)
+        {
+            const int domain = participant_domains[index];
+            const bool leader = participants[index]->primaryDeviceId() == members[domain].front().toLocalDeviceId();
+            const size_t adjacent_boundaries = size_t(domain > 0) + size_t(domain < terminal_domain);
+            const bool receives_native_fanout = domain > 0 && test.width > 1;
+            EXPECT_EQ(memory->claimedBytes(participants[index]->primaryDeviceId(), PhysicalMemoryOwner::ActivationTransportStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+                (leader ? adjacent_boundaries * geometry.device_bytes_per_boundary : 0) +
+                    (receives_native_fanout ? PipelineTransferMemory::fanoutDeviceBytes() : 0));
+            if (leader && domain < terminal_domain) expected_host_bytes += geometry.host_bytes_per_boundary;
+            if (receives_native_fanout) expected_host_bytes += PipelineTransferMemory::fanoutHostBytes();
+        }
+        // Every rank owns its original source's CPU obligations. Channel
+        // pages still belong only to each earlier stage: CUDA entry and ROCm
+        // middle. Native fanout owns only its exact per-member operands.
+        // CPU allocator presence cannot substitute for a zero transport claim.
+        ASSERT_TRUE(memory->contains(DeviceId::cpu()));
+        EXPECT_EQ(memory->plannedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging), expected_host_bytes);
         EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
-            PhysicalMemoryMaterializationKind::NewAllocation), geometry.host_bytes_per_boundary);
-
+            PhysicalMemoryMaterializationKind::NewAllocation), expected_host_bytes);
+        if (test.stage_count == 3)
+        {
+            std::map<int, double> actual_boundaries, expected_boundaries;
+            for (int boundary = 0; boundary < terminal_domain; ++boundary)
+                if (owners[boundary] == mpi->rank() || owners[boundary + 1] == mpi->rank())
+                    expected_boundaries[boundary] = geometry.activation_capacity_bytes;
+            for (const auto &record : PerfStatsCollector::snapshot())
+                if (record.domain == "forward_graph" && record.name == "original_rank_pipeline_activation_capacity")
+                {
+                    const int earlier = std::stoi(record.tags.at("source_stage"));
+                    const int later = std::stoi(record.tags.at("consumer_stage"));
+                    ASSERT_GE(earlier, 0);
+                    ASSERT_LT(earlier, terminal_domain);
+                    ASSERT_EQ(later, earlier + 1);
+                    EXPECT_EQ(std::stoi(record.tags.at("source_rank")), owners[earlier]);
+                    EXPECT_EQ(std::stoi(record.tags.at("consumer_rank")), owners[later]);
+                    EXPECT_EQ(std::stoi(record.tags.at("local_rank")), mpi->rank());
+                    EXPECT_EQ(record.tags.at("extent_kind"), "storage_capacity_only");
+                    actual_boundaries[earlier] += record.value;
+                }
+            EXPECT_EQ(actual_boundaries, expected_boundaries)
+                << "Both original cross-rank edges require distinct actual admitted channels";
+        }
         OrchestrationConfig config;
         config.max_seq_len = 512;
         config.prefill_max_bucket_size = test.admitted_rows;
@@ -347,17 +572,30 @@ protected:
         config.prefix_cache.enabled = false;
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
         RankExecutionPlan plan;
-        plan.primary_device = members.back().front();
+        plan.rank = mpi->rank();
+        plan.hostname = inventory->getRank(mpi->rank()).hostname;
+        plan.primary_device = members[source ? terminal_domain : local_domains.front()].front();
+        plan.has_lm_head = source;
+        plan.has_embedding = owners.front() == mpi->rank();
         plan.runtime.max_seq_len = 512;
-        // The real admission path publishes this capacity into the root plan
-        // as well as participant arenas. Keep the request scheduler on that
-        // same authority while the startup bucket ceiling remains larger.
         plan.runtime.resident_graph_rows = test.admitted_rows;
         plan.runtime.mtp = mtp;
         plan.runtime.prefix_cache = config.prefix_cache;
-        auto *pipeline = rank.get();
-        OrchestrationRunner runner(config, plan, std::move(rank));
+        lifetime.runner = std::make_unique<OrchestrationRunner>(config, plan, std::move(lifetime.prepared), mpi);
+        auto &runner = *lifetime.runner;
+        ASSERT_EQ(runner.coordinatedRootRank(), owners.back());
         int consumed_main_rows = 0;
+        /** @brief Validate completed public response cardinality without broadcasting token/model state. */
+        const auto terminal_count = [&](const GenerationResult &result, int expected) {
+            const int32_t count = source ? static_cast<int32_t>(result.tokens.size()) : 0;
+            std::array<int32_t, 2> counts{};
+            mpi->allgather_bytes(&count, counts.data(), sizeof(count));
+            for (int rank = 0; rank < mpi->world_size(); ++rank)
+                EXPECT_EQ(counts[rank], rank == owners.back() ? expected : 0);
+            EXPECT_EQ(result.tokens.size(), source ? size_t(expected) : 0u);
+            return counts[owners.back()];
+        };
+
         const bool shallow_initial = test.lane == PipelineGenerationLane::DynamicMTP && test.initial_depth < 15;
         // These terminal tags authenticate a successfully committed first
         // transaction, rather than merely repeating the requested policy.
@@ -444,7 +682,7 @@ protected:
                 ASSERT_LT(token, int(expected.size()));
                 ++expected[size_t(token)];
             }
-            for (size_t participant = participants.size() - size_t(test.width);
+            for (size_t participant = (source ? size_t{0} : participants.size());
                  participant < participants.size(); ++participant)
             {
                 auto &owner = *participants[participant];
@@ -540,7 +778,7 @@ protected:
                 for (size_t participant = 0; participant < participants.size(); ++participant)
                 {
                     const auto device = participants[participant]->primaryDeviceId().toString();
-                    const bool controller = participant >= participants.size() - size_t(test.width);
+                    const bool controller = source;
                     EXPECT_EQ(materializations[device], controller ? 1.0 : 0.0) << device;
                     EXPECT_EQ(forward_only_materializations[device], 1.0)
                         << "Every physical participant retains exactly one sampler-free parent: " << device;
@@ -570,7 +808,7 @@ protected:
             // through the real public pipeline/Rank fanout below.
             const auto expect_local_rejection = [&](int slot, Disposition disposition, const char *reason)
             {
-                for (size_t participant = participants.size() - size_t(test.width);
+                for (size_t participant = (source ? size_t{0} : participants.size());
                      participant < participants.size(); ++participant)
                 {
                     auto &owner = *participants[participant];
@@ -590,7 +828,7 @@ protected:
             expect_generated_history("explicit_publication", 0, 0, {});
             expect_direct_history_evidence();
             ASSERT_FALSE(HasFatalFailure());
-            ASSERT_TRUE(pipeline->stageStochasticTargetTokenForDeviceSampling(4, 0));
+            if (source) ASSERT_TRUE(pipeline->stageStochasticTargetTokenForDeviceSampling(4, 0));
             ASSERT_TRUE(pipeline->publishMTPDirectTokenHistory(0, Disposition::NewlyEmitted));
             ++direct_publications;
             expect_generated_history("explicit_publication", 0, 1, {4});
@@ -601,7 +839,7 @@ protected:
             expect_generated_history("explicit_publication", 0, 1, {4});
             expect_direct_history_evidence();
             ASSERT_FALSE(HasFatalFailure());
-            ASSERT_TRUE(pipeline->stageStochasticTargetTokenForDeviceSampling(4, 0));
+            if (source) ASSERT_TRUE(pipeline->stageStochasticTargetTokenForDeviceSampling(4, 0));
             ASSERT_TRUE(pipeline->publishMTPDirectTokenHistory(0, Disposition::NewlyEmitted));
             ++direct_publications;
             expect_generated_history("explicit_publication", 0, 2, {4, 4});
@@ -662,8 +900,13 @@ protected:
                         ASSERT_LE(response.size(), size_t(config.max_seq_len - prompt_token_count));
                         const int expected_cached_tokens = prompt_token_count + int(response.size()) -
                             (forced.returned_token_commit == ReturnedTokenCommitState::Pending ? 1 : 0);
-                        for (size_t participant = participants.size() - size_t(test.width);
-                             participant < participants.size(); ++participant)
+                        const int32_t expected_frontier = source ? expected_cached_tokens : -1;
+                        std::array<int32_t, 2> expected_frontiers{};
+                        mpi->allgather_bytes(&expected_frontier, expected_frontiers.data(), sizeof(expected_frontier));
+                        ASSERT_GE(expected_frontiers[owners.back()], prompt_token_count);
+                        for (int rank = 0; rank < mpi->world_size(); ++rank)
+                            if (rank != owners.back()) EXPECT_EQ(expected_frontiers[rank], -1);
+                        for (size_t participant = 0; participant < participants.size(); ++participant)
                         {
                             auto &owner = *participants[participant];
                             const auto device = owner.primaryDeviceId();
@@ -687,7 +930,7 @@ protected:
                                     sizeof(actual_cached_tokens), device.gpu_ordinal(), stream));
                             });
                             ASSERT_FALSE(HasFatalFailure());
-                            EXPECT_EQ(actual_cached_tokens, expected_cached_tokens)
+                            EXPECT_EQ(actual_cached_tokens, expected_frontiers[owners.back()])
                                 << "execution=" << execution << " repetition=" << repetition
                                 << " device=" << device.toString() << " returned=" << response.size()
                                 << " forced_commit=" << int(forced.returned_token_commit);
@@ -699,14 +942,15 @@ protected:
                     {
                         const auto forced = runner.forceDecodeToken(4);
                         ASSERT_TRUE(forced.success()) << forced.error;
-                        ASSERT_EQ(forced.tokens, std::vector<int32_t>{4});
+                        ASSERT_EQ(forced.tokens, source ? std::vector<int32_t>{4} : std::vector<int32_t>{});
+                        (void)terminal_count(forced, 1);
                         ASSERT_FALSE(forced.is_complete);
                         response.insert(response.end(), forced.tokens.begin(), forced.tokens.end());
                         expect_forced_frontier(forced);
                         ASSERT_FALSE(HasFatalFailure());
                         direct_publications += enabled ? 1 : 0;
                         expect_direct_history_evidence();
-                        if (!enabled && index > 0)
+                        if (source && !enabled && index > 0)
                             EXPECT_GT(completed_forward_only_transactions, 0)
                                 << "Repeated ordinary force must execute the sampler-free captured-domain transaction";
                         expect_generated_history(execution, repetition, 1, response);
@@ -720,7 +964,8 @@ protected:
                         runner.setDecodeStepTokenBudget(budget);
                         const auto result = runner.decodeStep();
                         ASSERT_TRUE(result.success()) << result.error;
-                        ASSERT_EQ(result.tokens.size(), size_t(budget));
+                        ASSERT_EQ(result.tokens.size(), source ? size_t(budget) : 0u);
+                        (void)terminal_count(result, budget);
                         response.insert(response.end(), result.tokens.begin(), result.tokens.end());
                         // The full17-token transaction commits its own history.
                         // Only the single direct output replays this scalar helper.
@@ -735,19 +980,21 @@ protected:
                     const auto forward_only_before_force = completed_forward_only_transactions;
                     const auto forced_after_grouped = runner.forceDecodeToken(4);
                     ASSERT_TRUE(forced_after_grouped.success()) << forced_after_grouped.error;
-                    ASSERT_EQ(forced_after_grouped.tokens, std::vector<int32_t>{4});
+                    ASSERT_EQ(forced_after_grouped.tokens, source ? std::vector<int32_t>{4} : std::vector<int32_t>{});
+                    (void)terminal_count(forced_after_grouped, 1);
                     response.insert(response.end(), forced_after_grouped.tokens.begin(), forced_after_grouped.tokens.end());
                     expect_forced_frontier(forced_after_grouped);
                     ASSERT_FALSE(HasFatalFailure());
                     direct_publications += enabled ? 1 : 0;
                     expect_generated_history(execution, repetition, 1, response);
                     expect_direct_history_evidence();
-                    if (!enabled) EXPECT_GT(completed_forward_only_transactions, forward_only_before_force);
+                    if (source && !enabled) EXPECT_GT(completed_forward_only_transactions, forward_only_before_force);
                     ASSERT_FALSE(HasFatalFailure());
                     runner.setDecodeStepTokenBudget(4);
                     const auto after_force = runner.decodeStep();
                     ASSERT_TRUE(after_force.success()) << after_force.error;
-                    ASSERT_EQ(after_force.tokens.size(), 4u);
+                    ASSERT_EQ(after_force.tokens.size(), source ? 4u : 0u);
+                    (void)terminal_count(after_force, 4);
                     response.insert(response.end(), after_force.tokens.begin(), after_force.tokens.end());
                     expect_generated_history(execution, repetition, 4, response);
                     expect_direct_history_evidence();
@@ -764,7 +1011,8 @@ protected:
                     ASSERT_FALSE(HasFatalFailure());
                     const auto forced_stop = runner.forceDecodeToken(4);
                     ASSERT_TRUE(forced_stop.success()) << forced_stop.error;
-                    ASSERT_EQ(forced_stop.tokens, std::vector<int32_t>{4});
+                    ASSERT_EQ(forced_stop.tokens, source ? std::vector<int32_t>{4} : std::vector<int32_t>{});
+                    (void)terminal_count(forced_stop, 1);
                     EXPECT_TRUE(forced_stop.is_complete);
                     EXPECT_EQ(forced_stop.returned_token_commit, ReturnedTokenCommitState::NoModelRow);
                     expect_direct_history_evidence();
@@ -788,8 +1036,9 @@ protected:
                     runner.setDecodeStepTokenBudget(1);
                     const auto sampled_stop = runner.decodeStep();
                     ASSERT_TRUE(sampled_stop.success()) << sampled_stop.error;
-                    ASSERT_EQ(sampled_stop.tokens.size(), 1u);
-                    EXPECT_EQ(sampled_stop.tokens.front(), test.greedy ? 1 : 4);
+                    ASSERT_EQ(sampled_stop.tokens.size(), source ? 1u : 0u);
+                    (void)terminal_count(sampled_stop, 1);
+                    if (source) EXPECT_EQ(sampled_stop.tokens.front(), test.greedy ? 1 : 4);
                     EXPECT_TRUE(sampled_stop.is_complete);
                     direct_publications += enabled ? 1 : 0;
                     expect_direct_history_evidence();
@@ -825,24 +1074,25 @@ protected:
                     runner.setDecodeStepTokenBudget(budget);
                     const auto result = runner.decodeStep();
                     ASSERT_TRUE(result.success()) << result.error;
-                    ASSERT_EQ(result.tokens.size(), size_t(budget));
+                    ASSERT_EQ(result.tokens.size(), source ? size_t(budget) : 0u);
+                    (void)terminal_count(result, budget);
                     serial_controls[repetition].insert(serial_controls[repetition].end(),
                         result.tokens.begin(), result.tokens.end());
                     expect_generated_history("off", repetition, budget, serial_controls[repetition]);
                     ASSERT_FALSE(HasFatalFailure());
                 }
-                ASSERT_EQ(serial_controls[repetition].size(), 84u);
+                ASSERT_EQ(serial_controls[repetition].size(), source ? 84u : 0u);
                 // A successful MTP/Off comparison must exercise a policy that
                 // changes an actual token, not merely publish enabled tags.
                 // These neutral token IDs belong to this authored numerical
                 // fixture; the oracle itself remains the real Off response.
-                if (test.greedy)
+                if (source && test.greedy)
                 {
                     const size_t sensitivity_row = repetition == 0 ? 54u : 47u;
                     EXPECT_NE(serial_controls[repetition][sensitivity_row], 26)
                         << "Greedy Off control must observe generated-token presence history";
                 }
-                else if (repetition == 0)
+                else if (source && repetition == 0)
                 {
                     EXPECT_NE(serial_controls[repetition][13], 7)
                         << "Stochastic Off control must observe generated-token presence history";
@@ -886,14 +1136,15 @@ protected:
                 const auto initial_before = firstTransactionEvidence();
                 const auto result = runner.decodeStep();
                 ASSERT_TRUE(result.success()) << result.error;
-                ASSERT_EQ(result.tokens.size(), size_t(budget));
+                ASSERT_EQ(result.tokens.size(), source ? size_t(budget) : 0u);
+                const auto completed_count = terminal_count(result, budget);
                 if (penalized)
                 {
                     actual_response.insert(actual_response.end(), result.tokens.begin(), result.tokens.end());
                     expect_generated_history("mtp", repetition, budget, actual_response);
                     ASSERT_FALSE(HasFatalFailure());
                 }
-                if (shallow_initial && budget == 65)
+                if (source && shallow_initial && budget == 65)
                 {
                     const auto initial_after = firstTransactionEvidence();
                     // Host sampling owns only the actual initial drafts; all
@@ -904,7 +1155,7 @@ protected:
                     if (!retained_generation_captures)
                         retained_generation_captures = capturedForwardNodes(CaptureScope::CompleteGeneration);
                 }
-                if (test.lane == PipelineGenerationLane::DynamicMTP && budget == 17)
+                if (source && test.lane == PipelineGenerationLane::DynamicMTP && budget == 17)
                 {
                     const auto continued = firstTransactionEvidence();
                     EXPECT_EQ(continued[0] - initial_before[0], 0)
@@ -939,6 +1190,7 @@ protected:
                     ASSERT_EQ(token, previous) << "repetition=" << repetition << " output_row=" << emitted;
                     ++emitted;
                 }
+                if (!source) emitted += completed_count;
             }
             // A token-only oracle cannot prove the follower wrote its own KV.
             // Inspect original cache payloads only after terminal completion,
@@ -957,7 +1209,7 @@ protected:
             consumed_main_rows += cached - int(prompt.size());
             retained_generation_captures = capturedForwardNodes(CaptureScope::CompleteGeneration);
         }
-        if (penalized)
+        if (penalized && source)
         {
             // The target request owns presence1.5, while the actual original
             // stochastic proposal is an unpenalized one-hot argmax. Greedy
@@ -1000,11 +1252,24 @@ protected:
         for (const char *name : {"activation_copy_host_bytes", "activation_copy_d2d_bytes",
                  "activation_copy_peer_bytes", "activation_copy_d2h_bytes", "activation_copy_h2d_bytes"})
             EXPECT_EQ(sum("transfer", name), 0.0) << name;
-        EXPECT_EQ(sum("forward_graph", "segmented_plan_segments"), 2);
-        EXPECT_EQ(sum("forward_graph", "segmented_graph_capture_segments"), 2);
-        EXPECT_GT(sum("forward_graph", "segmented_replay_segments", "prefill"), 0);
-        EXPECT_GT(sum("forward_graph", "segmented_replay_segments", "decode"), 0);
-        if (test.usesMTP())
+        EXPECT_EQ(sum("forward_graph", "segmented_plan_segments"), 0);
+        EXPECT_EQ(sum("forward_graph", "segmented_graph_capture_segments"), 0);
+        EXPECT_EQ(sum("forward_graph", "segmented_replay_segments", "prefill"), 0);
+        EXPECT_EQ(sum("forward_graph", "segmented_replay_segments", "decode"), 0);
+        if (test.usesMTP() && !source)
+            EXPECT_GT(sum("generation", "pipeline_mtp_follower_transaction_submissions"), 0);
+        if (test.stage_count == 3 && test.usesMTP())
+            for (size_t index = 0; index < participants.size(); ++index)
+                if (participant_domains[index] != terminal_domain)
+                {
+                    double submitted = 0;
+                    for (const auto &record : PerfStatsCollector::snapshot())
+                        if (record.domain == "generation" && record.name == "pipeline_mtp_follower_transaction_submissions" &&
+                            record.device == participants[index]->primaryDeviceId().toString())
+                            submitted += record.value;
+                    EXPECT_GT(submitted, 0) << "Every nonterminal stage must execute, including the entry on the terminal owner's rank";
+                }
+        if (test.usesMTP() && source)
         {
             EXPECT_GT(sum("mtp", "budget_limited_direct_emits"), 0);
             EXPECT_GT(sum("mtp", "device_generation_terminal_transactions"), 0);
@@ -1015,19 +1280,28 @@ protected:
             else
                 EXPECT_EQ(sum("mtp", "device_generation_terminal_depth_evaluated_windows"), 0);
         }
-        else
+        else if (!test.usesMTP())
         {
             // Ordinary sampling uses the same controller/terminal ledger.
             // Its transactions are real, but none may perform speculative work.
-            EXPECT_GT(sum("mtp", "device_generation_terminal_transactions"), 0);
+            if (source) EXPECT_GT(sum("mtp", "device_generation_terminal_transactions"), 0);
             // Each independently observed cache row requires one traversal of
-            // both layer domains, not one traversal per sampled response token.
-            EXPECT_EQ(sum("forward_graph", "segmented_replay_segments", "decode"), 2 * consumed_main_rows);
+            // every local participant, rather than one per returned token.
+            EXPECT_EQ(sum("forward_graph", "decode_graph_phase", "decode"), participants.size() * consumed_main_rows);
             for (const char *counter : {"device_generation_terminal_attempted_draft_tokens",
                      "device_generation_terminal_verifier_tokens",
                      "device_generation_terminal_compact_outcome_reductions",
                      "device_generation_terminal_depth_evaluated_windows"})
                 EXPECT_EQ(sum("mtp", counter), 0) << counter;
+        }
+        }
+        catch (const std::exception &error)
+        {
+            lifetime.abortOriginal(error.what());
+        }
+        catch (...)
+        {
+            lifetime.abortOriginal("nonstandard exception before original collective retirement");
         }
     }
 };
@@ -1093,6 +1367,9 @@ INSTANTIATE_TEST_SUITE_P(CrossBackend, PipelineDomainGeneration,
                                        PipelineGenerationLane::DynamicMTP})
                     for (const int rows : {128, 256})
                         cases.push_back({reverse, width, lane, rows});
+        for (const auto lane : {PipelineGenerationLane::Ordinary, PipelineGenerationLane::FixedMTP,
+                               PipelineGenerationLane::DynamicMTP})
+            cases.push_back({false, 1, lane, 128, 15, false, 3});
         // Keep every original initial-15 case; these twelve cold declarations
         // expose helpers that shallow initial execution never warmed itself.
         for (const bool reverse : {false, true})
@@ -1108,8 +1385,10 @@ INSTANTIATE_TEST_SUITE_P(CrossBackend, PipelineDomainGeneration,
     }()),
     [](const auto &info) {
         const auto &p = info.param;
-        return std::string(p.reverse ? "ROCm" : "CUDA") + std::to_string(p.width) + "_" +
-            (p.reverse ? "CUDA" : "ROCm") + std::to_string(p.width) + (p.lane == PipelineGenerationLane::Ordinary ? "_Ordinary" :
+        const auto topology = p.stage_count == 3 ? std::string("CUDA1_ROCm1_CUDA1") :
+            std::string(p.reverse ? "ROCm" : "CUDA") + std::to_string(p.width) + "_" +
+                (p.reverse ? "CUDA" : "ROCm") + std::to_string(p.width);
+        return topology + (p.lane == PipelineGenerationLane::Ordinary ? "_Ordinary" :
                 p.lane == PipelineGenerationLane::FixedMTP ? "_FixedMTP" : "_DynamicMTP") +
             (p.lane == PipelineGenerationLane::DynamicMTP && p.initial_depth < 15
                 ? "_Initial" + std::to_string(p.initial_depth) : "") +

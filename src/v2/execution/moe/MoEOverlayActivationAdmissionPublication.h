@@ -82,6 +82,34 @@ namespace llaminar2
     }
 
     /**
+     * @brief Wait for the dispatch publication only after the current grant was acquired.
+     * @param timeline Exact positive leased timeline for the granted retained stage.
+     * @param acquire_dispatch Exact native system-acquire load of its dispatch signal.
+     * @param aborted Original absorbing admission check, evaluated only while unpublished.
+     * @param pause Native device poll delay; a host replay supplies a bounded recorded step.
+     * @return Actual acquired word, or the original Abort sentinel for closed progress.
+     *
+     * A retained pre-grant wait may already have passed on the preceding
+     * generation. The source resets timelines before publishing the next
+     * admission, so the acquired new grant owns this new wait. A value above
+     * the requested timeline is returned unchanged for the existing exact
+     * descriptor validator to reject; this helper never repairs identity.
+     */
+    template<class DispatchAcquire,class AbortAcquire,class PollPause>
+    [[nodiscard]] LLAMINAR_MOE_ADMISSION_HD inline std::uint64_t
+    awaitMoEOverlayGrantedDispatchPublication(std::uint64_t timeline,
+        DispatchAcquire acquire_dispatch,AbortAcquire aborted,PollPause pause) noexcept
+    {
+        if(timeline==0u)return kMoEOverlayActivationAbortTimeline;
+        for(;;) {
+            const auto observed=acquire_dispatch();
+            if(observed>=timeline)return observed;
+            if(aborted())return kMoEOverlayActivationAbortTimeline;
+            pause();
+        }
+    }
+
+    /**
      * @brief Authenticate a snapshot only through generation then final ready acquire.
      * @param snapshot_generation Generation already copied with the candidate identity.
      * @param acquire_generation Exact acquire accessor for the original identity generation.

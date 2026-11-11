@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 namespace llaminar2 {
-class DeviceGraphOrchestrator;class Qwen4ExpReplicatedPLECohort;class IKVCache;
+class DeviceGraphOrchestrator;class Qwen4ExpReplicatedPLECohort;class Qwen4ExpFixedHeadPipelinePort;class IKVCache;
 enum class ForwardExecutionRole : std::uint8_t;enum class ForwardExecutionPhase : std::uint8_t;
 /** @brief Actual producer role, independent of the current values behind its pointers. */
 enum class Qwen4ExpPLEQuerySource { Request, PrefillChunk, OrdinaryFrontier, Verifier, ConditionFrontier, WorkspaceDeclaration };
@@ -46,6 +46,7 @@ public:
         std::uint64_t value=1469598103934665603ULL;
         const auto mix=[&](std::uint64_t word){value^=word;value*=1099511628211ULL;};
         mix(1);mix(reinterpret_cast<std::uintptr_t>(cohort_));mix(reinterpret_cast<std::uintptr_t>(owner_));
+        mix(reinterpret_cast<std::uintptr_t>(pipeline_));
         mix(static_cast<std::uint64_t>(device_.type));mix(device_.ordinal);mix(participant_);
         mix(reinterpret_cast<std::uintptr_t>(tokens_));mix(reinterpret_cast<std::uintptr_t>(cache_));
         mix(static_cast<std::uint64_t>(role_));mix(static_cast<std::uint64_t>(phase_));mix(static_cast<std::uint64_t>(source_));
@@ -54,15 +55,17 @@ public:
         return value?value:1;
     }
 private:
-    friend class DeviceGraphOrchestrator;friend class Qwen4ExpReplicatedPLECohort;
+    friend class DeviceGraphOrchestrator;friend class Qwen4ExpReplicatedPLECohort;friend class Qwen4ExpFixedHeadPipelinePort;
     /** @brief Mint only after the actual DGO validates its exact canonical bank and role. */
     Qwen4ExpReplicatedPLEQuery(const Qwen4ExpReplicatedPLECohort *cohort,const DeviceGraphOrchestrator *owner,
         DeviceId device,int participant,const std::int32_t *tokens,DeviceRowRange rows,const IKVCache *cache,
-        ForwardExecutionRole role,ForwardExecutionPhase phase,Qwen4ExpPLEQuerySource source)
+        ForwardExecutionRole role,ForwardExecutionPhase phase,Qwen4ExpPLEQuerySource source,
+        const Qwen4ExpFixedHeadPipelinePort *pipeline=nullptr)
         :cohort_(cohort),owner_(owner),device_(device),participant_(participant),tokens_(tokens),rows_(rows),
-         cache_(cache),role_(role),phase_(phase),source_(source){}
+         cache_(cache),role_(role),phase_(phase),source_(source),pipeline_(pipeline){}
     const Qwen4ExpReplicatedPLECohort *cohort_;const DeviceGraphOrchestrator *owner_;
     DeviceId device_;int participant_;const std::int32_t *tokens_;DeviceRowRange rows_;const IKVCache *cache_;
     ForwardExecutionRole role_;ForwardExecutionPhase phase_;Qwen4ExpPLEQuerySource source_;
+    const Qwen4ExpFixedHeadPipelinePort *pipeline_; ///< Original PLE-stage port, exclusive with standalone cohort authority.
 };
 } // namespace llaminar2

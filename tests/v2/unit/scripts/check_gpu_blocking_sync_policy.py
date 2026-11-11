@@ -352,9 +352,12 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "host_result",
         # All participant copies/events are enqueued before this terminal-only
-        # observation of independent KV positions. No transaction or prefill
-        # dispatcher may wait on these host-result events.
-        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finish", "backend_event", 1),
+        # observation of independent KV positions. The second lexical site is
+        # the exceptional-exit RAII fence retaining accepted copy destinations;
+        # completed normal observations clear its pending flag. Exact
+        # companion body regressions reject either site escaping its terminal ownership.
+        # No transaction or prefill dispatcher may wait on these events.
+        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finish", "backend_event", 2),
         # One lexical wait site, iterated only over submitted participants after
         # the complete one-shot cohort has launched. Its terminal-copy RAII
         # fence retains host result backing on every false/throw exit; failure
@@ -384,6 +387,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "lifecycle",
+        # One cold exact setup stream retires native frame initialization before
+        # its addresses enter captured broadcasts. Replay/reset cannot enter create.
+        ("src/v2/collective/DeviceCountedAllGather.cpp", "DeviceCountedAllGather::create", "worker_stream", 1),
         # Sole cold metadata publication event, completed before raw sequence
         # pointers reach independent streams; never a reset/append/capture wait.
         ("src/v2/kernels/KVCacheMetadataInitialization.h", "completeColdKVMetadataInitialization", "backend_event", 1),
@@ -407,10 +413,11 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # terminal event before authenticating close and retiring the worker.
         # Native regressions prove inactive/repeated reset adds no extra wait.
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::retireRetainedStorageForRequestReset", "backend_event", 1),
-        # Rank's two-phase request reset first joins original native producers,
-        # then records/observes THIS reader's terminal frontier before any
-        # shared channel retirement or data clearing. No hot replay may call it.
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset", "backend_event", 1),
+        # Rank request reset and failed-source teardown first join original
+        # native producers, then observe THIS reader's terminal frontier before
+        # shared-channel retirement/clearing. The reset wrapper delegates here;
+        # no hot replay may use this lifecycle-only original-event proof.
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageProducerProof", "backend_event", 1),
         # Metadata initialization/admission can enqueue before runner publication
         # fails. Only failed submission or last setup-owner teardown waits its
         # exact pre-created event. Successful admission/capture/terminal paths
@@ -466,7 +473,11 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "validateAllStaticTerminals", "worker_event", 1),
         # A capture-rejecting exact setup copy must retire its temporary host
         # address vector before publishing the retained immutable table owner.
-        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeWorkspaceMetadata", "backend_event", 1),
+        # One site belongs to each overload: a private temporary event or the
+        # original context-owned cold event held through actual completion.
+        # The body regression proves capture exclusion/ownership for both;
+        # this is not permission for two waits in either overload.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeWorkspaceMetadata", "backend_event", 2),
     ),
 )
 

@@ -3,12 +3,13 @@
  * @brief Source-authored remote executable and directed channel obligations in the original candidate BOM.
  *
  * Each independently runnable remote owner needs one existing General device
- * slot and its exact authored host program. These are immutable estimator
+ * slot and its declared mapped certificate or native-General host purpose. These are immutable estimator
  * contributions to the original PMA, never a live capacity ledger. Optional
  * geometry is evaluated before selection; no creator adds an after-quota cost.
  */
 #pragma once
 #include <algorithm>
+#include <type_traits>
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "PooledImmutableDirectedOwnerProgram.h"
 #include "PooledImmutableDirectedTransport.h"
@@ -19,7 +20,7 @@ namespace llaminar2::qwen4exp {
 /** @brief Complete per-model remote definitions shared by exclusive source variants. */
 class PooledImmutableRetainedParticipantBudget final {
 public:
-    /** @brief Project each actual nonlocal owner through the installed authored program class. */
+    /** @brief Project every actual nonlocal owner through its explicit mapped-flat or native-General contract. */
     static PhysicalMemoryPlan completeBOM(const AdaptiveImmutableLookupGeometry& geometry,
         PhysicalMemoryResource originalCPU0,std::span<const PhysicalMemoryResource> originalGPUs,
         const NativeOrderingEventBudgetProjection& source=NativeOrderingEventBudgetProjection::installed()){
@@ -52,11 +53,22 @@ public:
                     RetainedParticipantGraphSourceSlots::physicalBytes(physical.owners().size()));
                 sourceHolder=true;
             }
-            const auto program=PooledImmutableDirectedOwnerProgram::declare(physical,geometry.coordinator(),coordinate);
-            const auto host=source.remoteHostBOM(program,originalCPU0,*gpu);
-            for(const auto& line:host.resources())result.add(line);
-            result.add(*gpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
-                GPUGraphMemoryContract::reservationBytesPerExecutable(gpu->device));
+            const auto program=PooledImmutableDirectedOwnerProgram::declareStorage(physical,geometry.coordinator(),coordinate);
+            std::visit([&](const auto& contract){
+                using Contract=std::decay_t<decltype(contract)>;
+                if constexpr(std::is_same_v<Contract,PooledRemoteGraphProgram>){
+                    const auto host=source.remoteHostBOM(contract,originalCPU0,*gpu);
+                    for(const auto& line:host.resources())result.add(line);
+                    result.add(*gpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
+                        GPUGraphMemoryContract::reservationBytesPerExecutable(gpu->device));
+                }else{
+                    // Native-library graphs consume the existing full General
+                    // contract under their own storage purpose. No flat class,
+                    // model reservation or caller-sized allowance can replace it.
+                    const auto native=RetainedParticipantGraphExecutable::nativeStorageBOM(contract,originalCPU0,*gpu);
+                    for(const auto& line:native.resources())result.add(line);
+                }
+            },program);
         }
         return result.build();
     }

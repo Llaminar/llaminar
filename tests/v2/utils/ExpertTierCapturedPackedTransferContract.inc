@@ -4,6 +4,8 @@
  *
  * CUDA receipts prove graph-owned packed service bytes; HIP uses its original
  * explicit native-stream completion while the inference graph remains held.
+ * HIP future readers are submitted only after native transfer completion: it
+ * does not certify progress behind 32 prequeued waits on aliased HSA queues.
  * Remote lane release is the service completion/owner boundary, NOT MPI send
  * acknowledgement. No transport or backend execution mechanism is invented.
  * Only DeviceBuffer/Success adapt the existing owning fixtures' native storage.
@@ -12,7 +14,7 @@
         enum class CapturedPackedClient { LocalTier, RemoteProjection };
 
         /**
-         * @brief Prove every source format progresses under a captured future-reader fanout.
+         * @brief Prove captured-peer transfer progress under each backend's ordering contract.
          * @tparam DeviceBuffer Owning backend fixture's genuine native allocation wrapper.
          * @tparam Success Owning backend's native success status.
          * @param device Exact compiled backend endpoint.
@@ -20,10 +22,14 @@
          * @param rectangle Whether to transfer the original47-row intersection across unequal roots.
          *
          * Every allocation, graph and event is prepared before the peer is held.
-         * The held graph makes native future readers unable to service the
-         * conversion; the graph-owned CUDA worker or explicit HIP native queue
-         * must finish both directions anyway. Its receipt/event, not wall time
-         * or PerfStats, releases each staging slice. Three rectangle repetitions
+         * CUDA's graph-owned worker must progress with 32 prequeued future readers.
+         * HIP's native queue must finish both directions while the peer is held;
+         * its 32 readers are then submitted before releasing that peer. HIP stream
+         * pools can alias hardware queues, so unresolved future waits cannot
+         * precede the native operation that this contract requires to progress.
+         * All 32 reader outputs are checked after release and stream completion.
+         * Its receipt/event, not wall time or PerfStats, releases each staging
+         * slice. Three rectangle repetitions
          * reuse the same retained body; the direct dirty-replay test separately
          * proves GPU source/destination reset. No MPI send ACK is fabricated.
          */
@@ -122,7 +128,7 @@
                     output.data(), output_scales.data(), output_mins.data(), output_emins.data(),
                     output.bytes(), output_scales.bytes(), output_mins.bytes(), output_emins.bytes()};
                 const auto capacity = std::max(down.chunkBytes(chunk_units), up.chunkBytes(chunk_units));
-                auto execution = transfers.allocatePersistentTransferExecutionLanes(
+                auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                     1u, device, "captured_packed_transfer");
                 std::shared_ptr<MappedTransferProgressEpoch> epoch;
                 if(device.is_cuda())epoch = MappedTransferProgressEpoch::create({
@@ -179,6 +185,9 @@
                 });
 
                 bool remote_acquired = false;
+                // A pending local lane retains this destination span. Keep it
+                // alive until release_guard drains the lane on fatal assertions.
+                std::vector<std::uint8_t> observed_cpu(down.cpuStorageBytes());
                 // Release the peer before any teardown/drain, even on a failed
                 // assertion. Pending commands retain their original leases.
                 auto release = [&](void *) {
@@ -202,18 +211,20 @@
                     branch.reset();
                 };
                 std::unique_ptr<void, decltype(release)> release_guard(control.get(), release);
-                context.submitAndWait([&] {
-                    if (!graph->launch() || !context.recordEventChecked(terminal, stream))
-                        throw std::runtime_error("Captured packed proof did not launch");
+                const auto submit_readers = [&] {
                     for (std::size_t index = 0; index < readers; ++index)
                         if (!context.waitEventChecked(terminal, observers[index]) ||
                             !backend->copyDeviceVisibleRegionByKernelOnStream(
                                 control->deviceAlias(device, (index + 1u) * 64u), payload.data(),
                                 16u, 0, observers[index]))
                             throw std::runtime_error("Captured packed future-reader submission failed");
+                };
+                context.submitAndWait([&] {
+                    if (!graph->launch() || !context.recordEventChecked(terminal, stream))
+                        throw std::runtime_error("Captured packed proof did not launch");
+                    if (epoch) submit_readers(); // CUDA graph service owns prequeued fanout progress.
                 });
                 const unsigned repetitions=rectangle?3u:1u;
-                std::vector<std::uint8_t> observed_cpu(down.cpuStorageBytes());
                 for(unsigned replay=0;replay<repetitions;++replay) {
                 SCOPED_TRACE(replay);
                 std::fill(observed_cpu.begin(),observed_cpu.end(),0xa5);
@@ -298,8 +309,17 @@
                     bool ready=true;
                     ASSERT_TRUE(context.queryEventChecked(terminal,ready));
                     EXPECT_FALSE(ready) << "transfer must progress before the held inference terminal";
+                    // HIP's native lane is complete. Future waits can now be
+                    // queued without blocking its work on an aliased HSA queue.
+                    if (!epoch) submit_readers();
                 });
                 release_guard.reset();
+                for (std::size_t index = 0; index < readers; ++index)
+                {
+                    SCOPED_TRACE(index);
+                    EXPECT_EQ(std::memcmp(control->mutableHostData((index + 1u) * 64u),
+                        source.payload.data(), 16u), 0) << "completed future reader bytes";
+                }
                 std::vector<std::uint8_t> actual_payload;
                 std::vector<std::uint16_t> actual_scales, actual_mins;
                 std::vector<std::uint32_t> actual_emins;

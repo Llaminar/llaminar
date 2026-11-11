@@ -14,6 +14,9 @@
  * Original source-owned remote slots likewise retain their exact opaque owner
  * across proven runner retirement; only native handles are recreated at that
  * cold frontier, with a fresh definition identity and no live cache borrower.
+ * Native-library storage definitions use the existing General contract under
+ * their separate storage purpose. Mapped flat programs retain installed scope;
+ * one typed variant preserves that distinction through source-slot reuse.
  */
 #pragma once
 #include <mutex>
@@ -21,6 +24,7 @@
 #include "IGPUGraphCapture.h"
 #include "NativeContextRetirement.h"
 #include "NativeAuxiliaryResourceCatalog.h"
+#include "PooledRemoteGraphProgram.h"
 #include "memory/CPUStorageRoot.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "execution/local_execution/graph/IGraphCaptureAuxiliaryBranch.h"
@@ -53,10 +57,16 @@ public:
      * @brief Declare original General host/device slots and exact known wrapper backing before admission.
      * @param host Original CPU0 allocator observation.
      * @param gpu Original addressed GPU observation, with the same rank.
-     * @param slots Number of actual retained executables; checked arithmetic rejects overflow.
+     * @param slots Number of original General definitions; graph-only definitions consume their own slot.
      * @return Same-PMA typed BOM, with conservative host/device ProcessRuntime tokens and exact known objects.
      */
     static PhysicalMemoryPlan generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,std::size_t slots=1);
+    /** @brief Price an original native storage definition using the existing General host/device contract.
+     * @param program Closed native owner semantics. @param host Actual rank CPU resource. @param gpu Exact original owner resource.
+     * @return Same General units isolated under NativeStorageGraphExecutable, never a model reservation.
+     */
+    static PhysicalMemoryPlan nativeStorageBOM(const PooledNativeOwnerGraphProgram& program,
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu);
     /**
      * @brief Declare one closed startup calibration slot isolated from serving graph reservations.
      * @param host Original CPU0 allocator observation.
@@ -84,6 +94,15 @@ public:
      */
     static std::shared_ptr<RetainedParticipantGraphExecutable> create(
         const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program);
+    /**
+     * @brief Consume only the admitted native-storage General purpose for this exact original program.
+     * @param original Actual prepared worker/generation/PMA permit. @param stream Its exact retained stream.
+     * @param program Closed source-authored native semantic declaration.
+     * @return Original native owner retaining only its storage-purpose General reservations.
+     * @throws std::exception For foreign ownership, missing admission or failed native creation.
+     */
+    static std::shared_ptr<RetainedParticipantGraphExecutable> create(
+        const PreparedGPUContextUsePermit& original,void* stream,const PooledNativeOwnerGraphProgram& program);
     /** @return Explicit immutable qualification marker, never inferred from a successful replay. */
     GraphHostQualification hostQualification()const noexcept{return hostQualification_;}
     /** @brief Destroy actual handles only after terminal observation, retaining original physical tokens. */
@@ -98,7 +117,7 @@ private:
     friend class PlanningGPUExpertMeasurement; ///< Closed startup capture of original prepared experts.
     friend class PlanningExecutionMeasurement; ///< Original owner remains sole submission/terminal authority.
     /** @brief Closed cold-only purpose; serving participant definitions remain immutable. */
-    enum class DefinitionPurpose {RetainedParticipant,PreparedServiceCalibration};
+    enum class DefinitionPurpose {RetainedParticipant,PreparedServiceCalibration,NativeStorageGeneral};
     /**
      * @brief Price identical General geometry under the closed purpose's canonical PMA owner.
      * @param host Original CPU0 observation.
@@ -149,7 +168,7 @@ private:
      * @param stream Original non-default native capture stream.
      * @param host Optional authored remote obligation, absent for General and calibration definitions.
      * @param generalHost Original General host allowance or explicit device-only diagnostic ownership.
-     * @param purpose Serving or startup-only calibration; the latter cannot consume a serving owner line.
+     * @param purpose Model, startup calibration or native storage; each consumes only its own named owner line.
      * @return One original native definition retaining its same-purpose host/device obligations.
      */
     static std::shared_ptr<RetainedParticipantGraphExecutable> createBound(
@@ -184,7 +203,20 @@ private:
     RetainedParticipantGraphExecutable(std::shared_ptr<IWorkerGPUContext>,std::shared_ptr<PhysicalMemoryAuthority>,std::uint64_t,DeviceId,void*,NativeContextRetirementSlot,
         std::unique_ptr<IContextNativeRetirementObligation>);
     class RecordingCapture;
-    enum class Phase:std::uint8_t {Fresh,Recording,Recorded,Ready,Failed,Retired,RecordedStorageBody,DormantSourceSlot};
+    enum class Phase:std::uint8_t {
+        Fresh, Recording, RecordingFailed, Recorded, Ready, Failed, Retired,
+        RecordedStorageBody, RecordedSharedChild, DormantSourceSlot
+    };
+    /** @brief Seal one original General recording as a shareable child with no launch or reset rights. */
+    void sealSharedChildDefinition();
+    /**
+     * @brief Bind one independently admitted shared child before starting this parent recording.
+     * @param child Exact original sealed definition on the same worker, device, generation and PMA.
+     * @note The parent keeps this borrow until its own native graph and executable retire.
+     */
+    void bindSharedChildDefinition(const std::shared_ptr<RetainedParticipantGraphExecutable>& child);
+    /** @brief Import the prebound child exactly once at this parent's active stream frontier. */
+    void recordSharedChildAtFrontier();
     /** @brief Reject late recording changes without querying native state. */
     void requireConstruction()const;
     /** @brief Submit the next original invocation exactly once on its retained stream.
@@ -219,7 +251,7 @@ private:
      * matching per-device parent may later execute its cloned finite body.
      */
     void sealRecordedStorageBody();
-    /** @brief Enforce the same exact source-authored kernel chain for standalone and embedded storage. */
+    /** @brief Enforce mapped flat scope or the original native General contract for recorded storage. */
     void validateRemoteRecording();
     /**
      * @brief Move-only borrow retaining original source operands and blocking premature definition retirement.
@@ -291,8 +323,10 @@ private:
     std::unique_ptr<IContextNativeRetirementObligation> pendingObligation_; ///< Not adopted until immediately before the first possible native creator.
     PhysicalMemoryAllocationLease nativeObjectLease_,recordingObjectLease_;
     AlignedVector<std::byte> inspectionScratch_; ///< Original bounded CPU0 root; never embedded in native work.
-    std::optional<PooledRemoteGraphProgram> remoteProgram_;
+    std::optional<PooledStorageOwnerProgram> storageProgram_; ///< Exactly one source-issued mapped-flat or native-General declaration.
     GraphHostQualification hostQualification_=GraphHostQualification::DeviceBoundOnly;
+    std::shared_ptr<RetainedParticipantGraphExecutable> sharedChild_; ///< Prebound original General child through parent native teardown.
+    bool sharedChildRecorded_ = false; ///< Cold recording proof only.
     std::unique_ptr<IGPUGraphCapture> capture_;
     std::unique_ptr<RecordingCapture> recording_;
     std::weak_ptr<RetainedParticipantGraphExecutable> self_; ///< Original factory control block, rejecting counterfeit aliases.
@@ -340,20 +374,20 @@ private:
      * @throws std::exception For foreign/overlapping/failed ownership or failed native construction.
      */
     std::shared_ptr<RetainedParticipantGraphExecutable> acquire(std::uint64_t sourceIdentity,
-        const PreparedGPUContextUsePermit&,void* exactStream,const PooledRemoteGraphProgram&);
+        const PreparedGPUContextUsePermit&,void* exactStream,const PooledStorageOwnerProgram&);
     /** @brief Drop native handles before runner arenas/communicators die, retaining original opaque backing.
      * @param sourceIdentity Same prepared source identity. @param program Exact existing original program.
      * @param owner Sole runtime alias, after all actual native and clone readers retired.
      * @throws std::exception For incomplete retirement or foreign slot/program ownership.
      */
-    void release(std::uint64_t sourceIdentity,const PooledRemoteGraphProgram&,
+    void release(std::uint64_t sourceIdentity,const PooledStorageOwnerProgram&,
         const std::shared_ptr<RetainedParticipantGraphExecutable>&);
     /** @brief Preserve a failed original construction and release handles before borrowed arenas disappear.
      * @param sourceIdentity Same actual prepared source. @param program Its exact original program.
      * @param owner Partial original definition. @param failure Original construction diagnostic, kept absorbing.
      * @throws std::exception If physical cleanup or exact ownership cannot be proven.
      */
-    void abandon(std::uint64_t sourceIdentity,const PooledRemoteGraphProgram&,
+    void abandon(std::uint64_t sourceIdentity,const PooledStorageOwnerProgram&,
         const std::shared_ptr<RetainedParticipantGraphExecutable>&,std::exception_ptr);
     /** @return Placement-constructed handle roster within this same admitted CPU root. */
     Slot* slots()noexcept{return reinterpret_cast<Slot*>(this+1);}

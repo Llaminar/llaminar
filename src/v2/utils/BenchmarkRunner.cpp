@@ -17,6 +17,8 @@
  */
 
 #include "BenchmarkRunner.h"
+#include "execution/runner/ObservedFixedPipelineEvidence.h"
+#include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "app/modes/PrefixMovementJson.h"
 #include "Logger.h"
@@ -48,6 +50,23 @@
 
 namespace llaminar2
 {
+
+/** @copydoc observeFixedNativePipelineTerminal */
+nlohmann::json observeFixedNativePipelineTerminal(const IOrchestrationRunner& runner,
+    std::optional<std::uint64_t> expected_rows)
+{
+    const auto* model=runner.modelContextForDiagnostics();
+    const auto placement=model?model->resolvedImmutableRowTablePlacement():nullptr;
+    const auto* fixed=placement?placement->fixedHeadPipeline():nullptr;
+    if(!fixed)throw std::invalid_argument("Observed fixed native pipeline has no original terminal geometry");
+    const auto totals=qwen4exp::requireFixedHeadPipelineTerminalEvidence(
+        PerfStatsCollector::snapshot({"immutable_lookup"}),*fixed,placement->extent().rowBytes(),expected_rows);
+    nlohmann::json owners=nlohmann::json::object();
+    for(const auto& [device,values]:totals)
+        for(std::size_t metric=0;metric<values.size();++metric)
+            owners[device][std::string(qwen4exp::kFixedHeadPipelineTerminalMetrics[metric])]=values[metric];
+    return {{"schema","llaminar.fixed-native-pipeline-terminal.v1"},{"owners",std::move(owners)}};
+}
 
     /**
      * @brief Maximum request submissions needed by the prefill graph lifecycle.
@@ -638,9 +657,16 @@ namespace llaminar2
         auto records = PerfStatsCollector::snapshot({"immutable_lookup", "ngram_lookup"});
         std::erase_if(records, [](const auto &record) {
             if (!PerfStatsCollector::isDomainEnabled(record.domain) ||
-                record.kind != PerfStatRecord::Kind::Counter || record.phase != "generation_terminal") return true;
-            if (record.domain == "immutable_lookup") return false;
+                record.kind != PerfStatRecord::Kind::Counter) return true;
             const auto authority = record.tags.find("authority");
+            if (record.phase == qwen4exp::kFixedHeadPipelineTerminalPhase && record.domain == "immutable_lookup" &&
+                authority != record.tags.end() && authority->second == "pipeline_generation_terminal")
+            {
+                const auto& names=qwen4exp::kFixedHeadPipelineTerminalMetrics;
+                return std::find(names.begin(),names.end(),record.name)==names.end();
+            }
+            if (record.phase != "generation_terminal") return true;
+            if (record.domain == "immutable_lookup") return false;
             return record.domain != "ngram_lookup" || authority == record.tags.end() ||
                 authority->second != "completed_local_hot_terminal";
         });

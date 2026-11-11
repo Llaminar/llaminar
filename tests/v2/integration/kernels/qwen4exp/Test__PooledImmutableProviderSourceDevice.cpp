@@ -13,8 +13,6 @@
  * then materializes storage before capture-only seals retain its allocations.
  * Original local gates remain; new cross-vendor reader component gates retain
  * the same real-provider/root authorities through independent complete captures.
- * Serving, same-vendor native peer factories and opaque context admission remain
- * separately unqualified.
  */
 #include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
@@ -42,6 +40,8 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GPUGraphMemoryContract.h"
 #include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/qwen4exp/PooledImmutableFactoryReplayAccess.h"
+#include "execution/qwen4exp/PooledImmutableDirectedLookupGraph.h"
 #include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
 #include "backends/NativeOrderingEventGroup.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"

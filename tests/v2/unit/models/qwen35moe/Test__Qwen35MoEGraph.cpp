@@ -10,6 +10,8 @@
  * consumed through their original stable storage instead of a redundant copy.
  * Independent CPU/CUDA/ROCm GDN formats retain participant-local graph state
  * when their collective cannot perform a homogeneous live-state handoff.
+ * Native graph-construction fixtures admit real setup storage through their
+ * original model authority; typed stage inspection alone is not execution proof.
  */
 
 #include <gtest/gtest.h>
@@ -2587,6 +2589,10 @@ TEST(Test__Qwen35MoEGraph,
  * measured four-device transport result. All participants fold the same
  * original-order slot bank, so no root-only arithmetic or compact return
  * broadcast remains in the transaction.
+ * The construction fixture materializes real ROCm epoch/ticket setup storage,
+ * but its mock TP context and metadata-only expert engines do not execute the
+ * declared collective. Admit the exact epoch BOM on the original model owner
+ * before graph construction rather than bypassing its materialization guard.
  */
 TEST(Test__Qwen35MoEGraph,
      ROCmPhaseSplitDecodeUsesCanonicalRouteSlotAllreduce)
@@ -2624,6 +2630,17 @@ TEST(Test__Qwen35MoEGraph,
 
     const auto model_ctx =
         makeNodeTPOverlayModelContext(*config.moe.routed_expert_plan);
+    const auto manager = model_ctx->concreteWeightManager();
+    ASSERT_NE(manager, nullptr);
+    ASSERT_FALSE(manager->physicalMemoryAuthority());
+    const auto epoch_declaration = admitEpochArenaForTest({
+        .device_id = config.default_device,
+        .request_slot_capacity = 1u,
+    });
+    const auto memory = epoch_declaration.memory_authority;
+    ASSERT_NE(memory, nullptr);
+    manager->installPhysicalMemoryAuthority(memory);
+    ASSERT_EQ(manager->physicalMemoryAuthority(), memory);
     TestableQwen35MoEGraph graph_builder(model_ctx, nullptr, config);
     graph_builder.setDecodeReplicatedDenseWeightBindings(
         makeDecodeDenseBindingSource());
@@ -2649,6 +2666,10 @@ TEST(Test__Qwen35MoEGraph,
         ForwardExecutionPhase::Decode,
         publication_stream.get());
 
+    EXPECT_EQ(memory->claimedBytes(config.default_device,
+        PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),
+        DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u));
     ASSERT_NE(
         graph.getNode("layer0_moe_canonical_routes_allreduce"),
         nullptr);
@@ -6845,6 +6866,7 @@ class EarlyEpochMemoryGraph final : public Qwen35MoEGraph
 public:
     using Qwen35MoEGraph::Qwen35MoEGraph;
     using Qwen35MoEGraph::moeOverlayEpochArenaConfig;
+    using Qwen35MoEGraph::moeActivationBatchMemoryAuthority;
 };
 }
 
@@ -7009,4 +7031,39 @@ TEST(Test__Qwen35MoEGraph, MTPWorkspaceDeclarationUsesOriginalTicketFactoryWitho
     cpu.draft_token_ids=&token;cpu.position_ids=&position;
     const auto cpu_forward=mtpForwardConstructionInput(cpu);
     EXPECT_EQ(cpu_forward.token_ids,&token);EXPECT_EQ(cpu_forward.position_ids,&position);
+}
+
+/** @test Batch consumes the original prepared-store handoff, unlike earlier metadata-only epoch declaration. */
+TEST(Test__Qwen35MoEGraph, ActivationBatchRequiresOriginalPreparedAuthorityContract)
+{
+    for(int replay=0;replay<20;++replay){
+        SCOPED_TRACE(replay);
+        const auto original=admitEpochArenaForTest({.device_id=DeviceId::cpu()}).memory_authority;
+        const auto model=ModelContext::createForTesting("batch_original_prepared_metadata.gguf",nullptr,1,true);
+        const auto manager=model->concreteWeightManager();
+        ASSERT_NE(manager,nullptr);
+        manager->installPhysicalMemoryAuthority(original);
+        EarlyEpochMemoryGraph graph(makeMoEConfig());graph.setModelContext(model);
+        ASSERT_FALSE(manager->preparedWeightStoreIfInitialized());
+        EXPECT_THROW(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),std::logic_error);
+        EXPECT_EQ(graph.moeOverlayEpochArenaConfig(DeviceId::cpu()).memory_authority,original);
+        const auto store=manager->preparedWeightStore();
+        ASSERT_NE(store,nullptr);ASSERT_EQ(store->physicalMemoryAuthority(),original);
+        graph.setPreparedWeightStore(store.get());
+        EXPECT_EQ(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),original);
+        EXPECT_THROW(graph.moeActivationBatchMemoryAuthority(DeviceId::cuda(113)),std::logic_error);
+        graph.setPreparedWeightStore(nullptr);
+        EXPECT_THROW(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),std::logic_error);
+        PreparedWeightStore missing;
+        graph.setPreparedWeightStore(&missing);
+        EXPECT_THROW(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),std::logic_error);
+        PreparedWeightStore foreign;
+        foreign.installPhysicalMemoryAuthority(admitEpochArenaForTest({.device_id=DeviceId::cpu()}).memory_authority);
+        graph.setPreparedWeightStore(&foreign);
+        EXPECT_THROW(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),std::logic_error);
+        graph.setPreparedWeightStore(store.get());
+        EXPECT_EQ(graph.moeActivationBatchMemoryAuthority(DeviceId::cpu()),original);
+        EXPECT_EQ(original->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
 }

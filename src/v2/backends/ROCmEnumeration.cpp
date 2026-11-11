@@ -171,6 +171,7 @@ namespace llaminar2
                 // Preserve the driver's full endpoint, including PCI function.
                 // Reconstructing from ordinal or link bottleneck loses identity.
                 dev.pci_bus_address = prop.pci_address;
+                dev.native_isa = prop.isa_target;
                 dev.compute_units = prop.compute_units;
                 dev.last_level_cache_bytes = prop.last_level_cache > 0 ? static_cast<size_t>(prop.last_level_cache) : 0;
                 dev.total_memory_bytes = prop.total_memory;

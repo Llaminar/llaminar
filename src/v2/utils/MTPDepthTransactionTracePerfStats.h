@@ -9,6 +9,7 @@
 #pragma once
 #include "kernels/common/MTPDepthTransactionTrace.h"
 #include "execution/mtp/MTPDepthReplayBuildIdentity.h"
+#include "MTPDepthTraceImmutableLookupObservation.h"
 #include "PerfStatsCollector.h"
 #include <span>
 #include <string>
@@ -26,9 +27,11 @@ inline PerfStatsCollector::Tags mtpDepthReplayCompiledIdentityTags()
  * @param trace Complete native trace after terminal observation.
  * @param device Actual producer participant. @param identity Existing lifecycle identity.
  * @param authority Must describe the actual resident owner, never a model-state replay.
+ * @param lookup_observation_mode Immutable layout from the sealed placement.
  */
 inline void publishMTPDepthTransactionInitial(const sampling_math::MTPDepthTransactionTrace &trace,
-    const std::string &device, const std::string &identity, const char *authority)
+    const std::string &device, const std::string &identity, const char *authority,
+    ImmutableRowTableObservationMode lookup_observation_mode)
 {
     auto tags = mtpDepthReplayCompiledIdentityTags();
     tags.emplace("diagnostic", "untimed_depth_transaction_trace_v3");
@@ -36,6 +39,8 @@ inline void publishMTPDepthTransactionInitial(const sampling_math::MTPDepthTrans
     tags.emplace("phase", "validated_pre_first_response_append");
     tags.emplace("capacity", std::to_string(trace.capacity)); tags.emplace("record_words", std::to_string(trace.record_words));
     tags.emplace("schema_version", std::to_string(trace.version));
+    tags.emplace(std::string(kMTPDepthTraceImmutableLookupObservation),
+        std::string(mtpDepthTraceImmutableLookupName(lookup_observation_mode)));
     for (int word = 0; word < sampling_math::kDeviceGenerationControlCount; ++word)
         tags.emplace("control_word_" + std::to_string(word), std::to_string(trace.initial_control[word]));
     PerfStatsCollector::addCounter("mtp", "depth_transaction_trace.initial", 1.0, "decode", device, std::move(tags));
@@ -77,9 +82,11 @@ inline void publishMTPDepthTransactionRecord(const sampling_math::MTPDepthTransa
  * @param control Already authenticated terminal control from the existing D2H.
  * @param device Actual producer participant. @param identity Existing lifecycle identity.
  * @param authority Actual resident owner provenance.
+ * @param lookup_observation_mode Same sealed layout as the initial trace.
  */
 inline void publishMTPDepthTransactionFinal(std::span<const int, sampling_math::kDeviceGenerationControlCount> control,
-    const std::string &device, const std::string &identity, const char *authority)
+    const std::string &device, const std::string &identity, const char *authority,
+    ImmutableRowTableObservationMode lookup_observation_mode)
 {
     PerfStatsCollector::Tags tags{{"diagnostic", "untimed_depth_transaction_trace_v3"},
         {"authority", authority}, {"observation_identity", identity},
@@ -88,6 +95,8 @@ inline void publishMTPDepthTransactionFinal(std::span<const int, sampling_math::
         {"emitted_tokens", std::to_string(control[sampling_math::kDeviceGenerationControlResponseTokenCount])},
         {"model_stopped", control[sampling_math::kDeviceGenerationControlModelStopped] != 0 ? "true" : "false"},
         {"replay_projection", "controller_owned_fields_only"}};
+    tags.emplace(std::string(kMTPDepthTraceImmutableLookupObservation),
+        std::string(mtpDepthTraceImmutableLookupName(lookup_observation_mode)));
     for (int word = 0; word < sampling_math::kDeviceGenerationControlCount; ++word)
         tags.emplace("control_word_" + std::to_string(word), std::to_string(control[word]));
     PerfStatsCollector::addCounter("mtp", "depth_transaction_trace.final", 1.0, "decode", device, std::move(tags));

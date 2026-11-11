@@ -12,6 +12,7 @@
  */
 
 #include "MoEExpertOverlayExecutionPlan.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "planning/RankHardwareOwnership.h"
 
@@ -1032,7 +1033,8 @@ namespace llaminar2
     std::shared_ptr<MoERoutedExpertPlacementPlan>
     bindMoEExpertOverlayPlanToClusterInventory(
         const MoERoutedExpertPlacementPlan &plan,
-        const ClusterInventory &inventory)
+        const ClusterInventory &inventory,
+        std::optional<MoEOverlayNodeLocalRouteTransport> diagnostic)
     {
         if (!plan.usesExpertOverlayAuthority())
         {
@@ -1044,6 +1046,21 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Automatic MoE overlay rank binding requires a non-empty cluster inventory");
         }
+
+        if (plan.observed_route_diagnostic && !plan.observed_route_transport)
+            throw std::invalid_argument("Restored MoE route diagnostic has no original bound transport policy");
+        if (plan.observed_route_transport) {
+            if (!plan.observed_route_transport->resolved())
+                throw std::invalid_argument("Restored MoE route policy is not a complete original binding");
+            if (diagnostic && diagnostic != plan.observed_route_diagnostic)
+                throw std::invalid_argument("New MoE route diagnostic conflicts with its restored original binding");
+            // An absent new startup diagnostic cannot erase the saved typed
+            // binding. The original inventory still rederives and authenticates
+            // the transport below; this value grants no hardware capability.
+            diagnostic = plan.observed_route_diagnostic;
+        }
+        if (diagnostic == MoEOverlayNodeLocalRouteTransport::Unresolved)
+            throw std::invalid_argument("MoE route diagnostic cannot be Unresolved");
 
         auto bound = std::make_shared<MoERoutedExpertPlacementPlan>(plan);
         for (auto &domain : bound->domains)
@@ -1228,6 +1245,31 @@ namespace llaminar2
                 });
             if (resolved != bound->domains.end())
                 dense_domain = resolved->toExecutionDomainDefinition();
+        }
+        const auto continuation = std::find_if(bound->domains.begin(), bound->domains.end(),
+            [&](const auto& domain) { return domain.name == bound->continuation_domain; });
+        bound->observed_route_transport.reset();
+        bound->observed_route_diagnostic.reset();
+        if (continuation != bound->domains.end() && continuation->participants.size() > 1 &&
+            continuation->owner_rank >= 0 &&
+            std::all_of(continuation->participants.begin(), continuation->participants.end(),
+                [](const auto& endpoint) { return endpoint.toLocalDeviceId().is_gpu(); }) &&
+            std::all_of(continuation->world_ranks.begin(), continuation->world_ranks.end(),
+                [&](int owner) { return owner == continuation->owner_rank; })) {
+            std::vector<DeviceId> devices;
+            for (const auto& endpoint:continuation->participants) devices.push_back(endpoint.toLocalDeviceId());
+            const auto& original=inventory.getRank(continuation->owner_rank);
+            for (const auto device:devices) requireRankLocalGPUOwnership(original,device,"MoE route policy binding");
+            const bool homogeneous=std::all_of(devices.begin(),devices.end(),
+                [&](auto endpoint) { return endpoint.type==devices.front().type; });
+            const auto coverage=homogeneous?std::optional{ObservedPeerGrouping(original).coverage(devices)}:std::nullopt;
+            const auto selected=selectMoEOverlayDiagnosticPrefillTransportPolicy(devices,coverage,diagnostic);
+            if (plan.observed_route_transport && *plan.observed_route_transport!=selected)
+                throw std::invalid_argument("MoE route hardware binding changed its immutable transport policy");
+            bound->observed_route_transport=selected;
+            bound->observed_route_diagnostic=diagnostic;
+        } else if (plan.observed_route_transport) {
+            throw std::invalid_argument("MoE route hardware binding lost its original local continuation geometry");
         }
         return bound;
     }

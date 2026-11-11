@@ -544,7 +544,10 @@ namespace llaminar2
             // width.  Replication is expected geometry, not an operator event;
             // retain the useful diagnosis without flooding normal planning
             // output once per candidate.
-            LOG_DEBUG("[TensorParallelConfig] GQA replication: n_kv_heads=" << n_kv_heads
+            // Automatic admission revisits this geometry for many candidates.
+            // Keep participant details at TRACE; the selected orchestration
+            // reports lifecycle summaries through its owning runner.
+            LOG_TRACE("[TensorParallelConfig] GQA replication: n_kv_heads=" << n_kv_heads
                                                                             << " < tp_degree=" << devices.size()
                                                                             << ", replicating K/V on all devices");
         }

@@ -23,6 +23,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -263,6 +264,17 @@ namespace llaminar2
          */
         static void addCounterWithSequence(const CounterIdentity& identity,double value,
             std::initializer_list<uint64_t> words);
+
+        /**
+         * @brief Verify a passive counter against its expected ordered fixed-width observations.
+         * @param record Original collected aggregate.
+         * @param words Concatenated expected steps in original submission order.
+         * @param words_per_step Positive word count of each expected step.
+         * @return Whether count, schema, extrema and both canonical digests agree.
+         * @note This diagnostic uses the same codec without publishing or changing collection.
+         */
+        static bool matchesCounterSequence(const PerfStatRecord &record,
+            std::span<const uint64_t> words, std::size_t words_per_step);
 
         static void recordTimingNs(
             std::string domain,

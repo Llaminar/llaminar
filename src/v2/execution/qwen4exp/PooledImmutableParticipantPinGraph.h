@@ -127,8 +127,7 @@ public:
      * @param memory Same original PMA that owns both local participant allocations and the channel.
      * @param senderSetupStream Exact original ordinary source setup stream.
      * @param receiverSetupStream Exact original ordinary receiver setup stream.
-     * @param originalInventory Retained original endpoint topology, required for peer payload materialization.
-     * @param nativeCompletion Original admitted native TP completion bank; absent retains captured transport.
+     * @param nativeCompletion Original admitted native TP completion bank; mandatory for homogeneous endpoints, absent only for cross-vendor mapped transport.
      * @return Retained original endpoint bindings; no native communicator or runtime eligibility is issued.
      * @throws std::exception For wrong cohort/generation/PMA/roots/endpoints, capture-time binding or a missing native transport.
      */
@@ -136,7 +135,6 @@ public:
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
         void* senderSetupStream,void* receiverSetupStream,
-        std::shared_ptr<const ClusterInventory> originalInventory = {},
         std::shared_ptr<const PooledImmutableNativeCompletionStorage> nativeCompletion = {});
     /** @brief Cold failure and final graph-owner destruction release the exact original invocation binding. */
     ~PooledImmutableCapturedPinEdge() noexcept;
@@ -174,14 +172,12 @@ private:
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
         PooledImmutableTransferChannel channel,PooledImmutableTransferBinding invocationSend,PooledImmutableTransferBinding invocationReceive,
         PooledImmutableTransferBinding frontierSend,PooledImmutableTransferBinding frontierReceive,
-        std::optional<PooledImmutableTransferBinding> commandSend,std::optional<PooledImmutableTransferBinding> commandReceive,
-        std::shared_ptr<const ClusterInventory> originalInventory);
+        std::optional<PooledImmutableTransferBinding> commandSend,std::optional<PooledImmutableTransferBinding> commandReceive);
     PooledImmutablePinEdge declaration_;
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator_;
     std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner_;
     std::shared_ptr<PhysicalMemoryAuthority> memory_;
     uint64_t coordinator_identity_,owner_identity_;
-    std::shared_ptr<const ClusterInventory> original_inventory_;
     PooledImmutableTransferChannel channel_; // Same priced source channel, phase-reused by the free wave.
     PooledImmutableTransferBinding invocation_send_,invocation_receive_,frontier_send_,frontier_receive_;
     std::optional<PooledImmutableTransferBinding> command_send_,command_receive_;

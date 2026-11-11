@@ -685,6 +685,7 @@ namespace llaminar2
 
     LocalTPContext::~LocalTPContext()
     {
+        retireOriginalNativeContextBorrows();
         abortBackendAfterGraphOwnersReleased();
         releaseGraphCaptureBoundaryDeviceWords();
         releaseFp16ScratchBuffers();
@@ -5609,6 +5610,7 @@ namespace llaminar2
         for (std::size_t i = 0; i < devices_.size(); ++i)
             if (fabric->devices()[i] != devices_[i].toLocalDeviceId())
                 throw std::invalid_argument("LocalTP counted fabric membership differs from its communicator");
+        fabric->requireOriginalContext(*this);
         counted_allgather_ = std::move(fabric);
     }
 

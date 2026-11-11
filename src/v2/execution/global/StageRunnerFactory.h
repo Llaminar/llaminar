@@ -19,6 +19,10 @@
  *
  * @author David Sanftenberg
  * @date May 2026
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
@@ -64,6 +68,10 @@ namespace llaminar2
 
         /// Explicit model-light admission, rejected for concrete model contexts.
         TestableInferenceRunnerOverrides test_runner_overrides;
+
+        /// Exact local stage bindings; empty for a dense model. The complete
+        /// set is installed before any child prepares weights or captures.
+        std::vector<std::shared_ptr<const MoEOverlayPipelineStageBinding>> moe_stage_bindings;
 
         /// Registry of domain communicators for global TP stages.
         /// May be nullptr; if so, global TP stage building will throw.

@@ -1188,6 +1188,7 @@ namespace llaminar2
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
         std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bounded serving ladder; --prefill-max-bucket-size publishes an explicit LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES override here.
+        bool prefill_graph_max_cached_buckets_explicit = false; ///< Whether the user authored a cache ceiling.
         int prefill_graph_max_cached_buckets = static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);                                                                 ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
@@ -1482,6 +1483,7 @@ namespace llaminar2
             prefill_graph_max_cached_buckets =
                 static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);
             const char *prefill_graph_max_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
+            prefill_graph_max_cached_buckets_explicit = prefill_graph_max_buckets_env != nullptr;
             if (prefill_graph_max_buckets_env)
             {
                 prefill_graph_max_cached_buckets = std::max(0, std::atoi(prefill_graph_max_buckets_env));

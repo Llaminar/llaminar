@@ -12,6 +12,8 @@
 
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
+#include "backends/HardwareInventory.h"
+#include <array>
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/NUMATopology.h"
@@ -520,7 +522,7 @@ namespace llaminar2
         {
             if (mpi_env.is_mpi_process &&
                 (!config.hostfile.empty() || config.execution_rank_selection ||
-                 automatic_multi_rank_discovery))
+                 automatic_multi_rank_discovery || config.mpi_procs > 0))
                 configureClusterRankThreads(config);
             return {BootstrapResult::Action::CONTINUE, 0};
         }
@@ -636,25 +638,21 @@ namespace llaminar2
             }
 
             const int target_numa = config.device_for_this_rank->numa_node;
-            const auto cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(target_numa);
-            if (cpu_set.empty())
-            {
-                throw std::runtime_error(
-                    "Explicit CPU NUMA target " + std::to_string(target_numa) +
-                    " has no physical CPU set; refusing to launch with different affinity");
-            }
-
-            // Only replace socket mapping once the requested node is proven.
-            // A NUMA node may be smaller than a socket: size its worker team
-            // from these actual physical cores, never an unrelated socket sum.
-            launch_config.cpu_set = cpu_set;
-            launch_config.omp_threads_per_rank = static_cast<int>(parseCpuList(cpu_set).size());
+            const auto *hardware = dm.hardware();
+            if (!hardware)
+                throw std::logic_error("Explicit NUMA launch requires original cached CPU placement");
+            const std::array selected{target_numa};
+            const auto logical = NUMATopology::logicalMPICoresForNUMANodes(hardware->mpi_core_placement, selected);
+            const auto mapping = MPINUMAMapping::fromObservedPlacement(hardware->mpi_core_placement, selected);
+            if (launch_config.num_procs == 1) launch_config.numa_mapping = mapping;
+            else launch_config.cpu_set = mapping.cpuSet(); // Preserve explicit multi-rank-on-one-node geometry.
+            launch_config.omp_threads_per_rank = static_cast<int>(logical.at(target_numa).size());
             launch_config.omp_places = "cores";
             launch_config.omp_proc_bind = "close";
             launch_config.bind_to_socket = false;
             launch_config.map_by_socket = false;
             LOG_INFO("[Main] Explicit CPU NUMA target " << target_numa
-                     << " detected; applying MPI cpu-set='" << cpu_set << "'");
+                     << " uses original hwloc logical core set='" << mapping.cpuSet() << "'");
         }
 
         // GPU NUMA affinity
@@ -668,27 +666,45 @@ namespace llaminar2
             if (inference_numas.size() == 1)
             {
                 const int target_numa = *inference_numas.begin();
-                std::string cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(target_numa);
-                if (cpu_set.empty())
-                    cpu_set = MPIBootstrap::getCpuSetForNumaNode(target_numa);
-
-                if (!cpu_set.empty())
-                {
-                    launch_config.bind_to_socket = false;
-                    launch_config.map_by_socket = false;
-                    launch_config.cpu_set = cpu_set;
-                    launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
-                    launch_config.omp_places = "cores";
-                    launch_config.omp_proc_bind = "close";
-
-                    LOG_DEBUG("[Main] All target devices on NUMA node " << target_numa
-                                                                        << "; binding MPI process to cpu-set='" << cpu_set << "'");
-                }
+                const auto *hardware = dm.hardware();
+                if (!hardware)
+                    throw std::logic_error("GPU NUMA launch requires original cached CPU placement");
+                const std::array selected{target_numa};
+                const auto logical = NUMATopology::logicalMPICoresForNUMANodes(hardware->mpi_core_placement, selected);
+                const auto mapping = MPINUMAMapping::fromObservedPlacement(hardware->mpi_core_placement, selected);
+                if (launch_config.num_procs == 1) launch_config.numa_mapping = mapping;
+                else launch_config.cpu_set = mapping.cpuSet();
+                launch_config.bind_to_socket = false;
+                launch_config.map_by_socket = false;
+                launch_config.omp_threads_per_rank = static_cast<int>(logical.at(target_numa).size());
+                launch_config.omp_places = "cores";
+                launch_config.omp_proc_bind = "close";
+                LOG_DEBUG("[Main] All target devices on NUMA node " << target_numa
+                    << "; using hwloc logical core set='" << mapping.cpuSet() << "'");
             }
             else if (inference_numas.size() > 1)
             {
-                launch_config.bind_to_socket = true;
-                launch_config.map_by_socket = true;
+                // Exact local one-rank-per-node requests use MPI's native
+                // NUMA mapper, restricted to original hwloc logical core IDs.
+                // Socket indices cannot identify arbitrary NUMA labels or
+                // multiple nodes per package. Other explicit launch geometries
+                // retain their original mapping policy and admission checks.
+                if (config.hostfile.empty() &&
+                    launch_config.num_procs == static_cast<int>(inference_numas.size()))
+                {
+                    const auto *hardware = dm.hardware();
+                    if (!hardware)
+                        throw std::logic_error("MPI NUMA mapping requires its original cached CPU placement");
+                    const std::vector<int> selected(inference_numas.begin(), inference_numas.end());
+                    launch_config.numa_mapping = MPINUMAMapping::fromObservedPlacement(hardware->mpi_core_placement, selected);
+                    launch_config.bind_to_socket = false;
+                    launch_config.map_by_socket = false;
+                }
+                else
+                {
+                    launch_config.bind_to_socket = true;
+                    launch_config.map_by_socket = true;
+                }
                 launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
                 launch_config.omp_places = "cores";
                 launch_config.omp_proc_bind = "close";
@@ -702,7 +718,7 @@ namespace llaminar2
                 }
                 LOG_INFO("[Main] Inference spans NUMA nodes {" << nodes_str
                                                                << "}; launching " << launch_config.num_procs
-                                                               << " process(es) with socket binding");
+                                                               << " process(es) with " << (launch_config.numa_mapping ? "observed NUMA" : "socket") << " binding");
             }
         }
 

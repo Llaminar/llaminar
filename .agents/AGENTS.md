@@ -58,6 +58,37 @@ tuning data alone must never prevent inference.
    entrypoints, generic suites, CLI names, capability checks, and dead code when
    the replacement is installed. Do not preserve a second path "just in case."
 
+### Topology Flexibility
+
+**Derive inference structure from the admitted topology, never from the
+development machine's device counts.** Planning, allocation, loading, graph
+construction, communication, scheduling and retirement must use the same typed
+participant and ownership plan. Support valid positive GPU, CPU socket, MPI
+rank and pipeline-stage counts, including singleton stages, unequal stage
+widths and composed CPU/GPU TP/EP/PP domains. Do not introduce two-rank,
+two-socket or two-stage assumptions, count whitelists such as `2/4/8`, fixed
+participant arrays or masks that impose arbitrary limits, or special loading
+and execution paths tied to one tested arrangement. Size persistent storage
+from admitted membership before execution; this does not permit hot-path
+allocation.
+
+Actual hardware, model geometry, numerical contracts and transport/API limits
+may constrain a configuration. Express each necessary constraint in the typed
+admission contract, document its reason and test its boundary; an unimplemented
+case or the number of devices available for testing is not such a constraint.
+Kernel specializations may optimize particular geometries without restricting
+the engine's supported topology. Preserve original MPI rank and NUMA ownership:
+native GPU collectives operate within the actual rank-local homogeneous domain;
+cross-rank and CPU-socket communication uses the existing MPI/shmemspin
+machinery. Never invent ranks, remote device aliases or ownership bypasses to
+make a configuration fit.
+
+Regressions must exercise singleton, odd/non-power-of-two and larger participant
+counts, unequal widths, more than two pipeline stages and CPU/GPU compositions
+where valid. Device-free topology tests must cover counts beyond the local
+hardware; native tests use real ownership and report unavailable configurations
+as unqualified. A successful fixed-size fixture does not prove generality.
+
 ### Communication Volume
 
 **Communicate only the necessary live data.** In every multi-rank or

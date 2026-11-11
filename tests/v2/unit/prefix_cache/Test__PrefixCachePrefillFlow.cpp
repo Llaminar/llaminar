@@ -2049,3 +2049,33 @@ TEST(Test__PrefixCachePrefillFlow, AdvertisedTerminalRestoreFailureHardFails)
     EXPECT_EQ(mock_ptr->forward_calls, 0);
     EXPECT_EQ(mock_ptr->harvest_calls, 0);
 }
+
+/** @test A participant without terminal payload ownership keeps a full MTP hit
+ * without inventing hidden/logit rows or submitting an unnecessary suffix. */
+TEST(Test__PrefixCachePrefillFlow, FullMTPHitWithoutTerminalOwnershipPreservesLocalPayloadFacts)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        auto *observed = mock.get();
+        observed->lookup_result.supported = true;
+        observed->lookup_result.cache_enabled = true;
+        observed->lookup_result.block_size = 2;
+        observed->lookup_result.cached_tokens = 4;
+        observed->lookup_result.requires_terminal_logits = false;
+        observed->lookup_result.requires_terminal_hidden = false;
+        observed->lookup_result.has_terminal_logits = false;
+        observed->lookup_result.has_terminal_hidden = false;
+        auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+        EXPECT_THAT(observed->populated_tokens, ElementsAre(4));
+        EXPECT_EQ(observed->forward_calls, 0);
+        EXPECT_EQ(observed->restore_terminal_calls, 1);
+        const auto summary = runner->prefixStateProbe().prefix_request;
+        EXPECT_EQ(summary.matched_tokens, 4);
+        EXPECT_FALSE(summary.partial_hit);
+        EXPECT_FALSE(summary.terminal_hidden_restored);
+        EXPECT_FALSE(observed->lookup_result.has_terminal_logits);
+        EXPECT_FALSE(observed->lookup_result.has_terminal_hidden);
+    }
+}

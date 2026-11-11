@@ -646,6 +646,29 @@ namespace llaminar2
         }
     }
 
+    MoEOverlayCanonicalRouteReturnTicketStorage::MetadataLayout
+    MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(size_t route_capacity)
+    {
+        if (!route_capacity) throw std::invalid_argument("Canonical ticket requires positive route capacity");
+        size_t offset = sizeof(MoEOverlayCanonicalRouteTicketControl);
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        const auto original = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "original route slots"),
+            "original route slots");
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        const auto compact = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "compact route slots"),
+            "compact route slots");
+
+        return {offset, original, compact};
+    }
+
     void MoEOverlayCanonicalRouteReturnTicketStorage::bindFixedCapacity(
         int layer_idx,
         size_t route_capacity,
@@ -708,21 +731,10 @@ namespace llaminar2
                 "canonical route return contribution region is smaller than immutable ticket geometry");
         }
 
-        size_t offset = sizeof(MoEOverlayCanonicalRouteTicketControl);
-        offset = alignTicketOffset(offset, alignof(int32_t));
-        original_route_slots_offset_ = offset;
-        offset = checkedTicketAdd(
-            offset,
-            checkedTicketProduct(
-                route_capacity, sizeof(int32_t), "original route slots"),
-            "original route slots");
-        offset = alignTicketOffset(offset, alignof(int32_t));
-        compact_route_slots_offset_ = offset;
-        offset = checkedTicketAdd(
-            offset,
-            checkedTicketProduct(
-                route_capacity, sizeof(int32_t), "compact route slots"),
-            "compact route slots");
+        const auto metadata = metadataLayout(route_capacity);
+        const auto offset = metadata.bytes;
+        original_route_slots_offset_ = metadata.original_route_slots_offset;
+        compact_route_slots_offset_ = metadata.compact_route_slots_offset;
 
         construction_intent_ = intent;
         contribution_region_ = contribution_region;
@@ -1066,6 +1078,57 @@ namespace llaminar2
                 ?input.original_route_slots_host[entry]:input.compact_route_slots_host[entry]);
             for(size_t column=0;column<width;++column)if(!std::isfinite(destination[slot*width+column]))return false;
         }
+        return true;
+    }
+
+    bool copyMoEOverlayCanonicalRouteRowsToHostReturn(const MoEOverlaySparseRows& input,
+        std::span<const float> source,MoEOverlayReturnRows& output) noexcept
+    {
+        const auto maximum=std::numeric_limits<size_t>::max();
+        if(input.d_model<=0 || input.top_k<=0 || input.live_row_count>input.row_capacity ||
+            input.live_entry_count>input.entry_capacity || (input.live_entry_count && !input.live_row_count) ||
+            output.layout!=MoEOverlayReturnLayout::CanonicalExpertRoutes || output.d_model!=input.d_model ||
+            input.live_entry_count>output.row_capacity) return false;
+        const auto width=static_cast<size_t>(input.d_model),count=input.live_entry_count;
+        if(source.size()%width || source.size()>maximum/sizeof(float) ||
+            output.row_capacity>maximum/width/sizeof(float) || output.row_capacity>maximum/sizeof(int32_t) ||
+            input.entry_capacity>maximum/sizeof(int32_t) || input.entry_capacity>maximum/sizeof(float)) return false;
+        const auto overlaps=[](const void* a,size_t an,const void* b,size_t bn) {
+            if(!an || !bn) return false;
+            const auto left=reinterpret_cast<uintptr_t>(a),right=reinterpret_cast<uintptr_t>(b);
+            if(!a || !b || an>std::numeric_limits<uintptr_t>::max()-left || bn>std::numeric_limits<uintptr_t>::max()-right)
+                return true;
+            return left<right+bn && right<left+an;
+        };
+        const auto payload_bytes=output.row_capacity*width*sizeof(float),id_bytes=output.row_capacity*sizeof(int32_t);
+        if(count && (!input.original_route_slots_host || !input.compact_route_slots_host || !input.route_weights_host ||
+            !output.output_rows_fp32 || !output.row_ids_host || !source.data())) return false;
+        if(overlaps(source.data(),source.size_bytes(),output.output_rows_fp32,payload_bytes) ||
+            overlaps(source.data(),source.size_bytes(),output.row_ids_host,id_bytes) ||
+            overlaps(output.row_ids_host,id_bytes,output.output_rows_fp32,payload_bytes)) return false;
+        for(const auto* original:{static_cast<const void*>(input.original_route_slots_host),
+                static_cast<const void*>(input.compact_route_slots_host),static_cast<const void*>(input.route_weights_host)})
+            if(overlaps(original,input.entry_capacity*sizeof(int32_t),output.output_rows_fp32,payload_bytes) ||
+                overlaps(original,input.entry_capacity*sizeof(int32_t),output.row_ids_host,id_bytes)) return false;
+        int32_t previous_original=-1,previous_compact=-1;
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry],compact=input.compact_route_slots_host[entry];
+            if(slot<=previous_original || compact<=previous_compact || static_cast<size_t>(slot)>=source.size()/width ||
+                !std::isfinite(input.route_weights_host[entry])) return false;
+            previous_original=slot;previous_compact=compact;
+        }
+        // Validation precedes all stores. Copy raw FP32 bytes without weighting
+        // or reduction, so the original continuation's ordered FMA remains the
+        // sole top-k arithmetic authority. Inactive packet tails are untouched.
+        for(size_t entry=0;entry<count;++entry) {
+            const auto slot=input.original_route_slots_host[entry];
+            output.row_ids_host[entry]=slot;
+            std::copy_n(source.data()+static_cast<size_t>(slot)*width,width,output.output_rows_fp32+entry*width);
+        }
+        output.key=input.key;
+        output.residency_epoch=input.residency_epoch;
+        output.source_participant=input.target_participant;output.target_participant=input.source_participant;
+        output.live_row_count=count;
         return true;
     }
 

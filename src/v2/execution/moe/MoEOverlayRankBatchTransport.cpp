@@ -164,6 +164,20 @@ namespace llaminar2
         return transport;
     }
 
+    void MoEOverlayRankBatchTransportRegistry::installActivationBatchInventory(
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> inventory)
+    {
+        std::lock_guard lock(mutex_);
+        if(!inventory || activation_batch_inventory_ || !transports_.empty())
+            throw std::logic_error("Activation Batch source declaration must be installed exactly once before original channels");
+        activation_batch_inventory_=std::move(inventory);
+    }
+    std::shared_ptr<const MoEOverlayActivationBatchInventory>
+    MoEOverlayRankBatchTransportRegistry::activationBatchInventory()const
+    {
+        std::lock_guard lock(mutex_);return activation_batch_inventory_;
+    }
+
     /** @brief Cold projection of the SAME existing channel owners; no second allocator or live state. */
     struct MoEOverlayRankBatchTransportRegistry::OriginalNativeProjection
     {

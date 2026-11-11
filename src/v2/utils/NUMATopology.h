@@ -8,6 +8,10 @@
  *
  * @author David Sanftenberg
  * @date 2025-10-31
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #pragma once
@@ -16,9 +20,19 @@
 #include <vector>
 #include <optional>
 #include <filesystem>
+#include <span>
+#include <map>
 
 namespace llaminar2
 {
+
+    /** @brief One actual hwloc core with independent OS and MPI logical identities. */
+    struct MPICorePlacement
+    {
+        int os_numa_node = -1; ///< Actual physical NUMA identity, never a logical rank.
+        int logical_core_index = -1; ///< hwloc CORE logical_index consumed by OpenMPI --cpu-set.
+        std::vector<int> os_cpu_ids; ///< Original kernel PU IDs; never emitted as MPI logical indices.
+    };
 
     /**
      * @brief NUMA topology information for current process
@@ -71,6 +85,24 @@ namespace llaminar2
          * @return NUMA info with detection status
          */
         static NUMAInfo detectLocalNUMANode();
+
+        /**
+         * @brief Observe CPU-only hwloc placement once at canonical hardware discovery.
+         * @return Actual NUMA/core/PU joins, preserving hwloc logical indices.
+         * @throws std::runtime_error For failed/foreign/ambiguous physical topology.
+         * No affinity or environment changes, GPU plugins, or runtime probes are permitted.
+         */
+        static std::vector<MPICorePlacement> observeMPICorePlacement();
+        /**
+         * @brief Select logical MPI cores from already observed physical NUMA membership.
+         * @param observed Canonical cached core facts, or authored device-free observations.
+         * @param selected_nodes Exact OS NUMA labels participating in this launch.
+         * @return Original logical core indices grouped by selected OS node identity.
+         * @throws std::invalid_argument For contradictory/unknown/empty geometry.
+         */
+        static std::map<int,std::vector<int>> logicalMPICoresForNUMANodes(
+            std::span<const MPICorePlacement> observed, std::span<const int> selected_nodes);
+
 
         /**
          * @brief Resolve a procfs caller binding through exact sysfs CPU owners.

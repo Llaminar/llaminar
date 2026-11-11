@@ -18,10 +18,13 @@
  * CPU serial storage declarations survive admission and runtime projection.
  * CPU setup materializes only after the frozen plan binds its original source
  * and physical authority; no eager CPU payload cache precedes bounded loading.
+ * An explicit singleton PP stage publishes full dense source geometry instead
+ * of inheriting another stage's retained tensor-parallel assignment.
  */
 
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "InferenceRunnerFactory.h"
+#include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "DenseDecodeWeightSelection.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "backends/HostMemoryCapacity.h"
@@ -280,8 +283,11 @@ namespace llaminar2
         {
             if (!graph.flash_next) return;
             const int ple = static_cast<int>(graph.flash_next->ngrams().decoder_layer);
-            if (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers) return;
-            const auto &placement = graph.ngram_table_placement;
+            const auto& placement = graph.ngram_table_placement;
+            const bool pipeline_storage = placement && placement->fixedHeadPipeline() &&
+                placement->containsAllocator({placement->worldRank(), graph.default_device});
+            if (!pipeline_storage &&
+                (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers)) return;
             if (!placement)
                 throw std::logic_error("PLE participant reached weight completion without admitted ngram placement");
             const auto model = std::dynamic_pointer_cast<ModelContext>(context);
@@ -289,8 +295,15 @@ namespace llaminar2
             if (!model || !memory || memory->worldRank() != placement->worldRank())
                 throw std::logic_error("PLE materialization requires its exact model and rank memory authority");
             const DeviceId device = graph.default_device;
-            const auto execution = placement->lookupForConsumer({memory->worldRank(), device});
+            const auto execution = pipeline_storage ? ImmutableRowLookupExecution::FixedHeadShardGPU :
+                placement->lookupForConsumer({memory->worldRank(), device});
             auto &transfers = TransferEngine::instance();
+            const auto prepareNative = [&](const std::optional<ImmutableRowTableDevicePreparation>& upload) {
+                if (pipeline_storage)
+                    model->prepareImmutableRowTableForFixedPipelineOwner(*placement, memory, device, upload, transfers);
+                else
+                    model->prepareImmutableRowTableForConsumer(*placement, memory, device, upload, transfers);
+            };
             if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
             {
                 if(const auto source=model->nativeContextPreparation()){
@@ -321,7 +334,7 @@ namespace llaminar2
             }
             if (!immutableRowLookupUsesNativeDeviceStorage(execution) || model->residentImmutableRowTable(device))
             {
-                model->prepareImmutableRowTableForConsumer(*placement, memory, device, std::nullopt, transfers);
+                prepareNative(std::nullopt);
                 return;
             }
             const auto weights = model->concreteWeightManager();
@@ -333,8 +346,7 @@ namespace llaminar2
                 void *stream = worker.getOrCreateAuxiliaryStream("immutable_native_table_upload");
                 if (!stream)
                     throw std::runtime_error("Resident ngram setup could not create its explicit upload stream");
-                model->prepareImmutableRowTableForConsumer(*placement, memory, device,
-                    ImmutableRowTableDevicePreparation{device, stream, staging}, transfers);
+                prepareNative(ImmutableRowTableDevicePreparation{device, stream, staging});
             });
         }
 
@@ -922,6 +934,8 @@ namespace llaminar2
                                                    : runner_mpi_ctx;
             graph_config.moe.rank_batch_transport_registry =
                 config.moe_rank_batch_transport_registry;
+            graph_config.moe.activation_batch_inventory=config.moe_rank_batch_transport_registry
+                ? config.moe_rank_batch_transport_registry->activationBatchInventory() : nullptr;
             graph_config.moe.device_controller_fabric =
                 config.moe_device_controller_fabric;
             graph_config.moe.node_local_route_exchange =
@@ -2407,7 +2421,34 @@ namespace llaminar2
         graph_config.lm_head_column_parallel = false;
     }
 
-    static bool configureStaticMoEExpertRange(GraphConfig &graph_config)
+    /**
+     * @brief Bind the declared singleton pipeline stage's complete dense source geometry.
+     * @param graph_config Actual stage graph, after its original device and model dimensions are known.
+     *
+     * The shared weight manager can still retain the preceding TP stage's
+     * immutable assignment. A singleton is an explicit placement too: publish
+     * its one-participant source windows before any of this stage's weights
+     * materialize. Clearing a nullable graph field would leave the prior source
+     * assignment installed and silently load only part of the dense weights.
+     */
+    static void bindSingletonPipelineDenseAssignment(GraphConfig &graph_config)
+    {
+        setFullDimensions(graph_config);
+        graph_config.tp_config = std::make_shared<TensorParallelConfig>(
+            TensorParallelConfig::equalSplit(1, graph_config.n_heads, graph_config.n_kv_heads,
+                graph_config.d_ff, graph_config.vocab_size,
+                std::vector<DeviceId>{graph_config.default_device}));
+    }
+
+    /**
+     * @brief Configure ordinary static expert IDs or authenticate original CPU fragment ownership.
+     * @param graph_config Graph after its exact dense TP assignment and overlay binding.
+     * @param config Original runner policy, including the immutable pipeline scope.
+     * @param device Execution device selected for this graph.
+     * @return True for a supported assignment. False for incomplete or unsupported tensor sharding.
+     */
+    static bool configureStaticMoEExpertRange(GraphConfig &graph_config,
+        const InferenceRunnerConfig &config, DeviceId device)
     {
         graph_config.moe.local_expert_start = 0;
         graph_config.moe.local_expert_count = -1;
@@ -2419,8 +2460,38 @@ namespace llaminar2
 
         if (graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
         {
-            LOG_ERROR("[InferenceRunner] Not Implemented: MoE tensor-sharded mode is not implemented for the standard Qwen3.5 MoE path.");
-            return false;
+            const auto& original = graph_config.moe.expert_overlay_cpu_joint_context;
+            const auto& parent = graph_config.moe.overlay_mpi_ctx;
+            const auto* native = dynamic_cast<const GlobalTPContext*>(original.get());
+            if (!device.is_cpu() || !config.pp_stage_config ||
+                config.pp_stage_config->generation_domain != DeviceGenerationExecutionDomain::HostedBoundary ||
+                !native || graph_config.tp_ctx != original.get() || !parent ||
+                !native->authenticatesOriginalCPUExpertBorrow(original, parent->communicator()))
+            {
+                LOG_ERROR("[InferenceRunner] Not Implemented: MoE tensor-sharded mode is not implemented for the standard Qwen3.5 MoE path. An authored CPU pipeline stage requires its original joint fragment domain.");
+                return false;
+            }
+
+            const auto& authority = graph_config.moe.expert_overlay_residency_authority;
+            const auto& residency = graph_config.moe.expert_overlay_participant_residency;
+            const auto snapshot = authority ? authority->snapshot() : nullptr;
+            const int index = original->myIndex();
+            const auto& ranks = original->worldRanks();
+            if (!snapshot || !snapshot->valid() || !residency ||
+                snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+                snapshot->originalProjectionPreparation() != residency->projectionPreparation() ||
+                &snapshot->originalOwnerMap() != &residency->initialOwnerMap() ||
+                snapshot->firstModelLayer() != config.pp_stage_config->first_layer ||
+                index < 0 || static_cast<std::size_t>(index) >= ranks.size() ||
+                graph_config.tp_device_idx != index || ranks[index] != parent->rank())
+            {
+                LOG_ERROR("[InferenceRunner] Original CPU pipeline tensor-sharded graph lost its prepared fragment or rank authority.");
+                return false;
+            }
+            // The original preparation map selects the Gate/Up N and Down K
+            // fragments for every expert. A whole-expert static ID range would
+            // discard part of the joint source, so leave that range unset.
+            return true;
         }
 
         if (graph_config.moe.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
@@ -3239,7 +3310,12 @@ namespace llaminar2
         const auto tp_config_owner = weight_mgr ? weight_mgr->tensorParallelConfig() : nullptr;
         const TensorParallelConfig *tp_config = tp_config_owner.get();
 
-        if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
+        if (config.pp_stage_config && (!tp_ctx || tp_ctx->degree()==1) &&
+            (!mpi_ctx || mpi_ctx->world_size()==1))
+        {
+            bindSingletonPipelineDenseAssignment(graph_config);
+        }
+        else if (injected_global_tp_ctx && injected_global_tp_ctx->degree() > 1)
         {
             if (!applyGlobalTPContextAssignment(graph_config, injected_global_tp_ctx, tp_device_idx,tp_config))
             {
@@ -3254,7 +3330,7 @@ namespace llaminar2
         {
             return nullptr;
         }
-        if (!configureStaticMoEExpertRange(graph_config))
+        if (!configureStaticMoEExpertRange(graph_config, config, device))
         {
             return nullptr;
         }
@@ -3611,8 +3687,23 @@ namespace llaminar2
         // All local weight work, including the authored CPU preparation join,
         // precedes this cold graph boundary. Later lazy families only borrow
         // the sealed source declaration; they must not re-admit bootstrap banks.
+        const bool original_cpu_joint_stage = config.pp_stage_config && device.is_cpu() &&
+            config.moe_expert_overlay_cpu_joint_context;
+        if (original_cpu_joint_stage)
+        {
+            const auto &original = config.moe_expert_overlay_cpu_joint_context;
+            const auto *native = dynamic_cast<const GlobalTPContext *>(original.get());
+            if (!config.moe_overlay_cpu_preparation || !native ||
+                !native->authenticatesOriginalCPUExpertBorrow(original) ||
+                !graph_config.moe.expert_overlay_participant_residency)
+                throw std::logic_error("CPU pipeline source preparation lost its original publication/native owner");
+            // All local stage weights are now complete. Publish this actual
+            // process-owned bank before admitting its original CPU graph source;
+            // remote members prepare their own banks under the original domain.
+            config.moe_overlay_cpu_preparation->afterLocalPreparation();
+        }
         if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
-            residency && !config.pp_stage_config)
+            residency && (!config.pp_stage_config || original_cpu_joint_stage))
         {
             std::string error;
             if (!residency->admitInitialCPUJointGraphSources(
@@ -4210,9 +4301,12 @@ namespace llaminar2
         else
         {
             // Single rank configuration (testable runner doesn't use MPI by default)
-            setFullDimensions(graph_config);
+            if(config.pp_stage_config)
+                bindSingletonPipelineDenseAssignment(graph_config);
+            else
+                setFullDimensions(graph_config);
         }
-        if (!configureStaticMoEExpertRange(graph_config))
+        if (!configureStaticMoEExpertRange(graph_config, config, device))
         {
             return nullptr;
         }
@@ -4837,8 +4931,23 @@ namespace llaminar2
         // All local weight work, including the authored CPU preparation join,
         // precedes this cold graph boundary. Later lazy families only borrow
         // the sealed source declaration; they must not re-admit bootstrap banks.
+        const bool original_cpu_joint_stage = config.pp_stage_config && device.is_cpu() &&
+            config.moe_expert_overlay_cpu_joint_context;
+        if (original_cpu_joint_stage)
+        {
+            const auto &original = config.moe_expert_overlay_cpu_joint_context;
+            const auto *native = dynamic_cast<const GlobalTPContext *>(original.get());
+            if (!config.moe_overlay_cpu_preparation || !native ||
+                !native->authenticatesOriginalCPUExpertBorrow(original) ||
+                !graph_config.moe.expert_overlay_participant_residency)
+                throw std::logic_error("CPU pipeline source preparation lost its original publication/native owner");
+            // All local stage weights are now complete. Publish this actual
+            // process-owned bank before admitting its original CPU graph source;
+            // remote members prepare their own banks under the original domain.
+            config.moe_overlay_cpu_preparation->afterLocalPreparation();
+        }
         if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
-            residency && !config.pp_stage_config)
+            residency && (!config.pp_stage_config || original_cpu_joint_stage))
         {
             std::string error;
             if (!residency->admitInitialCPUJointGraphSources(

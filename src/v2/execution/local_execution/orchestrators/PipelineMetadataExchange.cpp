@@ -46,7 +46,7 @@ PipelineMetadataLayout::PipelineMetadataLayout(Kind kind, int rows) : kind_(kind
 {
     switch (kind)
     {
-    case Kind::Condition: case Kind::CommittedState: case Kind::NextToken:
+    case Kind::Condition: case Kind::CommittedState: case Kind::NextToken: case Kind::CommittedStateWithMoERounds:
         if (rows == 1) return;
         break;
     case Kind::Verifier:
@@ -57,7 +57,7 @@ PipelineMetadataLayout::PipelineMetadataLayout(Kind kind, int rows) : kind_(kind
 }
 
 size_t PipelineMetadataLayout::fieldCount() const noexcept
-{ return kind_ == Kind::CommittedState ? 4u : kind_ == Kind::NextToken ? 1u : 3u; }
+{ return kind_ == Kind::CommittedStateWithMoERounds ? 7u : kind_ == Kind::CommittedState ? 4u : kind_ == Kind::NextToken ? 1u : 3u; }
 
 size_t PipelineMetadataLayout::elements(size_t field) const
 {
@@ -80,6 +80,7 @@ const char *PipelineMetadataLayout::name() const noexcept
     case Kind::Condition: return "pipeline_mtp_condition_rows";
     case Kind::Verifier: return "pipeline_mtp_verifier_rows";
     case Kind::CommittedState: return "pipeline_mtp_committed_state";
+    case Kind::CommittedStateWithMoERounds: return "pipeline_mtp_committed_state_and_round_evidence";
     case Kind::NextToken: return "pipeline_next_token";
     }
     return "invalid_pipeline_metadata"; // Construction rejects an unknown kind.
@@ -149,6 +150,17 @@ CapturedTransferBinding PipelineMetadataBank::bind(TransferEngine &transfer,
     }, owner_);
 }
 
+PipelineNativeByteBinding PipelineMetadataBank::bindNative(std::shared_ptr<PipelineNativeByteChannel> channel,
+    int participant, CapturedTransferMessage message) const
+{
+    (void)data();
+    if (message.bytes != elements_ * sizeof(std::int32_t))
+        throw std::invalid_argument("Native pipeline metadata must cover its exact original bank");
+    return std::visit([&](const auto &owner) {
+        return PipelineNativeByteBinding(channel, participant, message, owner, offset_);
+    }, owner_);
+}
+
 void PipelineMetadataBank::requireOutput(void *stream) const
 {
     if (!stream) throw std::invalid_argument("Pipeline metadata requires an explicit stream");
@@ -169,14 +181,14 @@ PipelineMetadataExchange::PipelineMetadataExchange(DeviceId device, PipelineMeta
     : IComputeStage(device), layout_(layout), transport_(native),
       membership_(device, &native.context, native.participant)
 {
-    if (fields.size() != layout_.fieldCount())
+    if (native.root < -1 || native.root >= native.context.degree() || fields.size() != layout_.fieldCount())
         throw std::invalid_argument("Pipeline metadata requires every field of its declared schema");
     for (size_t i = 0; i < fields.size(); ++i)
     {
         if (!fields[i]) throw std::invalid_argument("Pipeline metadata has a missing local bank");
         fields_[i] = {.kind = LocalTPCollectiveSidebandKind::Broadcast,
             .send_buffer = fields[i], .recv_buffer = fields[i], .element_count = layout_.elements(i),
-            .dtype = CollectiveDataType::INT32, .root_device_index = native.context.degree() - 1,
+            .dtype = CollectiveDataType::INT32, .root_device_index = native.root < 0 ? native.context.degree() - 1 : native.root,
             .name = std::to_string(i)};
     }
     validateFields(layout_, std::span(fields_).first(layout_.fieldCount()));
@@ -190,7 +202,8 @@ PipelineMetadataExchange::PipelineMetadataExchange(DeviceId device, PipelineMeta
 {
     auto &binding = std::get<DomainBinding>(transport_);
     const auto &port = binding.domain;
-    if (!device.is_gpu() || (!port.inbound && !port.outbound) ||
+    if (!device.is_gpu() || (!port.inbound && !port.outbound && !port.native_inbound && !port.native_outbound) ||
+        (port.inbound && port.native_inbound) || (port.outbound && port.native_outbound) ||
         (port.inbound && port.inbound == port.outbound) || binding.banks.size() != layout_.fieldCount())
         throw std::invalid_argument("Pipeline metadata requires a complete schema and directed domain boundary");
     const auto leader = membership_.leader();
@@ -207,6 +220,17 @@ PipelineMetadataExchange::PipelineMetadataExchange(DeviceId device, PipelineMeta
             if (!layout_.message(i).fits(channel->capacityBytes()))
                 throw std::invalid_argument("Pipeline metadata exceeds admitted channel capacity");
     }
+    for (const auto &[edge, incoming] : std::array{std::pair{port.native_inbound, true},
+             std::pair{port.native_outbound, false}}) {
+        if (!edge) continue;
+        if (edge->device(port.native_participant) != device ||
+            (incoming ? !edge->isConsumer(port.native_participant)
+                      : (port.participant == 0 && !edge->isSource(port.native_participant))))
+            throw std::invalid_argument("Native metadata edge lost its actual original domain endpoint");
+        for (std::size_t field = 0; field < layout_.fieldCount(); ++field)
+            if (!layout_.message(field).fits(edge->capacity()))
+                throw std::invalid_argument("Native metadata exceeds its admitted original edge capacity");
+    }
     for (size_t i = 0; i < binding.banks.size(); ++i)
     {
         const auto &bank = binding.banks[i];
@@ -215,6 +239,10 @@ PipelineMetadataExchange::PipelineMetadataExchange(DeviceId device, PipelineMeta
         fields_[i] = {.kind = LocalTPCollectiveSidebandKind::Broadcast,
             .send_buffer = bank.data(), .recv_buffer = bank.data(), .element_count = bank.elements(),
             .dtype = CollectiveDataType::INT32, .root_device_index = 0, .name = std::to_string(i)};
+        if (port.native_inbound)
+            binding.native_inbound.push_back(bank.bindNative(port.native_inbound, port.native_participant, layout_.message(i)));
+        if (port.native_outbound && port.participant == 0)
+            binding.native_outbound.push_back(bank.bindNative(port.native_outbound, port.native_participant, layout_.message(i)));
         if (port.participant == 0)
         {
             if (port.inbound) binding.inbound.push_back(bank.bind(transfer, port.inbound,
@@ -244,6 +272,7 @@ bool PipelineMetadataExchange::execute(IDeviceContext *context)
     // can overwrite an unconsumed predecessor. Native fanout occurs after the
     // complete schema arrives and before either local use or onward publication.
     for (const auto &receive : binding.inbound) binding.transfer->enqueueCapturedTransfer(receive, stream);
+    for (const auto &receive : binding.native_inbound) receive.enqueue(stream);
     if (binding.domain.inbound && binding.domain.context)
     {
         for (const auto &bank : binding.banks) bank.requireOutput(stream);
@@ -252,6 +281,7 @@ bool PipelineMetadataExchange::execute(IDeviceContext *context)
         for (const auto &bank : binding.banks) bank.publishOutput(stream);
     }
     for (const auto &send : binding.outbound) binding.transfer->enqueueCapturedTransfer(send, stream);
+    for (const auto &send : binding.native_outbound) send.enqueue(stream);
     return true;
 }
 
@@ -268,6 +298,14 @@ size_t PipelineMetadataExchange::estimatedMemoryBytes() const
     return bytes;
 }
 
+std::span<const PipelineMetadataBank> PipelineMetadataExchange::receivedBanks() const noexcept
+{
+    if (const auto *binding = std::get_if<DomainBinding>(&transport_);
+        binding && (binding->domain.inbound || binding->domain.native_inbound))
+        return binding->banks;
+    return {};
+}
+
 StageBufferContract PipelineMetadataExchange::bufferContract() const
 {
     StageBufferContract contract;
@@ -281,7 +319,7 @@ StageBufferContract PipelineMetadataExchange::bufferContract() const
             // A relay reads only after publishing its own received field. The
             // capture ledger recognizes this intra-stage dependency from the
             // declared output, without fabricating an external producer event.
-            if (binding->domain.inbound) contract.addPreallocatedOutput(*id, "INT32");
+            if (binding->domain.inbound || binding->domain.native_inbound) contract.addPreallocatedOutput(*id, "INT32");
             else contract.addInput(*id, "INT32");
         }
     }

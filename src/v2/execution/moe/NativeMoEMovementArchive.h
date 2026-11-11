@@ -10,6 +10,7 @@
 #pragma once
 
 #include "DeviceMoERebalanceMovementJournal.h"
+#include "DeviceMoERebalanceCompletedDecision.h"
 #include "MoEOptimizationStatus.h"
 #include <span>
 
@@ -62,6 +63,7 @@ namespace llaminar2
          * @param state Completed journal prefix copied after publisher completion.
          * @param waves Exactly the populated immutable wave range.
          * @param edges Exactly the populated immutable edge range.
+         * @param decision Latest successful policy receipt; cleared for publication-only controls.
          * @return First newly retained public edge index (for optional mirrors).
          * @throws std::invalid_argument on stale, malformed or mutated evidence.
          *
@@ -72,12 +74,18 @@ namespace llaminar2
         std::size_t observe(std::uint64_t session_epoch, std::uint64_t workspace_generation,
             const DeviceMoERebalanceMovementJournalState &state,
             std::span<const DeviceMoERebalanceMovementWave> waves,
-            std::span<const DeviceMoERebalanceMovementEdge> edges);
+            std::span<const DeviceMoERebalanceMovementEdge> edges,
+            const DeviceMoERebalanceCompletedDecision &decision = {});
 
         /** @return Immutable diagnostic history; no device access or progress. */
         [[nodiscard]] const MoEOptimizationMovementLedger &ledger() const noexcept { return ledger_; }
         /** @return Completed facts from retained device receipts, never PerfStats. */
         [[nodiscard]] const MoEOptimizationMovementTotals &totals() const noexcept { return totals_; }
+
+        /** @return Cumulative request-scoped device completion deltas, never host launches. */
+        [[nodiscard]] std::uint64_t completedDecisionWindows() const noexcept { return completed_decision_windows_; }
+        /** @return Latest immutable real policy receipt; empty until a decision completes. */
+        [[nodiscard]] const std::optional<MoEOptimizationDecisionReceipt> &lastDecision() const noexcept { return last_decision_; }
 
     private:
         /**
@@ -94,6 +102,9 @@ namespace llaminar2
             std::span<const DeviceMoERebalanceMovementWave> waves,
             std::span<const DeviceMoERebalanceMovementEdge> edges) const;
 
+        DeviceMoERebalanceCompletedDecision previous_decision_{};
+        std::uint64_t completed_decision_windows_ = 0;
+        std::optional<MoEOptimizationDecisionReceipt> last_decision_;
         NativeMoEMovementArchiveConfig config_;
         std::uint64_t session_epoch_ = 0;
         std::uint64_t last_model_epoch_ = 0;

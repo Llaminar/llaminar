@@ -188,6 +188,9 @@ def _observation(
         source_format=source_format,
         candidate_id=candidate_id,
         effective_candidate_id=candidate_id,
+        # Match the schema default for pre-tournament observations. An empty
+        # evidence object retains legacy full-grade admission, not screening.
+        physical_launch_evidence={},
         observed_candidate_id=candidate_id,
         supported=forceable,
         forced_route_ok=forceable,

@@ -31,7 +31,7 @@ Qwen4ExpReplicatedPLECohort::Qwen4ExpReplicatedPLECohort(ILocalTPContext &contex
 }
 bool Qwen4ExpReplicatedPLECohort::requiresReplicatedQuery(const ResolvedImmutableRowTablePlacement &placement)
 {
-    return placement.isFixedHeadShards() ||
+    return (placement.isFixedHeadShards() && !placement.fixedHeadPipeline()) ||
         (placement.isGPUAdaptive() && placement.consumers().size()>1 &&
          placement.gpuAdaptiveLayout().adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
          placement.gpuAdaptiveRequest().placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal);

@@ -74,6 +74,10 @@ def prerequisite_evidence(pair):
     return {isa: {"test_runner_image": inventory_image(pair["source"], isa),
                   "runtime_image": pair["images"][isa]["id"],
                   "report": {"preflight_return_code": 0,
+                             "preflight_qualification": {"schema": 1,
+                                "registered": ["V2_Unit_Contract", "V2_Integration_Preflight"],
+                                "selected": ["V2_Unit_Contract", "V2_Integration_Preflight"],
+                                "requirements": {}, "hardware": None, "unqualified": {}},
                              "preflight_tests": ["V2_Unit_Contract", "V2_Integration_Preflight"],
                              "preflight_test_count": 2}}
             for isa in suite.ISAS}

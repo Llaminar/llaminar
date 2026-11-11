@@ -7,7 +7,13 @@
  * accelerator, model payload or inference is substituted. Runtime setup tests
  * construct the same histogram, residency and empty prepared-bank owners used
  * by production, then hand them to the checked pipeline binding.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
+#include "planning/OriginalRankCapacityExchange.h"
+#include "collective/NativeCPUCollectiveProgram.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/PlanningForwardWeightWork.h"
@@ -21,6 +27,7 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "loaders/ModelContext.h"
 #include "../../mocks/MockMPIContext.h"
@@ -1040,6 +1047,25 @@ MoEPipelineMemoryPolicy sourcePolicy(std::span<const DeviceId> devices,const Mod
         .native_ordering_events=NativeOrderingEventGroupReplayAccess::projection(devices),
         .retained_host_services=planningHostServiceProjection(),.native_context_preparation=std::move(source)};
 }
+/**
+ * @brief Reuse all original source-admission contracts for the actual local stage GPU set.
+ * @param topology Original compiled rank projection; remote devices never enter its event quote.
+ * @param loader Original sparse GGUF directory supplying the real maximum tensor extent.
+ * @param rows Explicit retained prefill inventory owned by the calling fixture.
+ * @return Existing complete GPU-load/event/host-service policy with only the requested prefill envelope changed.
+ */
+MoEPipelineMemoryPolicy globalSourcePolicy(const ResolvedRankOrchestration &topology,
+    const ModelLoader &loader, std::span<const int> rows)
+{
+    std::set<DeviceId> unique;
+    for (const auto &stage : topology.pipelineStages())
+        for (const auto device : stage.overlayExecution().currentRankPlan().local_devices)
+            if (device.is_gpu()) unique.insert(device);
+    const std::vector<DeviceId> devices(unique.begin(), unique.end());
+    auto result = sourcePolicy(devices, loader);
+    result.prefill = {.bucket_rows = rows, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16};
+    return result;
+}
 }
 /** @test Actual original source backing survives immutable topology compilation and is charged once across every stage. */
 TEST(MoEPipelineNativePreparation, OriginalSourceReachesParentAllStagesAndFinalPMAOnce){
@@ -1123,3 +1149,481 @@ TEST(MoEPipelineNativePreparation, PartialOriginalPreparationRejectsBeforePlanni
     }()),::testing::ExitedWithCode(0),"");
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Actual per-rank admission/preparation preserves source, layers and sole PMA on every owner. */
+TEST(MoEGlobalPipelineMemory, LocalClaimsMTPEnvelopeAndPartialFailureRemainRankOwned)
+{
+    static constexpr std::array prefill_rows{1, 8, 32};
+    PlanningGGUFFixture file(true, true, GGUFTensorType::Q4_0);
+    PlanningModelSource source(file.path());
+    auto observed = inventory(2);
+    auto peer = observed.ranks.front();
+    peer.rank = peer.local_rank = 1;
+    peer.cpu.numa_node = 17;
+    std::erase_if(observed.ranks.front().gpus, [](const auto &gpu) { return gpu.type != DeviceType::CUDA; });
+    std::erase_if(peer.gpus, [](const auto &gpu) { return gpu.type != DeviceType::ROCm; });
+    for (auto &gpu : peer.gpus) gpu.numa_node = peer.cpu.numa_node;
+    observed.ranks.push_back(std::move(peer));
+    observed.world_size = 2;
+    observed.buildNodeAggregations();
+    auto input = proposal(source, 2, false);
+    input.config.mpi_procs = 2;
+    input.config.domain_definitions.back().owner_rank = 1;
+    for (const bool retained_mtp : {false, true})
+    {
+        input.config.mtp_activation_policy = retained_mtp ? MTPActivationPolicy::Automatic : MTPActivationPolicy::Disabled;
+        input.config.mtp.graph_capacity_draft_tokens = retained_mtp ? 15 : 0;
+        for (const auto mode : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Observe, MoERebalanceRuntimeMode::Dynamic})
+        {
+            input.config.moe_rebalance.mode = mode;
+            for (int rank = 0; rank < 2; ++rank)
+            {
+                SCOPED_TRACE(::testing::Message() << rank << '/' << retained_mtp << '/' << int(mode));
+                ExecutionPlanBuilder builder;
+                const auto topology = ResolvedRankOrchestration::resolve(input.config, source.metadata(), observed, builder, rank);
+                const auto admitted = std::make_shared<const AdmittedMoEPipelineMemory>(AdmittedMoEPipelineMemory::admit(
+                    topology, source.metadata(), source.loader(), observed,
+                    globalSourcePolicy(topology, source.loader(), prefill_rows)));
+                ASSERT_TRUE(admitted->globalPipeline());
+                ASSERT_EQ(admitted->stages().size(), 1u);
+                const auto &stage = admitted->stages().front();
+                EXPECT_EQ(stage.topology().stageId(), rank);
+                EXPECT_EQ(stage.rankPlan().rank, rank);
+                EXPECT_EQ(stage.weightManifest().front().layer_idx, rank);
+                EXPECT_EQ(stage.weightManifest().size(), rank == 1 && retained_mtp ? 2u : 1u);
+                for (const auto &resource : admitted->physicalAdmission()->plan().resources())
+                    EXPECT_EQ(resource.resource().world_rank, rank);
+                auto model = metadataContext(file.path());
+                const auto prepared = MoEPipelinePreparedPlan::create(admitted, model);
+                ASSERT_EQ(prepared->stages().size(), 1u);
+                EXPECT_EQ(prepared->stages().front().metadata.first_model_layer, rank);
+                auto memory = std::make_shared<PhysicalMemoryAuthority>(admitted->physicalAdmission(), rank);
+                const auto unclaimed = memory->rankAttestationSummary();
+                const auto mpi = std::make_shared<MockMPIContext>(rank, 2);
+                auto bindings = prepared->createRuntimeBindings(model->concreteLoader(), memory, mpi, topology);
+                ASSERT_EQ(bindings.size(), 1u);
+                EXPECT_EQ(bindings.front()->owners().mpi, mpi);
+                ASSERT_EQ(bindings.front()->owners().residency->localParticipantIds().size(), 2u);
+                EXPECT_EQ(bindings.front()->scope().first_layer, rank);
+                std::weak_ptr<MoEOverlayResidencyAuthority> owner = bindings.front()->owners().authority;
+                bindings.clear();
+                EXPECT_TRUE(owner.expired());
+                EXPECT_EQ(memory->rankAttestationSummary(), unclaimed);
+                EXPECT_THROW((void)prepared->createRuntimeBindings(model->concreteLoader(), memory,
+                    std::make_shared<MockMPIContext>(1-rank, 2), topology), std::invalid_argument);
+                EXPECT_EQ(memory->rankAttestationSummary(), unclaimed);
+                auto changed = input.config;
+                // A remote-only edit must not be accepted as the same retained
+                // global topology merely because this rank's local stage fits.
+                auto &remote = changed.domain_definitions[1-rank].devices;
+                std::reverse(remote.begin(), remote.end());
+                const auto foreign = ResolvedRankOrchestration::resolve(changed, source.metadata(), observed, builder, rank);
+                EXPECT_THROW((void)prepared->createRuntimeBindings(model->concreteLoader(), memory, mpi, foreign), std::invalid_argument);
+                EXPECT_EQ(memory->rankAttestationSummary(), unclaimed);
+                EXPECT_FALSE(model->concreteWeightManager()->preparedWeightStoreIfInitialized());
+            }
+        }
+    }
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test One rank may prepare separated global stages without taking another rank's interval or CPU storage. */
+TEST(MoEGlobalPipelineMemory, ReversedAndRepeatedRankStagesKeepExactAdmissionAndProjection)
+{
+    static constexpr std::array prefill_rows{1, 8, 32};
+    PlanningGGUFFixture file(true, false, GGUFTensorType::Q4_0, 256, std::nullopt, 8,
+        PlanningGGUFFixture::Geometry::Directory, 4);
+    PlanningModelSource source(file.path());
+    for (const auto &owners : {std::vector<int>{1,0}, std::vector<int>{2,0,2,1}})
+    {
+        const int count = *std::max_element(owners.begin(), owners.end()) + 1;
+        auto observed = inventory(1);
+        const auto seed = observed.ranks.front();
+        observed.ranks.clear(); observed.world_size = count;
+        for (int rank = 0; rank < count; ++rank)
+        {
+            auto entry = seed;
+            entry.rank = entry.local_rank = rank;
+            entry.cpu.numa_node = 9 + rank * 7;
+            std::erase_if(entry.gpus, [rank](const auto &gpu) {
+                return gpu.type != (rank % 2 ? DeviceType::ROCm : DeviceType::CUDA); });
+            for (auto &gpu : entry.gpus)
+            {
+                gpu.local_device_id += 4 * rank;
+                gpu.uuid += "-rank" + std::to_string(rank);
+                gpu.numa_node = entry.cpu.numa_node;
+            }
+            observed.ranks.push_back(std::move(entry));
+        }
+        observed.buildNodeAggregations();
+        std::vector<std::string> arguments{"original-pipeline", "--mpi-procs", std::to_string(count), "--no-mtp"};
+        for (size_t stage = 0; stage < owners.size(); ++stage)
+        {
+            const int owner = owners[stage]; const bool cuda = owner % 2 == 0;
+            arguments.insert(arguments.end(), {"--define-domain", "part" + std::to_string(stage) + "=" +
+                (cuda ? "cuda:" : "rocm:") + std::to_string(4 * owner) + ";scope=single;backend=" +
+                (cuda ? "nccl" : "rccl") + ";owner=" + std::to_string(owner), "--pp-stage",
+                std::to_string(stage) + "=part" + std::to_string(stage) + ":" + std::to_string(stage) + "-" +
+                std::to_string(stage + 1 == owners.size() ? 3 : stage)});
+        }
+        std::vector<char *> argv;for (auto &arg : arguments) argv.push_back(arg.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+        config.model_path = file.path(); config.max_seq_len = 128;
+        config.moe_routed_prefill.overlay_segment_rows = 32;
+        config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        for (int rank = 0; rank < count; ++rank)
+        {
+            ExecutionPlanBuilder builder;
+            const auto topology = ResolvedRankOrchestration::resolve(config, source.metadata(), observed, builder, rank);
+            const auto admitted = std::make_shared<const AdmittedMoEPipelineMemory>(AdmittedMoEPipelineMemory::admit(
+                topology, source.metadata(), source.loader(), observed,
+                globalSourcePolicy(topology, source.loader(), prefill_rows)));
+            auto model = metadataContext(file.path());
+            const auto prepared = MoEPipelinePreparedPlan::create(admitted, model);
+            auto memory = std::make_shared<PhysicalMemoryAuthority>(admitted->physicalAdmission(), rank);
+            const auto before = memory->rankAttestationSummary();
+            auto bindings = prepared->createRuntimeBindings(model->concreteLoader(), memory,
+                std::make_shared<MockMPIContext>(rank, count), topology);
+            size_t local = 0;
+            for (size_t stage = 0; stage < owners.size(); ++stage)
+                if (owners[stage] == rank)
+                {
+                    const auto &claim = admitted->stages().at(local);
+                    const auto &binding = bindings.at(local++);
+                    EXPECT_EQ(claim.topology().stageId(), stage);
+                    EXPECT_EQ(binding->scope().first_layer, stage);
+                    EXPECT_EQ(binding->owners().mpi->rank(), rank);
+                    const auto &domain = binding->plan()->domains.front();
+                    InferenceRunnerConfig destination;
+                    destination.pp_stage_config = binding->scope();
+                    destination.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+                    destination.cpu_serial_expert_storage.push_back(nullptr);
+                    EXPECT_THROW(binding->installRuntime(destination, domain.participants, domain.weights,
+                        domain.backend), std::invalid_argument);
+                    EXPECT_FALSE(destination.moe_routed_expert_plan);
+                    EXPECT_FALSE(destination.moe_expert_overlay_residency_authority);
+                    EXPECT_EQ(destination.cpu_serial_expert_storage.size(), 1u);
+                    destination.cpu_serial_expert_storage.clear();
+                    binding->installRuntime(destination, domain.participants, domain.weights, domain.backend);
+                    EXPECT_EQ(destination.moe_expert_overlay_residency_authority, binding->owners().authority);
+                    EXPECT_THROW(binding->installRuntime(destination, domain.participants, domain.weights,
+                        domain.backend), std::invalid_argument);
+                }
+            EXPECT_EQ(local, bindings.size());
+            bindings.clear();
+            EXPECT_EQ(memory->rankAttestationSummary(), before);
+            for (const auto &resource : admitted->physicalAdmission()->plan().resources())
+                EXPECT_EQ(resource.resource().world_rank, rank);
+        }
+    }
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Original CPU global shards reach the canonical input adapter without becoming local TP. */
+TEST(MoEGlobalPipelineMemory, OriginalCPUStageMemoryInputsRequireExactProgramScopeAndRank)
+{
+    PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0,256,std::nullopt,8,
+        PlanningGGUFFixture::Geometry::FullAttentionGraph,2);
+    PlanningModelSource source(file.path());
+    auto observed=inventory(0);
+    const auto seed=observed.ranks.front();observed.ranks.clear();observed.world_size=2;
+    for(int rank=0;rank<2;++rank) {
+        auto owner=seed;owner.rank=owner.local_rank=rank;owner.cpu.numa_node=7+rank*10;owner.numa_nodes=2;
+        observed.ranks.push_back(std::move(owner));
+    }
+    observed.buildNodeAggregations();
+    for(const auto compute:{RoutedExpertComputePolicy::TensorSharded,RoutedExpertComputePolicy::Apportioned}) {
+        OrchestrationConfig config;config.model_path=file.path();config.mpi_procs=2;config.max_seq_len=64;
+        config.mtp_activation_policy=MTPActivationPolicy::Disabled;config.mtp.graph_capacity_draft_tokens=0;
+        config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.moe_routed_prefill.overlay_segment_rows=8;
+        DomainDefinition cpu;cpu.name="original_cpu";cpu.scope=TPScope::NODE_LOCAL;
+        cpu.backend=CollectiveBackendType::UPI;cpu.routed_compute_policy=compute;
+        for(const auto& owner:observed.ranks) {
+            cpu.devices.push_back(GlobalDeviceAddress::cpu(owner.cpu.numa_node,owner.hostname));
+            cpu.explicit_ranks.push_back(owner.rank);
+        }
+        DomainDefinition tail;tail.name="cpu_tail";tail.owner_rank=0;tail.scope=TPScope::AUTO;
+        tail.devices={cpu.devices.front()};tail.backend=CollectiveBackendType::HOST;
+        tail.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
+        config.domain_definitions={cpu,tail};config.pp_stage_definitions={{0,cpu.name,0,0},{1,tail.name,1,1}};
+        for(int rank=0;rank<2;++rank) {
+            SCOPED_TRACE(::testing::Message()<<rank<<"/"<<int(compute));
+            ExecutionPlanBuilder builder;
+            const auto topology=ResolvedRankOrchestration::resolve(config,source.metadata(),observed,builder,rank);
+            ASSERT_TRUE(topology.globalPipeline());
+            const auto programs=originalCPUPipelinePrograms(topology.config(),*topology.globalPipeline(),observed);
+            ASSERT_EQ(programs.size(),1u);
+            const auto& child=topology.pipelineStages().front();
+            const auto& scope=child.scope();const auto& mtp=child.rankPlan().runtime.mtp;
+            const auto family=resolveMoEOverlayInferenceGraphFamilyIdentity(source.loader(),source.loader().architecture(),
+                source.loader().blockCount(),MoEOverlayMTPGraphFamilyPolicy::MainOnly,1,8,1,1,0)
+                    .forRoutedLayerInterval(scope.first_layer,scope.layerCount());
+            const auto manifest=buildMoEOverlayLayerWeightManifestFromLoader(source.loader(),scope.layerCount(),8,scope.first_layer);
+            const auto storage=resolveMoEOverlayCapacityAdmissionPolicy(*child.config().moe_routed_expert_plan,
+                child.config(),2,scope.layerCount(),8);
+            static constexpr std::array rows{1,8};
+            const auto settings=globalSourcePolicy(topology,source.loader(),rows);
+            MoEOverlayMemoryPlanInputRequest request{
+                .model=source.metadata().memoryProfile(),.rank_plan=child.rankPlan(),.config=child.config(),
+                .inventory=observed,.execution=child.overlayExecution(),.capacity_policy=storage,.retained_mtp=mtp,
+                .graph_family=family,.prefill=settings.prefill,.gpu_weight_load=settings.gpu_weight_load,
+                .pipeline_stage=scope,.original_expert_manifest=manifest,
+                .native_source_placement=source.loader().nativeWeightSourcePlacement(),.original_cpu_stage_program=&programs.front()};
+            const auto inputs=buildMoEOverlayMemoryPlanInputs(request,8);
+            EXPECT_EQ(inputs.local_capacity.original_cpu_stage_program,&programs.front());
+            EXPECT_EQ(inputs.local_capacity.rank_plan,&child.rankPlan());
+            EXPECT_TRUE(inputs.local_capacity.rank_plan->usesGlobalTP());
+            EXPECT_TRUE(inputs.local_capacity.rank_plan->local_tp_devices.empty());
+            EXPECT_EQ(inputs.local_capacity.rank_inventory,&observed.ranks[rank]);
+            EXPECT_EQ(inputs.local_capacity.generation_domain,DeviceGenerationExecutionDomain::HostedBoundary);
+            EXPECT_EQ(inputs.local_capacity.graph_family.first_model_layer,0);
+            EXPECT_EQ(inputs.local_capacity.graph_family.main_layer_count,1);
+            EXPECT_EQ(inputs.local_capacity.resident_graph_rows,8);
+            request.original_cpu_stage_program=nullptr;
+            EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request,8),std::invalid_argument);
+            request.original_cpu_stage_program=&programs.front();
+            auto foreign=child.rankPlan();foreign.primary_device.numa_node=999;
+            // Rebind the borrowed immutable rank reference through aggregate
+            // reconstruction; no sealed topology is mutated to create a valid case.
+            MoEOverlayMemoryPlanInputRequest wrong_rank{
+                .model=request.model,.rank_plan=foreign,.config=request.config,.inventory=observed,
+                .execution=request.execution,.capacity_policy=storage,.retained_mtp=mtp,.graph_family=family,
+                .prefill=settings.prefill,.gpu_weight_load=settings.gpu_weight_load,.pipeline_stage=scope,
+                .original_expert_manifest=manifest,.native_source_placement=request.native_source_placement,
+                .original_cpu_stage_program=&programs.front()};
+            EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(wrong_rank,8),std::invalid_argument);
+            foreign=child.rankPlan();foreign.weight_shard.shard_index=1-rank;
+            EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(wrong_rank,8),std::invalid_argument);
+            auto foreign_stage=topology.globalPipeline()->stages.front();
+            foreign_stage.first_layer=foreign_stage.last_layer=1;foreign_stage.has_embedding=false;foreign_stage.has_lm_head=true;
+            const auto foreign_program=OriginalCPUPipelineProgram::checked(foreign_stage,observed);
+            request.original_cpu_stage_program=&foreign_program;
+            EXPECT_THROW((void)buildMoEOverlayMemoryPlanInputs(request,8),std::invalid_argument);
+        }
+    }
+}
+/** @test Unequal original local stage sets feed one complete CPU PMA plan, preserving stage and allocator identity. */
+TEST(MoEGlobalPipelineMemory, OriginalCPUStageCapacityExchangePreservesUnequalOriginalOwnership)
+{
+    PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0,256,std::nullopt,8,
+        PlanningGGUFFixture::Geometry::FullAttentionGraph,2);
+    PlanningModelSource source(file.path());
+    auto observed=inventory(0);
+    const auto seed=observed.ranks.front();
+    observed.ranks.clear();
+    observed.world_size=2;
+    for(int rank=0;rank<2;++rank) {
+        auto owner=seed;
+        owner.rank=owner.local_rank=rank;
+        owner.cpu.numa_node=7+rank*10;
+        owner.numa_nodes=2;
+        observed.ranks.push_back(std::move(owner));
+    }
+    observed.buildNodeAggregations();
+    OrchestrationConfig config;
+    config.model_path=file.path();config.mpi_procs=2;config.max_seq_len=64;
+    config.mtp_activation_policy=MTPActivationPolicy::Disabled;config.mtp.graph_capacity_draft_tokens=0;
+    config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+    config.moe_routed_prefill.overlay_segment_rows=8;
+    DomainDefinition head;
+    head.name="head";head.scope=TPScope::NODE_LOCAL;head.backend=CollectiveBackendType::UPI;
+    head.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+    for(const auto& owner:observed.ranks) {
+        head.devices.push_back(GlobalDeviceAddress::cpu(owner.cpu.numa_node,owner.hostname));
+        head.explicit_ranks.push_back(owner.rank);
+    }
+    DomainDefinition tail;
+    tail.name="tail";tail.owner_rank=0;tail.scope=TPScope::AUTO;tail.backend=CollectiveBackendType::HOST;
+    tail.devices={head.devices.front()};tail.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
+    config.domain_definitions={head,tail};config.pp_stage_definitions={{0,head.name,0,0},{1,tail.name,1,1}};
+    ExecutionPlanBuilder first_builder,second_builder;
+    const auto first=ResolvedRankOrchestration::resolve(config,source.metadata(),observed,first_builder,0);
+    const auto second=ResolvedRankOrchestration::resolve(config,source.metadata(),observed,second_builder,1);
+    ASSERT_TRUE(first.globalPipeline());
+    const auto& topology=*first.globalPipeline();
+    const auto budget=[](int rank,size_t planned,size_t resident) {
+        PhysicalMemoryBOMBuilder builder(PhysicalMemoryResource{rank,DeviceId::cpu(),4096,2048});
+        builder.add(PhysicalMemoryOwner::NativeCPUCollectiveDomain,planned,resident);
+        return MoEOverlayBoundPhysicalMemoryBudget{
+            MoEOverlayLocalCapacityPlanner::physicalResourceId(rank,DeviceId::cpu()),
+            PhysicalMemoryAdmissionCertificate(builder.build())};
+    };
+    const std::vector first_head{budget(0,11,1)}, first_tail{budget(0,17,2)}, second_head{budget(1,23,3)};
+    const std::array first_parts{OriginalPipelineFixedContribution{0,first_head},OriginalPipelineFixedContribution{1,first_tail}};
+    const std::array second_parts{OriginalPipelineFixedContribution{0,second_head}};
+    const auto first_frame=OriginalPipelineCapacitySendFrame::prepare(topology,0,first_parts);
+    const auto second_frame=OriginalPipelineCapacitySendFrame::prepare(topology,1,second_parts);
+    const auto first_read=parseOriginalPipelineCapacityFrame(first_frame.bytes(),0,topology);
+    const auto second_read=parseOriginalPipelineCapacityFrame(second_frame.bytes(),1,topology);
+    ASSERT_EQ(first_read.size(),2u);ASSERT_EQ(second_read.size(),2u);
+    ASSERT_EQ(first_read[0].budgets.size(),1u);ASSERT_EQ(first_read[1].budgets.size(),1u);
+    ASSERT_EQ(second_read[0].budgets.size(),1u);EXPECT_TRUE(second_read[1].budgets.empty());
+    EXPECT_EQ(first_read[0].budgets[0].bom().totalBytes(),11u);
+    EXPECT_EQ(first_read[1].budgets[0].bom().totalBytes(),17u);
+    EXPECT_EQ(second_read[0].budgets[0].bom().totalBytes(),23u);
+    EXPECT_EQ(second_read[0].budgets[0].worldRank(),1);
+    EXPECT_EQ(second_read[0].budgets[0].bom().charge(PhysicalMemoryOwner::NativeCPUCollectiveDomain).already_resident_bytes,3u);
+    EXPECT_THROW(parseOriginalPipelineCapacityFrame(first_frame.bytes(),1,topology),std::invalid_argument);
+    EXPECT_THROW(OriginalPipelineCapacitySendFrame::prepare(topology,0,second_parts),std::invalid_argument);
+    const std::array foreign_part{OriginalPipelineFixedContribution{0,first_head}};
+    EXPECT_THROW(OriginalPipelineCapacitySendFrame::prepare(topology,1,foreign_part),std::invalid_argument);
+    const std::array duplicate_parts{first_parts[0],first_parts[0]};
+    EXPECT_THROW(OriginalPipelineCapacitySendFrame::prepare(topology,0,duplicate_parts),std::invalid_argument);
+    auto bytes=std::vector<std::uint8_t>(first_frame.bytes().begin(),first_frame.bytes().end());
+    bytes.push_back(0);
+    EXPECT_THROW(parseOriginalPipelineCapacityFrame(bytes,0,topology),std::invalid_argument);
+    bytes.resize(bytes.size()-2);
+    EXPECT_THROW(parseOriginalPipelineCapacityFrame(bytes,0,topology),std::invalid_argument);
+    bytes.assign(first_frame.bytes().begin(),first_frame.bytes().end());
+    bytes.at(36)=1; // Sender rank inside the first CAP4 record, independently of its outer sender.
+    EXPECT_THROW(parseOriginalPipelineCapacityFrame(bytes,0,topology),std::invalid_argument);
+
+    static constexpr std::array rows{1,8};
+    const auto first_plan=AdmittedMoEPipelineMemory::admit(first,source.metadata(),source.loader(),observed,
+        globalSourcePolicy(first,source.loader(),rows));
+    const auto second_plan=AdmittedMoEPipelineMemory::admit(second,source.metadata(),source.loader(),observed,
+        globalSourcePolicy(second,source.loader(),rows));
+    EXPECT_EQ(topology.embeddingPublisherRank(), 0);
+    auto nonzero_leader = topology;
+    nonzero_leader.world_size = 3;
+    nonzero_leader.stages.front().participating_ranks = {1, 2};
+    EXPECT_EQ(nonzero_leader.embeddingPublisherRank(), 1);
+    nonzero_leader.stages.front().participating_ranks = {2, 1};
+    EXPECT_EQ(nonzero_leader.embeddingPublisherRank(), 1);
+    auto invalid_head = nonzero_leader;
+    invalid_head.stages.front().participating_ranks = {1, 1};
+    EXPECT_THROW((void)invalid_head.embeddingPublisherRank(), std::logic_error);
+    invalid_head = nonzero_leader;
+    invalid_head.stages.back().has_embedding = true;
+    EXPECT_THROW((void)invalid_head.embeddingPublisherRank(), std::logic_error);
+    auto singleton_head = topology;
+    singleton_head.stages.front().is_global_tp = false;
+    singleton_head.stages.front().participating_ranks.clear();
+    singleton_head.stages.front().owning_rank = 1;
+    EXPECT_EQ(singleton_head.embeddingPublisherRank(), 1);
+
+    // Seal actual production runtime bindings against the same immutable PMA
+    // plan on each rank, before any model weights or native domains exist.
+    auto model = metadataContext(file.path());
+    const auto prove_binding = [&](const auto& admitted, const auto& resolved, int rank) {
+        const auto sealed = std::make_shared<const AdmittedMoEPipelineMemory>(admitted);
+        const auto prepared = MoEPipelinePreparedPlan::create(sealed, model);
+        const auto memory = std::make_shared<PhysicalMemoryAuthority>(sealed->physicalAdmission(), rank);
+        const auto context = std::make_shared<MockMPIContext>(rank, 2);
+        const auto bindings = prepared->createRuntimeBindings(model->concreteLoader(), memory, context, resolved);
+        ASSERT_EQ(bindings.size(), rank == 0 ? 2u : 1u);
+        const auto& head_binding = *bindings.front();
+        const auto& owners = head_binding.owners();
+        const auto snapshot = owners.authority->snapshot();
+        ASSERT_TRUE(snapshot);
+        ASSERT_EQ(snapshot->ownershipKind(), MoEOverlayResidencyOwnershipKind::CPUJointFragments);
+        EXPECT_EQ(snapshot->jointOwnerMap().get(), &owners.residency->initialOwnerMap());
+        EXPECT_EQ(&snapshot->originalOwnerMap(), &owners.residency->initialOwnerMap());
+        const auto& local = owners.residency->localParticipantIds();
+        ASSERT_EQ(local.size(), 1u);
+        const auto* participant = snapshot->originalOwnerMap().participantForId(local.front());
+        ASSERT_NE(participant, nullptr);
+        EXPECT_EQ(participant->world_rank, rank);
+        EXPECT_EQ(participant->address, head.devices.at(rank));
+        ASSERT_EQ(snapshot->originalOwnerMap().owners().size(), 8u);
+        for (const auto& row : snapshot->originalOwnerMap().owners())
+            ASSERT_TRUE(row.shard_cohort);
+
+        if (rank == 0) {
+            const auto second_bindings = prepared->createRuntimeBindings(model->concreteLoader(), memory, context, resolved);
+            auto foreign = owners;
+            foreign.residency = second_bindings.front()->owners().residency;
+            ASSERT_NE(&foreign.residency->initialOwnerMap(), &snapshot->originalOwnerMap());
+            EXPECT_THROW((void)MoEOverlayPipelineStageBinding::seal(head_binding.scope(),
+                head_binding.metadata(), head.devices, std::move(foreign)), std::invalid_argument);
+        }
+    };
+    prove_binding(first_plan, first, 0);
+    prove_binding(second_plan, second, 1);
+    ASSERT_EQ(first_plan.stages().size(),2u);ASSERT_EQ(second_plan.stages().size(),1u);
+    ASSERT_EQ(first_plan.stages()[0].topology().stageId(),0);
+    ASSERT_EQ(first_plan.stages()[1].topology().stageId(),1);
+    ASSERT_EQ(second_plan.stages()[0].topology().stageId(),0);
+    const auto& first_resources=first_plan.physicalAdmission()->plan().resources();
+    const auto& second_resources=second_plan.physicalAdmission()->plan().resources();
+    ASSERT_EQ(first_resources.size(),2u);ASSERT_EQ(second_resources.size(),2u);
+    for(const auto& resource:first_resources) {
+        const auto peer=std::find_if(second_resources.begin(),second_resources.end(),
+            [&](const auto& item){return item.resource().sameAllocator(resource.resource());});
+        ASSERT_NE(peer,second_resources.end());
+        EXPECT_EQ(resource.resource().device,DeviceId::cpu());
+        EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::NativeCPUCollectiveDomain),NativeCPUCollectiveProgram::domainBytes());
+        EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::NativeCPUCollectiveProcessPool),NativeCPUCollectiveProgram::processPoolBytes());
+        for(size_t index=0;index<PhysicalMemoryBOM::ownerCount();++index) {
+            const auto owner=PhysicalMemoryBOM::ownerAt(index);
+            EXPECT_EQ(resource.charge(owner).planned_bytes,peer->charge(owner).planned_bytes);
+            EXPECT_EQ(resource.charge(owner).already_resident_bytes,peer->charge(owner).already_resident_bytes);
+        }
+    }
+}
+
+/** @test Stage framing preserves sparse and unequal rank membership beyond the serving fixture's two sockets. */
+TEST(MoEGlobalPipelineMemory, OriginalCPUStageCapacityExchangeUsesDeclaredCohortWidths)
+{
+    for (const int population : {3, 5, 9, 17}) {
+        SCOPED_TRACE(population);
+        GlobalPPStageSpec head;
+        head.stage_id = 0;
+        head.first_layer = head.last_layer = 0;
+        head.has_embedding = true;
+        head.is_global_tp = true;
+        GlobalPPStageSpec middle;
+        middle.stage_id = 1;
+        middle.first_layer = middle.last_layer = 1;
+        middle.is_global_tp = true;
+        GlobalPPStageSpec tail;
+        tail.stage_id = 2;
+        tail.first_layer = tail.last_layer = 2;
+        tail.has_lm_head = true;
+        tail.owning_rank = population - 2;
+        for (int rank = 0; rank < population; ++rank) {
+            if (rank % 2 == 0 || (population > 3 && rank == 1))
+                head.participating_ranks.push_back(rank);
+            if (rank % 2 != 0 || rank == population - 1)
+                middle.participating_ranks.push_back(rank);
+        }
+        const auto topology = GlobalPPTopology::build({head, middle, tail}, 3, population);
+        ASSERT_TRUE(topology.validate().empty());
+        for (int rank = 0; rank < population; ++rank) {
+            SCOPED_TRACE(rank);
+            PhysicalMemoryBOMBuilder builder(PhysicalMemoryResource{rank, DeviceId::cpu(), 4096, 2048});
+            builder.add(PhysicalMemoryOwner::NativeCPUCollectiveDomain, rank + 1);
+            const std::vector local{MoEOverlayBoundPhysicalMemoryBudget{
+                MoEOverlayLocalCapacityPlanner::physicalResourceId(rank, DeviceId::cpu()),
+                PhysicalMemoryAdmissionCertificate(builder.build())}};
+            std::vector<OriginalPipelineFixedContribution> contributions;
+            // Reverse the source order to prove the parser publishes stage
+            // identity order, independent of local submission order.
+            const std::array expected{rank % 2 == 0 || (population > 3 && rank == 1),
+                rank % 2 != 0 || rank == population - 1,
+                rank == population - 2};
+            for (int stage = static_cast<int>(expected.size()) - 1; stage >= 0; --stage)
+                if (expected[stage])
+                    contributions.push_back({stage, local});
+            const auto frame = OriginalPipelineCapacitySendFrame::prepare(topology, rank, contributions);
+            const auto decoded = parseOriginalPipelineCapacityFrame(frame.bytes(), rank, topology);
+            ASSERT_EQ(decoded.size(), expected.size());
+            for (std::size_t stage = 0; stage < expected.size(); ++stage) {
+                EXPECT_EQ(decoded[stage].stage_id, static_cast<int>(stage));
+                if (expected[stage]) {
+                    ASSERT_EQ(decoded[stage].budgets.size(), 1u);
+                    EXPECT_EQ(decoded[stage].budgets.front().worldRank(), rank);
+                    EXPECT_EQ(decoded[stage].budgets.front().bom().totalBytes(), static_cast<std::size_t>(rank + 1));
+                } else {
+                    EXPECT_TRUE(decoded[stage].budgets.empty());
+                }
+            }
+        }
+    }
+}
+
+}

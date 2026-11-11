@@ -1,0 +1,153 @@
+/** @file contract.cpp.in
+ * @brief Replay complete original/native SDMA submission and dependency callbacks.
+ * Only OS/HSA scheduling and packet sinks are shims. The actual callback owner,
+ * callback body, complete SubmitCommand bodies and native declarations are
+ * extracted verbatim from the exact dependency source bound by this proof.
+ */
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+#include <vector>
+using hsa_status_t=int;
+using hsa_signal_value_t=std::int64_t;
+using hsa_signal_t=std::uintptr_t;
+constexpr int HSA_STATUS_SUCCESS=0,HSA_STATUS_ERROR_OUT_OF_RESOURCES=1,HSA_SIGNAL_CONDITION_EQ=0;
+constexpr std::size_t HSA_MAX_DEP_SIGNALS=8;
+static std::size_t callback_allocations=0;
+static void* fixture_malloc(std::size_t bytes) { auto* p=std::malloc(bytes);if(p)++callback_allocations;return p; }
+static void fixture_free(void* p) { if(p)--callback_allocations;std::free(p); }
+namespace core {
+struct Signal {
+  std::int64_t value=1;
+  struct { std::uintptr_t event_mailbox_ptr=0;std::uint32_t event_id=0; } signal_;
+  alignas(32) std::uint64_t start_ts=0;
+  alignas(32) std::uint64_t end_ts=0;
+  std::uint64_t LoadRelaxed()const{return value;}
+  void* ValueLocation(){return &value;}
+  void GetSdmaTsAddresses(std::uint64_t*& start,std::uint64_t*& end){start=&start_ts;end=&end_ts;}
+  static hsa_signal_t Convert(Signal* signal){return reinterpret_cast<std::uintptr_t>(signal);}
+};
+struct Callback { hsa_signal_t signal;bool(*body)(hsa_signal_value_t,void*);void* argument; };
+struct Runtime {
+  static Runtime* runtime_singleton_;
+  std::vector<Callback> callbacks;
+  void SetAsyncSignalHandler(hsa_signal_t signal,int,std::int64_t,bool(*body)(hsa_signal_value_t,void*),void* argument)
+  {callbacks.push_back({signal,body,argument});}
+};
+Runtime instance;Runtime* Runtime::runtime_singleton_=&instance;
+}
+namespace AMD {
+struct hsa_exception:std::runtime_error {hsa_exception(int,const char* message):std::runtime_error(message){}};
+struct GpuAgent {bool enabled=false;bool profiling_enabled()const{return enabled;}};
+static std::uint32_t AlignUp(std::uint32_t x,std::uint32_t n){return (x+n-1)/n*n;}
+static bool IsMultipleOf(void* p,std::uintptr_t alignment){return reinterpret_cast<std::uintptr_t>(p)%alignment==0;}
+struct PacketBytes {
+  std::vector<std::uint64_t> values=std::vector<std::uint64_t>(4096);
+  std::uint64_t& operator[](std::size_t n){return values.at(n);}
+  void fill(std::size_t first,std::size_t last,std::uint64_t value){std::fill(values.begin()+first,values.begin()+last,value);}
+};
+class BlitSdmaBase {
+public:
+  virtual ~BlitSdmaBase()=default;
+@BASE_DECLARATIONS@
+};
+template<bool useGCR,bool scopeFields> class BlitSdma:public BlitSdmaBase {
+public:
+  GpuAgent* agent_;
+  bool sw_poll_workaround_=true,platform_atomic_support_=true,gang_leader_=false;
+  bool enable_sdma_hdp_flush_=false,hdp_flush_support_=false,is_dxg_=false,fail_reservation=false;
+  std::size_t poll_command_size_=16,atomic_command_size_=16,fence_command_size_=16,timestamp_command_size_=16;
+  std::size_t trap_command_size_=16,flush_command_size_=16,min_submission_size_=0;
+  std::mutex reservation_lock_;
+  std::uint64_t bytes_queued_=0;
+  std::array<char,4096> ring{};
+  PacketBytes bytes_written_;
+  std::size_t timestamp_packets=0,submissions=0,submitted_bytes=0;
+  void* completion_address=nullptr;
+  explicit BlitSdma(GpuAgent* agent):agent_(agent){}
+  char* AcquireWriteAddress(std::uint32_t,std::uint64_t& index){index=0;return fail_reservation?nullptr:ring.data();}
+  void ReleaseWriteAddress(std::uint64_t,std::uint32_t bytes){++submissions;submitted_bytes=bytes;}
+  static std::uint32_t WrapIntoRing(std::uint64_t index){return static_cast<std::uint32_t>(index);}
+  static std::uint32_t gcr_command_size(){return 16;}
+  static void packet(char* address){std::memset(address,0x69,16);}
+  static void BuildPollCommand(char* address,void*,std::uint32_t){packet(address);}
+  void BuildAtomicDecrementCommand(char* address,void* signal){packet(address);completion_address=signal;}
+  static void BuildFenceCommand(char* address,void*,std::uint32_t){packet(address);}
+  static void BuildTrapCommand(char* address,std::uint32_t){packet(address);}
+  static void BuildHdpFlushCommand(char* address){packet(address);}
+  static void BuildGCRCommand(char* address,bool){packet(address);}
+  void BuildGetGlobalTimestampCommand(char* address,void*){packet(address);++timestamp_packets;}
+@SUBMISSION_DECLARATIONS@
+};
+#define malloc fixture_malloc
+#define free fixture_free
+@CALLBACK_DATA@;
+#undef malloc
+#undef free
+@CALLBACK_HANDLER@
+@SUBMISSION_BODIES@
+}
+int main() {
+  struct Case {const char* name;bool initial,later;std::size_t pending;};
+  const Case cases[]{
+    {"deferred_on_off",true,false,1},{"deferred_off_on",false,true,1},
+    {"deferred_on_on",true,true,2},{"deferred_off_off",false,false,2},
+    {"immediate_on_off",true,false,0},{"immediate_off_on",false,true,0},
+  };
+  int failures=0;
+  for(const auto& c:cases) {
+    bool passed=true,packet_ok=true,global_unchanged=true;
+    std::size_t timestamps=0,callbacks=0,bytes=0;
+    for(int replay=0;replay<20;++replay) {
+      AMD::GpuAgent agent;agent.enabled=c.initial;
+      AMD::BlitSdma<false,false> native(&agent);
+      core::Signal first,second,output;
+      std::vector<core::Signal*> deps,gang;
+      if(c.pending)deps.push_back(&first);
+      if(c.pending>1)deps.push_back(&second);
+      std::array<unsigned char,16> original{};original.fill(static_cast<unsigned char>(17+replay));
+      auto source=original;
+      const auto status=native.SubmitCommand(source.data(),source.size(),8,deps,output,gang);
+      passed=passed && status==HSA_STATUS_SUCCESS && (c.pending?native.submissions==0:native.submissions==1);
+      agent.enabled=c.later;
+      // The real callback owns its copied native packets; caller storage may retire.
+      source.fill(0xf2);
+      auto pending=std::move(core::instance.callbacks);core::instance.callbacks.clear();
+      passed=passed && pending.size()==c.pending;
+      for(auto it=pending.rbegin();it!=pending.rend();++it) {
+        reinterpret_cast<core::Signal*>(it->signal)->value=0;
+        passed=(!it->body(0,it->argument)) && passed;++callbacks;
+      }
+      const auto offset=native.timestamp_packets?native.timestamp_command_size_:0;
+      const bool packet_matches=std::memcmp(native.ring.data()+offset,original.data(),original.size())==0;
+      packet_ok=packet_ok && packet_matches;
+      global_unchanged=global_unchanged && agent.enabled==c.later;
+      passed=passed && native.submissions==1 && native.timestamp_packets==(c.initial?2u:0u) &&
+          native.bytes_queued_==8 && native.completion_address==output.ValueLocation() && packet_matches && global_unchanged && callback_allocations==0 &&
+          core::instance.callbacks.empty();
+      timestamps+=native.timestamp_packets;bytes+=native.bytes_queued_;
+    }
+    std::cout<<c.name<<','<<passed<<','<<timestamps<<','<<callbacks<<','<<bytes<<','<<packet_ok<<','<<global_unchanged<<','<<callback_allocations<<'\n';
+    failures+=!passed;
+  }
+  // Original native reservation failure must still propagate through the new
+  // snapshot entry without submitting packets or changing signal/global policy.
+  AMD::GpuAgent agent;agent.enabled=true;
+  AMD::BlitSdma<false,false> rejected(&agent);rejected.fail_reservation=true;
+  core::Signal output;std::vector<core::Signal*> deps,gang;
+  const std::array<unsigned char,16> packet{};
+  const auto status=rejected.SubmitCommand(packet.data(),packet.size(),8,deps,output,gang);
+  const bool rejection=status==HSA_STATUS_ERROR_OUT_OF_RESOURCES && rejected.submissions==0 &&
+      rejected.timestamp_packets==0 && rejected.bytes_queued_==0 && output.value==1 &&
+      agent.enabled && callback_allocations==0 && core::instance.callbacks.empty();
+  std::cout<<"reservation_rejection,"<<rejection<<",0,0,0,1,"<<agent.enabled<<','<<callback_allocations<<'\n';
+  failures+=!rejection;
+  return failures?1:0;
+}

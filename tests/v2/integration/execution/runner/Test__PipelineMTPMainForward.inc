@@ -17,167 +17,156 @@ TEST_P(PipelineMTPStateOwnership, RankMTPConditionAdvancesEveryCapturedParticipa
     if (GetParam() == "CPU") return;
     initCPUBackend(-1);
     const bool cuda = GetParam() == "CUDA";
-    auto *backend = cuda ? getCUDABackend() : getROCmBackend();
+    OriginalNativePipelineReplayAdmission replay(cuda ? DeviceType::CUDA : DeviceType::ROCm);
+    auto *backend = getBackendFor(replay.devices.front());
     ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2) GTEST_SKIP() << "Requires two native GPU participants";
-    for (const bool reverse : {false, true})
+    ASSERT_EQ(replay.devices.size(), 2u);
+    constexpr int participants = 2;
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    // Each stage owns a distinct main layer. Only the final stage owns
+    // the trailing predictor, matching the physical model's global scope.
+    profile.n_layers = participants + 1;
+    profile.mtp_layer_count = 1;
+    profile.d_model = profile.head_dim = profile.vocab_size = 32;
+    profile.d_ff = 64;
+    profile.n_heads = profile.n_kv_heads = 1;
+    profile.max_seq_len = 64;
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.graph_capacity_draft_tokens = 15;
+    std::vector<DevicePlanConfig> memory_inputs;
+    for (int ordinal = 0; ordinal < participants; ++ordinal)
     {
-        constexpr int participants = 2;
-        ModelMemoryProfile profile;
-        profile.architecture = "qwen35";
-        // Each stage owns a distinct main layer. Only the final stage owns
-        // the trailing predictor, matching the physical model's global scope.
-        profile.n_layers = participants + 1;
-        profile.mtp_layer_count = 1;
-        profile.d_model = profile.head_dim = profile.vocab_size = 32;
-        profile.d_ff = 64;
-        profile.n_heads = profile.n_kv_heads = 1;
-        profile.max_seq_len = 64;
-        MTPRuntimeConfig mtp;
-        mtp.enabled = true;
-        mtp.graph_capacity_draft_tokens = 15;
-        std::vector<DevicePlanConfig> memory_inputs;
-        for (int ordinal = 0; ordinal < participants; ++ordinal)
+        DevicePlanConfig input;
+        input.device = replay.devices[ordinal];
+        input.first_layer = input.last_layer = ordinal;
+        input.max_seq_len = input.activation_seq_len = 64;
+        input.mtp_enabled = true;
+        input.mtp_target_query_rows = 16;
+        const auto execution = declaredDeviceGenerationExecutionPolicy(
+            input.device.type, DeviceGenerationExecutionDomain::NativeDomain);
+        const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(execution));
+        input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
+            {32},
+            mtp,
+            family,
+            input.first_layer + 1 == participants
+                ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
+            DeviceGenerationExecutionDomain::NativeDomain);
+        input.local_pipeline_backend = cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        memory_inputs.push_back(input);
+    }
+    auto memory = replay.admit(profile, memory_inputs);
+    std::vector<std::shared_ptr<OrdinaryDGOGraph>> graphs;
+    std::vector<std::unique_ptr<IInferenceRunner>> owners;
+    std::vector<DeviceGraphOrchestrator *> stages;
+    for (int participant = 0; participant < participants; ++participant)
+    {
+
+        const auto device = replay.devices[participant];
+        auto config = stateConfig(device);
+        config.n_layers = 1;
+        config.total_n_layers = profile.n_layers;
+        config.pp_layer_offset = participant;
+        config.layer_types.assign(profile.n_layers, "full_attention");
+        config.kv_cache_precision = KVCachePrecision::FP16;
+        config.mtp = mtp;
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
+        auto graph = std::make_shared<OrdinaryDGOGraph>(config, participant == 0, participant + 1 == participants, memory);
+        auto owner = DeviceGraphOrchestrator::createForTest({
+            .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph, .physical_memory_authority = memory});
+        owner->setPPStageConfig({.first_layer = participant, .last_layer = participant + 1,
+            .has_embedding = participant == 0, .has_lm_head = participant + 1 == participants});
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        context.submitAndWait([&] {
+            ASSERT_TRUE(graph->table.ensureOnDevice(device, context.defaultStream()));
+            TransferEngine::publishDeviceWrite(&graph->table, device, context.defaultStream());
+            ASSERT_TRUE(owner->initializeInferenceStateFromArena(1, 64, device));
+        });
+        ASSERT_FALSE(HasFatalFailure());
+        if (participant + 1 == participants)
         {
-            DevicePlanConfig input;
-            input.world_rank = 0;
-            input.device = cuda ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
-            input.first_layer = input.last_layer = reverse ? participants - 1 - ordinal : ordinal;
-            // Declare real admission capacity: the retained depth-15 family
-            // includes opaque native graph/workspace bounds beyond this toy's
-            // tiny tensor payloads. No reserve or secondary ledger is added.
-            input.device_total_bytes = backend->deviceMemoryTotal(ordinal);
-            input.device_free_bytes = backend->deviceMemoryFree(ordinal);
-            input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
-                .device = DeviceId::cpu(), .total_bytes = 1ull << 30, .admission_available_bytes = 1ull << 30};
-            input.device_compute_units = 128;
-            input.max_seq_len = input.activation_seq_len = 64;
-            input.mtp_enabled = true;
-            input.mtp_target_query_rows = 16;
-            const auto execution = declaredDeviceGenerationExecutionPolicy(
-                input.device.type, DeviceGenerationExecutionDomain::NativeDomain);
-            const auto family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(execution));
-            input.captured_serving_graphs = resolveCapturedServingGraphMemoryInventory(
-                {32},
-                mtp,
-                family,
-                input.first_layer + 1 == participants
-                    ? MTPGenerationParentRole::Controller : MTPGenerationParentRole::PipelineFollower,
-                DeviceGenerationExecutionDomain::NativeDomain);
-            input.local_pipeline_backend = cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
-            memory_inputs.push_back(input);
+            // Only the PP terminal owns a learned predictor.  Installing
+            // its frozen marker before family materialization verifies the
+            // same typed authority production uses for a retained sidecar;
+            // followers deliberately remain predictor-free.
+            owner->setFrozenWeightSet(
+                makeOrdinaryMTPFrozenWeightSet(*graph, device));
         }
-        auto memory = std::make_shared<PhysicalMemoryAuthority>(
-            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(MemoryPlanner::plan(profile, memory_inputs).physicalPlan()), 0);
-        std::vector<std::shared_ptr<OrdinaryDGOGraph>> graphs;
-        std::vector<std::unique_ptr<IInferenceRunner>> owners;
-        std::vector<DeviceGraphOrchestrator *> stages;
+        stages.push_back(owner.get());
+        graphs.push_back(std::move(graph));
+        owners.push_back(std::move(owner));
+    }
+    RankOrchestrator::Config rank_config;
+    rank_config.mode = RankOrchestrator::ParallelismMode::PP;
+    rank_config.original_pipeline_mpi_ctx = replay.mpi;
+    rank_config.max_seq_len = 64;
+    for (int participant = 0; participant < participants; ++participant)
+        rank_config.pp_stages.push_back({.first_layer = participant, .last_layer = participant + 1,
+            .has_embedding = participant == 0, .has_lm_head = participant + 1 == participants,
+            .stage_devices = {GlobalDeviceAddress::fromLocalDeviceId(stages[participant]->primaryDeviceId())}});
+    auto rank = RankOrchestrator::createForTestWithPipelineStages(
+        MockModelContext::createMinimal(), std::move(owners), rank_config);
+    ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch({
+        .prefill_bucket_rows = {32}, .prefill_pad_token_id = 0,
+        .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+    const std::array builds{graphs[0]->builds, graphs[1]->builds};
+    // Use the exact captured prefill geometry.  A one-token prompt would
+    // be an inadmissible padded replay below the production bucket's
+    // minimum, whereas this full bucket proves the same graph that a
+    // serving request actually executes.
+    std::array<int, 32> prompt{};
+    prompt.fill(2);
+    // The injected pipeline deliberately has no legacy LocalPPContext:
+    // production graph-native PP prefill crosses participants through the
+    // retained bucket transaction installed above.  Going through the old
+    // sequential forwardPP() entrypoint would test an absent transport
+    // object rather than the captured pipeline being proved here.
+    ASSERT_TRUE(rank->supportsPrefillChunkSchedule(
+        static_cast<int>(prompt.size())));
+    ASSERT_TRUE(rank->forwardPrefillChunkSchedule(
+        prompt.data(),
+        static_cast<int>(prompt.size()),
+        {.bucket_sizes = {32}, .fixed_chunk_real_tokens = 32,
+         .real_token_start = 0,
+         .real_token_count = static_cast<int>(prompt.size())},
+        /*restored_prefix_tokens=*/0,
+        /*allow_padded_execution=*/true));
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        const int token = (iteration * 7 + 3) % 32;
+        const auto purpose = kMTPConditionForwardPurposes[iteration % kMTPConditionForwardPurposes.size()];
+        ASSERT_TRUE(rank->stageStochasticTargetTokenForDeviceSampling(token, 0));
+        ASSERT_TRUE(rank->advanceMTPMainConditionFromDeviceTargetSample(-1, 0, purpose));
         for (int participant = 0; participant < participants; ++participant)
         {
-            const int ordinal = reverse ? participants - 1 - participant : participant;
-            const auto device = cuda ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
-            auto config = stateConfig(device);
-            config.n_layers = 1;
-            config.total_n_layers = profile.n_layers;
-            config.pp_layer_offset = participant;
-            config.layer_types.assign(profile.n_layers, "full_attention");
-            config.kv_cache_precision = KVCachePrecision::FP16;
-            config.mtp = mtp;
-            config.prefix_cache.enabled = false;
-            config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
-            auto graph = std::make_shared<OrdinaryDGOGraph>(config, participant == 0, participant + 1 == participants);
-            auto owner = DeviceGraphOrchestrator::createForTest({
-                .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph, .physical_memory_authority = memory});
-            owner->setPPStageConfig({.first_layer = participant, .last_layer = participant + 1,
-                .has_embedding = participant == 0, .has_lm_head = participant + 1 == participants});
+            SCOPED_TRACE(::testing::Message() << "iteration=" << iteration
+                << " participant=" << participant);
+            auto &stage = *stages[participant];
+            const auto device = stage.primaryDeviceId();
             auto &context = GPUDeviceContextPool::instance().getContext(device);
             context.submitAndWait([&] {
-                ASSERT_TRUE(graph->table.ensureOnDevice(device, context.defaultStream()));
-                TransferEngine::publishDeviceWrite(&graph->table, device, context.defaultStream());
-                ASSERT_TRUE(owner->initializeInferenceStateFromArena(1, 64, device));
+                void *const producer = DeviceGraphOrchestratorLiveStateTestAccess::mainForwardProducerStream(stage);
+                ASSERT_NE(producer, nullptr);
+                int32_t cached = -1;
+                ASSERT_TRUE(backend->deviceToHost(&cached,
+                    stage.inferenceState().kv_cache->deviceSequenceCachedTokenCountPtr(0), sizeof(cached),
+                    device.gpu_ordinal(), producer));
+                EXPECT_EQ(cached, iteration + 33);
+                const auto row = DeviceGraphOrchestratorLiveStateTestAccess::followerInput(stage, 1);
+                int32_t received = -1;
+                ASSERT_TRUE(backend->deviceToHost(&received, row.token_ids_device, sizeof(received),
+                    device.gpu_ordinal(), producer));
+                EXPECT_EQ(received, token);
+                std::array<float, 32> hidden{};
+                ASSERT_TRUE(backend->deviceToHost(hidden.data(), stage.inferenceState().hidden->gpu_data_ptr(),
+                    sizeof(hidden), device.gpu_ordinal(), producer));
+                for (int column = 0; column < 32; ++column)
+                    EXPECT_EQ(hidden[column], (column - token - 1 + 32) % 32 < 4 ? 4.0F : -16.0F);
             });
-            ASSERT_FALSE(HasFatalFailure());
-            if (participant + 1 == participants)
-            {
-                // Only the PP terminal owns a learned predictor.  Installing
-                // its frozen marker before family materialization verifies the
-                // same typed authority production uses for a retained sidecar;
-                // followers deliberately remain predictor-free.
-                owner->setFrozenWeightSet(
-                    makeOrdinaryMTPFrozenWeightSet(*graph, device));
-            }
-            stages.push_back(owner.get());
-            graphs.push_back(std::move(graph));
-            owners.push_back(std::move(owner));
-        }
-        RankOrchestrator::Config rank_config;
-        rank_config.mode = RankOrchestrator::ParallelismMode::PP;
-        rank_config.max_seq_len = 64;
-        for (int participant = 0; participant < participants; ++participant)
-            rank_config.pp_stages.push_back({.first_layer = participant, .last_layer = participant + 1,
-                .has_embedding = participant == 0, .has_lm_head = participant + 1 == participants,
-                .stage_devices = {GlobalDeviceAddress::fromLocalDeviceId(stages[participant]->primaryDeviceId())}});
-        auto rank = RankOrchestrator::createForTestWithPipelineStages(
-            MockModelContext::createMinimal(), std::move(owners), rank_config);
-        ASSERT_TRUE(rank->materializeServingGraphFamilyWithoutLaunch({
-            .prefill_bucket_rows = {32}, .prefill_pad_token_id = 0,
-            .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
-        const std::array builds{graphs[0]->builds, graphs[1]->builds};
-        // Use the exact captured prefill geometry.  A one-token prompt would
-        // be an inadmissible padded replay below the production bucket's
-        // minimum, whereas this full bucket proves the same graph that a
-        // serving request actually executes.
-        std::array<int, 32> prompt{};
-        prompt.fill(2);
-        // The injected pipeline deliberately has no legacy LocalPPContext:
-        // production graph-native PP prefill crosses participants through the
-        // retained bucket transaction installed above.  Going through the old
-        // sequential forwardPP() entrypoint would test an absent transport
-        // object rather than the captured pipeline being proved here.
-        ASSERT_TRUE(rank->supportsPrefillChunkSchedule(
-            static_cast<int>(prompt.size())));
-        ASSERT_TRUE(rank->forwardPrefillChunkSchedule(
-            prompt.data(),
-            static_cast<int>(prompt.size()),
-            {.bucket_sizes = {32}, .fixed_chunk_real_tokens = 32,
-             .real_token_start = 0,
-             .real_token_count = static_cast<int>(prompt.size())},
-            /*restored_prefix_tokens=*/0,
-            /*allow_padded_execution=*/true));
-        for (int iteration = 0; iteration < 20; ++iteration)
-        {
-            const int token = (iteration * 7 + 3) % 32;
-            const auto purpose = kMTPConditionForwardPurposes[iteration % kMTPConditionForwardPurposes.size()];
-            ASSERT_TRUE(rank->stageStochasticTargetTokenForDeviceSampling(token, 0));
-            ASSERT_TRUE(rank->advanceMTPMainConditionFromDeviceTargetSample(-1, 0, purpose));
-            for (int participant = 0; participant < participants; ++participant)
-            {
-                SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " iteration=" << iteration
-                    << " participant=" << participant);
-                auto &stage = *stages[participant];
-                const auto device = stage.primaryDeviceId();
-                auto &context = GPUDeviceContextPool::instance().getContext(device);
-                context.submitAndWait([&] {
-                    void *const producer = DeviceGraphOrchestratorLiveStateTestAccess::mainForwardProducerStream(stage);
-                    ASSERT_NE(producer, nullptr);
-                    int32_t cached = -1;
-                    ASSERT_TRUE(backend->deviceToHost(&cached,
-                        stage.inferenceState().kv_cache->deviceSequenceCachedTokenCountPtr(0), sizeof(cached),
-                        device.gpu_ordinal(), producer));
-                    EXPECT_EQ(cached, iteration + 33);
-                    const auto row = DeviceGraphOrchestratorLiveStateTestAccess::followerInput(stage, 1);
-                    int32_t received = -1;
-                    ASSERT_TRUE(backend->deviceToHost(&received, row.token_ids_device, sizeof(received),
-                        device.gpu_ordinal(), producer));
-                    EXPECT_EQ(received, token);
-                    std::array<float, 32> hidden{};
-                    ASSERT_TRUE(backend->deviceToHost(hidden.data(), stage.inferenceState().hidden->gpu_data_ptr(),
-                        sizeof(hidden), device.gpu_ordinal(), producer));
-                    for (int column = 0; column < 32; ++column)
-                        EXPECT_EQ(hidden[column], (column - token - 1 + 32) % 32 < 4 ? 4.0F : -16.0F);
-                });
-                EXPECT_EQ(graphs[participant]->builds, builds[participant]) << "Live execution must reuse serving captures";
-            }
+            EXPECT_EQ(graphs[participant]->builds, builds[participant]) << "Live execution must reuse serving captures";
         }
     }
 }
@@ -220,12 +209,10 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
     OrdinaryGraphEvidence evidence("generation,forward_graph,mtp");
     initCPUBackend(-1);
     const bool cuda = GetParam() == "CUDA";
-    auto *backend = cuda ? getCUDABackend() : getROCmBackend();
+    OriginalNativePipelineReplayAdmission replay(cuda ? DeviceType::CUDA : DeviceType::ROCm);
+    auto *backend = getBackendFor(replay.devices.front());
     ASSERT_NE(backend, nullptr);
-    if (backend->deviceCount() < 2) GTEST_SKIP() << "Requires two native GPU participants";
-    for (const bool reverse : {false, true})
-    {
-    SCOPED_TRACE(::testing::Message() << "reverse=" << reverse);
+    ASSERT_EQ(replay.devices.size(), 2u);
     MTPRuntimeConfig mtp;
     mtp.enabled = true;
     mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
@@ -254,14 +241,8 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
     for (int ordinal = 0; ordinal < 2; ++ordinal)
     {
         DevicePlanConfig input;
-        input.world_rank = 0;
-        input.device = cuda ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal);
-        input.first_layer = input.last_layer = reverse ? 1 - ordinal : ordinal;
-        input.device_total_bytes = backend->deviceMemoryTotal(ordinal);
-        input.device_free_bytes = backend->deviceMemoryFree(ordinal);
-        input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
-            .device = DeviceId::cpu(), .total_bytes = 1ull << 30, .admission_available_bytes = 1ull << 30};
-        input.device_compute_units = 128;
+        input.device = replay.devices[ordinal];
+        input.first_layer = input.last_layer = ordinal;
         input.max_seq_len = input.activation_seq_len = 512;
         input.mtp_enabled = true;
         input.mtp_target_query_rows = 16;
@@ -278,14 +259,13 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
         input.local_pipeline_backend = cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
         memory_inputs.push_back(input);
     }
-    auto memory = std::make_shared<PhysicalMemoryAuthority>(
-        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(MemoryPlanner::plan(profile, memory_inputs).physicalPlan()), 0);
+    auto memory = replay.admit(profile, memory_inputs);
     std::vector<std::shared_ptr<OrdinaryDGOGraph>> graphs;
     std::vector<std::unique_ptr<IInferenceRunner>> owners;
     std::vector<DeviceGraphOrchestrator *> stages;
     for (int participant = 0; participant < 2; ++participant)
     {
-        const auto device = memory_inputs[reverse ? 1 - participant : participant].device;
+        const auto device = replay.devices[participant];
         auto config = stateConfig(device);
         config.n_layers = 1;
         config.total_n_layers = profile.n_layers;
@@ -296,7 +276,7 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
         config.mtp = mtp;
         config.prefix_cache.enabled = false;
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Disabled;
-        auto graph = std::make_shared<OrdinaryDGOGraph>(config, participant == 0, participant == 1);
+        auto graph = std::make_shared<OrdinaryDGOGraph>(config, participant == 0, participant == 1, memory);
         auto owner = DeviceGraphOrchestrator::createForTest({
             .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph, .physical_memory_authority = memory});
         owner->setPPStageConfig({.first_layer = participant, .last_layer = participant + 1,
@@ -316,6 +296,7 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
     }
     RankOrchestrator::Config rank_config;
     rank_config.mode = RankOrchestrator::ParallelismMode::PP;
+    rank_config.original_pipeline_mpi_ctx = replay.mpi;
     rank_config.max_seq_len = 512;
     for (int participant = 0; participant < 2; ++participant)
         rank_config.pp_stages.push_back({.first_layer = participant, .last_layer = participant + 1,
@@ -446,7 +427,6 @@ void PipelineMTPStateOwnership::runPublicMTPStreamingProof(MTPDepthPolicyMode mo
             committed_transactions += record.value;
     EXPECT_GT(committed_transactions, 80)
         << "Every request/continuation must execute complete captured MTP transactions";
-    }
 }
 
 /** @test Adaptive-depth continuations retain graph identity and exact serial output. */

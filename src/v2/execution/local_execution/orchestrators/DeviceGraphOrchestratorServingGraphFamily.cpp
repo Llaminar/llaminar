@@ -328,7 +328,11 @@ namespace llaminar2
         const ServingGraphFamilyMaterializationPlan &requested_plan)
     {
         auto plan = requested_plan;
-        if (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary())
+        // Every typed pipeline domain receives into each participant's OWN
+        // admitted arena bank, including homogeneous native TP/EP domains.
+        // The enclosing TP runner passes one stage plan to all members; its
+        // primary bank is not an input owner for any of its siblings.
+        if (pipeline_forward_edges_ && pipeline_forward_edges_->hasDomainBoundary())
             plan.pipeline_hidden_input = pp_stage_config_ && !pp_stage_config_->has_embedding
                 ? state_.hidden.get() : nullptr;
         ScopedDeviceLog device_log(state_.device_id);
@@ -401,6 +405,10 @@ namespace llaminar2
                 "before request ticket authority is installed");
             return false;
         }
+        const auto placement = graph_builder_ ? graph_builder_->config().ngram_table_placement : nullptr;
+        if (placement && placement->fixedHeadPipeline() &&
+            normalized_buckets != exactPrefillGraphWidths(normalized_buckets.back()))
+            throw std::invalid_argument("Fixed PLE pipeline serving family omitted a retained exact prefill width");
         if (!serving_graph_family_plan_)
             serving_graph_family_plan_ = plan;
         if (pp_stage_config_.has_value() &&

@@ -221,15 +221,18 @@ def main(argv: list[str] | None = None) -> int:
         if installed is not None:
             validate_prerequisites(installed)
             report["prerequisite_report_digest"] = digest(installed)
-        prerequisites = ((installed["preflight_return_code"], installed["preflight_elapsed_seconds"],
-                          installed["preflight_tests"]) if installed is not None else
+        prerequisites = (parity.PreflightResult(installed["preflight_return_code"], installed["preflight_elapsed_seconds"],
+                          tuple(installed["preflight_tests"]), installed["preflight_qualification"]) if installed is not None else
                          parity.reuse_unchanged_production_test_preflight(args.build_dir, args.reuse_preflight_report)
                          if args.reuse_preflight_report else
                          parity.run_production_test_preflight(args.build_dir, None,
                                                                artifact_directory=args.output / "preflight"))
-        code, elapsed, tests = prerequisites
+        code = prerequisites.return_code
+        elapsed = prerequisites.elapsed_seconds
+        tests = prerequisites.tests
         report.update(preflight_return_code=code, preflight_elapsed_seconds=elapsed,
                       preflight_tests=list(tests), preflight_test_count=len(tests),
+                      preflight_qualification=prerequisites.qualification,
                       preflight_build_directory=str(args.build_dir.resolve()),
                       preflight_completed_ns=time.time_ns())
         if args.reuse_preflight_report:

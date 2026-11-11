@@ -14,6 +14,7 @@ also remain available in Release without admitting functional test binaries.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -31,6 +32,7 @@ CMAKE_LISTS = MODULE.parent.parent / "CMakeLists.txt"
 OWNED_REGISTRATION = MODULE.with_name("OwnedSharedBackingTests.cmake")
 COHORT_REGISTRATION = MODULE.with_name("V2PooledCompleteCohortTests.cmake")
 HOST_SERVICE_REGISTRATION = MODULE.with_name("V2RetainedHostServiceTests.cmake")
+PEER_TRANSFER_REGISTRATION = MODULE.with_name("V2OriginalExpertPeerTransferTests.cmake")
 
 
 class TestTargetSelection(unittest.TestCase):
@@ -360,7 +362,8 @@ endforeach()
         stop = declaration.index("endfunction()", first) + len("endfunction()")
         helper = declaration[first:stop]
         first = declaration.index("    add_v2_test(V2_Integration_GPUExpertTransfer")
-        aggregate = declaration[first:declaration.index("    if(HAVE_CUDA)", first)]
+        aggregate = declaration[first:declaration.index(
+            "    add_v2_test(V2_Integration_HeterogeneousGPUExpertBlobTransfer", first)]
         owner = MODULE.with_name("V2FiniteStorageParentTests.cmake")
         replay = CMAKE_LISTS.parent / "integration/transfer/FiniteBodySiblingNativeReplay.inc"
         new_cases = re.findall(r"TEST\(FiniteBodySiblingNativeIntegration,\s*(\w+)\)", replay.read_text())
@@ -370,8 +373,12 @@ endforeach()
         source_stop = declaration.index("    add_executable(v2_unit_gpu_expert_transfer", source_first)
         old_sources = re.findall(r"(?:unit|integration)/[\w/.-]+[.]cpp", declaration[source_first:source_stop])
         old_suites = set()
+        old_cases = set()
         for relative in old_sources:
-            old_suites.update(re.findall(r"TEST(?:_F|_P)?\(\s*(\w+)\s*,", (CMAKE_LISTS.parent / relative).read_text()))
+            body = (CMAKE_LISTS.parent / relative).read_text()
+            old_suites.update(re.findall(r"TEST(?:_F|_P)?\(\s*(\w+)\s*,", body))
+            old_cases.update(".".join(case) for case in re.findall(
+                r"TEST(?:_F|_P)?\(\s*(\w+)\s*,\s*(\w+)\s*\)", body))
         self.assertTrue(old_suites)
         self.assertNotIn("FiniteBodySiblingNativeIntegration", old_suites)
         for cuda, rocm in ((True, False), (False, True), (True, True)):
@@ -407,6 +414,8 @@ foreach(target v2_unit_gpu_expert_transfer v2_test_compute_graph_execution)
     # actual native fixture execution remains a separate GPU qualification.
     file(CREATE_LINK "${{CMAKE_COMMAND}}" "${{CMAKE_CURRENT_BINARY_DIR}}/${{target}}" SYMBOLIC)
 endforeach()
+include("{PEER_TRANSFER_REGISTRATION.as_posix()}")
+file(CREATE_LINK "${{CMAKE_COMMAND}}" "${{CMAKE_CURRENT_BINARY_DIR}}/v2_integration_original_expert_peer_transfer" SYMBOLIC)
 {aggregate}
 include("{owner.as_posix()}")
 """
@@ -421,9 +430,37 @@ include("{owner.as_posix()}")
                 tests = {entry["name"]: entry for entry in json.loads(inventory.stdout)["tests"]}
                 old = tests["V2_Integration_GPUExpertTransfer"]["command"]
                 filters = [arg for arg in old if arg.startswith("--gtest_filter=")]
-                self.assertEqual(filters, ["--gtest_filter=-FiniteBodySiblingNativeIntegration.*"])
-                # The ONLY exclusion is the newly introduced namespace; every
-                # source-owned original suite remains admitted by that filter.
+                self.assertEqual(len(filters), 1)
+                self.assertTrue(filters[0].startswith("--gtest_filter=-"))
+                exclusions = filters[0].removeprefix("--gtest_filter=-").split(":")
+                self.assertEqual(len(exclusions), len(set(exclusions)))
+                self.assertEqual(exclusions[0], "FiniteBodySiblingNativeIntegration.*")
+                # Every removed original body has one real MPI-owner registration.
+                # Source-owned preparation controls must remain in the aggregate.
+                peers = {name: entry for name, entry in tests.items()
+                         if name.startswith("V2_Integration_OriginalExpertPeerTransfer_")}
+                self.assertEqual(len(peers), 4 * (cuda + rocm))
+                peer_filters = set()
+                for entry in peers.values():
+                    command = entry["command"]
+                    selected = [arg.removeprefix("--gtest_filter=") for arg in command
+                                if arg.startswith("--gtest_filter=")]
+                    self.assertEqual(len(selected), 1)
+                    self.assertIn(selected[0], old_cases)
+                    self.assertNotIn(selected[0], peer_filters)
+                    peer_filters.add(selected[0])
+                    properties = {item["name"]: item["value"] for item in entry["properties"]}
+                    family = "CUDA" if "CUDA." in selected[0] else "ROCm"
+                    for label in ("ProductionTestPreflight", "FullDeviceInventory",
+                                  "HardwareOptional", "Devices2", "DirectedPeerEdge"):
+                        self.assertIn(label, properties["LABELS"])
+                    self.assertNotIn(family + "Devices2", properties["LABELS"])
+                    self.assertEqual(properties["TIMEOUT"], 30)
+                    self.assertEqual(command[command.index("-np") + 1], "2")
+                self.assertEqual(set(exclusions[1:]), peer_filters)
+                excluded_original = {case for case in old_cases
+                                     if any(fnmatch.fnmatchcase(case, pattern) for pattern in exclusions)}
+                self.assertEqual(excluded_original, peer_filters)
                 for suite in old_suites:
                     self.assertFalse(suite.startswith("FiniteBodySiblingNativeIntegration"))
                 expected = {case for case in new_cases if (cuda and case.startswith("CUDA_")) or

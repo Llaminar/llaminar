@@ -8,6 +8,7 @@
  * retain actual bytes/claims. No GPU execution value is copied to the host.
  */
 #pragma once
+#include "collective/NativeLocalTPContextBorrow.h"
 #include "PooledImmutableNativePlan.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "loaders/ImmutableLookupNativeOwnership.h"
@@ -80,12 +81,12 @@ private:
     /** @brief Release only this exact cold/captured invocation after its original graphs have retired. */
     void releaseInvocationChannel(const CapturedTransferBinding& original);
     /** @brief Drop one original immutable native cohort borrow after actual parent retirement, never on request reset. */
-    void releaseNativeInvocation(const std::shared_ptr<const Qwen4ExpReplicatedPLECohort>& original, int participant);
+    void releaseNativeInvocation(const NativeLocalTPContextBorrow& original, int participant);
 
     /** @brief Bind once to the original owner invocation receiver before any graph is recorded. */
     void bindInvocationChannel(const CapturedTransferBinding& original);
-    /** @brief Bind only an original continuation reader's native abort capability before any parent capture. */
-    void bindNativeInvocation(std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, int participant);
+    /** @brief Bind an original native transport member’s abort capability before any parent capture. */
+    void bindNativeInvocation(NativeLocalTPContextBorrow cohort, int participant);
     /** @return Original immutable native communicator/abort identity; absent on mapped/local owners. */
     ncclLlaminarCompletionAuthority nativeInvocationAuthority() const;
 
@@ -96,7 +97,7 @@ private:
     std::shared_ptr<detail::PooledNativeRootStorage> roots_;
     /** Destroy the original allocation borrow before releasing its physical root/claim owner. */
     std::shared_ptr<const CapturedTransferBinding> original_invocation_;
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> native_invocation_cohort_;
+    std::optional<NativeLocalTPContextBorrow> native_invocation_cohort_;
     int native_invocation_participant_ = -1;
     ncclLlaminarCompletionAuthority native_invocation_authority_{}; ///< Immutable original borrow remains valid through abort and physical retirement.
 };

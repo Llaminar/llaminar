@@ -33,6 +33,10 @@
  * CPU serial storage declarations survive admission and runtime projection.
  * Explicit prefill transport diagnostics freeze into the existing phase-aware
  * graph configuration; driver topology and decode/MTP policy stay authoritative.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #include "RankOrchestrator.h"
@@ -119,22 +123,6 @@ namespace llaminar2
 {
     namespace
     {
-        /**
-         * @brief Copy the diagnostic once at cold Rank startup, never on replay.
-         * @return Immutable typed process-startup choice shared by every Rank child.
-         * @throws std::invalid_argument for a malformed explicit environment value.
-         *
-         * DebugEnv::envValue is only a lookup boundary, so the function-local
-         * const owns the parsed value rather than retaining an environment pointer.
-         * Reloading DebugEnv or changing the environment cannot rewrite live graphs.
-         */
-        const std::optional<MoEOverlayNodeLocalRouteTransport> &
-        diagnosticMoEPrefillRouteTransport()
-        {
-            static const auto selected = parseMoEOverlayDiagnosticPrefillTransport(
-                DebugEnv::envValue(kMoEOverlayDiagnosticPrefillTransportEnv));
-            return selected;
-        }
         /**
          * @brief Authenticate all local graph owners against a frozen PP domain.
          * @param runner The single-device runner or existing nested TP owner.
@@ -795,7 +783,7 @@ namespace llaminar2
         {
             throw std::invalid_argument("Invalid RankOrchestrator configuration");
         }
-        if (diagnosticMoEPrefillRouteTransport())
+        if (resolvedMoEOverlayDiagnosticPrefillTransport())
         {
             // Auxiliary expert ranks share the original global overlay plan;
             // only its exact multi-GPU continuation cell applies this policy.
@@ -1389,51 +1377,17 @@ namespace llaminar2
                     root_index < static_cast<int>(
                                      continuation_domain->participants.size()))
                 {
-                    const bool homogeneous = std::all_of(
-                        cell_devices.begin() + 1,
-                        cell_devices.end(),
-                        [&](const DeviceId &candidate)
-                        {
-                            return candidate.type ==
-                                   cell_devices.front().type;
-                        });
-                    std::optional<PeerAccessCoverage> peer_coverage;
-                    if (homogeneous)
-                    {
-                        peer_coverage =
-                            DeviceManager::instance().peerAccessCoverage(
-                                cell_devices);
-                    }
-
-                    MoEOverlayNodeLocalRouteTransportPolicy selected_policy =
-                        config_.moe_node_local_route_transport_policy;
-                    if (!selected_policy.unresolved() &&
-                        !selected_policy.resolved())
-                    {
-                        throw std::runtime_error(
-                            "RankOrchestrator: continuation route transport policy is only partially resolved");
-                    }
-                    if (selected_policy.unresolved())
-                    {
-                        selected_policy =
-                            selectMoEOverlayNodeLocalRouteTransportPolicy(
-                                cell_devices, peer_coverage);
-                    }
-                    // Support is independent of the default economy choice:
-                    // mapped transport on real P2P hardware is an explicit mode.
-                    validateMoEOverlayNodeLocalRouteTransportPolicy(
-                        cell_devices, peer_coverage, selected_policy);
-                    if (const auto diagnostic = diagnosticMoEPrefillRouteTransport())
-                    {
-                        const auto diagnostic_policy =
-                            selectMoEOverlayDiagnosticPrefillTransportPolicy(
-                                cell_devices, peer_coverage, diagnostic);
-                        if (config_.moe_node_local_route_transport_policy.resolved() &&
-                            selected_policy != diagnostic_policy)
-                            throw std::invalid_argument(
-                                "Diagnostic MoE prefill route transport conflicts with the preselected graph policy");
-                        selected_policy = diagnostic_policy;
-                    }
+                    const bool homogeneous = std::all_of(cell_devices.begin(), cell_devices.end(),
+                        [&](const auto& device) { return device.type == cell_devices.front().type; });
+                    if (!config_.moe_node_local_route_transport_policy.unresolved() &&
+                        !config_.moe_node_local_route_transport_policy.resolved())
+                        throw std::invalid_argument("Rank continuation route transport policy is only partially resolved");
+                    if (!overlay_plan.observed_route_transport || !overlay_plan.observed_route_transport->resolved())
+                        throw std::invalid_argument("Rank continuation route requires its original hardware-bound transport policy");
+                    const auto selected_policy = *overlay_plan.observed_route_transport;
+                    if (config_.moe_node_local_route_transport_policy.resolved() &&
+                        config_.moe_node_local_route_transport_policy != selected_policy)
+                        throw std::invalid_argument("Rank continuation route changed its admitted original transport policy");
                     config_.moe_node_local_route_transport_policy =
                         selected_policy;
 
@@ -1444,18 +1398,27 @@ namespace llaminar2
 
                     if (selected_policy.requiresMappedExchange())
                     {
-                        if (!config_.moe_node_local_route_exchange)
                         {
-                            config_.moe_node_local_route_exchange =
-                                std::make_shared<
-                                    MoEOverlayNodeLocalRouteExchange>(
-                                    MoEOverlayNodeLocalRouteExchange::Config{
-                                        .devices = cell_devices,
-                                        .root_device = root_device,
-                                        .identity =
-                                            "continuation:" +
-                                            continuation_domain->name,
-                                    });
+                            const auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_);
+                            const auto memory = model && model->concreteWeightManager()
+                                ? model->concreteWeightManager()->physicalMemoryAuthority() : nullptr;
+                            const auto mpi = config_.moe_expert_overlay_mpi_ctx;
+                            const auto inventory = mpi ? mpi->clusterInventory() : nullptr;
+                            if (!model || !memory || !inventory)
+                                throw std::invalid_argument("Mapped continuation requires its original admitted model and MPI inventory");
+                            const auto profile = ModelMemoryProfile::fromGGUF(model->concreteLoader().getModel());
+                            const auto rows = OrdinaryTerminalProjectionCapacity::checkedFlattenedRows(config_.batch_size,
+                                config_.resident_graph_rows > 0 ? config_.resident_graph_rows :
+                                resolveActivationBufferSeqLen(config_.max_seq_len, root_device));
+                            MoEOverlayNodeLocalRouteExchange::Config topology{
+                                .devices = cell_devices, .root_device = root_device,
+                                .identity = "continuation:" + continuation_domain->name};
+                            auto storage = MoEOverlayNodeLocalRouteExchange::declareStorage(
+                                topology, rows, profile.expert_used_count, profile.d_model);
+                            if (!config_.moe_node_local_route_exchange)
+                                config_.moe_node_local_route_exchange = std::make_shared<MoEOverlayNodeLocalRouteExchange>(
+                                    std::move(topology), storage, memory, inventory);
+                            else config_.moe_node_local_route_exchange->requireOriginalAdmission(storage, memory, inventory);
                         }
                     }
                     else if (config_.moe_node_local_route_exchange)
@@ -1464,12 +1427,7 @@ namespace llaminar2
                             "RankOrchestrator: all-native continuation route transport policy cannot retain a mapped sparse exchange");
                     }
 
-                    const std::string peer_access =
-                        homogeneous
-                            ? (peer_coverage
-                                   ? peerAccessCoverageName(*peer_coverage)
-                                   : "preselected")
-                            : "heterogeneous";
+                    const std::string peer_access = homogeneous ? "original_observed" : "heterogeneous";
                     const auto record_transport =
                         [&](std::string phase,
                             MoEOverlayNodeLocalRouteTransport transport)
@@ -1726,30 +1684,29 @@ namespace llaminar2
                 {
                     std::vector<DeviceId> members;
                     for (const auto &address : devices) members.push_back(address.toLocalDeviceId());
-                    const auto coverage = DeviceManager::instance().peerAccessCoverage(members);
-                    if (!coverage) throw std::runtime_error("Projection transport has no canonical P2P observation");
-                    if (*coverage == PeerAccessCoverage::None)
+                    const auto original_mpi = config_.moe_expert_overlay_mpi_ctx;
+                    const auto original_inventory = original_mpi ? original_mpi->clusterInventory() : nullptr;
+                    const auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_);
+                    if (!original_inventory || !model || !memory_authority)
+                        throw std::logic_error("Projection transport requires its original rank inventory and admitted model/physical authority");
+                    const auto &observed = original_inventory->getRank(memory_authority->worldRank());
+                    const auto topology = DeviceCountedAllGatherTopology::resolve(observed, members);
+                    const auto arena = MoEProjectionArenaGeometry::resolve(
+                        ModelMemoryProfile::fromGGUF(model->concreteLoader().getModel()), members.size());
+                    const int rows = std::max(config_.resident_graph_rows > 0
+                        ? std::min(static_cast<int>(config_.max_seq_len), config_.resident_graph_rows)
+                        : resolveActivationBufferSeqLen(config_.max_seq_len, members.front()),
+                        retainsMTPGraphCapacity(config_.mtp) ? resolveMTPRetainedTargetQueryRows(config_.mtp) : 1);
+                    std::vector<void *> streams(members.size());
+                    for (std::size_t i = 0; i < members.size(); ++i)
                     {
-                        const auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_);
-                        if (!model || !memory_authority)
-                            throw std::logic_error("Projection transport has no admitted model/physical authority");
-                        const auto arena = MoEProjectionArenaGeometry::resolve(
-                            ModelMemoryProfile::fromGGUF(model->concreteLoader().getModel()), members.size());
-                        const int rows = std::max(config_.resident_graph_rows > 0
-                            ? std::min(static_cast<int>(config_.max_seq_len), config_.resident_graph_rows)
-                            : resolveActivationBufferSeqLen(config_.max_seq_len, members.front()),
-                            retainsMTPGraphCapacity(config_.mtp) ? resolveMTPRetainedTargetQueryRows(config_.mtp) : 1);
-                        std::vector<void *> streams(members.size());
-                        for (std::size_t i = 0; i < members.size(); ++i)
-                        {
-                            auto &worker = GPUDeviceContextPool::instance().getContext(members[i]);
-                            worker.submitAndWait([&] { streams[i] = worker.getOrCreateAuxiliaryStream("projection_exchange_setup"); });
-                        }
-                        tp_ctx_->installDeviceCountedAllGather(DeviceCountedAllGather::create(
-                            *memory_authority, DeviceId::cpu(), members, streams, *coverage, arena.packetCapacityBytes(rows)));
-                        LOG_INFO("RankOrchestrator: installed device-counted projection exchange: participants="
-                            << members.size() << " max_packet_bytes=" << arena.packetCapacityBytes(rows));
+                        auto &worker = GPUDeviceContextPool::instance().getContext(members[i]);
+                        worker.submitAndWait([&] { streams[i] = worker.getOrCreateAuxiliaryStream("projection_exchange_setup"); });
                     }
+                    tp_ctx_->installDeviceCountedAllGather(DeviceCountedAllGather::create(
+                        *memory_authority, *tp_ctx_, DeviceId::cpu(), topology, streams, arena.packetCapacityBytes(rows)));
+                    LOG_INFO("RankOrchestrator: installed device-counted projection exchange: participants="
+                        << members.size() << " max_packet_bytes=" << arena.packetCapacityBytes(rows));
                 }
             }
         }
@@ -3021,7 +2978,7 @@ namespace llaminar2
             if (PipelineDeviceGeneration::isGPUStageSet(pp_stage_runners_))
             {
                 if (!pp_device_generation_)
-                    pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
+                    pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_, config_.original_pipeline_mpi_ctx);
                 if (!pp_device_generation_->prepareServing(plan)) return false;
                 materialized_native_segments = pp_stage_runners_.size();
             }
@@ -13008,7 +12965,7 @@ namespace llaminar2
         if (!pp_stage_runners_.empty())
         {
             if (!pp_device_generation_)
-                pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
+                pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_, config_.original_pipeline_mpi_ctx);
             return pp_device_generation_->begin(request);
         }
         if (!request.valid())
@@ -19756,48 +19713,7 @@ namespace llaminar2
             const auto projected = config_.forPipelineStage(index);
             binding->requireDestination(projected.nested_pp_stage_config.value(),
                 stage.stage_devices, stage.tp_weights, stage.tp_backend, config_.moe_rebalance.mode);
-            if (const auto *domain = dynamic_cast<const IRankOrchestrator *>(child.get()))
-            {
-                if (domain->device_count() != static_cast<int>(stage.stage_devices.size()))
-                    throw std::logic_error("MoE pipeline child lost an admitted TP participant");
-                for (int member = 0; member < domain->device_count(); ++member)
-                    if (!domain->deviceRunner(member) || domain->deviceRunner(member)->primaryDeviceId() !=
-                        stage.stage_devices[static_cast<std::size_t>(member)].toLocalDeviceId())
-                        throw std::logic_error("MoE pipeline child has foreign ordered TP membership");
-            }
-            else if (stage.stage_devices.size() != 1u ||
-                child->primaryDeviceId() != stage.stage_devices.front().toLocalDeviceId())
-                throw std::logic_error("MoE pipeline child has a foreign single-participant identity");
-            if (child->moeOverlayAuthorityExecution() != binding->plan()->authority_execution)
-                throw std::logic_error("MoE pipeline child authority differs from its own admitted owner");
-            const auto &no_peer = binding->owners().authority->noPeerResidency();
-            if (no_peer)
-            {
-                const auto &metadata = binding->metadata();
-                no_peer->requireDestination(child->primaryDeviceId(), metadata.first_model_layer,
-                    metadata.num_layers, metadata.num_experts);
-                if (no_peer->authorityExecution() != binding->plan()->authority_execution)
-                    throw std::logic_error("MoE pipeline no-peer proof has a foreign authority locus");
-            }
-            else if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
-            {
-                // A genuinely movable host stage needs its own admitted host
-                // maintenance composition. A no-peer identity cannot certify it.
-                if (binding->plan()->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident)
-                {
-                    const auto &owner = binding->owners().host_maintenance;
-                    if (!owner) throw std::logic_error("Movable host MoE pipeline stage has no admitted maintenance owner");
-                    owner->requireScope(binding->owners().authority.get(), binding->owners().residency.get(), binding->metadata());
-                    if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized && !owner->ready())
-                        throw std::logic_error("Movable host MoE pipeline stage has no prepared maintenance family");
-                }
-                else if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
-                    !child->deviceResidentMoEOverlayMaintenanceReady())
-                    throw std::logic_error("Movable MoE pipeline stage has no complete native maintenance family");
-            }
-            if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
-                !binding->owners().residency->allInitialBanksReady())
-                throw std::logic_error("MoE pipeline stage has incomplete physical prepared residency");
+            binding->requireRuntimeOwner(*child, frontier);
         }
         if (frontier == MoEPipelineOwnershipValidation::ServingMaterialized &&
             !validatePPGraphTransactionReady("MoE stage ownership certification"))

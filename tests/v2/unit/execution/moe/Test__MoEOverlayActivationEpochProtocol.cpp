@@ -1,6 +1,10 @@
 /**
  * @file Test__MoEOverlayActivationEpochProtocol.cpp
  * @brief Adversarial CPU tests for device-owned ExpertOverlay activation epochs.
+ *
+ * Replay uses the actual shared publication helpers and original host protocol.
+ * Recorded delayed dispatch, reset and absorbing cancellation observations prove
+ * ordering without a GPU, host execution mirror or invented native receipt.
  */
 
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
@@ -150,7 +154,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 9u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 10u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -901,10 +905,15 @@ namespace llaminar2::test
         auto foreign = config;
         foreign.cohort_target = MoEOverlayRouteTarget::cpuCohort(5).word();
         EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, foreign), std::logic_error);
-        const auto saved_version = control.channel.abi_version;
-        --control.channel.abi_version;
-        EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, config), std::logic_error);
-        control.channel.abi_version = saved_version;
+        EXPECT_EQ(control.channel.abi_version, 10u);
+        // Size compatibility is insufficient to establish the native roster
+        // slot authority in this version. Reject old and future records.
+        for (const std::uint32_t foreign_version : {9u, 11u})
+        {
+            control.channel.abi_version = foreign_version;
+            EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, config), std::logic_error);
+        }
+        control.channel.abi_version = kMoEOverlayActivationABIVersion;
         MoEOverlayActivationEpochProtocol protocol(control, config);
         std::string error;
         const auto identity = protocol.arm(makeTicket(config), 1, 10000, &error);
@@ -1153,3 +1162,58 @@ TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionFailedWaitU
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test The actual shared device helper re-waits after a pre-grant edge passed old work. */
+TEST(Test__MoEOverlayActivationEpochProtocol, GrantedDispatchWaitsForCurrentPublicationReplay) {
+    for(int replay=0;replay<20;++replay)for(const std::uint64_t required:{1u,2u,5u,17u}) {
+        const auto old_stream_wait=required;
+        ASSERT_GE(old_stream_wait,required); // Prior generation's retained scheduling edge passed.
+        std::uint64_t current=0;int reads=0,pauses=0,abort_reads=0;
+        const auto acquire=[&] { ++reads;return current; };
+        // Original validator's single acquired load rejected the newly reset
+        // descriptor even though its grant was current and dispatch delayed.
+        EXPECT_NE(acquire(),required);
+        const auto observed=awaitMoEOverlayGrantedDispatchPublication(required,acquire,
+            [&] { ++abort_reads;return false; },[&] { if(++pauses==2)current=required; });
+        EXPECT_EQ(observed,required);EXPECT_EQ(pauses,2);EXPECT_EQ(abort_reads,2);EXPECT_EQ(reads,4);
+        int unexpected=0;
+        EXPECT_EQ(awaitMoEOverlayGrantedDispatchPublication(required,[&] { return required; },
+            [&] { ++unexpected;return false; },[&] { ++unexpected; }),required);
+        EXPECT_EQ(unexpected,0);
+    }
+}
+/** @test Cancellation or an invalid timeline cannot strand a newly granted consumer. */
+TEST(Test__MoEOverlayActivationEpochProtocol, GrantedDispatchAbortAndOvershootRemainExactReplay) {
+    for(int replay=0;replay<20;++replay) {
+        int polls=0,pauses=0;
+        EXPECT_EQ(awaitMoEOverlayGrantedDispatchPublication(1,[&] { ++polls;return std::uint64_t{0}; },
+            [&] { return polls==2; },[&] { ++pauses; }),kMoEOverlayActivationAbortTimeline);
+        EXPECT_EQ(polls,2);EXPECT_EQ(pauses,1);
+        EXPECT_EQ(awaitMoEOverlayGrantedDispatchPublication(1,[] { return kMoEOverlayActivationAbortTimeline; },
+            [] { ADD_FAILURE()<<"Published Abort must not require another read";return false; },[] {}),kMoEOverlayActivationAbortTimeline);
+        // Overshoot remains a rejected exact descriptor; no loop repairs it to the requested word.
+        EXPECT_EQ(awaitMoEOverlayGrantedDispatchPublication(1,[] { return std::uint64_t{2}; },[] { return false; },[] {}),2u);
+        EXPECT_EQ(awaitMoEOverlayGrantedDispatchPublication(0,[] { ADD_FAILURE();return std::uint64_t{0}; },
+            [] { return false; },[] {}),kMoEOverlayActivationAbortTimeline);
+    }
+}
+/** @test Actual protocol reset closes previous dispatch words before the next identity is published. */
+TEST(Test__MoEOverlayActivationEpochProtocol, GrantedDispatchResetStartsUnpublishedBeforeRearmReplay) {
+    const auto config=makeConfig();MoEOverlayActivationEpochControl control{};
+    MoEOverlayActivationEpochProtocol::initialize(control,config);
+    MoEOverlayActivationEpochProtocol protocol(control,config);std::string error;
+    for(std::uint64_t generation=1;generation<=20;++generation) {
+        const auto identity=protocol.arm(makeTicket(config,generation,generation),generation,1000,&error);
+        ASSERT_TRUE(identity)<<error;
+        EXPECT_EQ(control.admission.ready_signal,kMoEOverlayActivationAdmissionTimeline);
+        for(const auto& bank:control.buffers) { EXPECT_EQ(bank.dispatch_signal.value,0u);EXPECT_EQ(bank.dispatch_descriptor.timeline,0u); }
+        activateBoth(protocol,*identity);
+        for(std::uint32_t stage=0;stage<config.model_layer_indices.size();++stage)runOneStage(protocol,*identity,stage);
+        completeBoth(protocol,*identity);
+        ASSERT_TRUE(protocol.reset(*identity,&error))<<error;
+        EXPECT_EQ(control.admission.ready_signal,0u);
+        for(const auto& bank:control.buffers) { EXPECT_EQ(bank.dispatch_signal.value,0u);EXPECT_EQ(bank.dispatch_descriptor.timeline,0u); }
+    }
+}
+}

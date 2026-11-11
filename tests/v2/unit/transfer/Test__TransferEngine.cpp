@@ -9,6 +9,9 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
+#include "execution/moe/ExpertTierGpuPeerTransferLane.h"
+#include <limits>
 
 #include "tensors/CoherenceState.h"
 #include "transfer/TransferEngine.h"
@@ -502,38 +505,64 @@ TEST(Test__TransferEngine_StagingSlab, UnpreparedCopyFailsWithoutThrowingOrGPUWo
     }
 }
 
-TEST(Test__TransferEngine_ExecutionStreamPool,
-     InvalidGeometryFailsBeforeAnyDeviceContextIsRequired)
-{
-    TransferEngine engine;
-    const PersistentTransferExecutionLane invalid_lane;
+namespace {
+/** The public authority cannot create any native execution lane without its original permit. */
+template<class Engine> concept UnadmittedExecutionPool = requires(const Engine& engine) {
+    engine.allocatePersistentTransferExecutionLanes(size_t{1},DeviceId::cuda(0),std::string("unadmitted"));
+};
+static_assert(!UnadmittedExecutionPool<TransferEngine>);
+}
 
-    EXPECT_FALSE(invalid_lane.valid());
-    EXPECT_EQ(invalid_lane.device(), DeviceId::invalid());
-    EXPECT_THROW((void)invalid_lane.stream(), std::logic_error);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            0u,
-            DeviceId::cuda(0),
-            "unit_invalid_zero_width"),
-        std::invalid_argument);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            1u,
-            DeviceId::cpu(),
-            "unit_invalid_cpu_endpoint"),
-        std::invalid_argument);
-    EXPECT_THROW(
-        (void)engine.allocatePersistentTransferExecutionLanes(
-            1u,
-            DeviceId::cuda(0),
-            ""),
-        std::invalid_argument);
-    // Function preparation can synchronize a native module loader, so reject
-    // even valid pool geometry before attempting a context lookup in capture.
-    GraphCaptureGuard capture_guard;
-    EXPECT_THROW((void)engine.allocatePersistentTransferExecutionLanes(
-        1u, DeviceId::cuda(0), "unit_forbidden_capture_preparation"), std::logic_error);
+/** @brief Explicit component handles remain usable infrastructure but cannot mint original authority. */
+TEST(Test__TransferEngine_ExecutionStreamPool, ComponentScopeCannotEnterOriginalPeerEventOwner)
+{
+    for(const auto device:{DeviceId::cuda(7),DeviceId::rocm(11)}) {
+        auto owner=std::make_shared<int>(17);
+        std::weak_ptr<int> weak=owner;
+        auto lane=ComponentTransferExecutionPoolFixtureAccess::recordedComponentForReplay(
+            owner,reinterpret_cast<void*>(0x1000),device);
+        owner.reset();
+        EXPECT_FALSE(weak.expired());ASSERT_TRUE(lane.valid());
+        EXPECT_EQ(lane.stream(),reinterpret_cast<void*>(0x1000));
+        EXPECT_THROW((void)lane.originalContext(),std::logic_error);
+        EXPECT_THROW((void)ExpertTierGpuPeerTransferLane((ExpertTierGpuPeerTransferLane::Config{
+            .source_device=device,.destination_device=device,.execution=lane,
+            .lane_name="component_cannot_mint_original"})),std::logic_error);
+        auto copied=lane;
+        lane={};EXPECT_FALSE(weak.expired());EXPECT_TRUE(copied.valid());
+        copied={};EXPECT_TRUE(weak.expired());
+    }
+    for(const auto stream:std::array<void*,3>{nullptr,reinterpret_cast<void*>(1),reinterpret_cast<void*>(2)}) {
+        auto lane=ComponentTransferExecutionPoolFixtureAccess::recordedComponentForReplay(
+            std::make_shared<int>(1),stream,DeviceId::cuda(0));
+        EXPECT_FALSE(lane.valid());EXPECT_THROW((void)lane.stream(),std::logic_error);
+        EXPECT_THROW((void)lane.originalContext(),std::logic_error);
+    }
+}
+
+TEST(Test__TransferEngine_ExecutionStreamPool, OriginalBOMRejectsInvalidGeometryAndScalesActualLanes)
+{
+    const PhysicalMemoryResource host{2,DeviceId::cpu(),size_t{1}<<50,size_t{1}<<50};
+    for(const auto device:{DeviceId::cuda(7),DeviceId::rocm(11)}) {
+        const PhysicalMemoryResource gpu{2,device,size_t{1}<<50,size_t{1}<<50};
+        const auto one=TransferEngine::persistentTransferExecutionLanesBOM(1,host,gpu);
+        for(const size_t count:{1u,2u,3u,7u,32u,65u}) {
+            const auto quote=TransferEngine::persistentTransferExecutionLanesBOM(count,host,gpu);
+            ASSERT_EQ(quote.resources().size(),one.resources().size());
+            for(size_t r=0;r<quote.resources().size();++r) {
+                EXPECT_TRUE(quote.resources()[r].resource().sameAllocator(one.resources()[r].resource()));
+                EXPECT_EQ(quote.resources()[r].bytes(PhysicalMemoryOwner::NativeAuxiliaryStream),
+                    count*one.resources()[r].bytes(PhysicalMemoryOwner::NativeAuxiliaryStream));
+            }
+        }
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(0,host,gpu),std::invalid_argument);
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(std::numeric_limits<size_t>::max(),host,gpu),std::overflow_error);
+        auto foreign=host;foreign.world_rank=3;
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(1,foreign,gpu),std::invalid_argument);
+        EXPECT_THROW(TransferEngine::persistentTransferExecutionLanesBOM(1,host,host),std::invalid_argument);
+    }
+    const PersistentTransferExecutionLane invalid;
+    EXPECT_FALSE(invalid.valid());EXPECT_THROW(invalid.stream(),std::logic_error);
 }
 
 TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
@@ -1941,6 +1970,35 @@ protected:
 };
 
 FailableEventMockBackend *Test__TransferEngine_EventFailure::s_failable_mock_ = nullptr;
+
+/** @test A completed pipeline host handoff is consumed without a second physical download. */
+TEST_F(Test__TransferEngine_EventFailure, PipelineHostCopyReusesPublishedLiveRows)
+{
+    TransferEngine engine(resolver_);
+    auto source = createTensorOnDeviceWithEvent();
+    auto destination = TestTensorFactory::createFP32({4, 4});
+    for (int replay = 0; replay < 20; ++replay) {
+        const size_t live = std::array<size_t, 5>{16, 1, 7, 3, 16}[replay % 5];
+        auto *produced = static_cast<float *>(source->gpu_data_ptr());
+        for (size_t index = 0; index < source->numel(); ++index)
+            produced[index] = static_cast<float>(100 * replay + index);
+        TransferEngine::publishDeviceWrite(source, DeviceId::cuda(0), mockProducerStream());
+        std::fill_n(destination->mutable_data(), destination->numel(), -1.0F);
+        const auto before = mock_->getTransferStats();
+        ASSERT_TRUE(engine.transferActivation(source.get(), DeviceId::cpu(), live * sizeof(float)).success);
+        ASSERT_TRUE(source->hostValid());
+        const auto published = mock_->getTransferStats();
+        ASSERT_EQ(published.d2h_count - before.d2h_count, 1u);
+        ASSERT_EQ(published.d2h_bytes - before.d2h_bytes, live * sizeof(float));
+        for (int consume = 0; consume < 2; ++consume) {
+            ASSERT_TRUE(engine.copyActivation(source.get(), destination.get(), DeviceId::cpu(), live * sizeof(float)).success);
+            EXPECT_EQ(mock_->getTransferStats().d2h_count, published.d2h_count);
+            EXPECT_EQ(mock_->getTransferStats().d2h_bytes, published.d2h_bytes);
+            for (size_t index = 0; index < destination->numel(); ++index)
+                EXPECT_EQ(destination->data()[index], index < live ? produced[index] : -1.0F);
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // downloadFull: the host observes bytes only after the exact D2H event.

@@ -16,14 +16,28 @@ namespace llaminar2
  * @brief Project the original sidecar input for existing reusable graph builders.
  * @param input Exact MTP pointer, geometry and construction-purpose declaration.
  * @return Borrowed forward input for one scoped construction interval.
- * @throws std::invalid_argument If the original construction purpose is unknown.
+ * @throws std::invalid_argument For an unknown construction purpose or inconsistent sidecar cache role.
  */
 inline ForwardInput mtpForwardConstructionInput(const MTPForwardInput &input)
 {
     if (input.graph_submission_intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
         !executableForwardSubmissionIntent(input.graph_submission_intent))
         throw std::invalid_argument("Unknown MTP graph construction intent");
+    switch (input.capture_role)
+    {
+    case MTPSidecarCaptureRole::Full:
+    case MTPSidecarCaptureRole::Chained:
+        break;
+    case MTPSidecarCaptureRole::KVOnly:
+        if (!input.kv_cache_only)
+            throw std::invalid_argument("KV-only sidecar cache role requires its original KV-only graph purpose");
+        break;
+    default:
+        throw std::invalid_argument("Unknown original sidecar cache role");
+    }
     ForwardInput result;
+    result.mtp_sidecar_capture_role = input.kv_cache_only
+        ? MTPSidecarCaptureRole::KVOnly : input.capture_role;
     result.graph_submission_intent = input.graph_submission_intent;
     result.token_ids = input.draft_token_ids_device ? nullptr : input.draft_token_ids;
     result.token_ids_device = input.draft_token_ids_device;

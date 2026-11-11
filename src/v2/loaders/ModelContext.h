@@ -284,6 +284,19 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
             const TransferEngine &transfers,
             const std::optional<AdaptiveImmutableLookupDevicePreparation> &adaptive_setup=std::nullopt);
 
+        /**
+         * @brief Materialize an admitted fixed PLE pipeline storage range after its original loader drains.
+         * @param placement Exact sealed rank-local pipeline placement.
+         * @param authority Original rank PMA owning the storage range.
+         * @param owner Actual fixed range storage device, independent of PLE compute membership.
+         * @param upload Original drained-loader upload lease and stream for a fresh owner.
+         * @param transfers Sole allocation and native transfer authority.
+         * @throws std::exception For a foreign owner, changed source, missing lease or failed original upload.
+         */
+        void prepareImmutableRowTableForFixedPipelineOwner(const ResolvedImmutableRowTablePlacement& placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId owner,
+            const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers);
+
         /** @brief Require every exact planned allocator Ready before orchestration publishes inference-ready.
          * @param placement Original sealed placement, compared by complete immutable value.
          * @param authority Same canonical rank PMA, never a recreated certificate.
@@ -390,6 +403,23 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         }
 
     private:
+        /**
+         * @brief Join the one original immutable source preparation for an authenticated endpoint.
+         * @param placement Original sealed layout.
+         * @param authority Exact rank PMA.
+         * @param consumer Actual upload or execution endpoint.
+         * @param execution Checked storage mode selected by the endpoint role.
+         * @param upload Exact drained-loader authority for fresh native storage.
+         * @param transfers Sole allocation and copy authority.
+         * @param adaptive_setup Exact adaptive metadata setup, when required.
+         * @throws std::exception For invalid or failed original preparation.
+         */
+        void prepareImmutableRowTableOriginal(const ResolvedImmutableRowTablePlacement& placement,
+            std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+            ImmutableRowLookupExecution execution,
+            const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers,
+            const std::optional<AdaptiveImmutableLookupDevicePreparation>& adaptive_setup);
+
         friend class RankOrchestrator;
         friend class DeviceGraphOrchestrator;
         /**

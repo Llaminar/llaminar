@@ -61,6 +61,25 @@ namespace
         return PlanningModelMetadata(std::move(profile), 4);
     }
 
+    /**
+     * @brief Declare this metadata fixture's complete observed no-peer topology.
+     * @param original Authored rank inventory; no native runtime is queried.
+     * @details Sparse ordinals retain discovery order. Every directed edge is
+     * explicitly unavailable; missing observations must remain production errors.
+     */
+    void declareNoPeerTopology(ClusterInventory &original)
+    {
+        for (auto &rank : original.ranks)
+            for (const auto family : {DeviceType::CUDA, DeviceType::ROCm}) {
+                const auto count = std::count_if(rank.gpus.begin(), rank.gpus.end(),
+                    [family](const auto &gpu) { return gpu.type == family; });
+                auto &matrix = family == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+                auto &degree = family == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+                degree = static_cast<int>(count);
+                matrix.assign(static_cast<std::size_t>(count * count), false);
+            }
+    }
+
     /** @return Distinct physical hosts whose NUMA IDs are not communicator ranks. */
     ClusterInventory hosts(int count)
     {
@@ -100,6 +119,7 @@ namespace
             gpu.compute_units = 64;
             inventory.ranks[rank].gpus.push_back(std::move(gpu));
         }
+        declareNoPeerTopology(inventory);
         inventory.buildNodeAggregations();
     }
 
@@ -518,6 +538,10 @@ TEST(AutomaticOrchestrationCandidates,
         if (gpu.type == DeviceType::ROCm)
             gpu.numa_node = inventory.ranks[1].cpu.numa_node;
     inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    // Shared visibility adds GPU records after cards() sealed the initial
+    // fixture matrices. Publish the same explicit no-peer observations for
+    // both observers before any complete rank-local cohort is compiled.
+    declareNoPeerTopology(inventory);
     inventory.buildNodeAggregations();
 
     auto config = request({DeviceType::CUDA, DeviceType::ROCm},
@@ -558,6 +582,10 @@ TEST(AutomaticOrchestrationCandidates,
         if (gpu.type == DeviceType::ROCm)
             gpu.numa_node = inventory.ranks[1].cpu.numa_node;
     inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    // Shared visibility adds GPU records after cards() sealed the initial
+    // fixture matrices. Publish the same explicit no-peer observations for
+    // both observers before any complete rank-local cohort is compiled.
+    declareNoPeerTopology(inventory);
     inventory.buildNodeAggregations();
 
     auto config = request({DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm},
@@ -1039,5 +1067,55 @@ TEST(AutomaticOrchestrationCandidates, RankLocalGPUOwnershipPreservesDiscoveryAn
         }
         EXPECT_EQ(inventory.ranks[0].gpus.size(), original);
         EXPECT_EQ(inventory.ranks[1].gpus.size(), original);
+    }
+}
+
+
+/** @test Original GPU population never emits zero-head shards, including beyond eight cards. */
+TEST(AutomaticOrchestrationCandidates, EveryOriginalTensorParticipantHasPositiveSourceSlicesReplay)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool gdn : {false, true})
+    {
+        auto inventory = hosts(1);
+        cards(inventory, 0, backend, 9);
+        std::reverse(inventory.ranks.front().gpus.begin(), inventory.ranks.front().gpus.end());
+        const auto source = model();
+        auto profile = source.memoryProfile();
+        profile.n_heads = 8;
+        profile.head_dim = profile.d_model / profile.n_heads;
+        profile.n_kv_heads = 2;
+        profile.gdn_group_count = gdn ? 8 : 0;
+        profile.gdn_time_step_rank = gdn ? 8 : 0;
+        const auto enumerate = [&](int count) {
+            auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+            config.automatic_planning.device_counts = {{backend, count}};
+            std::size_t proposals = 0;
+            ExecutionPlanBuilder builder;
+            visitAutomaticOrchestrationCandidates(config, PlanningModelMetadata(profile, 4), inventory,
+                [&](const auto &candidate) {
+                    ++proposals;
+                    const auto resolved = ResolvedRankOrchestration::resolve(candidate.config,
+                        PlanningModelMetadata(profile, 4), candidate.membership.inventory(), builder, 0);
+                    EXPECT_TRUE(resolved.rankPlan().validate().empty());
+                });
+            return proposals;
+        };
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            std::size_t infeasible = 1;
+            EXPECT_NO_THROW(infeasible = enumerate(9));
+            EXPECT_EQ(infeasible, 0u);
+            EXPECT_GT(enumerate(8), 0u);
+            profile.n_heads = 16;
+            profile.head_dim = profile.d_model / profile.n_heads;
+            profile.gdn_group_count = gdn ? 16 : 0;
+            profile.gdn_time_step_rank = gdn ? 16 : 0;
+            if (!gdn) EXPECT_GT(enumerate(9), 0u);
+            profile.n_heads = 8;
+            profile.head_dim = profile.d_model / profile.n_heads;
+            profile.gdn_group_count = gdn ? 8 : 0;
+            profile.gdn_time_step_rank = gdn ? 8 : 0;
+        }
     }
 }

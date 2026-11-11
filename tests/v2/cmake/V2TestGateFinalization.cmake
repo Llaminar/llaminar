@@ -47,7 +47,12 @@ function(v2_finalize_test_gates)
 
         # Use the final CTest label inventory, not a second hook-owned executable
         # list. Shared fixtures are built once; only the labeled tests are run.
-        set(V2_PREFLIGHT_GATE_TARGETS "")
+        # POST_BUILD-discovered cases do not exist in configure-time TESTS.
+        # Their same registration declares original build owners explicitly.
+        get_property(V2_PREFLIGHT_GATE_TARGETS GLOBAL PROPERTY
+            V2_DISCOVERED_PREFLIGHT_GATE_TARGETS)
+        get_property(V2_PREFLIGHT_HARDWARE_EXPORT_REQUIRED GLOBAL PROPERTY
+            V2_DISCOVERED_PREFLIGHT_HARDWARE_EXPORT_REQUIRED)
         foreach(V2_CONFIGURED_TEST IN LISTS V2_CONFIGURED_TESTS)
             get_property(V2_CONFIGURED_TEST_LABELS
                 TEST ${V2_CONFIGURED_TEST} PROPERTY LABELS)
@@ -55,8 +60,19 @@ function(v2_finalize_test_gates)
                 get_property(V2_TEST_BUILD_TARGETS GLOBAL PROPERTY
                     "V2_TEST_BUILD_TARGETS_${V2_CONFIGURED_TEST}")
                 list(APPEND V2_PREFLIGHT_GATE_TARGETS ${V2_TEST_BUILD_TARGETS})
+                if("HardwareOptional" IN_LIST V2_CONFIGURED_TEST_LABELS)
+                    set(V2_PREFLIGHT_HARDWARE_EXPORT_REQUIRED TRUE)
+                endif()
             endif()
         endforeach()
+        if(V2_PREFLIGHT_HARDWARE_EXPORT_REQUIRED)
+            # Reuse the original model-free native exporter and its complete
+            # MPI/backend lifetime; no independent GPU discovery tool is added.
+            if(NOT TARGET v2_integration_parity_qwen4exp_production_matrix)
+                message(FATAL_ERROR "Optional native preflight geometry requires its original hardware exporter")
+            endif()
+            list(APPEND V2_PREFLIGHT_GATE_TARGETS v2_integration_parity_qwen4exp_production_matrix)
+        endif()
         list(REMOVE_DUPLICATES V2_PREFLIGHT_GATE_TARGETS)
         if(NOT V2_PREFLIGHT_GATE_TARGETS)
             message(FATAL_ERROR "The production preflight gate has no executable targets")

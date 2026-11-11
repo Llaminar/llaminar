@@ -16,6 +16,7 @@
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "Qwen4ExpConfig.h"
 #include "Qwen4ExpReplicatedPLECohort.h"
+#include "execution/local_execution/orchestrators/Qwen4ExpFixedHeadPipelinePort.h"
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
 #include "Qwen4ExpTrunkBinding.h"
@@ -173,7 +174,10 @@ Qwen4ExpImmutableWeightBinding Qwen4ExpGraph::gain(const WeightBinding *weight) 
 sampling_math::DeviceGenerationForwardFailurePolicy Qwen4ExpGraph::deviceGenerationForwardFailurePolicy() const
 {
     using Policy=sampling_math::DeviceGenerationForwardFailurePolicy;
-    if (!config_.default_device.is_gpu() || !ownsPLE()) return Policy::ResetAtResponseAdmission;
+    if (!config_.default_device.is_gpu()) return Policy::ResetAtResponseAdmission;
+    if (config_.ngram_table_placement && config_.ngram_table_placement->fixedHeadPipeline())
+        return Policy::PreserveUntilRequestReset;
+    if (!ownsPLE()) return Policy::ResetAtResponseAdmission;
     if (!config_.ngram_table_placement)
         throw std::logic_error("Native request failure lifetime requires admitted immutable-table placement");
     if (config_.ngram_table_placement->isGPUAdaptive())
@@ -368,13 +372,13 @@ Qwen4ExpPLEContext Qwen4ExpGraph::pleContext(const ForwardInput &input,DeviceId 
         .projectionRows=config_.grouped_mtp_verifier ?
             std::optional{singleRequestProjectionQueryRows(input.seq_len,device)} : std::nullopt};
 }
-std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::adaptiveCountBinding(const ForwardInput &input,
+std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::nativePLECountBinding(const ForwardInput &input,
                                                                       const DeviceRowRange &rows) const
 {
     if (!rows.countOwner())
         return {};
     if (!arena_ || input.device != config_.default_device || !input.device.is_gpu())
-        throw std::logic_error("Adaptive original query requires its actual participant arena");
+        throw std::logic_error("Native PLE query requires its actual participant arena");
     BufferId role;
     if (input.device_prefill_chunk)
         role = BufferId::PREFILL_CHUNK_GEOMETRY;
@@ -387,17 +391,17 @@ std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::adaptiveCountBinding(const Forw
         role = BufferId::REQUEST_BATCH_GEOMETRY;
     else
         throw std::invalid_argument(
-            "Adaptive original query has no implemented request/chunk/verifier count producer");
+            "Native PLE query has no original request/chunk/verifier count producer");
     const auto owner = arena_->getSharedTensor(role);
     if (!owner || arena_->getTensor(role) != owner.get() || owner->native_type() != TensorType::INT32 ||
         owner->is_view() || owner->transferStorageOwner() != owner.get() ||
         owner->current_device() != input.device || !owner->gpu_data_ptr())
-        throw std::invalid_argument("Adaptive original count requires its canonical prepared arena root");
+        throw std::invalid_argument("Native PLE count requires its canonical prepared arena root");
     const auto base = reinterpret_cast<std::uintptr_t>(owner->gpu_data_ptr());
     const auto count = reinterpret_cast<std::uintptr_t>(rows.countOwner());
     if (count < base || count - base > owner->size_bytes() ||
         sizeof(std::int32_t) > owner->size_bytes() - (count - base) || (count - base) % alignof(std::int32_t))
-        throw std::invalid_argument("Adaptive query count is outside its actual producer arena root");
+        throw std::invalid_argument("Native PLE count is outside its actual producer arena root");
     return Qwen4ExpIntBinding(*owner, role, static_cast<std::size_t>(count - base));
 }
 
@@ -414,12 +418,21 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
     return [&]() -> Qwen4ExpPLEBuilder::LookupStorage {
         if(tier==ImmutableRowLookupExecution::FixedHeadShardGPU)
         {
-            if(!config_.ngram_replicated_ple_cohort || !input.replicated_ple_query || !arena_)
-                throw std::invalid_argument("Fixed-head PLE requires its actual Rank cohort and DGO query producer");
+            if(!input.replicated_ple_query || !arena_)
+                throw std::invalid_argument("Fixed-head PLE requires its actual DGO query producer and arena");
             const auto *native=rows.liveRows?std::get_if<Qwen4ExpNativeIntInput>(&rows.liveRows->value):nullptr;
             if(rows.liveRows && (!native || native->owner!=device || native->capacity!=1 || !native->data))
                 throw std::invalid_argument("Fixed-head PLE has no original native primitive count");
             const auto original=native?DeviceRowRange::deviceCounted(rows.capacity,native->data):DeviceRowRange::fullyActive(rows.capacity);
+            if (config_.ngram_table_placement->fixedHeadPipeline()) {
+                if (!input.fixed_head_pipeline_port)
+                    throw std::invalid_argument("Fixed PLE pipeline lost its original captured consumer port");
+                input.fixed_head_pipeline_port->requireQuery(*input.replicated_ple_query, input, original, owner);
+                return Qwen4ExpPLEBuilder::FixedPipelineLookupStorage{input.fixed_head_pipeline_port,
+                    *input.replicated_ple_query, nativePLECountBinding(input, original)};
+            }
+            if (!config_.ngram_replicated_ple_cohort || input.fixed_head_pipeline_port)
+                throw std::invalid_argument("Standalone fixed-head PLE requires its original Rank cohort");
             config_.ngram_replicated_ple_cohort->requireQuery(*input.replicated_ple_query,input,original,owner);
             auto table=model_ctx_->residentImmutableRowTable(device);
             if(!table)throw std::invalid_argument("Fixed-head PLE exact range owner is not materialized");
@@ -441,7 +454,7 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
                 config_.ngram_replicated_ple_cohort->requireQuery(*input.replicated_ple_query,input,original,owner);
                 if(!lookup_)
                     return Qwen4ExpPooledReaderLookupStorage{arena_,participants,
-                        DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),
+                        DeviceGenerationControlBinding::admit(*arena_,device,0),original,nativePLECountBinding(input,original),
                         model_ctx_->adaptiveImmutableLookupLocalHot(device)};
             }
             if (!lookup_ || !arena_)
@@ -456,7 +469,7 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
 #endif
             if(!code)throw std::invalid_argument("PLE split lookup requires its compiled original native backend");
             return Qwen4ExpPooledLookupStorage{arena_,lookup_,std::move(code),
-                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),participants,
+                DeviceGenerationControlBinding::admit(*arena_,device,0),original,nativePLECountBinding(input,original),participants,
                 model_ctx_->adaptiveImmutableLookupLocalHot(device)};
         }
         if (tier==ImmutableRowLookupExecution::ResidentGPU)

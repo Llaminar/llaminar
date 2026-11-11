@@ -262,6 +262,7 @@ namespace llaminar2
             std::vector<GlobalDeviceAddress> devices; ///< All devices for this stage
             std::vector<float> tp_weights;            ///< TP weights (empty = equal)
             CollectiveBackendType tp_backend = CollectiveBackendType::AUTO;
+            std::string domain_name; ///< Exact authored stage domain; empty only for unnamed flat PP.
         };
         std::vector<LocalPPStageTPInfo> local_pp_stage_tp_info;
 

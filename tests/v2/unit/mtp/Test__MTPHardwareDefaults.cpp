@@ -39,7 +39,12 @@ namespace
         return result;
     }
 
-    /** @brief Build canonical rank membership from caller-owned fake devices. */
+    /**
+     * @brief Author socket-local synthetic rank/card membership without discovery.
+     * Each fixture rank deliberately owns its numbered socket and its supplied
+     * cards. This construction is test data, not a production rank-to-NUMA rule;
+     * negative cases mutate the published observation after construction.
+     */
     ClusterInventory inventory(std::vector<std::vector<DeviceInfo>> devices)
     {
         ClusterInventory result;
@@ -54,16 +59,20 @@ namespace
             entry.numa_nodes = result.world_size;
             entry.cpu.numa_node = rank;
             entry.gpus = std::move(devices[rank]);
+            for (auto &gpu : entry.gpus) gpu.numa_node = entry.cpu.numa_node;
             result.ranks.push_back(std::move(entry));
         }
         result.buildNodeAggregations();
         return result;
     }
 
-    /** @brief Physical address sharing the fake inventory's exact locality. */
+    /**
+     * @brief Select a visible ordinal; the original planner binds its observed NUMA.
+     * Explicit domain owner ranks disambiguate repeated rank-local ordinals.
+     */
     GlobalDeviceAddress address(DeviceType type, int ordinal)
     {
-        return GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, ordinal), "node", 0);
+        return GlobalDeviceAddress::fromLocalDeviceId(DeviceId(type, ordinal), "node", -1);
     }
 
     /** @brief Run the real planner without a model file or a backend. */
@@ -531,6 +540,29 @@ TEST(MTPHardwareDefaults, RankLocalExplicitOwnerSelectsThatRanksCard)
     unknown.name = "AMD Instinct MI100";
     for (const auto &plan : plans(config, inventory({{unknown}, {card(DeviceType::ROCm, 0)}})))
         EXPECT_EQ(plan.runtime.mtp.depth_defaults_profile, MTPDepthDefaultsProfile::ROCmMI50);
+}
+
+/** @test A declared GPU owner still rejects remote or unknown physical locality. */
+TEST(MTPHardwareDefaults, ExplicitOwnerRequiresObservedLocalGPU)
+{
+    OrchestrationConfig config;
+    auto selected = domain("continuation", {address(DeviceType::ROCm, 0)}, {});
+    selected.owner_rank = 1;
+    selected.scope = TPScope::RANK_LOCAL;
+    config.domain_definitions = {selected};
+    const auto local = inventory({{}, {card(DeviceType::ROCm, 0)}});
+    ASSERT_EQ(local.ranks[1].cpu.numa_node, 1);
+    ASSERT_EQ(local.ranks[1].gpus.front().numa_node, 1);
+    EXPECT_NO_THROW(plans(config, local));
+    for (const int observed_node : {0, -1})
+    {
+        auto foreign = local;
+        foreign.ranks[1].gpus.front().numa_node = observed_node;
+        EXPECT_THROW(plans(config, foreign), std::invalid_argument);
+    }
+    auto unknown_cpu = local;
+    unknown_cpu.ranks[1].cpu.numa_node = -1;
+    EXPECT_THROW(plans(config, unknown_cpu), std::invalid_argument);
 }
 
 /** @test CPU terminal shards follow complete membership, not MTP enablement or scope. */

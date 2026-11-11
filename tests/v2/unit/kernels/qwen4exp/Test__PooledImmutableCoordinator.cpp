@@ -714,53 +714,29 @@ TEST(PooledImmutableCoordinator, ReplicatedReadersMissingCancelledAndStickyError
 /** @brief Price actual concurrent reader channels without multiplying the original query envelope. */
 TEST(PooledImmutableCoordinator, ReplicatedReadersGeometryBOMReplay)
 {
-    using ReaderGeometry = qwen4exp::PooledImmutableReplicatedReaderGeometry;
-    const PhysicalMemoryAllocatorIdentity source{0, DeviceId::rocm(1)};
-    const PhysicalMemoryResource host{0, DeviceId::cpu(), 1ULL << 30, 1ULL << 30};
-    for (const auto count : {2u, 4u, 8u}) {
+    using ReaderGeometry=qwen4exp::PooledImmutableReplicatedReaderGeometry;
+    const PhysicalMemoryAllocatorIdentity source{0,DeviceId::rocm(1)};
+    const PhysicalMemoryResource host{0,DeviceId::cpu(),1ULL<<30,1ULL<<30};
+    for(const auto count:{2u,4u,8u}) {
         std::vector<PhysicalMemoryAllocatorIdentity> consumers;
         std::vector<PhysicalMemoryResource> resources;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            consumers.push_back({0, DeviceId::rocm(i)});
-            resources.push_back({0, DeviceId::rocm(i), 1ULL << 30, 1ULL << 30});
+        for(std::uint32_t i=0;i<count;++i) {
+            consumers.push_back({0,DeviceId::rocm(i)});
+            resources.push_back({0,DeviceId::rocm(i),1ULL<<30,1ULL<<30});
         }
-        for (const auto coverage : {PeerAccessCoverage::None, PeerAccessCoverage::Complete}) {
-            std::vector<ImmutableRowTableReaderPeerAccess> edges;
-            for (const auto consumer : consumers)
-                if (consumer != source) edges.push_back({source, consumer, coverage});
-            const auto geometry = ReaderGeometry::checked(source, consumers, 256, 64, edges);
-            EXPECT_EQ(geometry.maximumOriginal(), 256u);
-            EXPECT_EQ(geometry.resultMaximum(), 256u * 64u * sizeof(float));
-            const auto bom = geometry.completeBOM(host, resources);
-            const auto target = edges.front().reader;
-            const auto forward = geometry.resultMemory(target);
-            const auto reverse = geometry.acknowledgementMemory(target);
-            const auto channels = count - 1;
-            ASSERT_NE(bom.find({0, DeviceId::cpu()}), nullptr);
-            EXPECT_EQ(bom.find({0, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                channels * (forward.mapped_host_bytes + reverse.mapped_host_bytes));
-            EXPECT_EQ(bom.find(source)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                channels * (forward.cursor_bytes_per_device + reverse.cursor_bytes_per_device +
-                    sizeof(qwen4exp::replicated_reader::Control) + forward.producer_payload_bytes));
-            for (const auto consumer : consumers) {
-                if (consumer == source) continue;
-                EXPECT_EQ(bom.find(consumer)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                    forward.cursor_bytes_per_device + reverse.cursor_bytes_per_device +
-                        sizeof(qwen4exp::replicated_reader::Control) + reverse.producer_payload_bytes);
-            }
-            EXPECT_EQ(forward.producer_payload_bytes != 0, coverage == PeerAccessCoverage::Complete);
-            EXPECT_EQ(reverse.producer_payload_bytes != 0, coverage == PeerAccessCoverage::Complete);
-            EXPECT_THROW(geometry.resultMemory(source), std::invalid_argument);
-            auto malformed = edges;
-            malformed.front().coverage = PeerAccessCoverage::Partial;
-            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64, malformed), std::invalid_argument);
-            malformed = edges;
-            malformed.front().coordinator = target;
-            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64, malformed), std::invalid_argument);
-            EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64), std::invalid_argument);
-        }
-        consumers.back() = consumers.front();
-        EXPECT_THROW(ReaderGeometry::checked(source, consumers, 256, 64), std::invalid_argument);
+        const auto geometry=ReaderGeometry::native(source,consumers,256,64);
+        EXPECT_TRUE(geometry.nativeCollective());
+        EXPECT_EQ(geometry.maximumOriginal(),256u);
+        EXPECT_EQ(geometry.resultMaximum(),256u*64u*sizeof(float));
+        const auto bom=geometry.completeBOM(host,resources);
+        EXPECT_EQ(bom.find({0,DeviceId::cpu()}),nullptr);
+        EXPECT_EQ(bom.find(source)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+            (count-1)*sizeof(qwen4exp::replicated_reader::Control));
+        for(const auto consumer:consumers)if(consumer!=source)
+            EXPECT_EQ(bom.find(consumer)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
+                sizeof(qwen4exp::replicated_reader::Control));
+        consumers.back()=consumers.front();
+        EXPECT_THROW(ReaderGeometry::native(source,consumers,256,64),std::invalid_argument);
     }
 }
 } // namespace llaminar2::test
@@ -1111,3 +1087,18 @@ TEST(PooledImmutableCoordinator, FutureCompactWireRequiresPurposeAndExactPartial
 }
 
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @brief A retired captured selector must not reappear beside the original native declaration. */
+template<class G> concept HasRetiredCapturedReaderSelector =
+    requires(const G& g){g.payloadStorage(PhysicalMemoryAllocatorIdentity{});} ||
+    requires(const G& g){g.resultMemory(PhysicalMemoryAllocatorIdentity{});} ||
+    requires(const G& g){g.acknowledgementMemory(PhysicalMemoryAllocatorIdentity{});} ||
+    requires{G::checked(PhysicalMemoryAllocatorIdentity{},std::span<const PhysicalMemoryAllocatorIdentity>{},16,32);};
+/** @test Original native reader metadata exposes no dormant homogeneous captured route. */
+TEST(PooledImmutableCoordinator,ReplicatedReadersRetireCapturedSelection)
+{
+    static_assert(!HasRetiredCapturedReaderSelector<qwen4exp::PooledImmutableReplicatedReaderGeometry>);
+    EXPECT_FALSE(HasRetiredCapturedReaderSelector<qwen4exp::PooledImmutableReplicatedReaderGeometry>);
+}
+}

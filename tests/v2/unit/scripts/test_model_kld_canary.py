@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_model_kld_canary.py
+#  @brief Preserve KL limits and source/ISA ownership while isolating CI and package fixtures.
 """Device-free adversarial phase/identity/threshold regressions for KL canaries."""
 from pathlib import Path
 import math
@@ -369,7 +371,7 @@ class ModelKLDLifecycleTests(unittest.TestCase):
                 root=Path(temp);model=root/'fixture.gguf';model.write_bytes(b'abcd')
                 corpus={'models':{'dense':{'entry':{'model_file':model.name,'model_bytes':4},'workload_path':root/'input.json'}}}
                 args=SimpleNamespace(binary=root/'binary',keep_logits=False)
-                adapter=SimpleNamespace(environment={},devices=['cuda:0','rocm:0'],
+                adapter=SimpleNamespace(environment={},paired=None,devices=['cuda:0','rocm:0'],
                     topology={'id':'recorded','expected_config':{'configuration':{'mpi_procs':1}}},
                     prepare=lambda *_:(root/'input.json',['--no-mtp']),backends=['cuda','rocm']) if corpus_v2 else None
                 with patch.dict(runner.os.environ,parent,clear=True),patch.object(runner,'physical_workers',return_value=1), \
@@ -424,7 +426,7 @@ class ModelKLDCITests(unittest.TestCase):
         from types import SimpleNamespace
         import tempfile,json,subprocess
         import run_published_image_suite as suite
-        from test_published_image_suite import image_pair,full_inventory
+        from test_published_image_suite import image_pair,full_inventory,prerequisite_evidence
         from production_artifacts import write_json,digest
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);pair=image_pair();manifest=suite.pipeline.e2e_projection(full_inventory(),pair['source']['revision'])
@@ -447,7 +449,8 @@ class ModelKLDCITests(unittest.TestCase):
                     write_json(lane/'e2e.json',dict(schema=1,image=pair['images'][isa]['id'],source_revision=pair['source']['revision'],
                         manifest_digest=digest(manifest),selected=len(manifest['cells']),correctness_passed=True,
                         cells=[dict(row,outcome='passed',return_code=0) for row in manifest['cells']]))
-            with patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
+            with patch.object(suite,'run_e2e_prerequisites',return_value=prerequisite_evidence(pair)), \
+                 patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
                 with self.assertRaisesRegex(ValueError,'KL phase failures'):
                     suite.run_e2e(SimpleNamespace(model_kld_canaries=True,models=root,model_ramdisk_root=root),pair,manifest,root)
             self.assertEqual(visited,list(suite.ISAS))
@@ -514,7 +517,8 @@ class ModelKLDPackagingTests(unittest.TestCase):
                     path=root/name;path.parent.mkdir(exist_ok=True);path.write_text('fixture')
                 binary.write_bytes(b'placeholder native observer')
                 inventory=installed.inventory(root);self.assertIn(binary.name,inventory['files'])
-                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(schema=1,inventory=inventory)))
+                receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(
+                    schema=1,scope=installed.InstalledTestScope.PRODUCTION.value,inventory=inventory)))
                 installed.validate(receipt,root)
                 binary.write_bytes(b'changed binary')
                 with self.assertRaises(ValueError):installed.validate(receipt,root)

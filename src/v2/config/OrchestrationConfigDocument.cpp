@@ -8,6 +8,9 @@
  * and optional policy state. A missing additive local-hot arm means the original
  * shared-only intent; explicit C0 remains losslessly distinct. Routed plans retain their compact stage's global
  * layer origin, so saved configurations cannot rebase later PP stages to zero.
+ * Resolved local route policy and its typed diagnostic remain lossless binding
+ * values, not transferable hardware authority: the original inventory binder
+ * must reproduce both before admission or graph construction.
  * This is setup-only value serialization, not a live
  * device-state mirror or a competing physical-memory ledger.
  */
@@ -76,6 +79,7 @@ namespace
     ENUM(MTPTerminalHeadPolicy, VALUE(VocabularySharded), VALUE(MirroredFullVocabulary), VALUE(Automatic))
     ENUM(RoutedExpertPlacementTopology, VALUE(SingleDomain), VALUE(TieredOverlay))
     ENUM(RoutedExpertResidencyPolicy, VALUE(Disabled), VALUE(StaticById), VALUE(HistogramTieredCache), VALUE(ExplicitMasks), VALUE(RoutedTierRebalanced))
+    ENUM(MoEOverlayNodeLocalRouteTransport, VALUE(Unresolved), VALUE(NativeCollective), VALUE(MappedSparse))
     ENUM(MoEOverlayAuthorityExecutionKind, VALUE(Unresolved), VALUE(HostResident), VALUE(DeviceResident))
     ENUM(MoEContinuationDensePolicyIntent, VALUE(Resolved), VALUE(Automatic), VALUE(Explicit))
     ENUM(MoEContinuationActivationLayout, VALUE(ReplicatedHidden), VALUE(RootOnlyHidden), VALUE(ShardedHiddenRequiresGather))
@@ -196,8 +200,12 @@ namespace
 #define MEMBERS(X) X(expert_ids)
     RECORD(RoutedExpertInitialLayerOrder, layer, MEMBERS)
 #undef MEMBERS
+#define MEMBERS(X) X(decode)
+    RECORD(MoEOverlayNodeLocalRouteTransportPolicy, ordinary_prefill, MEMBERS)
+#undef MEMBERS
 #define MEMBERS(X) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
-    X(continuation_domain_spec) X(residency_policy) X(authority_execution) X(replica_cache_capacity) \
+    X(continuation_domain_spec) X(residency_policy) X(authority_execution) \
+    X(observed_route_transport) X(observed_route_diagnostic) X(replica_cache_capacity) \
     X(owner_order) X(dense_domains) X(domains) X(routed_tiers) X(initial_layer_order_overrides) \
     X(placements) X(continuation_dense_policy_intent) X(first_model_layer)
     RECORD(MoERoutedExpertPlacementPlan, enabled, MEMBERS)

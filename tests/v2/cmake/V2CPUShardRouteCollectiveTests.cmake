@@ -24,7 +24,10 @@ add_v2_test(V2_Unit_CPUShardRouteCollective
         "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 foreach(cpu_shard_route_case IN ITEMS ArrivalOrderPartialAndRepeatedReset AllCohortWidthsUseSourceOrder
     InvalidCompletePrefixNeverPublishes EmptyAndLargeToSmallPreserveLiveExtent
-    FixedParticipantSumPrecedesOriginalWeighting OriginalSparseRoutesMatchDenseAndRejectPartialIdentity)
+    FixedParticipantSumPrecedesOriginalWeighting OriginalSparseRoutesMatchDenseAndRejectPartialIdentity
+    CPUHostCanonicalReturnKeepsOriginalSlotsUnweightedAndCompact
+    VariableOriginalCohortsKeepCanonicalAdditionOrderWithoutParticipantCap
+    IndexedOriginalRangeMetadataCannotAliasEitherOutput)
     set(cpu_shard_route_name "V2_Integration_CPUShardRouteCollective_${cpu_shard_route_case}Replay")
     add_v2_test(${cpu_shard_route_name}
         COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective>

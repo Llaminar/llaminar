@@ -3,7 +3,7 @@
  * @brief Explicit device-free dependency for native fixed/counting ABI tests.
  *
  * The real loader resolves this DSO through its ordinary explicit-path API.
- * AllGather, counted-gather and fixed/prefix/slice Broadcast are callable witnesses;
+ * AllGather, AllReduce, counted-gather and fixed/prefix/slice Broadcast are callable witnesses;
  * other symbols satisfy lookup and reject accidental use. No function reads
  * device pointers, initializes a runtime, performs transport or writes receipts.
  */
@@ -94,7 +94,16 @@ LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclCommCount)
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclCommCuDevice)
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclCommUserRank)
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclGetErrorString)
-LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclAllReduce)
+/** @brief Observe scalar reduction identity without dereferencing payload or creating a communicator. */
+extern "C" native_rows_abi::ncclResult_t ncclAllReduce(const void* send, void* receive,
+    std::size_t count, native_rows_abi::ncclDataType_t datatype, native_rows_abi::ncclRedOp_t reduction,
+    native_rows_abi::ncclComm_t communicator, void* stream)
+{
+    ++observed.fixed_calls; observed.send=send; observed.receive=receive; observed.elements=count;
+    observed.datatype=int(datatype); observed.reduction=int(reduction);
+    observed.communicator=communicator; observed.stream=stream;
+    return native_rows_abi::ncclSuccess;
+}
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclReduce)
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(ncclReduceScatter)
 LLAMINAR_NATIVE_ROWS_LOOKUP_ONLY(llaminarNcclAllReduceDeviceRows)

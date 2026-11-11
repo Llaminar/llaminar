@@ -19,6 +19,7 @@
 
 #include "MoEOverlayNodeLocalRouteExchangeABI.h"
 #include "backends/DeviceId.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,10 @@
 namespace llaminar2
 {
     class DeviceTransferBuffer;
+    class DeviceWorkspaceManager;
+    class WorkspaceBufferLease;
+    struct ClusterInventory;
+    namespace test { class NodeLocalRouteExchangeReplayAccess; }
     class MappedHostTransferRegion;
 
     /** Logical participant and exact process-local accelerator endpoint. */
@@ -61,12 +66,54 @@ namespace llaminar2
             std::string identity;
         };
 
+        /** @brief Exact shared layout declaration; only declareStorage may issue it. */
+        class StorageDeclaration final
+        {
+        public:
+            /** @return Original host mapping plus exact root workspace BOM, without allocation. */
+            [[nodiscard]] PhysicalMemoryPlan bom(PhysicalMemoryResource host, PhysicalMemoryResource root_gpu) const;
+            /** @return Page-aligned logical mapped protocol capacity, excluding arena slack. */
+            [[nodiscard]] std::size_t mappingBytes() const noexcept { return mapping_bytes_; }
+            /** @return Exact logical root staging capacity, excluding workspace alignment. */
+            [[nodiscard]] std::size_t rootBytes() const noexcept { return root_bytes_; }
+        private:
+            friend class MoEOverlayNodeLocalRouteExchange;
+            StorageDeclaration(std::vector<DeviceId> devices, DeviceId root, std::string identity,
+                std::uint32_t rows, std::uint32_t top_k, std::uint32_t width,
+                std::size_t mapping_bytes, std::size_t root_bytes)
+                : devices_(std::move(devices)), root_(root), identity_(std::move(identity)), rows_(rows), top_k_(top_k),
+                  width_(width), mapping_bytes_(mapping_bytes), root_bytes_(root_bytes) {}
+            std::vector<DeviceId> devices_;
+            DeviceId root_;
+            std::string identity_;
+            std::uint32_t rows_, top_k_, width_;
+            std::size_t mapping_bytes_, root_bytes_;
+        };
+        /** @brief Price the same checked protocol geometry later materialized by the owner. */
+        [[nodiscard]] static StorageDeclaration declareStorage(const Config&, std::uint32_t max_rows,
+            std::uint32_t top_k, std::uint32_t d_model);
         /**
-         * @brief Construct an unmaterialized route fabric.
-         * @param config Complete local device set and exact root device.
-         * @throws std::invalid_argument for invalid/duplicate/non-GPU devices.
+         * @brief Bind the complete admitted storage to its original rank-owned GPU cohort.
+         * @param config Exact continuation endpoints and root.
+         * @param declaration Original maximum graph geometry used by the admission BOM.
+         * @param memory Sole original source authority; missing authority is invalid.
+         * @param inventory Original complete hardware publication in that authority's namespace.
+         * @throws std::invalid_argument for any ownership, geometry or declaration mismatch.
          */
-        explicit MoEOverlayNodeLocalRouteExchange(Config config);
+        MoEOverlayNodeLocalRouteExchange(Config config, StorageDeclaration declaration,
+            std::shared_ptr<PhysicalMemoryAuthority> memory,
+            std::shared_ptr<const ClusterInventory> inventory);
+
+        /**
+         * @brief Reject a reused owner from another original source, inventory or retained graph envelope.
+         * @param declaration Same original exact topology/domain/geometry used by admission.
+         * @param memory Actual original model authority, compared by ownership identity.
+         * @param inventory Exact retained original hardware publication, never a reconstructed view.
+         * @throws std::logic_error for a raw-test owner, foreign authority or changed capture identity.
+         */
+        void requireOriginalAdmission(const StorageDeclaration& declaration,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+            const std::shared_ptr<const ClusterInventory>& inventory) const;
 
         /** Release the TransferEngine-owned mapping after captured users drain. */
         ~MoEOverlayNodeLocalRouteExchange();
@@ -185,6 +232,15 @@ namespace llaminar2
         void abortForShutdown() noexcept;
 
     private:
+        friend class test::NodeLocalRouteExchangeReplayAccess;
+        /** @brief Explicit test-only constructor: no production caller can omit admission. */
+        explicit MoEOverlayNodeLocalRouteExchange(Config config);
+        /** @brief Closed allocation authority; only the test friend can issue isolated storage. */
+        enum class StorageOwnership { OriginalAdmitted, IsolatedTestReplay };
+        /** @brief Share pure topology validation without a nullable production authority arm. */
+        MoEOverlayNodeLocalRouteExchange(Config, StorageOwnership);
+        /** @brief Pure endpoint validation shared by cold declaration and materialization. */
+        static void validateConfig(const Config&);
         /** Byte offsets for one non-root lane within the shared allocation. */
         struct LaneLayout
         {
@@ -196,12 +252,29 @@ namespace llaminar2
             std::size_t root_staging_offset = 0u;
         };
 
+        /** @brief Checked layout used identically by the quote and allocation. */
+        struct StorageLayout {
+            std::vector<LaneLayout> lanes;
+            std::uint32_t route_capacity;
+            std::size_t mapping_bytes, root_bytes, dense_control, dense_peers, dense_payload,
+                dense_elements, dense_payload_bytes;
+        };
+        /** @return Full endpoint-independent physical layout; no native operation. */
+        static StorageLayout storageLayout(std::size_t participants, std::uint32_t rows,
+            std::uint32_t top_k, std::uint32_t width);
         /** @return Endpoint-specific binding; caller must hold `mutex_`. */
         [[nodiscard]] MoENodeLocalRoutePeerDeviceBinding bindingLocked(
             const LaneLayout &lane,
             DeviceId alias_device) const;
 
         Config config_;
+        const StorageOwnership ownership_;
+        // Original authority precedes all physical owners, so it retires last.
+        std::shared_ptr<PhysicalMemoryAuthority> memory_;
+        std::shared_ptr<const ClusterInventory> inventory_;
+        std::unique_ptr<StorageDeclaration> declaration_;
+        std::unique_ptr<DeviceWorkspaceManager> root_workspace_;
+        std::shared_ptr<const WorkspaceBufferLease> root_lease_;
         mutable std::mutex mutex_;
         bool materialized_ = false;
         int root_participant_ = -1;

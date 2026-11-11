@@ -60,8 +60,16 @@ public:
     }
     /** @copydoc IGPUGraphCapture::endCapture */
     bool endCapture()override{
-        if(owner_.phase_!=Phase::Recording)throw std::logic_error("Original participant has no active recording");
-        try{owner_.requireRecordingAuthority();if(!native().endCapture()){owner_.phase_=Phase::Failed;return false;}owner_.phase_=Phase::Recorded;return true;}catch(...){owner_.phase_=Phase::Failed;throw;}
+        if(owner_.phase_!=Phase::Recording && owner_.phase_!=Phase::RecordingFailed)
+            throw std::logic_error("Original participant has no active recording");
+        const bool failed = owner_.phase_==Phase::RecordingFailed ||
+            (owner_.sharedChild_ && !owner_.sharedChildRecorded_);
+        try {
+            owner_.requireRecordingAuthority();
+            if(!native().endCapture()) {owner_.phase_=Phase::Failed;return false;}
+            owner_.phase_=failed ? Phase::Failed : Phase::Recorded;
+            return true;
+        } catch(...) {owner_.phase_=Phase::Failed;throw;}
     }
     /** @copydoc IGPUGraphCapture::instantiate */
     bool instantiate()override{
@@ -139,6 +147,12 @@ RetainedParticipantGraphExecutable::RetainedParticipantGraphExecutable(
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,std::size_t slots){
     return definitionBOM(host,gpu,slots,DefinitionPurpose::RetainedParticipant);
 }
+PhysicalMemoryPlan RetainedParticipantGraphExecutable::nativeStorageBOM(const PooledNativeOwnerGraphProgram& program,
+    PhysicalMemoryResource host,PhysicalMemoryResource gpu){
+    if(program.geometry().owner!=PhysicalMemoryAllocatorIdentity{gpu.world_rank,gpu.device} || host.world_rank!=gpu.world_rank)
+        throw std::invalid_argument("Native storage General BOM changed original owner/rank resources");
+    return definitionBOM(host,gpu,1,DefinitionPurpose::NativeStorageGeneral);
+}
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu){
     PhysicalMemoryPlanBuilder plan(definitionBOM(host,gpu,1,DefinitionPurpose::PreparedServiceCalibration));
     plan.add(host,PhysicalMemoryOwner::NativePreparationGraphExecutable,PreparedServiceCalibrationSlot::physicalBytes());
@@ -147,7 +161,9 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::calibrationBOM(PhysicalMe
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::definitionBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
     std::size_t slots,DefinitionPurpose purpose){
     const auto owner=purpose==DefinitionPurpose::PreparedServiceCalibration
-        ? PhysicalMemoryOwner::NativePreparationGraphExecutable : PhysicalMemoryOwner::NativeGraphExecutable;
+        ? PhysicalMemoryOwner::NativePreparationGraphExecutable
+        : purpose==DefinitionPurpose::NativeStorageGeneral ? PhysicalMemoryOwner::NativeStorageGraphExecutable
+        : PhysicalMemoryOwner::NativeGraphExecutable;
     if(!host.valid() || host.device!=DeviceId::cpu() || !gpu.valid() || !gpu.device.is_gpu() || host.world_rank!=gpu.world_rank)
         throw std::invalid_argument("General graph BOM requires original CPU0 and same-rank GPU observations");
     const auto hostUnit=GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(gpu.device);
@@ -213,6 +229,14 @@ std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExec
     return createBound(original,stream,HostProgramBinding{program,std::move(selected),
         nativeGraphCaptureObjectBytes(original.device()),GraphHostQualification::InstalledCertified});
 }
+std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExecutable::create(
+    const PreparedGPUContextUsePermit& original,void* stream,const PooledNativeOwnerGraphProgram& program){
+    const auto memory=original.memory();
+    if(!memory || program.geometry().owner!=PhysicalMemoryAllocatorIdentity{memory->worldRank(),original.device()})
+        throw std::invalid_argument("Native storage General creator changed original owner/rank");
+    auto result=createBound(original,stream,std::nullopt,GeneralHostOwnership::OriginalAllowance,DefinitionPurpose::NativeStorageGeneral);
+    result->storageProgram_=PooledStorageOwnerProgram(program);return result;
+}
 std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExecutable::createRecordedRemote(
     const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program,
     NativeAuxiliaryResourceSelection selected,std::size_t nativeObjectBytes){
@@ -242,14 +266,15 @@ std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExec
     current.requireWorker(worker);
     if(current.generation()!=original.generation())throw std::invalid_argument("Retained participant capture has stale original generation");
     const bool originalGeneral=generalHost==GeneralHostOwnership::OriginalAllowance;
-    if(purpose==DefinitionPurpose::PreparedServiceCalibration && (!originalGeneral || host))
-        throw std::invalid_argument("Prepared calibration requires its closed original General allowance");
+    if((purpose==DefinitionPurpose::PreparedServiceCalibration || purpose==DefinitionPurpose::NativeStorageGeneral) && (!originalGeneral || host))
+        throw std::invalid_argument("Prepared/native-storage General purpose requires its exact original allowance");
     const auto allocationOwner=purpose==DefinitionPurpose::PreparedServiceCalibration
         ? PhysicalMemoryOwner::NativePreparationGraphExecutable
-        : host ? PhysicalMemoryOwner::NativeStorageGraphExecutable : PhysicalMemoryOwner::NativeGraphExecutable;
+        : (host || purpose==DefinitionPurpose::NativeStorageGeneral) ? PhysicalMemoryOwner::NativeStorageGraphExecutable : PhysicalMemoryOwner::NativeGraphExecutable;
     if(originalGeneral && host)throw std::invalid_argument("General and authored remote host obligations cannot be double charged");
     std::string policy=policyIdentity();
     if(purpose==DefinitionPurpose::PreparedServiceCalibration)policy+="/prepared-service-calibration";
+    if(purpose==DefinitionPurpose::NativeStorageGeneral)policy+="/native-storage-general";
     std::optional<PhysicalMemoryOwnerReservation> opaqueHost;
     AlignedVector<std::byte> ownerStorage,scratch;
     PhysicalMemoryAllocationLease nativeObject,recordingObject;
@@ -312,7 +337,7 @@ std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExec
         // Existing CPUStorageRoot frees its original backing only AFTER the complete object destructor.
         result=std::shared_ptr<RetainedParticipantGraphExecutable>(object,
             [storage=std::move(ownerStorage)](RetainedParticipantGraphExecutable* object)mutable{object->~RetainedParticipantGraphExecutable();storage={};});
-        if(host){result->remoteProgram_=host->program;result->hostQualification_=host->qualification;}
+        if(host){result->storageProgram_=PooledStorageOwnerProgram(host->program);result->hostQualification_=host->qualification;}
         else result->hostQualification_=GraphHostQualification::GeneralProcessAllowance;
         result->inspectionScratch_=std::move(scratch);result->nativeObjectLease_=std::move(nativeObject);result->recordingObjectLease_=std::move(recordingObject);
     }else result=std::shared_ptr<RetainedParticipantGraphExecutable>(new RetainedParticipantGraphExecutable(
@@ -344,6 +369,52 @@ void RetainedParticipantGraphExecutable::requireLiveOriginal()const{
         throw std::invalid_argument("Graph recording mutation has stale original prepared authority");
 }
 bool RetainedParticipantGraphExecutable::readyForSubmission()const{return phase_==Phase::Ready && capture_ && capture_->hasExecutable();}
+void RetainedParticipantGraphExecutable::sealSharedChildDefinition()
+{
+    requireRecordingAuthority();
+    if(phase_!=Phase::Recorded || purpose_!=DefinitionPurpose::RetainedParticipant ||
+       storageProgram_ || sharedChild_ || !capture_ || capture_->hasExecutable() || !capture_->nodeCount())
+        throw std::logic_error("Shared child requires its original nonempty General graph-only definition");
+    phase_=Phase::RecordedSharedChild;
+}
+void RetainedParticipantGraphExecutable::bindSharedChildDefinition(
+    const std::shared_ptr<RetainedParticipantGraphExecutable>& child)
+{
+    requireRecordingAuthority();
+    if(isGraphCaptureActive() || phase_!=Phase::Fresh || sharedChild_ || storageProgram_ ||
+       purpose_!=DefinitionPurpose::RetainedParticipant || !child || child.get()==this)
+        throw std::invalid_argument("Shared child binding requires a fresh original General parent");
+    // An off-worker retirement can hold this lock while awaiting the
+    // original worker. Reject that overlap before touching native ownership.
+    std::unique_lock definition(child->embeddedDefinitionMutex_,std::try_to_lock);
+    if(!definition.owns_lock())
+        throw std::logic_error("Shared child is already closing its original definition");
+    if(child->phase_!=Phase::RecordedSharedChild || !child->capture_ ||
+       child->self_.owner_before(child) || child.owner_before(child->self_) ||
+       child->device_!=device_ || child->generation_!=generation_ || child->worker_!=worker_ ||
+       child->worker_.owner_before(worker_) || worker_.owner_before(child->worker_) ||
+       child->memory_!=memory_ || child->memory_.owner_before(memory_) || memory_.owner_before(child->memory_))
+        throw std::invalid_argument("Shared child changed its original definition, worker, device, generation or PMA");
+    child->requireLiveOriginal();
+    sharedChild_=child;
+    child->embeddedBorrowers_.fetch_add(1,std::memory_order_acq_rel);
+}
+void RetainedParticipantGraphExecutable::recordSharedChildAtFrontier()
+{
+    requireRecordingAuthority();
+    if(!isGraphCaptureActive() || phase_!=Phase::Recording || !sharedChild_ || sharedChildRecorded_)
+        throw std::logic_error("Shared child import requires its original active parent frontier exactly once");
+    try {
+        if(!capture_->appendActiveCaptureChild(*sharedChild_->capture_))
+            throw std::runtime_error("Original native shared child frontier import failed");
+        sharedChildRecorded_=true;
+    } catch(...) {
+        // Close the exact native interval normally before discarding the failed
+        // parent. Its child stays alive even after a partial SDK mutation.
+        phase_=Phase::RecordingFailed;
+        throw;
+    }
+}
 void RetainedParticipantGraphExecutable::requireConstruction()const{
     if(phase_!=Phase::Fresh && phase_!=Phase::Recording && phase_!=Phase::Recorded)
         throw std::logic_error("Original participant recording is sealed or failed");
@@ -409,7 +480,7 @@ std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExec
 }
 void RetainedParticipantGraphExecutable::resetPreparedCalibration(){
     requireLiveOriginal();
-    if(purpose_!=DefinitionPurpose::PreparedServiceCalibration || remoteProgram_ || cohortBound_.load() ||
+    if(purpose_!=DefinitionPurpose::PreparedServiceCalibration || storageProgram_ || cohortBound_.load() ||
        worker_->ownsCurrentThread() || pending_ || phase_!=Phase::Ready || !capture_ || lastSubmission_ <= calibrationRetiredSubmission_)
         throw std::logic_error("Only completed original startup calibration can replace its cold definition");
     try{
@@ -423,19 +494,25 @@ void RetainedParticipantGraphExecutable::resetPreparedCalibration(){
     }catch(...){phase_=Phase::Failed;throw;}
 }
 void RetainedParticipantGraphExecutable::validateRemoteRecording(){
-    if(!remoteProgram_)return;
+    if(!storageProgram_)return;
+    const auto* mapped=std::get_if<PooledRemoteGraphProgram>(&*storageProgram_);
+    if(!mapped){
+        if(purpose_!=DefinitionPurpose::NativeStorageGeneral || hostQualification_!=GraphHostQualification::GeneralProcessAllowance)
+            throw std::logic_error("Native storage definition lost its original General admission contract");
+        return; // Actual native semantics were checked by the original graph builder; no fake flat node scope.
+    }
     GPUFlatGraphStructure observed;std::string error;
-    if(!capture_->inspectFlatGraphStructure(remoteProgram_->limits(),
+    if(!capture_->inspectFlatGraphStructure(mapped->limits(),
         {inspectionScratch_.data(),inspectionScratch_.size()},observed,&error))
         throw std::runtime_error("Original remote graph failed its declared flat structural seal: "+error);
-    const auto& declared=remoteProgram_->limits();
+    const auto& declared=mapped->limits();
     if(observed.nodes!=declared.maximumNodes || observed.edges!=declared.maximumEdges ||
         !observed.linearChain || observed.kinds[static_cast<unsigned>(GPUFlatGraphNodeKind::Kernel)]!=observed.nodes)
         throw std::runtime_error("Original remote graph differs from its exact source-authored kernel chain");
 }
 void RetainedParticipantGraphExecutable::sealRecordedStorageBody(){
     requireRecordingAuthority();
-    if(phase_!=Phase::Recorded || !remoteProgram_ || !recordedRuntimePrepared_ ||
+    if(phase_!=Phase::Recorded || !storageProgram_ || !recordedRuntimePrepared_ ||
        !cohortBound_.load(std::memory_order_acquire) || !capture_ || capture_->hasExecutable())
         throw std::logic_error("Embedded storage requires its original prepared graph-only source definition");
     try{validateRemoteRecording();phase_=Phase::RecordedStorageBody;}
@@ -502,7 +579,7 @@ void RetainedParticipantGraphExecutable::releaseSourceDefinition(){
     requireLiveOriginal();
     if(worker_->ownsCurrentThread())throw std::logic_error("Original source definition release requires its terminal owner");
     std::lock_guard definition(embeddedDefinitionMutex_);
-    if(!remoteProgram_ || purpose_!=DefinitionPurpose::RetainedParticipant || pending_ ||
+    if(!storageProgram_ || purpose_==DefinitionPurpose::PreparedServiceCalibration || pending_ ||
        embeddedBorrowers_.load(std::memory_order_acquire) || !capture_ ||
        (phase_!=Phase::Ready && phase_!=Phase::RecordedStorageBody))
         throw std::logic_error("Original source slot still has a live, failed or incomplete native definition");
@@ -524,7 +601,7 @@ void RetainedParticipantGraphExecutable::reacquireSourceDefinition(){
     requireLiveOriginal();
     if(worker_->ownsCurrentThread())throw std::logic_error("Original source recording requires its cold owner");
     std::lock_guard definition(embeddedDefinitionMutex_);
-    if(!remoteProgram_ || phase_!=Phase::DormantSourceSlot || pending_ || !capture_ || recording_ ||
+    if(!storageProgram_ || phase_!=Phase::DormantSourceSlot || pending_ || !capture_ || recording_ ||
        capture_->nodeCount() || capture_->hasExecutable() || embeddedBorrowers_.load(std::memory_order_acquire) ||
        cohortBound_.load(std::memory_order_acquire) || definitionGeneration_==std::numeric_limits<std::uint64_t>::max())
         throw std::logic_error("Original source slot cannot replace its active or exhausted definition");
@@ -562,19 +639,19 @@ RetainedParticipantGraphSourceSlots::~RetainedParticipantGraphSourceSlots(){
     for(std::size_t i=0;i<count_;++i)std::destroy_at(slots()+i);
 }
 std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphSourceSlots::acquire(
-    std::uint64_t source,const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program){
+    std::uint64_t source,const PreparedGPUContextUsePermit& original,void* stream,const PooledStorageOwnerProgram& program){
     std::lock_guard lock(mutex_);
-    const auto coordinate=program.geometry().coordinate;
+    const auto coordinate=pooledStorageOwnerGeometry(program).coordinate;
     if(source!=sourceIdentity_ || coordinate>=count_ || original.memory().get()!=memory_.get() ||
        original.memory().owner_before(memory_) || memory_.owner_before(original.memory()) ||
-       program.geometry().owner!=PhysicalMemoryAllocatorIdentity{memory_->worldRank(),original.device()})
+       pooledStorageOwnerGeometry(program).owner!=PhysicalMemoryAllocatorIdentity{memory_->worldRank(),original.device()})
         throw std::invalid_argument("Original remote slot changed its source/PMA/owner coordinate");
     auto& slot=slots()[coordinate];if(slot.failure)std::rethrow_exception(slot.failure);
     try{
-        if(!slot.owner)slot.owner=RetainedParticipantGraphExecutable::create(original,stream,program);
+        if(!slot.owner)slot.owner=std::visit([&](const auto& contract){return RetainedParticipantGraphExecutable::create(original,stream,contract);},program);
         else{
             auto& owner=*slot.owner;
-            if(slot.owner.use_count()!=1 || !owner.remoteProgram_ || *owner.remoteProgram_!=program ||
+            if(slot.owner.use_count()!=1 || !owner.storageProgram_ || *owner.storageProgram_!=program ||
                owner.memory_.get()!=memory_.get() || owner.device_!=original.device() || owner.generation_!=original.generation() ||
                owner.stream_!=stream || owner.worker_!=original.worker() ||
                owner.worker_.owner_before(original.worker()) || original.worker().owner_before(owner.worker_))
@@ -592,20 +669,20 @@ std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphSour
         throw;
     }
 }
-void RetainedParticipantGraphSourceSlots::release(std::uint64_t source,const PooledRemoteGraphProgram& program,
+void RetainedParticipantGraphSourceSlots::release(std::uint64_t source,const PooledStorageOwnerProgram& program,
     const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){
-    std::lock_guard lock(mutex_);const auto coordinate=program.geometry().coordinate;
+    std::lock_guard lock(mutex_);const auto coordinate=pooledStorageOwnerGeometry(program).coordinate;
     if(source!=sourceIdentity_ || coordinate>=count_ || !owner || slots()[coordinate].owner.get()!=owner.get() ||
        slots()[coordinate].owner.owner_before(owner) || owner.owner_before(slots()[coordinate].owner) ||
-       !owner->remoteProgram_ || *owner->remoteProgram_!=program || slots()[coordinate].owner.use_count()!=2)
+       !owner->storageProgram_ || *owner->storageProgram_!=program || slots()[coordinate].owner.use_count()!=2)
         throw std::invalid_argument("Original source definition retirement changed its exact slot/program or retained borrowers");
     owner->releaseSourceDefinition();
 }
-void RetainedParticipantGraphSourceSlots::abandon(std::uint64_t source,const PooledRemoteGraphProgram& program,
+void RetainedParticipantGraphSourceSlots::abandon(std::uint64_t source,const PooledStorageOwnerProgram& program,
     const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::exception_ptr failure){
-    std::lock_guard lock(mutex_);const auto coordinate=program.geometry().coordinate;
+    std::lock_guard lock(mutex_);const auto coordinate=pooledStorageOwnerGeometry(program).coordinate;
     if(source!=sourceIdentity_ || coordinate>=count_ || !owner || !failure ||
-       slots()[coordinate].owner!=owner || !owner->remoteProgram_ || *owner->remoteProgram_!=program)
+       slots()[coordinate].owner!=owner || !owner->storageProgram_ || *owner->storageProgram_!=program)
         throw std::logic_error("Failed source definition lost its exact original slot/diagnostic");
     owner->retireDefinition();
     slots()[coordinate].failure=std::move(failure);
@@ -616,6 +693,10 @@ void RetainedParticipantGraphExecutable::retireDefinition(){
     if(pending_ || embeddedBorrowers_.load(std::memory_order_acquire))throw std::logic_error("Retained native definition requires its original off-worker terminal retirement");
     if(phase_==Phase::Retired)return;
     if(capture_)worker_->submitAndWait([&]{capture_.reset();});
+    if(sharedChild_) {
+        if(!sharedChild_->embeddedBorrowers_.fetch_sub(1,std::memory_order_acq_rel))std::terminate();
+        sharedChild_.reset();
+    }
     if(calibrationTimingEvents_[0] || calibrationTimingEvents_[1])
         worker_->submitAndWait([&]{for(auto& event:calibrationTimingEvents_)if(event){worker_->destroyEvent(event);event=nullptr;}});
     nativeObjectLease_={};inspectionScratch_={};
@@ -656,7 +737,7 @@ std::shared_ptr<RetainedParticipantGraphExecutable> PreparedServiceCalibrationSl
         if(owner.memory_.get()!=memory_.get() || owner.memory_.owner_before(memory_) || memory_.owner_before(owner.memory_) ||
            owner.device_!=device_ || owner.generation_!=original.generation() || owner.stream_!=stream ||
            owner.purpose_!=RetainedParticipantGraphExecutable::DefinitionPurpose::PreparedServiceCalibration ||
-           owner.remoteProgram_ || owner.pending_ || owner.embeddedBorrowers_.load(std::memory_order_acquire) ||
+           owner.storageProgram_ || owner.pending_ || owner.embeddedBorrowers_.load(std::memory_order_acquire) ||
            owner.cohortBound_.load(std::memory_order_acquire) || owner.phase_!=RetainedParticipantGraphExecutable::Phase::Fresh ||
            owner.lastSubmission_!=owner.calibrationRetiredSubmission_ || !owner.capture_ ||
            owner.capture_->nodeCount() || owner.capture_->hasExecutable())

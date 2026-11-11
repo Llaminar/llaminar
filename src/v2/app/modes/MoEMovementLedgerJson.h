@@ -292,11 +292,13 @@ namespace llaminar2
                     "Optimization status contains an invalid decision receipt");
             last_decision = {
                 {"transaction", decision.transaction},
+                {"source_request_epoch", decision.source_request_epoch},
                 {"candidate_epoch", decision.candidate_epoch},
                 {"snapshot_observations", decision.snapshot_observations},
                 {"command_count", decision.command_count},
                 {"accepted_cycles", decision.accepted_cycles},
-                {"rejected_cycles", decision.rejected_cycles},
+                {"rejected_cycles", decision.rejected_cycles_observed ? nlohmann::json(decision.rejected_cycles) : nlohmann::json(nullptr)},
+                {"rejected_cycles_observed", decision.rejected_cycles_observed},
                 {"phase_tradeoff_candidates",
                  decision.phase_tradeoff_candidates},
                 {"improvement_floor_rejected_cycles",

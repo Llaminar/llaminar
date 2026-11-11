@@ -2,6 +2,10 @@
  * @brief Select supported-backend resource-family allowances and retain original live ownership metadata.
  */
 #include "NativeAuxiliaryResourceCatalog.h"
+#include "NativeAuxiliaryStreamOwnership.h"
+#include "NativeContextPreparation.h"
+#include "ReadAheadNativeResourceObligation.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <limits>
 #include "NativeAuxiliaryQualifiedLimits.h"
 #include "GPUDeviceContextPool.h"
@@ -24,6 +28,8 @@ std::string NativeAuxiliaryRemoteFamilyScope::identity()const{
         std::to_string(arguments.alignment);
 }
 std::string NativeAuxiliaryResourceProgram::identity()const{
+    if(isPeerTransferEvents())return peerTransferTiming()?"peer-transfer-ordering1-timing2-v1":"peer-transfer-ordering1-timing0-v1";
+    if(isAuxiliaryStream())return "auxiliary-stream1-ordering0-v1";
     if(isReadAheadSide())return "side-stream1-ordering2-v1";
     if(isPooledRemoteOwner())return remoteProgramClass().identity();
     return "ordering-v1:"+std::to_string(static_cast<unsigned>(orderingProgram().kind()))+":"+std::to_string(orderingProgram().nonemptyRootMask())+
@@ -46,6 +52,17 @@ NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance
     NativeAuxiliaryResourceProgram program,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
     if(backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
         throw std::invalid_argument("Native auxiliary allowance requires a supported GPU backend");
+    if(program.isPeerTransferEvents()) {
+        // Keep timestamp semantics explicit. The timed trio uses the entire
+        // conservative four-event family envelope, not a per-handle startup
+        // multiplication. These are opaque ceilings, never measured exact bytes.
+        // Original source/flags review and CUDA/ROCm native peer-lane replay
+        // qualify this closed timing operation independently of Ordering.
+        auto bound=selectAllowance(backend,NativeAuxiliaryResourceProgram::ordering(
+            program.peerTransferTiming()?NativeOrderingEventProgram::pooledOwner(true):
+                NativeOrderingEventProgram::lookupSubmissionRetirement()),rows);
+        bound.program=program;return bound;
+    }
     // The same ordinary ordering-event native operation is repeated over the
     // original admitted slot roster. Scale its installed UNIT allowance here,
     // once, rather than treating one fixture's borrowed population as many.
@@ -79,7 +96,7 @@ NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance
         if(row.remoteFamily ? !remote : row.program!=program)continue;
         if(program.isPooledRemoteOwner() && !row.remoteFamily)
             throw std::logic_error("Remote graph host qualification requires reviewed family ceilings");
-        if(!row.hostBytes || (program.isReadAheadSide() && !row.deviceBytes) || !digest(row.evidence) || (row.lifetime!=NativePhysicalLifetime::ContextGeneration && row.lifetime!=NativePhysicalLifetime::ProcessRuntime))throw std::logic_error("Installed auxiliary program has incomplete reviewed evidence/lifetime");
+        if(!row.hostBytes || ((program.isReadAheadSide() || program.isAuxiliaryStream()) && !row.deviceBytes) || !digest(row.evidence) || (row.lifetime!=NativePhysicalLifetime::ContextGeneration && row.lifetime!=NativePhysicalLifetime::ProcessRuntime))throw std::logic_error("Installed auxiliary program has incomplete reviewed evidence/lifetime");
         if(program.isPooledRemoteOwner() && (row.deviceBytes || row.lifetime!=NativePhysicalLifetime::ProcessRuntime))
             throw std::logic_error("Remote graph host class must keep original device bytes separate and retain host backing through ProcessRuntime");
         const auto hostBytes=program.isPooledRemoteOwner()?PooledRemoteGraphHostAllowance::scaledBytes(program.remoteProgramClass().limits().maximumNodes,row.hostBytes):row.hostBytes;
@@ -101,5 +118,96 @@ NativeAuxiliaryResourceSelection NativeAuxiliaryResourceCatalog::require(DeviceI
     const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(device);
     const auto key=original.originalBirthKey(); // Strong alias of actual original contract; no cache/query/hash.
     return select(*key,original.generation(),program,resourceSourceIdentity(),detail::kNativeAuxiliaryQualifiedClasses);
+}
+}
+
+namespace llaminar2 {
+/** @brief No worker alias: the context record itself retains this original obligation. */
+struct NativeAuxiliaryStreamOwnership::State final {
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    DeviceId device;std::uint64_t generation;
+    const IWorkerGPUContext* worker;std::string name;GPUAuxiliaryStreamSchedulingClass scheduling;
+    NativeContextRetirementSlot slot;
+    std::unique_ptr<ReadAheadNativeResourceObligation> pending;
+    enum class Phase {Claimed,Attempted,ContextOwned,Retired};Phase phase=Phase::Claimed;
+    State(const PreparedGPUContextUsePermit& p,std::string n,GPUAuxiliaryStreamSchedulingClass priority,NativeContextRetirementSlot s,
+          std::unique_ptr<ReadAheadNativeResourceObligation> leaf)
+        :memory(p.memory()),device(p.device()),generation(p.generation()),worker(p.worker().get()),
+         name(std::move(n)),scheduling(priority),slot(std::move(s)),pending(std::move(leaf)){}
+};
+PhysicalMemoryPlan NativeAuxiliaryStreamOwnership::bom(PhysicalMemoryResource host,PhysicalMemoryResource gpu){
+    if(!host.valid() || !gpu.valid() || !host.device.is_cpu() || !gpu.device.is_gpu() || host.world_rank!=gpu.world_rank)
+        throw std::invalid_argument("Auxiliary stream requires exact original host/GPU resources");
+    const auto selected=NativeAuxiliaryResourceCatalog::allowance(gpu.device.type,NativeAuxiliaryResourceProgram::auxiliaryStream());
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(host,PhysicalMemoryOwner::NativeAuxiliaryStream,selected.hostBytes);
+    if(selected.deviceBytes)plan.add(gpu,PhysicalMemoryOwner::NativeAuxiliaryStream,selected.deviceBytes);
+    return plan.build();
+}
+NativeAuxiliaryStreamOwnership::NativeAuxiliaryStreamOwnership(std::unique_ptr<State> state):state_(std::move(state)){}
+std::unique_ptr<NativeAuxiliaryStreamOwnership> NativeAuxiliaryStreamOwnership::claim(
+    const PreparedGPUContextUsePermit& original,const std::string& name){
+    return claim(original,name,GPUAuxiliaryStreamSchedulingClass::Normal);
+}
+std::unique_ptr<NativeAuxiliaryStreamOwnership> NativeAuxiliaryStreamOwnership::claim(
+    const PreparedGPUContextUsePermit& original,const std::string& name,GPUAuxiliaryStreamSchedulingClass scheduling){
+    if(scheduling!=GPUAuxiliaryStreamSchedulingClass::Normal && scheduling!=GPUAuxiliaryStreamSchedulingClass::LatencyCritical &&
+       scheduling!=GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance)
+        throw std::invalid_argument("Auxiliary stream requires a declared scheduling class");
+    original.requireWorker(original.worker());
+    if(name.empty() || isGraphCaptureActive())throw std::invalid_argument("Auxiliary stream commitment requires original cold source/name");
+    const auto selected=NativeAuxiliaryResourceCatalog::require(original.device(),NativeAuxiliaryResourceProgram::auxiliaryStream());
+    if(selected.contextGeneration!=original.generation() || !selected.hostBytes)
+        throw std::logic_error("Auxiliary stream changed original source generation");
+    // Exact immutable strings, not another source hash or a guessed physical allowance.
+    const auto certificate=selected.sourceIdentity+":"+selected.resourceSource+":"+selected.evidence+":auxiliary-stream1-v1";
+    auto slot=original.provenance().reserveNativeRetirementSlot(original.memory(),certificate);
+    const auto population="auxiliary-stream1-v1:"+std::to_string(name.size())+":"+name+
+        (scheduling==GPUAuxiliaryStreamSchedulingClass::Normal?std::string{}:":scheduling="+std::to_string(static_cast<unsigned>(scheduling)));
+    std::unique_ptr<ReadAheadNativeResourceObligation> leaf;
+    const bool borrowed=selected.lifetime==NativePhysicalLifetime::ProcessRuntime && slot.tryBorrowProcessRuntime(population);
+    if(!borrowed){
+        auto host=original.memory()->reserveNewAllocations(DeviceId::cpu(),PhysicalMemoryOwner::NativeAuxiliaryStream,selected.hostBytes);
+        std::optional<PhysicalMemoryOwnerReservation> gpu;
+        if(selected.deviceBytes)gpu.emplace(original.memory()->reserveNewAllocations(original.device(),PhysicalMemoryOwner::NativeAuxiliaryStream,selected.deviceBytes));
+        if(selected.lifetime==NativePhysicalLifetime::ProcessRuntime)slot.prepareProcessRuntime(population);
+        leaf=std::unique_ptr<ReadAheadNativeResourceObligation>(new ReadAheadNativeResourceObligation(original.memory(),original.device(),original.generation(),certificate,std::move(host),std::move(gpu),selected.lifetime));
+    }
+    return std::unique_ptr<NativeAuxiliaryStreamOwnership>(new NativeAuxiliaryStreamOwnership(
+        std::make_unique<State>(original,name,scheduling,std::move(slot),std::move(leaf))));
+}
+void NativeAuxiliaryStreamOwnership::requireOriginal(const PreparedGPUContextUsePermit& p,
+    const IWorkerGPUContext* worker,const std::string& name)const{
+    requireOriginal(p,worker,name,GPUAuxiliaryStreamSchedulingClass::Normal);
+}
+void NativeAuxiliaryStreamOwnership::requireOriginal(const PreparedGPUContextUsePermit& p,
+    const IWorkerGPUContext* worker,const std::string& name,GPUAuxiliaryStreamSchedulingClass scheduling)const{
+    if(!state_ || state_->phase!=State::Phase::ContextOwned || p.device()!=state_->device || p.generation()!=state_->generation ||
+       p.worker().get()!=worker || worker!=state_->worker || name!=state_->name || scheduling!=state_->scheduling ||
+       p.memory().get()!=state_->memory.get() || p.memory().owner_before(state_->memory) || state_->memory.owner_before(p.memory()))
+        throw std::logic_error("Named auxiliary stream changed original authority/device/generation/name/scheduling");
+    p.requireWorker(p.worker());
+}
+void NativeAuxiliaryStreamOwnership::requireRetirement(RetirementScope scope)const{
+    if(!state_ || state_->phase!=State::Phase::ContextOwned || scope!=RetirementScope::OriginalContextShutdown)
+        throw std::logic_error("Original admitted auxiliary streams retire only with their original context");
+}
+void NativeAuxiliaryStreamOwnership::beginNativeAttempt(){
+    if(!state_ || state_->phase!=State::Phase::Claimed || isGraphCaptureActive())throw std::logic_error("Auxiliary stream native creation is cold and one-shot");
+    if(state_->pending)state_->slot.adopt(std::move(state_->pending));
+    state_->slot.armNativeAttempt();state_->phase=State::Phase::Attempted;
+}
+void NativeAuxiliaryStreamOwnership::delegateToContext()noexcept{
+    if(!state_ || state_->phase!=State::Phase::Attempted)std::terminate();
+    state_->slot.delegateHandlesToContext();state_->phase=State::Phase::ContextOwned;
+}
+void NativeAuxiliaryStreamOwnership::completeNativeHandles()noexcept{
+    if(!state_ || state_->phase==State::Phase::Retired)std::terminate();
+    if(state_->phase==State::Phase::Claimed)state_->pending.reset();
+    else state_->slot.completeNativeHandles();
+    state_->phase=State::Phase::Retired;
+}
+NativeAuxiliaryStreamOwnership::~NativeAuxiliaryStreamOwnership()noexcept{
+    if(state_ && state_->phase!=State::Phase::Claimed && state_->phase!=State::Phase::Retired)std::terminate();
 }
 }

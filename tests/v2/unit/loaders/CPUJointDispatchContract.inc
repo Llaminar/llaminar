@@ -8,6 +8,7 @@
  */
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
+#include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 namespace {
 /** @brief Dispatch-only observation at the existing public collective boundary. */
 class JointDispatchContractRecorder final : public llaminar2::IMoEOverlaySparseCollectiveContext {
@@ -28,6 +29,36 @@ public:
     }
     /** @brief Observe cancellation without a native transport or pending work to retire. */
     void abort(const llaminar2::MoEOverlayCollectiveKey&,int)override {}
+};
+
+/** @brief Observe rank-batch packets at the production stage's transport boundary. */
+class JointRankBatchDispatchRecorder final : public llaminar2::IMoEOverlayRankBatchTransport {
+public:
+    explicit JointRankBatchDispatchRecorder(int target) : participants_{target} {}
+    int calls = 0;
+    llaminar2::MoEOverlaySparseRows observed;
+    llaminar2::MoEOverlayRankBatchTransportKind kind() const noexcept override
+    { return llaminar2::MoEOverlayRankBatchTransportKind::MPI; }
+    int sourceWorldRank() const noexcept override { return 0; }
+    int targetWorldRank() const noexcept override { return 1; }
+    int localWorldRank() const noexcept override { return 0; }
+    const std::vector<int>& participantIds() const noexcept override { return participants_; }
+    llaminar2::MoEOverlayCollectiveResult exchangeDispatch(const llaminar2::MoEOverlayRankBatchKey&,
+        std::span<const llaminar2::MoEOverlaySparseRows *const> outbound,
+        std::span<llaminar2::MoEOverlaySparseRows *const> inbound) override
+    {
+        if (outbound.size() != 1 || !outbound.front() || !inbound.empty())
+            return {.ok=false,.error="Unexpected dispatch packet roster"};
+        observed = *outbound.front();
+        ++calls;
+        return {.ok=true,.collective_complete=false};
+    }
+    llaminar2::MoEOverlayCollectiveResult exchangeReturn(const llaminar2::MoEOverlayRankBatchKey&,
+        std::span<const llaminar2::MoEOverlayReturnRows *const>,
+        std::span<llaminar2::MoEOverlayReturnRows *const>) override
+    { return {.ok=false,.error="Dispatch contract never fabricates a return"}; }
+private:
+    std::vector<int> participants_;
 };
 }
 /** @test Real Static publication preserves joint fanout and scalar GPU ownership for partial/empty work. */
@@ -127,14 +158,44 @@ TEST(CPUJointDispatchContract, ZeroWeightsCompactBeforePublicationWithoutLosingO
     FP32Tensor indices({rows,K}),weights({rows,K}),hidden({rows,H});
     for(int i=0;i<rows*K;++i)indices.mutable_data()[i]=float(i%2?511:64);
     for(int i=0;i<rows*H;++i)hidden.mutable_data()[i]=float(i+7);
-    MoEExpertDispatchOutput output;MoEExpertDispatchStage::Params p;
+    const auto output_owner = std::make_shared<MoEExpertDispatchOutput>();
+    auto& output = *output_owner;
+    MoEExpertDispatchStage::Params p;
     p.device_id=DeviceId::cpu();p.routing_indices=&indices;p.routing_weights=&weights;p.hidden=&hidden;
     p.seq_len=rows;p.top_k=K;p.d_model=H;p.continuation_domain=original.plan->continuation_domain;
     p.placement=original.plan->placements.front();p.routed_tiers=original.plan->routed_tiers;
     p.residency_authority=authority;p.output=&output;
     MoEExpertDispatchStage dispatch(p);llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(),ComputeBackendType::CPU);
-    const std::array<std::array<float,rows*K>,3> patterns{{{{0,1,0,0,0,0}},{{0,0,0,0,0,0}},{{1,0,1,0,0,1}}}};
+    const auto snapshot = authority->snapshot();
+    const auto* remote = snapshot->originalOwnerMap().participantForId(members.back());
+    ASSERT_NE(remote, nullptr);
+    ASSERT_EQ(remote->world_rank, 1);
+    auto batch_recorder = std::make_shared<JointRankBatchDispatchRecorder>(remote->participant_id);
+    auto batch_workspace = std::make_shared<MoEOverlayCollectiveWorkspace>();
+    batch_workspace->ensureCapacity(rows,rows*K,H,K,DeviceId::cpu());
+    auto batch_buffer = batch_workspace->localExpertInput(7,1);
+    MoERankBatchDispatchStage::Params batch;
+    batch.device_id = DeviceId::cpu();
+    batch.transport = batch_recorder;
+    batch.key = makeMoEOverlayRankBatchKey(23,0,ExpertHistogramSource::PrefillChunk,7,1,1,0,1,
+        MoEOverlayCollectiveDirection::Dispatch);
+    batch.source_participant = sourceOwner->owner_participant;
+    batch.participant_ids = {remote->participant_id};
+    batch.participant_workspaces = {batch_workspace};
+    batch.hidden = &hidden;
+    batch.routing_indices = &indices;
+    batch.routing_weights = &weights;
+    batch.dispatch_output = output_owner;
+    batch.seq_len = rows;
+    batch.top_k = K;
+    batch.d_model = H;
+    batch.tier_index = 1;
+    MoERankBatchDispatchStage batch_consumer(batch);
+    int replay = 0;
+    const std::array<std::array<float,rows*K>,4> patterns{{
+        {{1,1,1,1,1,1}}, {{0,1,0,0,0,0}}, {{0,0,0,0,0,0}}, {{1,0,1,0,0,1}}}};
     for(const auto& pattern:patterns) {
+        SCOPED_TRACE(replay);
         std::copy(pattern.begin(),pattern.end(),weights.mutable_data());ASSERT_TRUE(dispatch.execute(&ctx));
         ASSERT_TRUE(output.residency_lease);ASSERT_EQ(output.tiers[1].entries.size(),size_t(rows*K));
         std::vector<int32_t> expectedSlots,expectedRows,firstSlots;
@@ -142,6 +203,28 @@ TEST(CPUJointDispatchContract, ZeroWeightsCompactBeforePublicationWithoutLosingO
             expectedSlots.push_back(row*K+k);
             if(expectedRows.empty() || expectedRows.back()!=row)expectedRows.push_back(row);
         }
+        std::fill_n(batch_buffer.hidden_rows_fp32, rows*H, -739.0f);
+        const IComputeStage::MoEOverlayCollectiveRuntimeParams runtime{
+            .generation_id=23,.step_id=static_cast<uint64_t>(++replay),
+            .execution_semantics=IComputeStage::MoEOverlayCollectiveRuntimeParams::ExecutionSemantics::Prefill};
+        batch_consumer.updateMoEOverlayCollectiveRuntimeParams(runtime);
+        ASSERT_TRUE(batch_consumer.execute(&ctx));
+        ASSERT_EQ(batch_recorder->calls, replay);
+        const auto& remote_packet = batch_recorder->observed;
+        ASSERT_EQ(remote_packet.live_entry_count, expectedSlots.size());
+        ASSERT_EQ(remote_packet.live_row_count, expectedRows.size());
+        EXPECT_EQ(remote_packet.residency_epoch, snapshot->epoch);
+        EXPECT_EQ(remote_packet.target_participant, remote->participant_id);
+        for (std::size_t i=0; i<expectedSlots.size(); ++i)
+            EXPECT_EQ(remote_packet.original_route_slots_host[i], expectedSlots[i]);
+        for (std::size_t i=0; i<expectedRows.size(); ++i) {
+            EXPECT_EQ(remote_packet.row_ids_host[i], expectedRows[i]);
+            EXPECT_TRUE(std::equal(remote_packet.hidden_rows_fp32+i*H,
+                remote_packet.hidden_rows_fp32+(i+1)*H, hidden.data()+expectedRows[i]*H));
+        }
+        EXPECT_TRUE(std::all_of(remote_packet.hidden_rows_fp32+expectedRows.size()*H,
+            remote_packet.hidden_rows_fp32+rows*H, [](float value){return value==-739.0f;}));
+
         for(const int target:members) {
             JointDispatchContractRecorder recorder;MoEOverlayCollectiveWorkspace workspace;
             workspace.ensureCapacity(rows,rows*K,H,K,DeviceId::cpu());
@@ -174,4 +257,18 @@ TEST(CPUJointDispatchContract, ZeroWeightsCompactBeforePublicationWithoutLosingO
                 [](float value){return value==-733.0f;}));
         }
     }
+
+    const IComputeStage::MoEOverlayCollectiveRuntimeParams invalid_runtime{
+        .generation_id=23,.step_id=9,
+        .execution_semantics=IComputeStage::MoEOverlayCollectiveRuntimeParams::ExecutionSemantics::Prefill};
+    auto wrong = batch;
+    wrong.transport = std::make_shared<JointRankBatchDispatchRecorder>(members.front());
+    wrong.participant_ids = {members.front()}; // Genuine CPU member on the wrong original target rank.
+    MoERankBatchDispatchStage wrong_rank(wrong);
+    wrong_rank.updateMoEOverlayCollectiveRuntimeParams(invalid_runtime);
+    EXPECT_FALSE(wrong_rank.execute(&ctx));
+    output.residency_lease.reset();
+    batch_consumer.updateMoEOverlayCollectiveRuntimeParams(invalid_runtime);
+    EXPECT_FALSE(batch_consumer.execute(&ctx));
+    EXPECT_EQ(batch_recorder->calls, replay);
 }

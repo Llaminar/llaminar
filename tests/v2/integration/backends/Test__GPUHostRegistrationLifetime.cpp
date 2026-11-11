@@ -13,6 +13,7 @@
  * MPI staging additionally proves the actual process_vm_readv syscall after
  * captured GPU publication; a CPU-readable device mapping alone is insufficient.
  */
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
@@ -74,7 +75,7 @@ namespace
                     SCOPED_TRACE(device.toString() + " bytes=" + std::to_string(bytes) +
                         " round=" + std::to_string(round));
                     auto &worker = GPUDeviceContextPool::instance().getContext(device);
-                    const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
+                    const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                         1u, device, "host_registration_lifetime");
                     auto download = transfers.allocatePinnedHostBuffer(bytes, device);
                     worker.submitAndWait([&] {
@@ -199,7 +200,7 @@ TEST(GPUHostRegistrationLifetime, RemoteStagingSupportsCmaAfterCapturedPublicati
                 bytes, 2u, device, HostTransferAccess::CrossProcessReadable);
             const auto input = transfers.mappedStagingView(staging[0]);
             const auto output = transfers.mappedStagingView(staging[1]);
-            const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
+            const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                 1u, device, "remote_staging_cma_publication");
             std::vector<unsigned char> observed(bytes);
             worker.submitAndWait([&] {
@@ -269,7 +270,7 @@ TEST(GPUHostRegistrationLifetime, FullSpanPolicyAndNeighbourReclaimPreserveCaptu
             const auto device = deviceAt(ordinal);
             SCOPED_TRACE(device.toString() + (mapped_channel ? " mapped" : " pinned"));
             auto &worker = GPUDeviceContextPool::instance().getContext(device);
-            const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
+            const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                 1u, device, "host_registration_neighbour_reclaim");
             worker.submitAndWait([&] {
                 // Interior PMDs and the unrelated tail initially share one

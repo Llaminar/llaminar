@@ -59,8 +59,13 @@ a partial ambient locator or an LM-only reference cannot select another history.
 
 from __future__ import annotations
 
-from production_artifacts import artifact_identity_path
+from production_artifacts import (artifact_identity_path, validate_preflight_qualification,
+    optional_native_cohort_absence, validate_optional_native_cohort_requirement)
 from generation_movement_ledger import validate_cohort_parity_documents
+from run_qfn_source_admission import (
+    registrations as source_admission_registrations,
+    source_hardware_devices,
+)
 
 import argparse
 import csv
@@ -571,6 +576,7 @@ class CampaignMatrixResult:
     preflight_elapsed_seconds: float
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     fixture_elapsed_seconds: float
     model_staging_return_code: int
@@ -647,6 +653,7 @@ class IndividualProgressReport:
     preflight_return_code: int
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     model_staging_return_code: int
     artifact_root: str
@@ -672,6 +679,7 @@ class FocusedExactCellReport:
     preflight_return_code: int
     preflight_test_count: int
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     fixture_return_code: int
     model_staging_return_code: int
     model_staging_root: str
@@ -998,8 +1006,12 @@ def discover_production_test_preflight_registrations(
             command,
             _as_string_list(properties.get("RESOURCE_LOCK", [])),
         )
+        if "HardwareOptional" in labels and any(properties.get(key) for key in (
+                "DISABLED", "SKIP_RETURN_CODE", "SKIP_REGULAR_EXPRESSION")):
+            raise RuntimeError("optional hardware native body must remain strict: " + name)
         registrations.append(PreflightRegistration(name, labels, ranks, lane, ctest_index))
 
+    preflight_optional_hardware_requirements(registrations)
     registrations.sort(key=lambda registration: registration.name)
     names = tuple(registration.name for registration in registrations)
     if not registrations:
@@ -1011,6 +1023,127 @@ def discover_production_test_preflight_registrations(
             "CTest returned duplicate ProductionTestPreflight tests"
         )
     return tuple(registrations)
+
+
+def preflight_optional_hardware_requirements(
+    registrations: Iterable[PreflightRegistration],
+) -> dict[str, dict]:
+    """Compile declared optional geometry from the original CMake labels and MPI command."""
+    requirements = {}
+    for row in registrations:
+        isa_labels = sorted(label for label in row.labels if label.startswith("NativeISA"))
+        stage_labels = sorted(label for label in row.labels if label.startswith("StageSizes"))
+        rank_labels = sorted(label for label in row.labels if label.startswith("RankSizes"))
+        if "HardwareOptional" not in row.labels:
+            if row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+                raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
+            continue
+        device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
+        if (any(not re.fullmatch(r"Devices[1-9][0-9]*", label) for label in device_labels)
+                or any(not re.fullmatch(r"NativeISA-[a-z][a-z0-9_]*", label) for label in isa_labels)
+                or any(not re.fullmatch(r"StageSizes[1-9][0-9]*(?:x[1-9][0-9]*)+", label) for label in stage_labels)
+                or any(not re.fullmatch(r"RankSizes[1-9][0-9]*x[1-9][0-9]*", label) for label in rank_labels)):
+            raise RuntimeError("malformed optional native geometry: " + row.name)
+        backends = row.labels & {"CUDA", "ROCm"}
+        family_labels = sorted(label for label in row.labels
+                               if label.startswith(("CUDADevices", "ROCmDevices")))
+        if family_labels:
+            if (backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+                    or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
+                raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
+            degrees = {label.split("Devices")[0].lower(): int(label.split("Devices")[1])
+                       for label in family_labels}
+            if set(degrees) != {"cuda", "rocm"} or sum(degrees.values()) != int(device_labels[0][7:]):
+                raise RuntimeError("inconsistent optional mixed-family geometry: " + row.name)
+            requirement = {"backend_degrees": degrees, "mpi_ranks": row.mpi_ranks,
+                "locality": "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
+                            else "original-numa-local-rank"}
+            try:
+                validate_optional_native_cohort_requirement(requirement)
+            except ValueError as error:
+                raise RuntimeError(f"unsupported optional native geometry: {row.name}: {error}") from error
+            requirements[row.name] = requirement
+            continue
+        if len(backends) != 1 or len(device_labels) != 1 or len(isa_labels) > 1 or len(stage_labels) > 1 or len(rank_labels) > 1 or (rank_labels and stage_labels):
+            raise RuntimeError("ambiguous optional native geometry: " + row.name)
+        distinct_ranks = "DistinctNUMARanks" in row.labels
+        if distinct_ranks and row.mpi_ranks != 2:
+            raise RuntimeError("unsupported optional native geometry: " + row.name)
+        try:
+            requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
+                "locality": "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+            peer_labels = row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+            if len(peer_labels) > 1:
+                raise ValueError("conflicting optional directed peer geometry")
+            if peer_labels:
+                requirement["peer_access"] = "directed-edge" if "DirectedPeerEdge" in peer_labels else "no-directed-pair"
+                requirement["mpi_ranks"] = row.mpi_ranks
+            if isa_labels:
+                requirement["native_isa"] = isa_labels[0].removeprefix("NativeISA-")
+            if stage_labels:
+                requirement["stage_sizes"] = [int(size) for size in stage_labels[0][10:].split("x")]
+                requirement["mpi_ranks"] = row.mpi_ranks
+            if rank_labels:
+                requirement["rank_sizes"] = [int(size) for size in rank_labels[0][9:].split("x")]
+                requirement["mpi_ranks"] = row.mpi_ranks
+            validate_optional_native_cohort_requirement(requirement)
+        except ValueError as error:
+            raise RuntimeError(f"unsupported optional native geometry: {row.name}: {error}") from error
+        requirements[row.name] = requirement
+    return requirements
+
+
+def preflight_hardware_qualification(
+    tests: tuple[str, ...], requirements: dict[str, dict], hardware: dict | None,
+) -> dict:
+    """Derive the full selected/unqualified partition without changing any test body."""
+    observed = source_hardware_devices(hardware) if requirements else {}
+    unavailable = {}
+    for name, requirement in requirements.items():
+        absence = optional_native_cohort_absence(requirement, hardware)
+        if absence is not None:
+            unavailable[name] = absence
+    result = {"schema": 1, "registered": list(tests),
+        "selected": [name for name in tests if name not in unavailable],
+        "requirements": requirements, "hardware": hardware, "unqualified": unavailable}
+    validate_preflight_qualification(list(tests), result)
+    return result
+
+
+def observe_preflight_hardware(build_dir: Path, timeout: float | None) -> dict:
+    """Reuse the original native exporter, including its MPI and backend retirement.
+
+    Native/query/parse failure is fatal, never an empty physical inventory.
+    Temporary output is fresh; the complete document travels in the gate receipt.
+    No model fixtures or files are read by this original executable mode.
+    """
+    limit = 30 if timeout is None else min(30, timeout)
+    listing = json.loads(subprocess.check_output(
+        ["ctest", "--test-dir", str(build_dir), "--show-only=json-v1"],
+        text=True, timeout=limit))
+    registered = source_admission_registrations(listing)
+    binaries = {row["binary"] for row in registered.values()}
+    if len(binaries) != 1:
+        raise ValueError("source inventory belongs to more than one executable")
+    # CMake owns executable placement in source builds and installed runners.
+    # The original source-admission parser validates its complete registration;
+    # neither a guessed build-root path nor another installation may replace it.
+    binary = Path(binaries.pop()).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix="preflight-native-hardware-") as directory:
+        path = Path(directory).resolve() / "hardware.json"
+        completed = subprocess.run([str(binary.resolve(strict=True)),
+            f"--qfn-source-hardware-inventory={path}"], check=True,
+            env={**os.environ, "HWLOC_COMPONENTS": "-gl,-opencl",
+                "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "0", "LLAMINAR_SKIP_CUDA_STARTUP": "0",
+                "LLAMINAR_SKIP_ROCM_STARTUP": "0"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=limit)
+        if completed.stdout:
+            print(completed.stdout, end="", flush=True)
+        hardware = json.loads(path.read_text(encoding="utf-8"))
+    source_hardware_devices(hardware)
+    return hardware
 
 
 def preflight_execution_plan(
@@ -3708,6 +3841,15 @@ def _run_preflight_parallel_processes(
 
 
 @dataclass(frozen=True)
+class PreflightResult:
+    """One canonical result; qualification cannot be lost by tuple unpacking."""
+    return_code: int
+    elapsed_seconds: float
+    tests: tuple[str, ...]
+    qualification: dict | None
+
+
+@dataclass(frozen=True)
 class PrerequisiteReport:
     """Standalone model-free gate evidence, never a model/image certificate.
 
@@ -3719,6 +3861,7 @@ class PrerequisiteReport:
     preflight_return_code: int
     preflight_elapsed_seconds: float
     preflight_tests: tuple[str, ...]
+    preflight_qualification: dict | None
     preflight_build_directory: str
     preflight_completed_ns: int
     preflight_test_count: int
@@ -3732,19 +3875,22 @@ def run_production_test_preflight(
     timeout_seconds: float | None,
     installed_build_receipt: Path | None = None,
     artifact_directory: Path | None = None,
-) -> tuple[int, float, tuple[str, ...]]:
+) -> PreflightResult:
     """Build and run every model-free prerequisite before model staging.
 
     The phases deliberately have separate, source-owned inventories: CTest's
     complete Unit namespace and the Integration-only preflight label.  Their
-    concatenated identities remain the existing report receipt, so a green
-    campaign proves both without adding a parallel manifest.
+    concatenated identities remain the full registered report inventory. Only
+    explicitly optional physical geometries can remain hardware-unqualified;
+    their exact requirements, observation and absence survive in the same result.
+    Eligible original native bodies remain strict and execute unchanged.
     """
 
     # CTest omits command metadata for executables not built yet. Authenticate
     # the complete runnable inventory only after this owner builds its gates
     # (or validates the installed image receipt); never weaken discovery itself.
     tests: tuple[str, ...] = ()
+    qualification: dict | None = None
     timeout_text = (
         "disabled" if timeout_seconds is None else f"{timeout_seconds:.3f}"
     )
@@ -3760,18 +3906,19 @@ def run_production_test_preflight(
             return None
         return max(deadline - time.monotonic(), 0.001)
 
-    def complete(return_code: int, elapsed: float) -> tuple[int, float, tuple[str, ...]]:
+    def complete(return_code: int, elapsed: float) -> PreflightResult:
         """Publish this gate's own receipt without requiring a model run."""
         if artifact_directory is not None:
             write_report(artifact_directory / "prerequisites.json", PrerequisiteReport(
                 preflight_return_code=return_code,
                 preflight_elapsed_seconds=elapsed,
                 preflight_tests=tests,
+                preflight_qualification=qualification,
                 preflight_build_directory=str(build_dir.expanduser().resolve()),
                 preflight_completed_ns=time.time_ns(),
                 preflight_test_count=len(tests),
             ))
-        return return_code, elapsed, tests
+        return PreflightResult(return_code, elapsed, tests, qualification)
 
     print(
         "[production-parity] preflight_status=RUNNING "
@@ -3856,6 +4003,18 @@ def run_production_test_preflight(
     require_retired((native_session_bases[name] for name in tests
                      if name in native_session_bases), timeout_seconds=0)
 
+    requirements = preflight_optional_hardware_requirements(integration_registrations)
+    hardware = observe_preflight_hardware(build_dir, remaining_timeout()) if requirements else None
+    qualification = preflight_hardware_qualification(tests, requirements, hardware)
+    selected_integration = tuple(row for row in integration_registrations
+        if row.name in qualification["selected"])
+    print("[production-parity] hardware_qualification_status=PASS "
+        f"registered={len(integration_registrations)} selected={len(selected_integration)} "
+        f"hardware_ineligible_unqualified={len(qualification['unqualified'])}", flush=True)
+    for name, reason in qualification["unqualified"].items():
+        print("[production-parity] hardware-ineligible-unqualified " + name + " " +
+            json.dumps(reason, sort_keys=True), flush=True)
+
     def process_scope(names: tuple[str, ...]):
         """Keep this lane closed until its original native owners remove backing."""
         return retirement_scope(native_session_bases[name] for name in names
@@ -3909,13 +4068,14 @@ def run_production_test_preflight(
     unit_return_code = return_code
 
     with ExitStack() as selector_owners:
-        execution_plan = preflight_execution_plan(integration_registrations)
+        execution_plan = preflight_execution_plan(selected_integration)
         planned_names = tuple(
             name
             for lane in PreflightExecutionLane
             for name in execution_plan[lane]
         )
-        if set(planned_names) != set(integration_tests) or len(planned_names) != len(integration_tests):
+        selected_names = tuple(row.name for row in selected_integration)
+        if set(planned_names) != set(selected_names) or len(planned_names) != len(selected_names):
             raise RuntimeError("preflight execution plan does not cover its exact CTest inventory")
 
         def integration_command(
@@ -4078,7 +4238,7 @@ def run_production_test_preflight(
 def reuse_unchanged_production_test_preflight(
     build_dir: Path,
     report_path: Path,
-) -> tuple[int, float, tuple[str, ...]]:
+) -> PreflightResult:
     """Reuse canonical prerequisite evidence only for an unchanged build tree.
 
     Numerical and generation runners share this admission authority. The prior
@@ -4149,10 +4309,9 @@ def reuse_unchanged_production_test_preflight(
                 f"registration changed afterward: {boundary}"
             )
 
-    tests = (
-        discover_production_parity_unit_tests(resolved_build)
-        + discover_production_test_preflight_tests(resolved_build)
-    )
+    registrations = discover_production_test_preflight_registrations(resolved_build)
+    tests = (discover_production_parity_unit_tests(resolved_build)
+        + tuple(row.name for row in registrations))
     reported_tests = tuple(document.get("preflight_tests", ()))
     if (
         document.get("preflight_test_count") != len(tests)
@@ -4162,13 +4321,20 @@ def reuse_unchanged_production_test_preflight(
             "reusable preflight report does not prove the current complete "
             "unit and integration prerequisite inventory"
         )
+    requirements = preflight_optional_hardware_requirements(registrations)
+    qualification = document.get("preflight_qualification")
+    validate_preflight_qualification(list(tests), qualification)
+    hardware = observe_preflight_hardware(resolved_build, None) if requirements else None
+    current = preflight_hardware_qualification(tests, requirements, hardware)
+    if current != qualification:
+        raise ValueError("reusable preflight hardware qualification changed")
     print(
         "[production-parity] preflight_status=REUSED "
         f"test_count={len(tests)} evidence_report={resolved_report} "
         "build_identity=unchanged",
         flush=True,
     )
-    return 0, 0.0, tests
+    return PreflightResult(0, 0.0, tests, qualification)
 
 
 def prepare_model_fixture(
@@ -5141,6 +5307,7 @@ def run_unseen_cells_individually(
             preflight_return_code=125,
             preflight_test_count=0,
             preflight_tests=(),
+            preflight_qualification=None,
             fixture_return_code=0,
             model_staging_return_code=0,
             artifact_root="",
@@ -5161,6 +5328,7 @@ def run_unseen_cells_individually(
     completion_deadline = started + args.completion_timeout_seconds
     results: list[CampaignResult] = []
     preflight_return_code = 125
+    preflight_qualification = None
     preflight_tests: tuple[str, ...] = ()
     fixture_return_code = 125
     model_staging_return_code = 125
@@ -5175,23 +5343,21 @@ def run_unseen_cells_individually(
         flush=True,
     )
     if args.reuse_passed_preflight_report is None:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = run_production_test_preflight(
+        preflight_result = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     else:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     if preflight_return_code != 0:
         exit_code = preflight_return_code
         stopped_on_failure = True
@@ -5306,6 +5472,7 @@ def run_unseen_cells_individually(
         preflight_return_code=preflight_return_code,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         model_staging_return_code=model_staging_return_code,
         artifact_root=str(artifact_root),
@@ -5344,6 +5511,7 @@ def run_unseen_cells_individually(
 def run_focused_exact_cell(
     args: argparse.Namespace,
     selected: tuple[CampaignCell, ...],
+    declaration: dict | None = None,
 ) -> int:
     """Run one CTest-registered production cell through the full lifecycle.
 
@@ -5356,6 +5524,7 @@ def run_focused_exact_cell(
     Args:
         args: Parsed driver arguments containing one exact GTest identity.
         selected: CTest-discovered campaign aggregates after ordinary filters.
+        declaration: Original exact-cell metadata from model-free discovery.
 
     Returns:
         The focused cell's process/artifact result, or its prerequisite error.
@@ -5380,6 +5549,7 @@ def run_focused_exact_cell(
     started = time.monotonic()
     completion_deadline = started + args.completion_timeout_seconds
     preflight_return_code = 125
+    preflight_qualification = None
     preflight_tests: tuple[str, ...] = ()
     fixture_return_code = 125
     model_staging_return_code = 125
@@ -5394,23 +5564,21 @@ def run_focused_exact_cell(
         flush=True,
     )
     if args.reuse_passed_preflight_report is None:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = run_production_test_preflight(
+        preflight_result = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     else:
-        (
-            preflight_return_code,
-            _,
-            preflight_tests,
-        ) = reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
+        preflight_return_code = preflight_result.return_code
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     if preflight_return_code != 0:
         exit_code = preflight_return_code
     else:
@@ -5455,7 +5623,7 @@ def run_focused_exact_cell(
                 if history is not None:
                     try:
                         history.verify_unchanged()
-                        history.require_binding(result.artifact_directories)
+                        history.require_binding(result.artifact_directories, declaration)
                     except (OSError, ValueError, json.JSONDecodeError) as error:
                         result = replace(result,
                             return_code=result.return_code or 126,
@@ -5489,6 +5657,7 @@ def run_focused_exact_cell(
         preflight_return_code=preflight_return_code,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         model_staging_return_code=model_staging_return_code,
         model_staging_root=model_staging_root,
@@ -5572,7 +5741,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.exact_cell is not None:
         try:
-            return run_focused_exact_cell(args, tuple(selected))
+            return run_focused_exact_cell(args, tuple(selected), parameters.get(args.exact_cell))
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
             print(
                 f"production parity focused exact-cell error: {error}",
@@ -5611,12 +5780,9 @@ def main(argv: list[str] | None = None) -> int:
         f"exact_cell_timeout_seconds={EXACT_CELL_TIMEOUT_SECONDS:.3f}",
         flush=True,
     )
+    preflight_qualification = None
     try:
-        (
-            preflight_return_code,
-            preflight_elapsed,
-            preflight_tests,
-        ) = (reuse_unchanged_production_test_preflight(
+        preflight_result = reuse_unchanged_production_test_preflight(
             args.build_dir, args.reuse_passed_preflight_report,
         ) if args.reuse_passed_preflight_report is not None else run_production_test_preflight(
             args.build_dir,
@@ -5624,7 +5790,11 @@ def main(argv: list[str] | None = None) -> int:
             artifact_directory=args.report.resolve().parent / "prerequisites",
             **({"installed_build_receipt": args.installed_build_receipt}
                if args.installed_build_receipt else {}),
-        ))
+        )
+        preflight_return_code = preflight_result.return_code
+        preflight_elapsed = preflight_result.elapsed_seconds
+        preflight_tests = preflight_result.tests
+        preflight_qualification = preflight_result.qualification
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(
             f"production test preflight error: {error}",
@@ -5784,6 +5954,7 @@ def main(argv: list[str] | None = None) -> int:
         preflight_elapsed_seconds=preflight_elapsed,
         preflight_test_count=len(preflight_tests),
         preflight_tests=preflight_tests,
+        preflight_qualification=preflight_qualification,
         fixture_return_code=fixture_return_code,
         fixture_elapsed_seconds=fixture_elapsed,
         model_staging_return_code=model_staging_return_code,

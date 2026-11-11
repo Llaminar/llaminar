@@ -18,6 +18,8 @@
 #include "utils/MPIContext.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "Qwen4ExpCPUJointSocketEvidence.h"
+#include "../ModelParityRuntimeExport.h"
+#include "Qwen4ExpCrossRankPipelineCases.h"
 #include "config/OrchestrationConfigParser.h"
 #include "tools/ModelKLDQFNOwner.h"
 #include "Qwen4ExpProductionParityCases.h"
@@ -31,6 +33,7 @@
 #include "Qwen4ExpGDNProjectionEvidence.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
+#include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
 #include "../qwen2/Qwen2ParityTestBase.h"
 #include "models/qwen4exp/Qwen4ExpSchema.h"
 #include "loaders/ImmutableRowTable.h"
@@ -72,6 +75,27 @@ class Qwen4ExpConfigDrivenParityTest : public qwen2::ConfigDrivenParityTest<Deri
 {
 protected:
     using Base = qwen2::ConfigDrivenParityTest<Derived>;
+    std::shared_ptr<IMPIContext> original_pipeline_mpi_; ///< Original process MPI retained across base fixture setup.
+    /** @return Whether this case is a real cross-rank GPU pipeline surface. */
+    bool isCrossRankGPUPipelineSurface() const
+    {
+        const auto& topology=static_cast<const Derived*>(this)->modelParityCase().topology;
+        return topology.kind==ModelParityTopologyKind::NodePipelineParallel &&
+            std::all_of(topology.participants.begin(),topology.participants.end(),
+                [](const auto& participant){return participant.address.device_type!=DeviceType::CPU;});
+    }
+    /** @return Actual original local primary GPU, never the head rank's GPU. */
+    DeviceId originalPipelineDevice() const
+    {
+        int rank=-1;
+        if(MPI_Comm_rank(MPI_COMM_WORLD,&rank)!=MPI_SUCCESS)
+            throw std::runtime_error("QFN pipeline lost original MPI rank");
+        const auto& participants=static_cast<const Derived*>(this)->modelParityCase().topology.participants;
+        const auto local=std::find_if(participants.begin(),participants.end(),
+            [&](const auto& participant){return participant.world_rank==rank;});
+        if(local==participants.end())throw std::invalid_argument("QFN pipeline original rank owns no participant");
+        return {local->address.device_type,local->address.device_ordinal};
+    }
     /** @return Existing short reuse input unless a source-owned ordinary fixture declares sustained work. */
     virtual Qwen4ExpNativeGenerationRequest qwen4ExpLookupReuseRequest() const
     {
@@ -82,6 +106,22 @@ protected:
     /** @brief Retain the original published MPI inventory for the exact CPU socket domain. */
     void SetUp() override
     {
+        if(isCrossRankGPUPipelineSurface()) {
+            int rank=-1,world_size=0;
+            ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD,&rank),MPI_SUCCESS);
+            ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD,&world_size),MPI_SUCCESS);
+            const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+            ASSERT_EQ(world_size,cell.topology.mpi_ranks);
+            const auto startup=cell.makeOrchestrationConfig(cell.model.model_path,rank);
+            publishOrchestrationStartupPolicy(startup);
+            if(!DeviceManager::instance().hardware())
+                ASSERT_NO_THROW(RuntimeInitPhase::initializeDiscoveryRuntime(startup,rank,world_size));
+            original_pipeline_mpi_=MPIContextFactory::global();
+            ASSERT_TRUE(original_pipeline_mpi_);
+            const auto inventory=original_pipeline_mpi_->clusterInventory();
+            ASSERT_TRUE(inventory);
+            ASSERT_NO_THROW(requireQwen4ExpCrossRankPipelineOwners(cell,*inventory));
+        }
         if(isCPUJointNumericalSurface()) {
             // Inventory gathering may initialize a CPU-socket-filtered device
             // view. Publish the ordinary frontend's explicit-overlay startup
@@ -112,6 +152,10 @@ protected:
     /** @return The same original published MPI owner, without constructing another discovery context. */
     std::shared_ptr<IMPIContext> freshParityMPIContext() const override
     {
+        if(isCrossRankGPUPipelineSurface()) {
+            if(!original_pipeline_mpi_)throw std::invalid_argument("QFN pipeline lost original MPI owner");
+            return original_pipeline_mpi_;
+        }
         if(!isCPUJointNumericalSurface())return {};
         if(!Base::mpi_ctx_)throw std::invalid_argument("CPU joint numerical factory lost original MPI owner");
         return Base::mpi_ctx_;
@@ -120,12 +164,14 @@ protected:
     /** @return Participant-local backend for base fixture setup; follower never claims the continuation GPU. */
     DeviceId getDevice() override
     {
+        if(isCrossRankGPUPipelineSurface())return originalPipelineDevice();
         return isCPUJointNumericalSurface()?getDeviceForRank():Base::getDevice();
     }
 
     /** @return The original rank's actual continuation or CPU-only follower backend. */
     DeviceId getDeviceForRank() override
     {
+        if(isCrossRankGPUPipelineSurface())return originalPipelineDevice();
         if(!isCPUJointNumericalSurface())return Base::getDeviceForRank();
         const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
         const auto& plan=*cell.topology.expert_overlay_plan;
@@ -140,6 +186,22 @@ protected:
             [&](const auto& value){return value.world_rank==rank;});
         if(member==members.end())throw std::invalid_argument("CPU joint numerical follower is not an original member");
         return member->address.toLocalDeviceId();
+    }
+
+    /**
+     * @brief Preserve the typed observed pipeline's public serving capacity for parity setup.
+     * @return Its original public cap for exact graph admission and snapshot pricing.
+     */
+    std::optional<int> productionParityRetainedPrefillCap() const override
+    {
+        const auto &cell = static_cast<const Derived *>(this)->modelParityCase();
+        if (!cell.topology.observed_native_pipeline || !cell.ngram_table_policy ||
+            !cell.ngram_table_policy->isFixedHeadSharded())
+            return std::nullopt;
+        const auto config = modelParityServerConfiguration(cell);
+        accuracy::requireQFN(isObservedFixedNativePipeline(config),
+                             "QFN parity lost its bound fixed native pipeline configuration");
+        return config.prefill_max_bucket_size.value_or(kDefaultPrefillGraphMaxBucketSize);
     }
 
     /**
@@ -165,12 +227,30 @@ protected:
         accuracy::requireQFN(original.model.transformer_layers == 48 &&
                              Base::config_.mtp_expectation == ParityMTPExpectation::Disabled,
                              "Frozen history replay requires the original QFN main48 MTP-off cell");
-        auto arguments = modelParityDiagnosticBenchmarkArguments(original);
-        arguments.insert(arguments.begin(), "canonical-history-replay");
-        std::vector<char *> argv;
-        for (auto &argument : arguments) argv.push_back(argument.data());
-        const auto canonical = OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
-        replay->requireCanonicalConfiguration(canonical);
+        if (original.topology.observed_native_pipeline)
+        {
+            const auto canonical = modelParityServerConfiguration(original);
+            const auto *selected = dynamic_cast<const MPIContext *>(Base::mpi_ctx_.get());
+            const auto *membership = selected ? selected->executionMembership() : nullptr;
+            const auto *discovery = selected ? selected->originalDiscoveryContext() : nullptr;
+            accuracy::requireQFN(isObservedFixedNativePipeline(canonical) && membership && discovery &&
+                                 membership->selection() == *canonical.execution_rank_selection &&
+                                 membership->discoverySize() == discovery->world_size() &&
+                                 membership->discoverySize() == canonical.mpi_procs &&
+                                 membership->discoveryRanks().front() == discovery->rank() &&
+                                 selected->rank() == 0 && selected->world_size() == 1,
+                                 "Frozen history lost its authenticated selected original pipeline owner");
+            replay->requireCanonicalConfiguration(canonical);
+        }
+        else
+        {
+            auto arguments = modelParityDiagnosticBenchmarkArguments(original);
+            arguments.insert(arguments.begin(), "canonical-history-replay");
+            std::vector<char *> argv;
+            for (auto &argument : arguments) argv.push_back(argument.data());
+            replay->requireCanonicalConfiguration(OrchestrationConfigParser{}.parseArgs(
+                static_cast<int>(argv.size()), argv.data()));
+        }
         replay->configureCPUExecution();
         replay->requireCanonicalSource(Base::config_.model_path, Base::config_.shared_predictor,
                                        Base::config_.decode_steps);
@@ -222,7 +302,8 @@ protected:
         try
         {
             evidence = Base::frozen_history_replay_->servingPrefillEvidence(
-                PerfStatsCollector::snapshot({"forward_graph"}), native);
+                PerfStatsCollector::snapshot({"forward_graph"}), native,
+                Base::orch_runner_ ? &Base::orch_runner_->executionPlan() : nullptr);
             evidence["cpu_execution"] = Base::frozen_history_replay_->cpuExecutionEvidence(
                 PerfStatsCollector::snapshot({"kernel.cpu_moe_router_q8_worker_rows"}),
                 FrozenParityHistoryReplay::observeCPUExecution());
@@ -247,6 +328,8 @@ protected:
         if (static_cast<const Derived *>(this)->modelParityCase().model.transformer_layers != 48)
             return Base::acceptsAdditionalPrefillEvidence(summary);
         const bool final_logits = Base::config_.final_logit_mean_kl.has_value();
+        if(final_logits && Base::config_.uses_cross_rank_pipeline)
+            return Base::acceptsFinalLogitSummaryRawEvidence(summary,Base::config_,ParityForwardPhase::Prefill);
         const auto complete = acceptsQwen4ExpCompletePrefill(summary.layer_stats,
             final_logits ? summary.embedding_evidence_valid : summary.embedding_passed,
             final_logits ? summary.lm_head_evidence_valid : summary.lm_head_passed,
@@ -281,6 +364,12 @@ protected:
             return Base::acceptsAdditionalDecodeEvidence(summary);
         for (const auto &step : summary.step_stats)
         {
+            if(Base::config_.uses_cross_rank_pipeline)
+            {
+                if(const auto complete=Base::acceptsFinalLogitSummaryRawEvidence(step,Base::config_,ParityForwardPhase::Decode,step.step_idx);!complete)
+                    return complete;
+                continue;
+            }
             if (const auto evidence = acceptsQwen4ExpCompletePrefill(step.layer_stats, true, true,
                     Qwen4ExpMainEvidencePolicy::FiniteExactObservations, Qwen4ExpMainEvidencePhase::Decode); !evidence)
                 return ::testing::AssertionFailure() << "QFN decode step " << step.step_idx << ": " << evidence.message();
@@ -1017,16 +1106,21 @@ protected:
             else if(request.cache_physical_byte_limit)EXPECT_GT(slots,0u)
                 << "Positive-cache model qualification requires actual admitted RAM slots";
         }
-        else EXPECT_TRUE(ngramStorageHonors(test_case.ngram_table_policy->storage,placement->storage()));
+        else if (!placement->isFixedHeadShards())
+            EXPECT_TRUE(ngramStorageHonors(test_case.ngram_table_policy->storage,placement->storage()));
         std::vector<DeviceId> lookup_consumers;
         for (const auto &consumer : placement->consumers()) lookup_consumers.push_back(consumer.device);
-        const auto storage = placement->isHostAdaptive()?std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD)):
-            ngramStorageLabel(placement->storage());
         if (placement->isFixedHeadShards())
         {
             ASSERT_TRUE(test_case.ngram_table_policy->isFixedHeadSharded());
             ASSERT_EQ(context->hostImmutableRowProvider(), nullptr);
+            const bool observed_pipeline=test_case.topology.observed_native_pipeline.has_value();
+            if(observed_pipeline) {
+                ASSERT_TRUE(Base::orch_runner_);
+                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(test_case,*Base::orch_runner_,qfnObservationOwner()));
+            }
             std::vector<DeviceId> owners;
+            std::vector<std::shared_ptr<const ResidentImmutableRowTable>> native_owners;
             for (const auto &owner : placement->allocators())
             {
                 const auto native = context->residentImmutableRowTable(owner.device);
@@ -1034,6 +1128,30 @@ protected:
                 EXPECT_EQ(native->sourceRange(), placement->fixedHeadSourceRangeFor(owner));
                 EXPECT_EQ(native->nativeBytes(), native->sourceRange().nativeBytes());
                 owners.push_back(owner.device);
+                if(observed_pipeline)native_owners.push_back(native);
+            }
+            if(observed_pipeline) {
+                // The original request and reset preserve every fixed native
+                // range and the same participant family across real generation.
+                ASSERT_NO_THROW(Base::activeClearCache());
+                const auto request=qwen4ExpLookupReuseRequest();
+                ASSERT_FALSE(request.tokens.empty());
+                ASSERT_GT(request.minimum_tokens,0);
+                ASSERT_GE(request.maximum_tokens,request.minimum_tokens);
+                ASSERT_LE(request.tokens.size()+static_cast<size_t>(request.maximum_tokens),
+                    static_cast<size_t>(Base::orch_runner_->config().max_seq_len));
+                const auto generation=Base::orch_runner_->generate(request.tokens,request.maximum_tokens,request.sampling);
+                ASSERT_TRUE(generation.success())<<generation.error;
+                ASSERT_GE(generation.tokens.size(),static_cast<size_t>(request.minimum_tokens));
+                ASSERT_LE(generation.tokens.size(),static_cast<size_t>(request.maximum_tokens));
+                ASSERT_EQ(Base::activeModelContextForDiagnostics(),context);
+                ASSERT_EQ(context->resolvedImmutableRowTablePlacement(),placement);
+                for(size_t owner=0;owner<owners.size();++owner)
+                    EXPECT_EQ(context->residentImmutableRowTable(owners[owner]),native_owners[owner]);
+                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(test_case,*Base::orch_runner_,qfnObservationOwner()));
+                EXPECT_TRUE(PerfStatsCollector::writeCsv(
+                    (Base::ensureResultsDir()/"ngram_expert_runtime.csv").string(),
+                    {"ngram_lookup","immutable_lookup","moe_overlay","forward_graph","generation"}));
             }
             const auto records = PerfStatsCollector::snapshot({"immutable_lookup"});
             std::ofstream csv(Base::ensureResultsDir() / "ngram_storage.csv");
@@ -1041,6 +1159,27 @@ protected:
             writeQwen4ExpLookupCounterCSV(csv, records);
             csv.flush();
             ASSERT_TRUE(csv.good());
+            if(observed_pipeline) {
+                const auto* pipeline=placement->fixedHeadPipeline();
+                ASSERT_TRUE(pipeline);
+                for(const auto& owner:pipeline->owners()) {
+                    const auto role=owner.stage_index==pipeline->consumerStage()?"ple_consumer":"storage_only";
+                    ASSERT_TRUE(std::any_of(records.begin(),records.end(),[&](const auto& record){
+                        return record.kind==PerfStatRecord::Kind::Counter &&
+                            record.name=="fixed_head_pipeline_storage_ranges" && record.phase=="graph_setup" &&
+                            record.device==owner.allocator.device.toString() && record.value>0 &&
+                            record.tags.contains("role") && record.tags.at("role")==role &&
+                            record.tags.contains("stage") && record.tags.at("stage")==std::to_string(owner.stage_index) &&
+                            record.tags.contains("first_head") && record.tags.at("first_head")==std::to_string(owner.first_head) &&
+                            record.tags.contains("heads") && record.tags.at("heads")==std::to_string(owner.head_count) &&
+                            record.tags.contains("row_bytes") && record.tags.at("row_bytes")==std::to_string(placement->extent().rowBytes());
+                    }))<<"Missing original native fixed range declaration for "<<owner.allocator.device.toString();
+                }
+                ASSERT_NO_THROW((void)::llaminar2::qwen4exp::requireFixedHeadPipelineTerminalEvidence(
+                    records,*pipeline,placement->extent().rowBytes()));
+                ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence());
+                return;
+            }
             for (const auto &record : records)
             {
                 if (record.kind == PerfStatRecord::Kind::Counter)
@@ -1051,6 +1190,8 @@ protected:
             ASSERT_NO_THROW(requireQwen4ExpFixedHeadLookupEvidence(records, owners, placement->extent().rowBytes()));
             return;
         }
+        const auto storage = placement->isHostAdaptive()?std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD)):
+            ngramStorageLabel(placement->storage());
         const auto table = context->hostImmutableRowProvider();
         ASSERT_NE(table, nullptr) << "Hosted numerical cell requires its concrete native table owner";
         if(placement->isHostAdaptive())EXPECT_EQ(table->mode(),HostImmutableRowMode::AdaptiveRAMSSD);

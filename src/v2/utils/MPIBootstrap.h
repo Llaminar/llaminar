@@ -10,6 +10,10 @@
  * - Multi-machine support via hostfile
  *
  * @author David Sanftenberg
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #pragma once
@@ -17,6 +21,8 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <span>
+#include "NUMATopology.h"
 
 namespace llaminar2
 {
@@ -34,6 +40,39 @@ namespace llaminar2
         int numa_nodes = 1;           ///< Number of NUMA nodes
         bool hyperthreading = false;  ///< Hyperthreading detected
         std::string detection_method; ///< How topology was detected
+    };
+
+    /**
+     * @brief Immutable cold mapping of one real rank per observed NUMA partition.
+     *
+     * Node labels are physical observations, never MPI rank IDs. The original
+     * launcher writes native rankfile entries from their exact logical core
+     * sets. Rank indices enumerate observed partitions; they are never NUMA IDs.
+     */
+    class MPINUMAMapping final
+    {
+    public:
+        /**
+         * @brief Seal distinct observed nodes and their original logical core sets.
+         * @param placement Original cached OS NUMA/PU and logical-core observations.
+         * @param selected_nodes Exact participating OS NUMA labels, never rank IDs.
+         * @return Checked placement containing no worker/thread execution state.
+         * @throws std::invalid_argument For unknown nodes, empty lists or overlapping/invalid CPUs.
+         */
+        static MPINUMAMapping fromObservedPlacement(std::span<const MPICorePlacement> placement,
+            std::span<const int> selected_nodes);
+        /** @return Original node roster, unrelated to eventual MPI rank numbers. */
+        const std::vector<int> &nodes() const noexcept { return nodes_; }
+        /** @return Exact CPU union in the original launcher CPU-set grammar. */
+        const std::string &cpuSet() const noexcept { return cpu_set_; }
+        /** @return Native local OpenMPI rankfile, one complete logical-core set per observed node. */
+        const std::string &rankFileContents() const noexcept { return rank_file_contents_; }
+    private:
+        /** @brief Only the checked observation factory may publish a placement. */
+        MPINUMAMapping() = default;
+        std::vector<int> nodes_;
+        std::string cpu_set_;
+        std::string rank_file_contents_;
     };
 
     /**
@@ -55,6 +94,7 @@ namespace llaminar2
         std::string omp_places = "cores"; ///< One place per physical core, including its allowed SMT siblings.
         std::string omp_proc_bind = "close";
         std::string cpu_set; ///< Optional OpenMPI --cpu-set for explicit CPU NUMA targeting
+        std::optional<MPINUMAMapping> numa_mapping; ///< Exact local one-rank-per-observed-NUMA declaration.
     };
 
     /**
@@ -152,13 +192,15 @@ namespace llaminar2
          * @param config Launch configuration
          * @param topology CPU topology (for auto-detecting num_procs)
          * @param arguments Whether original application flags remain exact after re-exec.
+         * @param observed_numa_rankfile Original guardian-owned rankfile pathname, required only for a typed NUMA mapping.
          * @return Vector of command-line arguments for execvp
          */
         static std::vector<std::string> buildMPIRunCommand(
             int argc, char *argv[],
             const MPILaunchConfig &config,
             const CPUTopology &topology,
-            MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments);
+            MPIBootstrapArgumentPolicy arguments = MPIBootstrapArgumentPolicy::FilterLaunchArguments,
+            const std::string &observed_numa_rankfile = {});
 
         /**
          * @brief Self-launch via mpirun
@@ -203,15 +245,16 @@ namespace llaminar2
                                               const MPIEnvironmentInfo &env);
 
         /**
-         * @brief Read OpenMPI cpu-set mask string for a NUMA node (e.g., "28-55,84-111")
+         * @brief Read OS CPU-list string for a NUMA node (e.g., "28-55,84-111")
          */
         static std::string getCpuSetForNumaNode(int numa_node);
 
         /**
-         * @brief Read physical-core-only OpenMPI cpu-set for a NUMA node.
+         * @brief Read physical-core representatives as OS CPU IDs for a NUMA node.
          *
          * Uses thread_siblings topology to keep one logical CPU per physical core
-         * and returns a compact range list (e.g., "28-55").
+         * and returns a compact OS range list (e.g., "28-55"). These IDs are
+         * diagnostics/affinity inputs, never OpenMPI logical cpu-set indices.
          */
         static std::string getPhysicalCpuSetForNumaNode(int numa_node);
 

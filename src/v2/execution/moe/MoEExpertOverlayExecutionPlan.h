@@ -185,7 +185,8 @@ namespace llaminar2
      *
      * @param plan Immutable requested placement plan.
      * @param inventory Cluster-wide rank/device inventory gathered at startup.
-     * @return A copied plan with deterministic world-rank and owner bindings.
+     * @param diagnostic Already-resolved typed startup intent, never parsed again by the allocator.
+     * @return A copied plan with deterministic world-rank, owner and local route transport bindings.
      * @throws std::invalid_argument when requested hardware is absent,
      *         ambiguous after locality tie-breaking, or incompatible with the
      *         domain scope.
@@ -193,6 +194,7 @@ namespace llaminar2
     std::shared_ptr<MoERoutedExpertPlacementPlan>
     bindMoEExpertOverlayPlanToClusterInventory(
         const MoERoutedExpertPlacementPlan &plan,
-        const ClusterInventory &inventory);
+        const ClusterInventory &inventory,
+        std::optional<MoEOverlayNodeLocalRouteTransport> diagnostic = std::nullopt);
 
 } // namespace llaminar2

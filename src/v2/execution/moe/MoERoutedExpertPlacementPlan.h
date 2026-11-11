@@ -17,6 +17,7 @@
 #include "config/ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/moe/MoEOverlayAuthorityExecution.h"
+#include "execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "execution/moe/MoEOverlayReplicaCacheCapacity.h"
 
 #include <algorithm>
@@ -400,6 +401,12 @@ namespace llaminar2
          */
         MoEOverlayAuthorityExecutionKind authority_execution =
             MoEOverlayAuthorityExecutionKind::Unresolved;
+
+        /** Original-inventory-resolved local GPU route policy; absent outside a multi-GPU local continuation.
+         * This derived hardware binding is shared by BOM and Rank construction; it is not user input. */
+        std::optional<MoEOverlayNodeLocalRouteTransportPolicy> observed_route_transport;
+        /** Typed startup diagnostic consumed when the same hardware binding was produced. */
+        std::optional<MoEOverlayNodeLocalRouteTransport> observed_route_diagnostic;
 
         /** Setup-owned replica geometry; absent before admission or without a directory. */
         std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;

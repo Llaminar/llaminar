@@ -20,6 +20,7 @@
 #include "execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "DeviceType.h"
+#include "collective/NativeCollectiveCompletion.h"
 #include "backends/NativeAllocationCaptureLease.h"
 #include "GenerationPenaltyHistory.h"
 #include "kernels/common/GenerationLogicalState.h"
@@ -30,8 +31,13 @@
 
 namespace llaminar2
 {
+    enum class NativeCountedAllGatherPreparation : std::uint8_t;
+    enum class NativePipelineByteOperation : std::uint8_t;
+    struct NativePipelineByteInvocation;
+
     class TransferEngine;
     struct CapturedTransferChannelDeviceBinding;
+    struct PipelineActivationFanoutValidation;
     struct CapturedTransferChannelBatch;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
@@ -253,6 +259,41 @@ namespace llaminar2
     class IBackend
     {
     public:
+        /**
+         * @brief Seal one collective-owned native completion frame on its exact stream.
+         * @param memory Persistent admitted participant metadata, cleared once during setup.
+         * @param degree Actual original membership, without a fixed participant cap.
+         * @param table Capture-frozen semantic message key.
+         * @param admission Capture-frozen admitted packet bytes.
+         * @param preparation Cold Initialize clears the admitted bank/resolves kernels; captured Advance only seals the next invocation.
+         * @param device_id Original local GPU ordinal.
+         * @param stream Exact non-null stream after local extent production.
+         * @param outgoing Optional original aligned request counter for actual native sends.
+         * @return Whether the preparation launch was accepted; never reads a count on host.
+         */
+        virtual bool enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing = nullptr)
+        { (void)memory;(void)degree;(void)table;(void)admission;(void)preparation;(void)device_id;(void)stream;(void)outgoing;return false; }
+        /**
+         * @brief Prepare/validate one native pipeline endpoint using its original live row root.
+         * @param invocation Exact admitted frame, message, signed rows and native authority.
+         * @param operation Cold initialization or one captured scalar preparation/validation node.
+         * @param device_id Original local GPU ordinal. @param stream Exact non-null producer stream.
+         * @return Whether the native scalar operation was accepted; no host count readback occurs.
+         */
+        virtual bool enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+            NativePipelineByteOperation operation, int device_id, void *stream)
+        { (void)invocation; (void)operation; (void)device_id; (void)stream; return false; }
+        /** @brief Validate actual native receipts on the exact stream before dependent publication.
+         * @param memory Same persistent participant frame. @param degree Actual original membership.
+         * @param original Native authority captured before retirement. @param device_id Original GPU ordinal.
+         * @param stream Exact stream after all native payload launches.
+         * @return Whether validation was enqueued; unsupported implementations reject. */
+        virtual bool validateNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            ncclLlaminarCompletionAuthority original, int device_id, void *stream)
+        { (void)memory;(void)degree;(void)original;(void)device_id;(void)stream;return false; }
+
+
         virtual ~IBackend() = default;
 
         // ====================================================================
@@ -627,6 +668,7 @@ namespace llaminar2
          * @param pad_token_id Token id written to inactive bucket rows.
          * @param device_id GPU ordinal owning every pointer.
          * @param stream Exact graph execution stream.
+         * @param require_exact_rows Reject a device-computed extent shorter than the frozen graph width.
          * @param out_token_ids_device Stable INT32 token bucket.
          * @param out_position_ids_device Stable INT32 absolute-position bucket.
          * @param out_real_rows_device Device INT32 logical row count for this bucket.
@@ -641,6 +683,7 @@ namespace llaminar2
             int request_row_capacity,
             int bucket_seq_len,
             int pad_token_id,
+            bool require_exact_rows,
             int device_id,
             void *stream,
             void *out_token_ids_device,
@@ -655,6 +698,7 @@ namespace llaminar2
             (void)request_row_capacity;
             (void)bucket_seq_len;
             (void)pad_token_id;
+            (void)require_exact_rows;
             (void)device_id;
             (void)stream;
             (void)out_token_ids_device;
@@ -4314,6 +4358,16 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief Validate completed native activation fanout before dependent model/KV nodes.
+         * @param binding Original received header, local rows and actual native completion authority.
+         * @param device_id Exact local GPU. @param stream Explicit original participant stream.
+         * @return Whether one bounded validation node was enqueued; semantic mismatches trap on device.
+         * Production calls this through TransferEngine after the WHOLE native prefix operation.
+         * No allocation, host count readback or alternate payload path is permitted. */
+        virtual bool enqueuePipelineActivationFanoutValidation(
+            const PipelineActivationFanoutValidation &binding, int device_id, void *stream)
+        { (void)binding; (void)device_id; (void)stream; return false; }
+
         /**
          * @brief Lower independent original endpoints in bounded same-role native packets.
          * @param batch Immutable retained aliases; backend fills only copy launch geometry.
@@ -4607,17 +4661,6 @@ namespace llaminar2
          * that a GPU stream matches the backend before calling recordEvent).
          */
         virtual DeviceType backendDeviceType() const = 0;
-
-        /**
-         * @brief Enable already-admitted peer reads on the exact original worker during cold setup.
-         * @param device_id Exact consuming GPU ordinal. @param peer_device_id Payload-owning GPU ordinal.
-         * @return True only when native enable succeeds; unsupported backends reject.
-         * @note TransferEngine authenticates original cached bidirectional coverage before this call.
-         * No hardware query, alternative transport or parallel capability cache is installed.
-         */
-        virtual bool enableCapturedTransferPeerAccess(int device_id, int peer_device_id)
-        { (void)device_id; (void)peer_device_id; return false; }
-
 
     };
 

@@ -438,6 +438,7 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         raise ValueError('declared passive evidence lacks original resolved configuration')
     policy = config.get('ngram_table_policy') or {}
     adaptive = policy.get('storage') == 'AdaptiveVRAMRAMSSD'
+    observed_fixed = 'observed_pipeline_binding' in data
     expert = []
     initial_banks = []
     setup = []
@@ -500,6 +501,12 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
                 raise ValueError('passive native submission evidence is not the original submission schema')
             # These are submission observations, never a native payload byte oracle.
             submissions.append(dict(name=name,device=device,count=count,value=value,tags=tags))
+        elif observed_fixed and domain == 'immutable_lookup' and str(name).startswith('fixed_head_pipeline_'):
+            # The shared fixed pipeline validator below compares every actual
+            # measured terminal field with the native byte/receipt proof.
+            from model_parity_inventory import FIXED_NATIVE_PIPELINE_METRICS
+            if name not in FIXED_NATIVE_PIPELINE_METRICS:
+                raise ValueError('fixed pipeline measured evidence contains a nonterminal field')
         elif name in ('reset_terminal_closes','reset_terminal_waits'):
             if phase!='request_reset' or tags or value!=count:
                 raise ValueError('passive reset observation is not the original terminal infrastructure')
@@ -613,6 +620,12 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
     if not adaptive:
         if local_setup or local_terminal:raise ValueError('ordinary lookup cannot claim local hot cache evidence')
         if setup:raise ValueError('ordinary lookup cannot claim adaptive admitted setup')
+        if observed_fixed:
+            if terminal or submissions or not expert:
+                raise ValueError('fixed native pipeline measured evidence lacks expert owners or includes hosted lookup')
+            from model_parity_inventory import require_observed_pipeline_terminal
+            return dict(collection_policy=DECLARED_PASSIVE_POLICY,adaptive=False,
+                expert_selection=expert,fixed_native_pipeline=require_observed_pipeline_terminal(data,records))
         return dict(collection_policy=DECLARED_PASSIVE_POLICY,adaptive=False,
             expert_selection=expert,qualification_limits=['ordinary lookup schema remains its original mode contract'])
     request=policy['gpu_adaptive']
@@ -849,6 +862,40 @@ def validate_declared_passive_evidence(data: dict) -> dict:
         raise ValueError('incomplete declared passive evidence schema') from error
 
 
+def require_matched_original_launch(original: dict, current: dict, *,
+                                    panel_binary: Path, release_binary: Path) -> dict:
+    """Match MPI placement semantics while authenticating each build's actual helper.
+
+    Integration accuracy and Release timing intentionally own distinct session
+    executables. Their path/stat identities remain independently pinned across
+    timing; rankfile, MPI implementation, population, binding and overlap policy
+    must match exactly. Neither helper identity is evidence about the other.
+    """
+    from model_kld_corpus import identity
+    if (not isinstance(original,dict) or not isinstance(current,dict)
+            or set(original) != set(current) or 'session_launcher' not in original
+            or {k:v for k,v in original.items() if k != 'session_launcher'} !=
+               {k:v for k,v in current.items() if k != 'session_launcher'}):
+        raise ValueError("Release observed pipeline changed its paired MPI rankfile, launcher or binding")
+    pins = {}
+    for launch,binary_owner in ((original,panel_binary),(current,release_binary)):
+        helper = launch['session_launcher']
+        if (not isinstance(helper,dict) or set(helper) != {'path','stat'}
+                or not isinstance(helper['path'],str) or not helper['path']):
+            raise ValueError("Observed pipeline omitted its original build-owned session helper")
+        path = Path(helper['path']).resolve(strict=True)
+        expected = (Path(binary_owner).resolve(strict=True).parent/'llaminar_mpi_session').resolve(strict=True)
+        if path != expected:
+            raise ValueError("Observed pipeline session helper escaped its original binary build owner")
+        if not path.is_file() or not os.access(path,os.X_OK):
+            raise ValueError("Observed pipeline session helper is not an executable file")
+        pin = identity(path)
+        if json.loads(json.dumps(pin)) != helper['stat']:
+            raise ValueError("Observed pipeline build-owned session helper changed after admission")
+        pins[str(path)] = pin
+    return pins
+
+
 def run_declared_diagnostic(args) -> int:
     """Execute the existing benchmark mode under original paired/parser/process/driver owners; never certify."""
     import model_kld_corpus_execution as paired_owner
@@ -869,14 +916,19 @@ def run_declared_diagnostic(args) -> int:
     unchanged({str(panel_path):panel_pin})
     focused = panel.get('mode') == 'local_paired_focused_diagnostic'
     import model_parity_inventory as inventory
-    scope = inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused else inventory.InventoryScope.ALL
+    paired_source=(panel.get('paired_workload') or {}).get('source_export',{})
+    observed_pipeline='observed_pipeline_binding' in paired_source
+    if observed_pipeline and focused:
+        raise ValueError("Observed pipeline timing requires complete production prerequisites")
+    scope = inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused or observed_pipeline else inventory.InventoryScope.ALL
     (_campaign, exact, record), inventory_pins = declared_inventory(args,binary,scope=scope)
     output = args.report.parent / (args.report.stem + '-artifacts')
     if not args.list:
         output.mkdir(parents=True, exist_ok=False)
     selection = paired_owner.PairedCorpusSelection.from_export(exact, record, args.corpus_root, ROOT,
-        metadata_policy=paired_owner.PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused
-            else paired_owner.PairedMetadataPolicy.CANONICAL_ROOT,
+        metadata_policy=(paired_owner.PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused else
+            paired_owner.PairedMetadataPolicy.SOURCE_BOUND_OBSERVED_PIPELINE if observed_pipeline else
+            paired_owner.PairedMetadataPolicy.CANONICAL_ROOT),
         configuration_directory=None if args.list else output)
     workload = json.loads(args.workload.read_text())
     profile = declared_panel_eligibility(panel, exact, record, workload,allow_focused_diagnostic=focused)
@@ -907,6 +959,12 @@ def run_declared_diagnostic(args) -> int:
             or panel.get('binary',{}).get('sha256') != native.get('native_identity',{}).get('executable_sha256')):
         raise ValueError("numerical panel lacks original native source/config/publication proof")
 
+    if observed_pipeline:
+        inventory.require_observed_pipeline_runtime(record,native.get('observed_pipeline_binding'))
+        if (native.get('observed_pipeline_binding') != cell.get('observed_pipeline_binding')
+                or native.get('fixed_native_pipeline_terminal') != cell.get('fixed_native_pipeline_terminal')
+                or not native.get('fixed_native_pipeline_terminal')):
+            raise ValueError("numerical panel omitted the original fixed pipeline terminal evidence")
     accuracy_scope = declared_focused_accuracy_scope(panel,selection,cell) if focused else None
     if json.loads(selection.paths['benchmark'].read_text()) != workload:
         raise ValueError("benchmark workload differs from the original paired obligation")
@@ -941,7 +999,22 @@ def run_declared_diagnostic(args) -> int:
         '--temperature',str(workload['temperature']),'--top-k',str(workload['top_k']),
         '--top-p',str(workload['top_p']),'--benchmark-json-output',str(output/'benchmark.json')]
     command = [str(helper),'--session-base',str(output/'mpi-session'),'--',str(binary),*engine]
-    write_json(output/'invocation.json',dict(argv=command,environment=environment,exact_cell=exact,collection_policy=DECLARED_PASSIVE_POLICY))
+    invocation = dict(environment=environment,exact_cell=exact,collection_policy=DECLARED_PASSIVE_POLICY)
+    if observed_pipeline:
+        from types import SimpleNamespace
+        from run_model_kld_canaries import original_local_launch
+        original_launch = controller.get('native_launch') or {}
+        rankfile = (original_launch.get('rankfile') or {}).get('path')
+        if not rankfile or original_launch.get('schema') != 'llaminar.original-mpi-rankfile-launch.v1':
+            raise ValueError("Release observed pipeline requires its paired original discovery MPI launch")
+        command, launch_pins, launch = original_local_launch(
+            SimpleNamespace(mpi_rankfile=Path(rankfile),binary=binary), selection, None,
+            output, [str(binary),*engine], environment, prepare_session=False)
+        pins.update(require_matched_original_launch(original_launch,json.loads(json.dumps(launch)),
+            panel_binary=Path(panel['binary']['path']),release_binary=binary))
+        pins.update(launch_pins)
+        invocation['native_launch'] = launch
+    write_json(output/'invocation.json',dict(invocation,argv=command))
     result = dict(schema=1, policy='diagnostic_declared', diagnostic=True, certification_eligible=False,
         exact_cell=exact, source_export=record, complete=False, passed=False,
         collection_policy=DECLARED_PASSIVE_POLICY,
@@ -957,6 +1030,20 @@ def run_declared_diagnostic(args) -> int:
         data = json.loads((output/'benchmark.json').read_text())
         measured = validate_measurement(data,workload)
         declared_runtime_configuration(data,canonical,native['actual_owner']['actual_config'],workload,output,parser,environment)
+        if observed_pipeline:
+            runtime_binding=data.get('observed_pipeline_binding')
+            inventory.require_observed_pipeline_runtime(record,runtime_binding)
+            if runtime_binding != native.get('observed_pipeline_binding'):
+                raise ValueError("Release observed fixed ranges differ from the accepted numerical cell")
+            prompt_ids = data.get('prompt',{}).get('token_ids')
+            generated_ids = [row.get('generated_token_ids') for row in data['iterations']]
+            if (not isinstance(prompt_ids,list) or len(prompt_ids) != measured['prefill_tokens']
+                    or any(type(token) is not int or token < 0 for token in prompt_ids)
+                    or any(not isinstance(ids,list) or len(ids) != workload['decode_tokens']
+                           or any(type(token) is not int or token < 0 for token in ids) for ids in generated_ids)):
+                raise ValueError("Release observed pipeline omitted exact prompt or accepted output token IDs")
+            result.update(observed_pipeline_binding=runtime_binding,prompt_token_ids=prompt_ids,
+                          accepted_token_ids=generated_ids)
         passive = validate_declared_passive_evidence(data)
         unchanged(pins)
         result.update(measurement=measured,passive_evidence=passive)

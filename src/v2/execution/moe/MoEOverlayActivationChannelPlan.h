@@ -77,8 +77,10 @@ namespace llaminar2
         int top_k = 0;
         std::size_t graph_family_count = 0;
         std::size_t payload_matrix_bytes = 0;
-        /** Endpoint-private epoch-grant bytes retained by one logical lane. */
+        /** GPU allocator-rounded grant workspace for one actual lane's retained families. */
         std::size_t device_grant_bytes_per_lane = 0;
+        /** Exact CPU root for one actual lane's retained families, including GPU upload backing. */
+        std::size_t host_grant_bytes_per_lane = 0;
         /** One max-shape FP32 original-route bank per mapped GPU follower. */
         std::size_t canonical_route_matrix_bytes = 0;
         std::vector<MoEOverlayNodeLocalActivationChannelPlan> channels;

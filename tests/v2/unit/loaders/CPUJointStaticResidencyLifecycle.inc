@@ -247,6 +247,7 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
  input.row_ids_host=row_ids.data();input.entry_offsets_host=offsets.data();input.expert_ids_host=expert_ids.data();
  input.route_weights_host=weights.data();input.hidden_rows_fp32=hidden.data();
  MoEOverlayReturnRows output;output.row_capacity=2;output.d_model=8;output.row_ids_host=output_ids.data();output.output_rows_fp32=output_values.data();
+ output.layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
  std::array<int32_t,2> original_slots{0,1},compact_slots{0,1};
  input.original_route_slots_host=original_slots.data();input.compact_route_slots_host=compact_slots.data();
  MoELocalExpertStage::Params params;params.device_id=DeviceId::cpu();params.input_rows=&input;params.output_rows=&output;
@@ -298,6 +299,8 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
   EXPECT_EQ(canonical_moe_route_record::readRecordCount(arena->cpuJointPackedRecords()->data(),
    arena->cpuJointPackedRecords()->numel()),live);
   EXPECT_EQ(published->sourceSelection(),selected);
+  EXPECT_EQ(output.layout,MoEOverlayReturnLayout::CanonicalExpertRoutes);
+  EXPECT_EQ(output.live_row_count,0u);
  }
  auto replaced=params;replaced.prepared_gate_gemm[64]=published->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[64].gate().get();
  EXPECT_THROW((void)MoELocalExpertStage(replaced),std::invalid_argument);

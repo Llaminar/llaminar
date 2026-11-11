@@ -53,6 +53,8 @@ std::shared_ptr<const ResolvedImmutableRowTablePlacement> Qwen4ExpFixedHeadShard
 Qwen4ExpFixedHeadShardAssignment Qwen4ExpFixedHeadShards::assignmentFor(
     const ResolvedImmutableRowTablePlacement &placement,PhysicalMemoryAllocatorIdentity owner)
 {
+    if (placement.fixedHeadPipeline())
+        throw std::invalid_argument("Fixed PLE pipeline assignments require their distinct original storage and reader coordinates");
     const auto &ranges=placement.fixedHeadShardLayout().fixedRanges();
     for(const auto &range:ranges)
         if(range.owner.allocator==owner)

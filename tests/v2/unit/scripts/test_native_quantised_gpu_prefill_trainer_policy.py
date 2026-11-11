@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_native_quantised_gpu_prefill_trainer_policy.py
+#  @brief Guard retained tournament timing separately from isolated profiler collection.
 """Source-policy regressions for CUDA/ROCm NativeQuantised prefill trainers."""
 
 from __future__ import annotations
@@ -72,7 +74,23 @@ class NativeQuantisedGPUPrefillTrainerPolicyTest(unittest.TestCase):
                     else "hipStreamSynchronize("
                 )
                 self.assertEqual(source.count(event_wait), 1)
-                self.assertEqual(source.count(stream_wait), 2)
+                profile_waits = 0
+                if backend == "rocm":
+                    # The opt-in profiler owns one terminal join inside its
+                    # ROCTx range. It is outside the candidate sample loop.
+                    start = source.index("void profileExactCandidate(")
+                    end = source.index("\n    private:", start)
+                    profile = source[start:end]
+                    self.assertEqual(profile.count(stream_wait), 1)
+                    resume = profile.index("roctxProfilerResume(0)")
+                    launch = profile.index("const bool launched = graph.launch();")
+                    completion = profile.index(stream_wait)
+                    pause = profile.index("roctxProfilerPause(0)")
+                    self.assertLess(resume, launch)
+                    self.assertLess(launch, completion)
+                    self.assertLess(completion, pause)
+                    profile_waits = 1
+                self.assertEqual(source.count(stream_wait) - profile_waits, 2)
                 self.assertIn("bench_runs - 1", source)
                 self.assertIn("start_events_.reserve", source)
                 self.assertIn("stop_events_.reserve", source)

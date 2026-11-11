@@ -798,10 +798,11 @@ namespace llaminar2::test::parity
     /** @return Document only for declared per-consumer ceilings; argv-only helpers stay strict. */
     inline ModelParityRuntimeRepresentation modelParityRuntimeRepresentation(const ModelParityCase& cell)
     {
-        return cell.ngram_table_policy && cell.ngram_table_policy->isGPUAdaptive() &&
+        const bool local_consumer_ceilings=cell.ngram_table_policy && cell.ngram_table_policy->isGPUAdaptive() &&
             cell.ngram_table_policy->gpu_adaptive.local_hot_cache &&
-            !cell.ngram_table_policy->gpu_adaptive.local_hot_cache->consumer_overrides.empty()
-                ? ModelParityRuntimeRepresentation::ConfigurationDocument : ModelParityRuntimeRepresentation::Arguments;
+            !cell.ngram_table_policy->gpu_adaptive.local_hot_cache->consumer_overrides.empty();
+        return cell.topology.observed_native_pipeline || local_consumer_ceilings
+            ? ModelParityRuntimeRepresentation::ConfigurationDocument : ModelParityRuntimeRepresentation::Arguments;
     }
     /**
      * @brief Preserve the original typed request in the existing lossless public config format.
@@ -905,7 +906,18 @@ namespace llaminar2::test::parity
         if(cell.requiresPhysicalExpertMovement() && cell.topology.expert_overlay_plan &&
            MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan))
             *out << ",\"cohort_publication_inference\":true";
-        if(modelParityRuntimeRepresentation(cell)==ModelParityRuntimeRepresentation::ConfigurationDocument) {
+        if(cell.topology.needsObservedPipelineBinding()) {
+            if(cell.inventory_role!=ModelParityInventoryRole::NumericalDiagnostic)
+                throw std::invalid_argument("Unbound observed pipeline has no runtime certification eligibility");
+            const auto &request=*cell.topology.observed_native_pipeline;
+            *out << ",\"configuration_policy\":\"observed_pipeline_binding_required_v1\",\"observed_pipeline_request\":{"
+                 << "\"backend\":" << modelParityJsonString(request.backend==DeviceType::CUDA?"cuda":"rocm")
+                 << ",\"native_isa\":" << modelParityJsonString(request.native_isa)
+                 << ",\"mpi_ranks\":" << cell.topology.mpi_ranks << ",\"stage_sizes\":[";
+            for(size_t stage=0;stage<cell.topology.pipeline_stage_sizes.size();++stage)
+                *out << (stage?",":"") << cell.topology.pipeline_stage_sizes[stage];
+            *out << "]}}";
+        } else if(modelParityRuntimeRepresentation(cell)==ModelParityRuntimeRepresentation::ConfigurationDocument) {
             if(cell.e2e_certification || !cell.remote_cpu_overlays.empty())
                 throw std::invalid_argument("Lossless declared runtime document requires its own tagged E2E projection");
             *out << ",\"configuration_policy\":\"lossless_declared_document_v1\",\"configuration_document\":"

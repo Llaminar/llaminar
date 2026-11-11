@@ -12,6 +12,9 @@
  */
 #pragma once
 #include "tools/ModelKLDQFNContract.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include <map>
 #include "app/MPIBootstrapPhase.h"
 #include <omp.h>
 #include <sched.h>
@@ -194,14 +197,15 @@ public:
     };
 
     /**
-     * @brief Read the original public worker request for single-rank or exact CPU-joint histories.
+     * @brief Read the original public worker request for one rank, CPU joint or observed fixed pipeline.
      * @return Explicit positive worker count from the original lossless configuration.
      * @throws std::invalid_argument Without positive workers and a supported original typed rank population.
      */
     int requestedCPUWorkers() const
     {
         const auto config = deserializeOrchestrationConfig(value_.at("expected_config").dump());
-        accuracy::requireQFN(config.n_threads > 0 && (config.mpi_procs == 1 || accuracy::qfnDistributedCPUJointIntent(config)),
+        accuracy::requireQFN(config.n_threads > 0 && (config.mpi_procs == 1 || accuracy::qfnDistributedCPUJointIntent(config) ||
+                             isObservedFixedNativePipeline(config)),
                              "Frozen replay requires explicit positive workers on its original supported rank population");
         return config.n_threads;
     }
@@ -343,24 +347,27 @@ public:
     {
         std::vector<int> bucket_rows; ///< Original canonical serving ladder, never a copied table.
         int minimum_rows = 0; ///< Canonical default floor clipped to the explicit public cap.
-        int selected_rows = 0; ///< First retained bucket containing this history's real rows.
+        int selected_rows = 0; ///< Single padded transaction width, or zero for exact chunks.
     };
 
     /**
      * @brief Resolve the original serving capture family for this geometry diagnostic.
-     * @return Canonical typed bucket ladder and its selected physical transaction.
-     * @throws std::invalid_argument If this history cannot fit one retained bucket.
-     * @note This changes capture shape only; prompt, teachers, math and placement stay bound.
+     * @return Public ladder and floor before admission. Exact pipelines use the
+     *         admitted ladder to validate their actual transactions after execution.
+     * @throws std::invalid_argument If the public cap cannot represent the capture policy.
      */
     ServingPrefillCapture servingPrefillCapture() const
     {
         const auto config = deserializeOrchestrationConfig(value_.at("expected_config").dump());
         const int maximum = config.prefill_max_bucket_size.value_or(kDefaultPrefillGraphMaxBucketSize);
         auto buckets = prefillGraphBucketSizes(maximum);
+        const int floor = std::min(maximum, kDefaultPrefillGraphMinBucketSize);
+        if (isObservedFixedNativePipeline(config))
+            return {std::move(buckets), floor, 0};
         const auto selected = std::lower_bound(buckets.begin(), buckets.end(), static_cast<int>(promptIds().size()));
         accuracy::requireQFN(selected != buckets.end(), "Frozen geometry diagnostic exceeds its original serving bucket cap");
         const int physical = *selected;
-        return {std::move(buckets), std::min(maximum, kDefaultPrefillGraphMinBucketSize), physical};
+        return {std::move(buckets), floor, physical};
     }
 
     /**
@@ -382,25 +389,25 @@ public:
      * @brief Validate actual replay geometry after the original compared prefill has retired.
      * @param records Passive original forward_graph collector records, including setup.
      * @param native_required Actual fixture topology classification, false only for CPU-only.
-     * @return Small owner-authored geometry handoff; no numerical verdict or runtime certificate.
+     * @param pipeline Actual selected owner's admitted plan for an exact fixed pipeline.
+     * @return Small owner-authored geometry handoff.
      * @throws std::invalid_argument For missing native replay, wrong bucket or malformed records.
-     * @note Setup-only materialization cannot satisfy this replay proof. Counts are submissions,
-     *       not a timing or per-token performance metric. CPU retains its original live-row graph.
+     * @note Setup materialization cannot satisfy this proof. CPU retains its live-row graph.
      */
-    nlohmann::json servingPrefillEvidence(std::span<const PerfStatRecord> records, bool native_required) const
+    nlohmann::json servingPrefillEvidence(std::span<const PerfStatRecord> records, bool native_required,
+                                         const RankExecutionPlan *pipeline = nullptr) const
     {
         const auto capture = servingPrefillCapture();
-        const auto logical = promptIds().size();
+        const auto logical = static_cast<int>(promptIds().size());
+        if (capture.selected_rows == 0)
+        {
+            accuracy::requireQFN(native_required && pipeline,
+                                 "Frozen exact pipeline requires its actual admitted native prefill plan");
+            return exactPipelinePrefillEvidence(records, *pipeline, logical);
+        }
         bool observed = false;
         if (native_required)
         {
-            const auto integer = [](const std::string &text) {
-                int value = 0;
-                const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-                accuracy::requireQFN(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && value > 0,
-                                     "Frozen prefill replay has malformed physical or live row metadata");
-                return value;
-            };
             for (const auto &record : records)
             {
                 if (record.domain != "forward_graph" || record.name != "prefill_graph_phase" ||
@@ -409,11 +416,11 @@ public:
                 if (phase == record.tags.end() || phase->second != "replay") continue;
                 const auto real = record.tags.find("real_token_count");
                 accuracy::requireQFN(real != record.tags.end(), "Frozen prefill replay omitted live row authority");
-                if (integer(real->second) != static_cast<int>(logical)) continue;
+                if (positivePrefillRows(real->second) != logical) continue;
                 const auto bucket = record.tags.find("bucket_seq_len");
                 accuracy::requireQFN(record.kind == PerfStatRecord::Kind::Counter && record.phase == "prefill" &&
                                      record.count > 0 && std::isfinite(record.value) && record.value > 0 &&
-                                     bucket != record.tags.end() && integer(bucket->second) == capture.selected_rows,
+                                     bucket != record.tags.end() && positivePrefillRows(bucket->second) == capture.selected_rows,
                                      "Frozen geometry diagnostic did not replay the original production-serving physical bucket");
                 observed = true;
             }
@@ -423,7 +430,7 @@ public:
                 {"descriptor_sha256", digest_}, {"canonical_cell", value_.at("canonical_cell")},
                 {"history_id", value_.at("history_id")}, {"capture_mode", "production_serving_ladder"},
                 {"bucket_rows", capture.bucket_rows}, {"minimum_rows", capture.minimum_rows},
-                {"logical_rows", logical}, {"physical_rows", native_required ? capture.selected_rows : static_cast<int>(logical)},
+                {"logical_rows", logical}, {"physical_rows", native_required ? capture.selected_rows : logical},
                 {"native_replay_required", native_required}, {"native_replay_observed", observed}};
     }
 
@@ -535,6 +542,116 @@ public:
     const std::string &identity() const noexcept { return digest_; }
 
 private:
+
+    /** @brief Parse one required positive physical/live replay dimension. */
+    static int positivePrefillRows(const std::string &text)
+    {
+        int rows = 0;
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), rows);
+        accuracy::requireQFN(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && rows > 0,
+                             "Frozen prefill replay has malformed physical or live row metadata");
+        return rows;
+    }
+
+    /**
+     * @brief Join the actual admitted exact schedule to every original native replay.
+     * @param records Original request's prefill graph lifecycle records.
+     * @param pipeline Same selected owner's admitted stage and retained-width contract.
+     * @param logical Complete frozen prompt length, before any continuation.
+     * @return Exact chunk offsets/widths and the verified native participant roster.
+     * @throws std::invalid_argument If any required participant/chunk is missing, duplicated or padded.
+     */
+    nlohmann::json exactPipelinePrefillEvidence(std::span<const PerfStatRecord> records,
+                                               const RankExecutionPlan &pipeline, int logical) const
+    {
+        using accuracy::requireQFN;
+        const auto &admitted = pipeline.runtime.overlay_prefill_schedule;
+        requireQFN(pipeline.usesLocalPP() && pipeline.local_pp_stage_tp_info.size() == pipeline.local_pp_devices.size() &&
+                   admitted.enabled() && admitted.bucket_rows == exactPrefillGraphWidths(admitted.graph_row_capacity),
+                   "Frozen exact pipeline lost its admitted retained prefill family");
+        const auto schedule = planPrefillChunkSchedule(PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            admitted.bucket_rows, 0, logical, PrefillChunkWidthPolicy::ExactRetained));
+        requireQFN(schedule && !schedule.chunks.empty(), "Frozen exact pipeline could not schedule the complete prompt");
+
+        std::map<std::string, std::set<int>> replays;
+        for (std::size_t stage = 0; stage < pipeline.local_pp_devices.size(); ++stage)
+        {
+            const auto &members = pipeline.local_pp_stage_tp_info[stage].devices;
+            requireQFN(!members.empty() && members.front() == pipeline.local_pp_devices[stage],
+                       "Frozen exact pipeline changed an admitted stage's original participants");
+            for (const auto &address : members)
+            {
+                const auto device = address.toLocalDeviceId();
+                requireQFN(device.is_gpu() && replays.try_emplace(device.toString()).second,
+                           "Frozen exact pipeline has a nonnative or duplicate admitted participant");
+            }
+        }
+
+        // PerfStats groups repeated shapes under stable dimensions. Reuse the
+        // ordered witness for each width. A new placement key may delimit a
+        // later span of that width, but a chunk belongs to exactly one record.
+        constexpr std::size_t words_per_chunk = 3;
+        std::map<int, std::vector<std::uint64_t>> by_width;
+        for (const auto &chunk : schedule.chunks)
+        {
+            auto &words = by_width[chunk.bucket_seq_len];
+            words.insert(words.end(), {static_cast<std::uint64_t>(chunk.chunk_index),
+                static_cast<std::uint64_t>(chunk.token_offset),
+                static_cast<std::uint64_t>(chunk.token_offset + chunk.real_count)});
+        }
+        for (const auto &record : records)
+        {
+            if (record.domain != "forward_graph" || record.name != "prefill_graph_phase") continue;
+            const auto capture = record.tags.find("capture_phase");
+            if (capture == record.tags.end() || capture->second != "replay") continue;
+            const auto device = replays.find(record.device);
+            const auto live = record.tags.find("real_token_count");
+            const auto width = record.tags.find("bucket_seq_len");
+            requireQFN(device != replays.end() && record.phase == "prefill" && record.count > 0 &&
+                       record.value == static_cast<double>(record.count) && live != record.tags.end() &&
+                       width != record.tags.end() && record.sequence_minimum_words.size() == words_per_chunk,
+                       "Frozen exact pipeline replay did not identify its original native chunk span");
+            const int rows = positivePrefillRows(width->second);
+            const auto expected = by_width.find(rows);
+            requireQFN(positivePrefillRows(live->second) == rows && expected != by_width.end(),
+                       "Frozen exact pipeline replay changed its original live chunk width");
+
+            const auto &words = expected->second;
+            const auto first_index = record.sequence_minimum_words.front();
+            std::size_t offset = 0;
+            while (offset < words.size() && words[offset] < first_index)
+                offset += words_per_chunk;
+            requireQFN(offset < words.size() && words[offset] == first_index &&
+                       record.count <= (words.size() - offset) / words_per_chunk,
+                       "Frozen exact pipeline replay changed its original native chunk range");
+            const auto span = std::span<const std::uint64_t>(words).subspan(
+                offset, static_cast<std::size_t>(record.count) * words_per_chunk);
+            requireQFN(PerfStatsCollector::matchesCounterSequence(record, span, words_per_chunk),
+                       "Frozen exact pipeline replay changed its original live chunk order or offsets");
+            for (std::size_t step = 0; step < span.size(); step += words_per_chunk)
+                requireQFN(device->second.insert(static_cast<int>(span[step])).second,
+                           "Frozen exact pipeline replay repeated an original native chunk");
+        }
+
+        auto devices = nlohmann::json::array();
+        for (const auto &[device, chunks] : replays)
+        {
+            requireQFN(chunks.size() == schedule.chunks.size(),
+                       "Frozen exact pipeline is missing an original participant's chunk replay");
+            devices.push_back(device);
+        }
+        auto chunks = nlohmann::json::array();
+        for (const auto &chunk : schedule.chunks)
+            chunks.push_back({{"token_offset", chunk.token_offset}, {"logical_rows", chunk.real_count},
+                              {"physical_rows", chunk.bucket_seq_len}});
+        return {{"schema", "llaminar.model-kld-history-prefill-geometry.v1"},
+                {"descriptor_sha256", digest_}, {"canonical_cell", value_.at("canonical_cell")},
+                {"history_id", value_.at("history_id")}, {"capture_mode", "production_exact_retained"},
+                {"bucket_rows", admitted.bucket_rows}, {"minimum_rows", 1},
+                {"logical_rows", logical}, {"physical_rows", logical},
+                {"chunks", std::move(chunks)}, {"native_devices", std::move(devices)},
+                {"native_replay_required", true}, {"native_replay_observed", true}};
+    }
     /** @brief Admit only a complete parsed metadata request, never runtime ownership. */
     FrozenParityHistoryReplay(nlohmann::json value, std::string digest)
         : value_(std::move(value)), digest_(std::move(digest)) {}

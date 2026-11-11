@@ -1,0 +1,169 @@
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/inc/amd_blit_sdma.h
+@@ -42,6 +42,14 @@
+
+ #ifndef HSA_RUNTIME_CORE_INC_AMD_BLIT_SDMA_H_
+ #define HSA_RUNTIME_CORE_INC_AMD_BLIT_SDMA_H_
++
++/**
++ * @file amd_blit_sdma.h
++ * @brief Native SDMA packet ownership and deferred original profiling decisions.
++ * gfx90x software dependency callbacks retain the original packet bytes,
++ * completion signal and profiling fact. Later global profiling transitions
++ * cannot change whether this already-submitted command emits timestamps.
++ */
+
+ #include <mutex>
+ #include <stdint.h>
+@@ -75,6 +83,22 @@
+   virtual hsa_status_t SubmitCommand(const void* cmds, size_t cmd_size, uint64_t size,
+                                      const std::vector<core::Signal*>& dep_signals,
+                                      core::Signal& out_signal, std::vector<core::Signal*>& gang_signals) = 0;
++
++  /**
++   * @brief Resume an existing SDMA command with its original profiling decision.
++   * @param cmds Retained native copy packets; their payload/extent is unchanged.
++   * @param cmd_size Exact retained packet bytes.
++   * @param size Original live copy extent.
++   * @param dep_signals Remaining original dependencies.
++   * @param out_signal Original retained completion authority.
++   * @param gang_signals Existing gang completion dependencies.
++   * @param profiling_enabled Immutable decision captured before any deferred callback.
++   * @return The original native submission status; no policy is reread on resume.
++   */
++  virtual hsa_status_t SubmitCommand(const void* cmds, size_t cmd_size, uint64_t size,
++                                     const std::vector<core::Signal*>& dep_signals,
++                                     core::Signal& out_signal, std::vector<core::Signal*>& gang_signals,
++                                     bool profiling_enabled) = 0;
+
+   virtual hsa_status_t SubmitLinearCopyBroadcastCommand(
+       const std::vector<void*>& dsts, const void* src, size_t size,
+@@ -449,6 +473,14 @@
+                              core::Signal& out_signal,
+                              std::vector<core::Signal*>& gang_signals) override;
+
++  /** @copydoc BlitSdmaBase::SubmitCommand(const void*, size_t, uint64_t,
++   * const std::vector<core::Signal*>&, core::Signal&, std::vector<core::Signal*>&, bool) */
++  hsa_status_t SubmitCommand(const void* cmds, size_t cmd_size, uint64_t size,
++                             const std::vector<core::Signal*>& dep_signals,
++                             core::Signal& out_signal,
++                             std::vector<core::Signal*>& gang_signals,
++                             bool profiling_enabled) override;
++
+   hsa_status_t SubmitBlockingCommand(const void* cmds, size_t cmd_size, uint64_t size);
+
+   // Agent object owning the SDMA engine.
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_blit_sdma.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_blit_sdma.cpp
+@@ -44,6 +44,14 @@
+
+ #include <algorithm>
+ #include <atomic>
++/**
++ * @file amd_blit_sdma.cpp
++ * @brief Native SDMA packet ownership and deferred original profiling decisions.
++ * gfx90x software dependency callbacks retain the original packet bytes,
++ * completion signal and profiling fact. Later global profiling transitions
++ * cannot change whether this already-submitted command emits timestamps.
++ */
++
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -307,18 +315,28 @@
+
+ class CommandCallBackData {
+   public:
++    /** @brief Retain one original native command through its existing dependency wait.
++     * @param cmd Original native packet bytes, copied before the caller may retire them.
++     * @param cmd_size Exact native packet span.
++     * @param size Original live copy bytes.
++     * @param num_dep_signals Pending original dependency callbacks.
++     * @param out_signal Original caller-retained completion signal.
++     * @param gang_signals Existing gang completion signals.
++     * @param owner Original native SDMA queue, retained by its existing command lifetime.
++     * @param profiling_enabled Immutable profiling decision from the original submission.
++     */
+     CommandCallBackData(const void* cmd,
+                         size_t cmd_size,
+                         uint64_t size,
+                         size_t num_dep_signals,
+                         core::Signal& out_signal,
+                         std::vector<core::Signal*>& gang_signals,
+-                        BlitSdmaBase* owner):
++                        BlitSdmaBase* owner, bool profiling_enabled):
+                         cmd_size_(cmd_size),
+                         size_(size),
+                         num_dep_signals_(num_dep_signals),
+                         out_signal_(&out_signal),
+-                        owner_(owner) {
++                        owner_(owner), profiling_enabled_(profiling_enabled) {
+       cmd_ = malloc(cmd_size);
+       if (cmd == nullptr)
+         throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+@@ -341,8 +359,16 @@
+     core::Signal* out_signal_;
+     std::vector<core::Signal*> gang_signals_;
+     BlitSdmaBase* owner_;
++    // The gfx90x host dependency wait may outlive the caller's profiling scope.
++    // Keep both on and off as immutable command facts until this callback retires.
++    const bool profiling_enabled_;
+ };
+
++/** @brief Resume the original native command once its final dependency completes.
++ * @param signal_value Completed dependency value supplied by the native scheduler.
++ * @param arg Existing callback owner retaining packets, signal identity and profiling.
++ * @return False: each original dependency callback runs exactly once.
++ */
+ static bool DepSignalCompleteHandler(hsa_signal_value_t signal_value, void *arg ) {
+   CommandCallBackData* callbackData = reinterpret_cast<CommandCallBackData*>(arg);
+
+@@ -355,7 +381,7 @@
+                                         callbackData->size_,
+                                         dep_signals,
+                                         *(callbackData->out_signal_),
+-                                        callbackData->gang_signals_);
++                                        callbackData->gang_signals_, callbackData->profiling_enabled_);
+     delete callbackData;
+   }
+   return false;
+@@ -398,6 +424,19 @@
+                                              const std::vector<core::Signal*>& dep_signals,
+                                              core::Signal& out_signal,
+                                              std::vector<core::Signal*>& gang_signals) {
++  // Snapshot before the gfx90x workaround can defer native packet construction.
++  // The original submission owns this policy even if another command changes
++  // the agent-wide flag while its dependency is still pending.
++  return SubmitCommand(cmd, cmd_size, size, dep_signals, out_signal, gang_signals,
++                       agent_->profiling_enabled());
++}
++
++/** @brief Construct/resume packets using the immutable original profiling fact. */
++template <bool useGCR, bool scopeFields>
++hsa_status_t BlitSdma<useGCR, scopeFields>::SubmitCommand(const void* cmd, size_t cmd_size, uint64_t size,
++                                             const std::vector<core::Signal*>& dep_signals,
++                                             core::Signal& out_signal,
++                                             std::vector<core::Signal*>& gang_signals, bool profiling_enabled) {
+   uint32_t num_poll_command = 0;
+   uint32_t num_poll_signals = 0;
+
+@@ -424,7 +463,7 @@
+   // will call SubmitCommand(..) again without any dependent-signals.
+   if (sw_poll_workaround_ && num_poll_signals) {
+     CommandCallBackData* callbackArgs =
+-      new CommandCallBackData(cmd, cmd_size, size, num_poll_signals, out_signal, gang_signals, this);
++      new CommandCallBackData(cmd, cmd_size, size, num_poll_signals, out_signal, gang_signals, this, profiling_enabled);
+
+     if (callbackArgs == nullptr) {
+       throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+@@ -444,10 +483,6 @@
+
+   const uint32_t total_poll_command_size =
+       (num_poll_command * poll_command_size_);
+-
+-  // Load the profiling state early in case the user disable or enable the
+-  // profiling in the middle of the call.
+-  const bool profiling_enabled = agent_->profiling_enabled();
+
+   uint64_t* start_ts_addr = nullptr;
+   uint64_t* end_ts_addr = nullptr;

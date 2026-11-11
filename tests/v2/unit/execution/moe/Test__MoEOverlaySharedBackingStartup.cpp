@@ -161,3 +161,19 @@ TEST(MoEOverlaySharedBackingStartup, BoundPairReplaysFreshEpochsAndLargeToSmallF
         pair.files={};
     }
 }
+
+/** @test Calibration reuses the same creator/peer original-file authentication and retirement. */
+TEST(MoEOverlaySharedBackingStartup, PlanningHostDeviceKindUsesTheOriginalFileHandshake)
+{
+    Pair pair;
+    pair.epoch.kind = MoEOverlaySharedBackingKind::PlanningHostDevice;
+    pair.execute(8192);
+    ASSERT_FALSE(pair.errors[0]);
+    ASSERT_FALSE(pair.errors[1]);
+    EXPECT_EQ(pair.files[0].identity(), pair.files[1].identity());
+    EXPECT_NO_THROW(pair.files[0].requireExtent(8192));
+    EXPECT_NO_THROW(pair.files[1].requireExtent(8192));
+    EXPECT_TRUE(pair.link->messages.empty());
+    pair.files[0].unlink();
+    EXPECT_NO_THROW(pair.files[1].requireExtent(8192));
+}

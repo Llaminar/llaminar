@@ -10,8 +10,13 @@
  * aggregate-clear permit and does not certify next-request rearm or learned R1.
  */
 #include "backends/NativeContextPreparation.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
+#include "planning/ExecutionRankMembership.h"
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
 #include "backends/NativeOrderingEventGroup.h"
 #include "execution/local_execution/graph/OriginalSlotCaptureTerminals.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/compute_stages/stages/MoEOverlayEpochBoundaryStage.h"
 #include "execution/compute_stages/stages/MoEOverlayActivationPacketStages.h"
@@ -25,18 +30,6 @@ namespace llaminar2::test { namespace {
 /** @brief Reject incomplete native construction without advertising a skipped proof. */
 void requireRecurrentPacket(bool good,const char *reason)
 { if(!good)throw std::runtime_error(reason); }
-
-/** @return Actual startup allocator observation for this original source. */
-PhysicalMemoryResource recurrentPacketResource(DeviceId device)
-{
-    auto &manager=DeviceManager::instance();manager.initialize(-1,false);
-    const auto kind=device.is_cpu()?ComputeBackendType::CPU:device.is_cuda()?ComputeBackendType::GPU_CUDA:ComputeBackendType::GPU_ROCM;
-    const auto &inventory=manager.devices();
-    const auto found=std::find_if(inventory.begin(),inventory.end(),[&](const auto &entry){
-        return entry.type==kind && (device.is_cpu() || entry.device_id==device.ordinal);});
-    requireRecurrentPacket(found!=inventory.end(),"Original recurrent packet endpoint is absent");
-    return {0,device,found->total_memory_bytes,found->free_memory_bytes};
-}
 
 /**
  * @brief Exact same-PMA tensor roots; GPU claims precede TransferEngine storage.
@@ -116,8 +109,8 @@ class RecurrentOriginalSlotPacketReplay final {
     };
 public:
     /** @brief Select two physical devices of one backend; never emulate ranks. */
-    explicit RecurrentOriginalSlotPacketReplay(DeviceId source_device,RecurrentPacketProfile profile=RecurrentPacketProfile::Full)
-        :devices_{source_device,source_device.is_cuda()?DeviceId::cuda(1):DeviceId::rocm(1)},
+    explicit RecurrentOriginalSlotPacketReplay(std::shared_ptr<MPIContext> mpi,std::span<const DeviceId> devices,RecurrentPacketProfile profile=RecurrentPacketProfile::Full)
+        :mpi_(std::move(mpi)),devices_{devices[0],devices[1]},
          geometry_(MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(depth)),
          family_{std::make_unique<Family>(1),std::make_unique<Family>(4)},evidence_root_((3+4)*width,
              PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),profile_(profile) {}
@@ -129,14 +122,15 @@ public:
 
     /** @brief Admit exact cold graph/event/tensor populations through original PMA. */
     void prepare() {
-        const auto host=recurrentPacketResource(DeviceId::cpu());
-        std::array gpu{recurrentPacketResource(devices_[0]),recurrentPacketResource(devices_[1])};
+        original_=PreparedNativeLookupFixture::prepare(devices_,mpi_->rank());
+        source_=original_->source(); memory_=original_->memory();
+        const auto host=original_->resource(DeviceId::cpu());
+        std::array gpu{original_->resource(devices_[0]),original_->resource(devices_[1])};
         const std::array resources{host,gpu[0],gpu[1]};
-        source_=NativeContextPreparation::create(resources,0,devices_);
-        std::array<std::optional<PreparedGPUContextUsePermit>,2> permits;
-        for(unsigned p=0;p<2;++p)permits[p].emplace(source_->acquire(devices_[p]));
-        memory_=source_->memory();source_->freezeForPlanning();
-        PhysicalMemoryPlanBuilder plan(source_->mandatoryBOM());
+        const int rank=mpi_->rank();
+        topology_.workspace_generation=original_->permit(devices_[0]).generation();
+        topology_.source_world_rank=rank;topology_.target_world_rank=rank;
+        PhysicalMemoryPlanBuilder plan;
         const auto program=NativeOrderingEventProgram::captureSubmissionRetirement();
         // Exactly two raw executable creators on EACH physical endpoint.
         for(unsigned p=0;p<2;++p) {
@@ -162,20 +156,15 @@ public:
         declareChannels();
         layout_=channel_plan_.channels.at(0).mapping_layout;
         for(const auto &resource:resources)plan.add(resource,PhysicalMemoryOwner::ActivationTransportStaging,
-            channel_plan_.stagingBytesFor(0,resource.device));
-        source_->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
-        // The canonical staging plan is an admission ceiling, not a second
-        // allocation. Materialize only this actual mmap and original grants;
-        // packet tensor roots below claim their own actual storage separately.
-        channel_claims_.push_back(memory_->claimNewAllocation(DeviceId::cpu(),
-            PhysicalMemoryOwner::ActivationTransportStaging,layout_.mapping_bytes));
-        for(const auto &lane:channel_plan_.channels.at(0).localLanes(0))
-            channel_claims_.push_back(memory_->claimNewAllocation(lane.device,
-                PhysicalMemoryOwner::ActivationTransportStaging,channel_plan_.device_grant_bytes_per_lane));
+            channel_plan_.stagingBytesFor(rank,resource.device));
         for(unsigned p=0;p<2;++p) {
-            workers_[p]=permits[p]->worker();
-            for(auto &slot:graph_backing_[p])slot.emplace(FollowerPredecessorDiagnosticGraphResources::prepare(*permits[p]));
-            permits[p].reset();
+            const auto cold=MoEOverlayActivationBatchResources::coldPublicationBOM(host,gpu[p]);
+            for(const auto& resource:cold.resources())plan.add(resource);
+        }
+        original_->admit(plan.build());admitted_=true;
+        for(unsigned p=0;p<2;++p) {
+            workers_[p]=original_->permit(devices_[p]).worker();
+            for(auto &slot:graph_backing_[p])slot.emplace(FollowerPredecessorDiagnosticGraphResources::prepare(original_->permit(devices_[p])));
         }
         slots_.reserve(geometry_.slotCount());identities_.reserve(geometry_.slotCount());terminals_.reserve(geometry_.slotCount());
         makeTransport();
@@ -334,6 +323,7 @@ private:
     void prepareEndpoint(unsigned endpoint);
     /** @brief Drain actual terminals before native handles, mappings, and source withdrawal. */
     void dispose();
+    std::shared_ptr<MPIContext> mpi_; ///< Canonical selected owner retains original discovery membership.
     std::array<DeviceId,2> devices_;
     MoEOverlayInferenceOriginalSlotGeometry geometry_;
     std::array<std::unique_ptr<Family>,2> family_;
@@ -341,6 +331,7 @@ private:
     AlignedVector<float> evidence_;
     void *evidence_device_=nullptr;
     std::optional<PhysicalMemoryAllocationLease> evidence_claim_,mapping_claim_;
+    std::unique_ptr<PreparedNativeLookupFixture> original_;
     std::shared_ptr<NativeContextPreparation> source_;
     std::shared_ptr<PhysicalMemoryAuthority> memory_;
     std::array<std::shared_ptr<IWorkerGPUContext>,2> workers_;
@@ -356,7 +347,6 @@ private:
     std::shared_ptr<IMoEOverlayRankBatchTransport> transport_;
     std::shared_ptr<IMoEOverlayMappedActivationTransport> mapped_;
     MoEOverlayActivationChannelPlan channel_plan_;
-    std::vector<PhysicalMemoryAllocationLease> channel_claims_;
     Cache source_cache_;
     Cache::CaptureStreamTerminalTicket source_terminal_;
     std::vector<Cache::CaptureStreamTerminalTicket> terminals_;
@@ -364,7 +354,7 @@ private:
     std::vector<MoEOverlayActivationEpochIdentity> identities_;
     unsigned last_family_=0u;
     std::size_t terminal_observed_=0u;
-    bool observed_=false,disposed_=false,source_enqueued_=false;
+    bool observed_=false,disposed_=false,source_enqueued_=false,admitted_=false;
     RecurrentPacketProfile profile_=RecurrentPacketProfile::Full;
 };
 
@@ -377,15 +367,13 @@ void RecurrentOriginalSlotPacketReplay::declareChannels() {
     for(unsigned p=0;p<2;++p) {
         RoutedExpertDomain domain;domain.name=p?"follower":"source";domain.scope=ExecutionDomainScope::RANK_LOCAL;
         domain.participants={devices_[p].is_cuda()?GlobalDeviceAddress::cuda(devices_[p].ordinal):GlobalDeviceAddress::rocm(devices_[p].ordinal)};
-        domain.world_ranks={0};domain.owner_rank=0;domain.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
+        domain.world_ranks={mpi_->rank()};domain.owner_rank=mpi_->rank();domain.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
         placement.domains.push_back(domain);
         placement.routed_tiers.push_back(RoutedExpertTier{.name=domain.name,.domain=domain.name,.priority=p?30:80});
     }
     placement.authority_execution=resolveMoEOverlayAuthorityExecutionKind(placement);
     requireRecurrentPacket(placement.authority_execution==MoEOverlayAuthorityExecutionKind::DeviceResident,"Original all-GPU declaration lost device authority");
-    ClusterInventory cluster;cluster.world_size=1;cluster.ranks.resize(1);
-    cluster.ranks[0].rank=0;cluster.ranks[0].node_id=0;cluster.ranks[0].hostname="original-packet-source";
-    channel_plan_=MoEOverlayActivationChannelPlanner::plan({.placement_plan=&placement,.cluster_inventory=&cluster,
+    channel_plan_=MoEOverlayActivationChannelPlanner::plan({.placement_plan=&placement,.cluster_inventory=mpi_->clusterInventory().get(),
         .row_capacity=4u,.d_model=width,.top_k=1,.graph_family_count=2u,.original_native_slots=geometry_});
     requireRecurrentPacket(channel_plan_.channels.size()==1u,"Original two-GPU declaration did not produce exactly one channel");
     requireRecurrentPacket(channel_plan_.channels[0].targetParticipantIds()==std::vector<int>{target},"Original follower participant identity changed");
@@ -396,15 +384,16 @@ void RecurrentOriginalSlotPacketReplay::makeTransport() {
     const auto &channel=channel_plan_.channels.at(0);
     const std::string name="recurrent_original_slot_packet_"+std::to_string(::getpid());
     MoEOverlayRankBatchTransportConfig config;
-    config.mpi_ctx=makeContext(0,name,1);config.endpoint_scope=MoEOverlayActivationEndpointScope::RankLocalGPU;
-    config.rank_local_source_device=devices_[0];config.source_world_rank=0;config.target_world_rank=0;
+    config.mpi_ctx=mpi_;config.endpoint_scope=MoEOverlayActivationEndpointScope::RankLocalGPU;
+    config.rank_local_source_device=devices_[0];config.source_world_rank=config.mpi_ctx->rank();config.target_world_rank=config.mpi_ctx->rank();
     config.workspace=std::make_shared<MoEOverlayRankBatchWireWorkspace>(MoEOverlayRankBatchWireWorkspace::Config{
         .participant_ids={target},.max_total_rows=4u,.max_total_entries=4u,.d_model=width,.top_k=1,
         .return_layout=layout_.geometry.return_layout});
     config.max_rows_per_participant=4;config.max_entries_per_participant=4;config.d_model=width;config.top_k=1;
     config.tier_index=channel.tier_index;config.domain_ordinal=channel.domain_ordinal;config.channel_identity=name;
-    config.transaction_topology=topology_;config.source_endpoint={.world_rank=0,.participant_id=0,.tier_priority=80,.domain_ordinal=0};
-    config.target_tier_priority=30;config.activation_layout=layout_;config.local_lanes=channel.localLanes(0);
+    config.transaction_topology=topology_;config.source_endpoint={.world_rank=config.mpi_ctx->rank(),.participant_id=0,.tier_priority=80,.domain_ordinal=0};
+    config.target_tier_priority=30;config.activation_layout=layout_;config.local_lanes=channel.localLanes(config.mpi_ctx->rank());
+    config.physical_memory_authority=memory_;
     config.activation_graph_families={
         {.graph_role_mask=1u<<static_cast<unsigned>(MoEOverlayInferenceGraphRole::MTPDraft),.model_layer_indices={0}},
         {.graph_role_mask=1u<<static_cast<unsigned>(MoEOverlayInferenceGraphRole::MTPGroupedVerifier),.model_layer_indices={0}}};
@@ -585,7 +574,7 @@ void RecurrentOriginalSlotPacketReplay::checkCaptureIdentity() {
     auto &f=*family_[0];
     const auto transaction=[&](MoEOverlayMappedActivationDeviceLane lane) {
         return std::make_shared<MoEOverlayActivationLaneBatchState>(devices_[0],
-            std::vector<MoEOverlayMappedActivationDeviceLane>{std::move(lane)},1,0u,0);
+            std::vector<MoEOverlayMappedActivationDeviceLane>{std::move(lane)},1,0u,0,memory_);
     };
     const MoEOverlayActivationDispatchPackStage *actual_dispatch=nullptr;
     for(const auto &stage:f.stages[0])if(const auto *dispatch=dynamic_cast<const MoEOverlayActivationDispatchPackStage*>(stage.get()))actual_dispatch=dispatch;
@@ -707,34 +696,92 @@ void RecurrentOriginalSlotPacketReplay::dispose() {
     });
     for(auto &family:family_)family.reset();
     source_cache_.reset(Cache::StreamResetPolicy::Destroy);
-    mapped_.reset();transport_.reset();channel_claims_.clear();protocol_.reset();
+    mapped_.reset();transport_.reset();protocol_.reset();
     arenas_={};contexts_={};graph_backing_={};workers_={};evidence_claim_.reset();evidence_={};
-    if(source_) { EXPECT_EQ(source_->retireReleasedContexts(),2u);source_.reset(); }
+    if(original_) {
+        if(admitted_)original_->requirePayloadRetired();
+        original_->retire();original_->requireExactRetired();
+        source_.reset();original_.reset();
+    }
     disposed_=true;
 }
 
+/**
+ * @brief Select the sole actual GPU compute owner through production rank selection.
+ * @param family Original same-vendor two-device component cohort.
+ * @param profile Recorded full, partial or empty original-slot work.
+ * @param cancel Publish the existing absorbing cancellation instead of successor success.
+ * @details Discovery remains original MPI2 (or larger). The selected communicator
+ * contains every declared compute participant: exactly one original rank owns
+ * both GPUs, and idle discovery peers own no component graph/CPU work. The
+ * canonical factory preserves discovery-to-execution membership, UUIDs and
+ * NUMA facts; no caller synthesizes an inventory or rank-zero alias. Existing
+ * original-slot production contracts still require this real selected world1.
+ */
+void selectedRecurrentOriginalSlots(DeviceType family,RecurrentPacketProfile profile,bool cancel) {
+    const auto discovery=MPIContextFactory::global();
+    requireRecurrentPacket(discovery && discovery->clusterInventory(),"Original slot replay requires discovery inventory");
+    int owner=-1;std::array<DeviceId,2> devices;
+    for(const auto& rank:discovery->clusterInventory()->ranks) {
+        std::vector<DeviceId> owned;
+        for(const auto& gpu:rank.gpus)if(gpu.type==family && rankOwnsGPUDevice(rank,gpu))owned.emplace_back(family,gpu.local_device_id);
+        if(owned.size()>=2) {owner=rank.rank;std::copy_n(owned.begin(),2,devices.begin());break;}
+    }
+    requireRecurrentPacket(owner>=0,"Original slot replay requires two actual GPUs on one original NUMA owner");
+    ExecutionRankSelection selection({owner});
+    auto selected=MPIContextFactory::selectRanks(discovery,selection.discoveryRanks());
+    std::exception_ptr failure;
+    if(auto active=std::get_if<std::shared_ptr<MPIContext>>(&selected))try {
+        requireRecurrentPacket(*active && (*active)->executionMembership() &&
+            (*active)->executionMembership()->selection()==selection && (*active)->world_size()==1 &&
+            (*active)->executionMembership()->executionRank(discovery->rank())==(*active)->rank(),
+            "Original slot selection lost its actual discovery membership");
+        const auto& before=discovery->clusterInventory()->ranks.at(owner);
+        const auto& after=(*active)->clusterInventory()->ranks.at((*active)->rank());
+        requireRecurrentPacket(before.cpu.numa_node==after.cpu.numa_node && before.hostname==after.hostname,
+            "Original slot selected context changed physical host/NUMA");
+        for(const auto device:devices) {
+            requireRankLocalGPUOwnership(after,device,"Original selected-slot cohort");
+            const auto find=[&](const auto& rank)->const DeviceInfo& {
+                const auto gpu=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto& observed){return observed.type==device.type && observed.local_device_id==device.ordinal;});
+                requireRecurrentPacket(gpu!=rank.gpus.end(),"Selected original slot GPU disappeared");return *gpu;
+            };
+            const auto& original=find(before);const auto& projected=find(after);
+            requireRecurrentPacket(!original.uuid.empty() && original.uuid==projected.uuid &&
+                original.numa_node==projected.numa_node && original.native_isa==projected.native_isa &&
+                original.pcie_upstream_bdfs==projected.pcie_upstream_bdfs,
+                "Original slot selected context substituted a physical GPU");
+        }
+        RecurrentOriginalSlotPacketReplay replay(*active,devices,profile);replay.prepare();
+        if(cancel)replay.replayCancelledSuccessor();else replay.replay();
+    }catch(...) {failure=std::current_exception();}
+    // Idle discovery ranks join only this terminal evidence; selected native
+    // graph/source retirement completed before the original context rendezvous.
+    acceptPlanningCostPreparation(discovery,[&]{if(failure)std::rethrow_exception(failure);});
+}
+
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_CUDATwoPhysicalEndpointsAggregate) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::cuda(0));replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::CUDA,RecurrentPacketProfile::Full,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_ROCmTwoPhysicalEndpointsAggregate) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::rocm(0));replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::ROCm,RecurrentPacketProfile::Full,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_CUDATwoPhysicalEndpointsPartialVerifier) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::cuda(0),RecurrentPacketProfile::PartialVerifier);replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::CUDA,RecurrentPacketProfile::PartialVerifier,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_CUDATwoPhysicalEndpointsEmpty) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::cuda(0),RecurrentPacketProfile::Empty);replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::CUDA,RecurrentPacketProfile::Empty,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_CUDATwoPhysicalEndpointsCancelBeforeSuccessorSource) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::cuda(0));replay.prepare();replay.replayCancelledSuccessor();
+    selectedRecurrentOriginalSlots(DeviceType::CUDA,RecurrentPacketProfile::Full,true);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_ROCmTwoPhysicalEndpointsPartialVerifier) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::rocm(0),RecurrentPacketProfile::PartialVerifier);replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::ROCm,RecurrentPacketProfile::PartialVerifier,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_ROCmTwoPhysicalEndpointsEmpty) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::rocm(0),RecurrentPacketProfile::Empty);replay.prepare();replay.replay();
+    selectedRecurrentOriginalSlots(DeviceType::ROCm,RecurrentPacketProfile::Empty,false);
 }
 TEST(MoERecurrentOriginalSlotPacketReplay,DISABLED_ROCmTwoPhysicalEndpointsCancelBeforeSuccessorSource) {
-    RecurrentOriginalSlotPacketReplay replay(DeviceId::rocm(0));replay.prepare();replay.replayCancelledSuccessor();
+    selectedRecurrentOriginalSlots(DeviceType::ROCm,RecurrentPacketProfile::Full,true);
 }
 } } // namespace llaminar2::test

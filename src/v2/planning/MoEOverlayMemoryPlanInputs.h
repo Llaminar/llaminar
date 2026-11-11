@@ -37,6 +37,8 @@ struct MoEOverlayPrefillMemoryPolicy
     std::span<const int> bucket_rows;
     int minimum_sequence_rows = 0;
     int maximum_cached_buckets = 0;
+    bool maximum_cached_buckets_explicit = false; ///< User ceiling rather than the unrelated default cache limit.
+    bool exact_fixed_pipeline_widths = false; ///< Original fixed-head native pipeline uses exact retained widths.
 };
 
 /**
@@ -67,6 +69,10 @@ struct MoEOverlayMemoryPlanInputRequest
     /** Same original consumer representation and source allocation policy used by loading. */
     WeightPrecision weight_precision=WeightPrecision::NATIVE;
     std::optional<CPUStoragePlacement> native_source_placement;
+    /** Original local pipeline demand, resolved across every authored stage before per-stage solves. */
+    bool native_pipeline_maintenance_budget = false;
+    /** Original checked CPU pipeline program; borrowed through this complete planning transaction only. */
+    const OriginalCPUPipelineProgram* original_cpu_stage_program=nullptr;
 };
 
 /** @brief Complete local BOM input and the exact schedule/cache identity it prices. */

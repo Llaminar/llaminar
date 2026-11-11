@@ -13,6 +13,7 @@
 #include "PooledImmutableCompleteCohort.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/NativeOrderingEventGroup.h"
+#include "collective/OriginalNativeGraphCaptureGroup.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "../local_execution/graph/GraphCaptureGuard.h"
@@ -246,6 +247,8 @@ struct PooledImmutableCompleteCohort::State {
     std::vector<PooledImmutableCohortRemote> remotes;
     std::vector<FrozenParticipant> frozenRemotes;
     std::vector<std::shared_ptr<ImmutableLookupSubmissionRetirement>> frontiers;
+    std::optional<NativeLocalTPContextBorrow> native; ///< Actual bound storage union, independent of model-reader membership.
+    mutable std::vector<std::future<void>> pending; ///< Cold-reserved CPU enqueue slots, never GPU completion.
     mutable std::mutex submissionOrder; ///< Serializes CPU enqueue groups only; no GPU completion is awaited.
 
 };
@@ -345,6 +348,12 @@ std::shared_ptr<PooledImmutableCompleteCohort> PooledImmutableCompleteCohort::bi
         if (remote.coordinate!=coordinate || !holder || !*holder || !remote.participant.graph ||
             pooledSourceOwner((*holder)->read()->publication()->sourceWave())!=storage->originalOwners()[coordinate])
             throw std::invalid_argument("Complete pooled cohort changed original ordered physical owner/root identity");
+        const auto native=(*holder)->binding(PooledRetirementWireRole::Retired,CapturedTransferEndpoint::Producer).originalNativeContext();
+        if(native) {
+            if(state->native && !state->native->sameOriginal(*native))
+                throw std::invalid_argument("Complete pooled cohort changed its original native recording authority");
+            state->native=*native;
+        }
         const auto device=storage->originalOwners()[coordinate]->plan().allocator().device;
         if (device==boundary->device())
             throw std::invalid_argument("Complete pooled cohort cannot hide a local owner behind a remote program");
@@ -412,47 +421,55 @@ std::shared_ptr<PooledImmutableCompleteCohort> PooledImmutableCompleteCohort::bi
     // cohort. Acquire them once from the off-worker cold coordinator; request
     // admission must never hold source A while synchronously waiting on B.
     result->acquireRemoteSetup();
-    const auto record=[](State::FrozenParticipant& participant) {
-        participant.original.worker->submitAndWait([&] {
-            participant.capture=&participant.executable->capture();
-            if (participant.capture->executionStream()!=participant.original.stream ||
-                participant.capture->hasExecutable() || participant.capture->nodeCount()!=0)
+    std::vector<State::FrozenParticipant*> participants{&owned.source};
+    for(auto& remote:owned.frozenRemotes)participants.push_back(&remote);
+    owned.pending.reserve(participants.size());
+    std::vector<std::unique_ptr<DeviceGraphExecutor>> executors;
+    std::vector<std::unique_ptr<GraphCaptureDependencyLedger>> ledgers;
+    executors.reserve(participants.size());ledgers.reserve(participants.size());
+    std::vector<OriginalNativeGraphRecording> recordings;recordings.reserve(participants.size());
+    constexpr auto label="complete original pooled reader/retirement participant";
+    // Materialization and all external producer acquisition must finish before
+    // any sibling enters capture. Only the actual recording is symmetric.
+    for(auto* participant:participants) {
+        auto executor=std::make_unique<DeviceGraphExecutor>();
+        executor->setArena(participant->original.arena.get());
+        std::unique_ptr<GraphCaptureDependencyLedger> dependencies;
+        participant->original.worker->submitAndWait([&] {
+            participant->capture=&participant->executable->capture();
+            if(participant->capture->executionStream()!=participant->original.stream ||
+               participant->capture->hasExecutable() || participant->capture->nodeCount()!=0)
                 throw std::runtime_error("Complete pooled recorder requires its pristine sole original capture owner");
-            DeviceGraphExecutor executor;
-            executor.setArena(participant.original.arena.get());
-            // This closed source program includes explicit captured transfer
-            // collectives. The generic retained-child recorder correctly rejects
-            // collectives, so use the original public setup recorder/ledger here
-            // without relaxing its policy or accepting a caller executable.
-            constexpr auto label="complete original pooled reader/retirement participant";
-            if(!executor.allocateGraphStorageForCapture(*participant.original.graph,participant.original.context.get(),label))
+            if(!executor->allocateGraphStorageForCapture(*participant->original.graph,participant->original.context.get(),label))
                 throw std::runtime_error("Complete pooled participant storage prebinding failed");
-            for(const auto& name:participant.original.graph->getExecutionOrder()) {
-                auto* stage=participant.original.graph->getNode(name)->stage.get();
-                if(!stage->prepareGraphLaunch(participant.original.context.get(),participant.original.stream) || !stage->isGraphCapturable())
+            for(const auto& name:participant->original.graph->getExecutionOrder()) {
+                auto* stage=participant->original.graph->getNode(name)->stage.get();
+                if(!stage->prepareGraphLaunch(participant->original.context.get(),participant->original.stream) || !stage->isGraphCapturable())
                     throw std::runtime_error("Complete pooled participant stage preparation failed: "+name);
             }
-            if(!executor.prepareGraphStorageForCapture(*participant.original.graph,participant.original.context.get(),participant.original.stream,label))
+            if(!executor->prepareGraphStorageForCapture(*participant->original.graph,participant->original.context.get(),participant->original.stream,label))
                 throw std::runtime_error("Complete pooled participant capture frontier preparation failed");
-            auto dependencies=executor.planGraphCaptureDependencies(*participant.original.graph,
-                participant.original.graph->getExecutionOrder(),participant.device,participant.original.stream,label);
+            dependencies=executor->planGraphCaptureDependencies(*participant->original.graph,
+                participant->original.graph->getExecutionOrder(),participant->device,participant->original.stream,label);
             if(!dependencies)throw std::runtime_error("Complete pooled participant capture dependency ledger is incomplete");
-            {
-                ScopedBackendGraphCapture capture(*participant.original.worker,*participant.capture,label,dependencies.get());
-                if(!capture.begin())throw std::runtime_error("Complete pooled participant beginCapture failed");
-                if(!executor.recordSetupGraphMaterialization(*participant.original.graph,participant.original.context.get()))
-                    throw std::runtime_error("Complete pooled participant actual graph recording failed");
-                capture.finish();
-            }
-            if(!participant.capture->nodeCount())throw std::runtime_error("Complete pooled participant recorded an empty native graph");
-            std::string detail;
-            if (!participant.capture->validateExecutableMemoryClass(GPUGraphExecutableClass::General,&detail) ||
-                !participant.capture->instantiate())
-                throw std::runtime_error("Complete pooled participant executable admission failed: "+detail);
         });
-    };
-    record(owned.source);
-    for (auto& remote:owned.frozenRemotes)record(remote);
+        auto* recorder=executor.get();
+        recordings.push_back({participant->original.worker,participant->device,participant->capture,dependencies.get(),[participant,recorder] {
+            if(!recorder->recordSetupGraphMaterialization(*participant->original.graph,participant->original.context.get()))
+                throw std::runtime_error("Complete pooled participant actual graph recording failed");
+        }});
+        executors.push_back(std::move(executor));ledgers.push_back(std::move(dependencies));
+    }
+    OriginalNativeGraphCaptureGroup::record(recordings,owned.native,
+        std::string(label)+":source="+std::to_string(reinterpret_cast<std::uintptr_t>(boundary.get())));
+    // The original group has closed every capture before native instantiation.
+    for(auto* participant:participants)participant->original.worker->submitAndWait([&] {
+        if(!participant->capture->nodeCount())throw std::runtime_error("Complete pooled participant recorded an empty native graph");
+        std::string detail;
+        if(!participant->capture->validateExecutableMemoryClass(GPUGraphExecutableClass::General,&detail) ||
+           !participant->capture->instantiate())
+            throw std::runtime_error("Complete pooled participant executable admission failed: "+detail);
+    });
     result->requireCurrent();boundary->bindCompleteCohort(result);return result;
 }
 void PooledImmutableCompleteCohort::requireCurrent()const {
@@ -498,14 +515,39 @@ void PooledImmutableCompleteCohort::launch()const {
     for(const auto& remote:state_->frozenRemotes)if(remote.original.worker->ownsCurrentThread())throw std::invalid_argument("Cohort launch cannot occupy an original peer worker");
     // After the first actual launch, an exception is not proof that a peer
     // stopped reading. Failed submission is fatal before any owner unwinds.
-    const auto submit=[](const State::FrozenParticipant& participant) {
-        participant.original.worker->submitAndWait([&] {
-            if(participant.invocation==std::numeric_limits<std::uint64_t>::max())throw std::overflow_error("Complete pooled participant invocation ownership exhausted");
-            if(!participant.executable->submit(++participant.invocation))throw std::runtime_error("Original pooled participant owned submission failed");
-        });
+    std::mutex errorMutex;std::exception_ptr firstError;
+    const auto fail=[&](std::exception_ptr error) noexcept {
+        {std::lock_guard lock(errorMutex);if(!firstError)firstError=std::move(error);}
+        if(state_->native)try {
+            const auto use=state_->native->acquire();
+            if(!use.context().signalNativeCompletionAbort())std::terminate();
+        }catch(...){std::terminate();}
     };
-    try { submit(state_->source);for(const auto& remote:state_->frozenRemotes)submit(remote); }
-    catch (...) { std::terminate(); }
+    const auto submit=[&](const State::FrozenParticipant& participant) {
+        const auto* original=&participant;
+        state_->pending.push_back(participant.original.worker->submitAsync([original,&fail] {
+            try {
+                if(original->invocation==std::numeric_limits<std::uint64_t>::max())throw std::overflow_error("Complete pooled participant invocation ownership exhausted");
+                if(!original->executable->submit(++original->invocation))throw std::runtime_error("Original pooled participant owned submission failed");
+            }catch(...) {
+                // Publish from the failing actor: its future may be behind a
+                // sibling whose native enqueue is waiting for this participant.
+                fail(std::current_exception());throw;
+            }
+        }));
+    };
+    try {submit(state_->source);for(const auto& remote:state_->frozenRemotes)submit(remote);}
+    catch(...) {fail(std::current_exception());}
+    // A worker wrapper may fail before invoking our callback. Scan every ready
+    // future, so its abort is never hidden behind an earlier blocked enqueue.
+    joinOriginalNativeWorkerSubmissions(state_->pending,fail);
+    state_->pending.clear();
+    if(firstError) {
+        try{std::rethrow_exception(firstError);}
+        catch(const std::exception& error){LOG_ERROR("Original pooled participant enqueue failed: "<<error.what());}
+        catch(...){LOG_ERROR("Original pooled participant enqueue failed with a non-standard exception");}
+        std::terminate();
+    }
 }
 std::vector<GPUGraphKernelNodeInfo> PooledImmutableCompleteCohort::kernelInventory(std::optional<std::uint32_t> coordinate)const {
     if (isGraphCaptureActive() || state_->completion.read.publication.source.boundary->hasActiveInterval())

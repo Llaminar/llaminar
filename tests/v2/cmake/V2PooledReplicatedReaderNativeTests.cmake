@@ -1,26 +1,14 @@
 #[[
 @file V2PooledReplicatedReaderNativeTests.cmake
-@brief Bind actual replicated-reader metadata kernels and payload receipts to native preflight.
+@brief Original source-frame dependency proof complementing actual native reader replay.
 
-The existing captured-channel executable owns original endpoint discovery,
-streams and native teardown. Each backend executes its actual cached route;
-coverage properties distinguish peer VRAM from genuinely unavailable-peer RAM.
-These are correctness replay gates, never timing or full-model qualification.
+NativeCompletedCollective owns actual native payload/metadata/ACK/cancellation
+capture. This file retains the independent device-free original-frame contract.
 ]]
-if(TARGET v2_integration_captured_transfer_channel)
-    foreach(_reader_backend CUDA ROCm)
-        if((_reader_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
-           (_reader_backend STREQUAL "ROCm" AND HAVE_ROCM))
-            add_v2_test(V2_Integration_PooledReplicatedReader_${_reader_backend}2_CapturedMetadataReplay
-                COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
-                    --gtest_filter=PooledReplicatedReaderNative.${_reader_backend}OriginalCapturedMetadataReplay
-                LABELS "V2;Integration;ProductionTestPreflight;${_reader_backend};GPU;Ngram;Transfer;Capture;TraceReplay;Regression"
-                NO_MODELS MPI_PROCS 1 TIMEOUT 30)
-            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-                V2_Integration_PooledReplicatedReader_${_reader_backend}2_CapturedMetadataReplay)
-        endif()
-    endforeach()
-endif()
+# NativeCompletedCollective.{CUDA,ROCm}_ReaderAckReplay owns the actual native
+# reader metadata/ACK/reset/fault/abort regression. Its explicit preflight entries
+# live in V2NativeCountedBroadcastTests.cmake; do not preserve a second captured
+# channel alias that selects an obsolete homogeneous transport.
 
 # Device-free original-frame declaration proof complements native reader capture.
 if(TARGET v2_test_qwen4exp_primitives)

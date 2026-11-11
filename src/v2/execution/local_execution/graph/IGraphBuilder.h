@@ -18,6 +18,7 @@
 
 #include "DeviceGraphExecutor.h"
 #include "ForwardGraphSubmissionIntent.h"
+#include "execution/mtp/MTPSidecarCaptureLayout.h"
 #include "DeviceDecodePositionBinding.h"
 #include "kernels/common/SparseQueryExecutionProgram.h"
 #include "DeviceRequestQueryBinding.h"
@@ -371,6 +372,7 @@ namespace llaminar2
         int request_row_capacity = 0; ///< Flattened rows available in the admitted request bank.
         int bucket_seq_len = 0; ///< Physical graph width materialized on every replay.
         int pad_token_id = 0; ///< Deterministic token used for inactive bucket rows.
+        bool require_exact_rows = false; ///< Captured graph width must equal the device-computed live extent.
         uint64_t capture_identity = 0; ///< Complete pointer/geometry identity used by graph caching.
 
         /** @return true when every captured address and geometry field is complete. */
@@ -544,6 +546,7 @@ namespace llaminar2
         Ordinary = 0, ///< No additional restored-prefix state transition.
         RestoredPrefixMTPDecodeBridge, ///< Decode plus shifted-MTP KV/archive bridge.
         CommittedMTPCondition, ///< Scalar condition plus one new decode commit.
+        ForwardOnlyCondition, ///< Already-emitted condition advances model state without a new cadence round.
     };
 
 
@@ -587,6 +590,8 @@ namespace llaminar2
      */
     struct ForwardInput
     {
+        /** Present only inside original learned-sidecar construction; never inferred from rows. */
+        std::optional<MTPSidecarCaptureRole> mtp_sidecar_capture_role;
         const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
         /**
          * @brief Optional device-resident INT32 token IDs.
@@ -599,6 +604,7 @@ namespace llaminar2
          */
         const void *token_ids_device = nullptr;
         std::optional<Qwen4ExpReplicatedPLEQuery> replicated_ple_query; ///< Actual DGO-issued immutable source projection for fixed-head PLE only.
+        std::shared_ptr<const Qwen4ExpFixedHeadPipelinePort> fixed_head_pipeline_port; ///< Exact original captured PLE consumer port, if declared.
         const int *position_ids = nullptr; ///< Host position IDs [batch_size * seq_len]
         /**
          * @brief Optional device-resident INT32 position IDs.

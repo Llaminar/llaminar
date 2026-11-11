@@ -14,6 +14,10 @@
  * retain their diagnostic campaigns without becoming runtime/control authorities.
  * Dynamic-depth expectations use the declared model ceiling; the standard
  * full-matrix depth and retained graph storage do not override that request.
+ * Discovery population and selected execution membership remain separate typed
+ * facts. An observed native pipeline has no physical addresses until original
+ * inventory binding; independent stage expert policies lower into their named
+ * domains without installing a competing model-wide placement authority.
  */
 
 #pragma once
@@ -22,9 +26,11 @@
 #include "ModelParityGenerationWorkload.h"
 #include "ModelParityPairedWorkload.h"
 #include "ModelParityCrossHostE2E.h"
+#include "../../utils/ObservedISAPipelinePlacement.h"
 
 #include "backends/GlobalDeviceAddress.h"
 #include "config/ActivationPrecisionPolicy.h"
+#include "config/OrchestrationPlanningPolicy.h"
 #include "execution/config/RoutedExpertPolicy.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -494,6 +500,13 @@ namespace llaminar2::test::parity
             const ModelParityParticipant &) = default;
     };
 
+    /** @brief Declarative native architecture request; physical addresses require original inventory binding. */
+    struct ModelParityObservedNativePipeline
+    {
+        DeviceType backend = DeviceType::ROCm;
+        std::string native_isa;
+    };
+
     /**
      * @brief General typed topology shared by dense, MoE, and overlay parity.
      *
@@ -511,7 +524,7 @@ namespace llaminar2::test::parity
             ModelParityTopologyKind::SingleDevice;
         std::vector<ModelParityParticipant> participants;
         Collective collective = Collective::None;
-        int mpi_ranks = 1;
+        int mpi_ranks = 1; ///< Original discovery launch population; selected execution has its own existing membership.
         std::vector<int> pipeline_stage_sizes;
         std::vector<float> pipeline_weights;
         Collective tensor_parallel_collective = Collective::None;
@@ -520,10 +533,60 @@ namespace llaminar2::test::parity
         /** Per-stage TP collectives for mixed-vendor pipelines; empty uses the common scalar. */
         std::vector<Collective> pipeline_tensor_parallel_collectives;
 
+        /** Unbound requests contain no invented physical participant addresses. */
+        std::optional<ModelParityObservedNativePipeline> observed_native_pipeline;
+        /** Original discovery membership; participant owners use its compact execution namespace. */
+        std::optional<ExecutionRankSelection> execution_rank_selection;
+        /** One authored routed compute policy per pipeline stage; empty keeps ordinary domains. */
+        std::vector<RoutedExpertComputePolicy> pipeline_routed_compute_policies;
+
+        /** @return Actual admitted execution population without hiding discovery size. */
+        [[nodiscard]] int executionRankCount() const noexcept
+        {
+            return execution_rank_selection ? execution_rank_selection->size() :
+                observed_native_pipeline ? 1 : mpi_ranks;
+        }
+
+        /** @return Whether only a native ISA/cardinality request exists, without physical ownership. */
+        [[nodiscard]] bool needsObservedPipelineBinding() const noexcept
+        {
+            return observed_native_pipeline && participants.empty();
+        }
+
+        /**
+         * @brief Bind the requested stage sizes through the original discovered ISA/UUID/NUMA authority.
+         * @param inventory Complete original discovery namespace, before production rank selection.
+         * @return Physical stage addresses and exact discovery-to-execution selection, preserving all mode axes.
+         * @throws std::invalid_argument For incomplete, already-bound or ambiguous hardware/ownership.
+         */
+        [[nodiscard]] ModelParityTopologyDefinition bindObservedPipeline(const ClusterInventory &inventory) const
+        {
+            if (!needsObservedPipelineBinding() || execution_rank_selection ||
+                kind != ModelParityTopologyKind::RankLocalPipelineParallel ||
+                inventory.world_size != mpi_ranks || pipeline_stage_sizes.empty())
+                throw std::invalid_argument("Observed parity pipeline requires its unbound original discovery request");
+            std::vector<std::size_t> sizes;
+            for (const int size : pipeline_stage_sizes)
+            {
+                if (size <= 0) throw std::invalid_argument("Observed parity pipeline stage size must be positive");
+                sizes.push_back(static_cast<std::size_t>(size));
+            }
+            const auto selected = ::llaminar2::test::ObservedISAPipelinePlacement::require(inventory,
+                observed_native_pipeline->backend, observed_native_pipeline->native_isa, sizes);
+            auto result = *this;
+            result.execution_rank_selection = selected.selection();
+            const auto &owner = inventory.ranks.at(selected.discovery_owner);
+            for (const auto &stage : selected.stages)
+                for (const auto device : stage)
+                    result.participants.push_back({GlobalDeviceAddress::fromLocalDeviceId(device,
+                        owner.hostname, owner.cpu.numa_node), 0});
+            return result;
+        }
+
         /** @return Whether this topology enables ExpertOverlay matrix axes. */
         [[nodiscard]] bool isExpertOverlay() const noexcept
         {
-            return expert_overlay_plan != nullptr;
+            return expert_overlay_plan != nullptr || !pipeline_routed_compute_policies.empty();
         }
     };
 
@@ -850,6 +913,21 @@ namespace llaminar2::test::parity
          */
         [[nodiscard]] bool requiresCanonicalTPAllreduceMTPDiagnostics() const
         {
+            if (mtpEnabled() && expert_overlay &&
+                !topology.pipeline_routed_compute_policies.empty())
+            {
+                const auto &sizes = topology.pipeline_stage_sizes;
+                const int tail_count = sizes.empty() ? 1 : sizes.back();
+                if (topology.needsObservedPipelineBinding())
+                    return tail_count > 2 && topology.observed_native_pipeline->backend != DeviceType::CPU;
+                if (tail_count <= 0 || static_cast<std::size_t>(tail_count) > topology.participants.size())
+                    throw std::logic_error("Pipeline expert diagnostics require complete tail participants");
+                const auto tail_size = static_cast<std::size_t>(tail_count);
+                if (tail_size <= 2u) return false;
+                const auto first = topology.participants.end() - static_cast<std::ptrdiff_t>(tail_size);
+                return first->address.isGPU() && std::all_of(first, topology.participants.end(),
+                    [&](const auto &member) { return member.address.device_type == first->address.device_type; });
+            }
             if (!mtpEnabled() || !expert_overlay ||
                 !topology.expert_overlay_plan)
             {
@@ -987,12 +1065,15 @@ namespace llaminar2::test::parity
          */
         [[nodiscard]] TestConfig toTestConfig() const
         {
+            if (topology.observed_native_pipeline &&
+                (topology.needsObservedPipelineBinding() || !topology.execution_rank_selection))
+                throw std::logic_error("Observed parity pipeline must bind original inventory before runtime configuration");
             TestConfig config;
             config.name = testName();
             config.parallelism = legacyParallelism();
             config.collective = topology.collective;
             config.thresholds = thresholds;
-            config.mpi_ranks = topology.mpi_ranks;
+            config.mpi_ranks = topology.executionRankCount();
             config.model_path = model.model_path;
             config.shared_predictor = model.shared_predictor;
             config.snapshot_dir = model.reference_directory;
@@ -1063,16 +1144,16 @@ namespace llaminar2::test::parity
             {
                 config.routed_expert_owner_order =
                     expert_overlay->owner_order;
-                config.moe_routed_expert_plan =
-                    std::make_shared<MoERoutedExpertPlacementPlan>(
-                        *topology.expert_overlay_plan);
-                config.moe_routed_expert_plan->owner_order =
-                    expert_overlay->owner_order;
-                config.moe_routed_expert_plan->residency_policy =
-                    expert_overlay->movement ==
-                            ModelParityExpertMovement::Dynamic
-                        ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
-                        : RoutedExpertResidencyPolicy::StaticById;
+                if (topology.expert_overlay_plan)
+                {
+                    config.moe_routed_expert_plan =
+                        std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+                    config.moe_routed_expert_plan->owner_order = expert_overlay->owner_order;
+                    config.moe_routed_expert_plan->residency_policy =
+                        expert_overlay->movement == ModelParityExpertMovement::Dynamic
+                            ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                            : RoutedExpertResidencyPolicy::StaticById;
+                }
                 config.moe_movement_expectation =
                     requiresPhysicalExpertMovement()
                         ? ParityMoEMovementExpectation::PhysicalMovement
@@ -1173,16 +1254,16 @@ namespace llaminar2::test::parity
                             ModelParityExpertMovement::Dynamic
                         ? MoERebalanceRuntimeMode::Dynamic
                         : MoERebalanceRuntimeMode::Off;
-                config.moe_routed_expert_plan =
-                    std::make_shared<MoERoutedExpertPlacementPlan>(
-                        *topology.expert_overlay_plan);
-                config.moe_routed_expert_plan->owner_order =
-                    expert_overlay->owner_order;
-                config.moe_routed_expert_plan->residency_policy =
-                    expert_overlay->movement ==
-                            ModelParityExpertMovement::Dynamic
-                        ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
-                        : RoutedExpertResidencyPolicy::StaticById;
+                if (topology.expert_overlay_plan)
+                {
+                    config.moe_routed_expert_plan =
+                        std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+                    config.moe_routed_expert_plan->owner_order = expert_overlay->owner_order;
+                    config.moe_routed_expert_plan->residency_policy =
+                        expert_overlay->movement == ModelParityExpertMovement::Dynamic
+                            ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                            : RoutedExpertResidencyPolicy::StaticById;
+                }
             }
         }
 
@@ -1209,8 +1290,14 @@ namespace llaminar2::test::parity
             const std::string &resolved_model_path,
             int current_rank) const
         {
+            if (topology.observed_native_pipeline &&
+                (topology.needsObservedPipelineBinding() || !topology.execution_rank_selection))
+                throw std::logic_error("Observed parity pipeline must bind original inventory before runtime configuration");
             OrchestrationConfig config = OrchestrationConfig::defaults();
             config.model_path = resolved_model_path;
+            config.mpi_procs = topology.mpi_ranks;
+            config.execution_rank_selection = topology.execution_rank_selection;
+            if (topology.execution_rank_selection) config.planning_mode = OrchestrationPlanningMode::Apply;
             config.shared_predictor = model.shared_predictor;
             config.max_seq_len = model.max_seq_len;
             config.batch_size = 1;
@@ -1241,7 +1328,7 @@ namespace llaminar2::test::parity
             {
                 config.device_mode = DeviceAssignmentMode::EXPLICIT;
                 std::vector<bool> installed(
-                    static_cast<std::size_t>(topology.mpi_ranks), false);
+                    static_cast<std::size_t>(topology.executionRankCount()), false);
                 for (const auto &participant : topology.participants)
                 {
                     if (!participant.world_rank)
@@ -1381,6 +1468,11 @@ namespace llaminar2::test::parity
                             domain.devices.size(),
                             1.0f / static_cast<float>(domain.devices.size()));
                     }
+                    if (!topology.pipeline_routed_compute_policies.empty())
+                    {
+                        domain.routed_compute_policy = topology.pipeline_routed_compute_policies.at(stage);
+                        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+                    }
                     config.domain_definitions.push_back(std::move(domain));
                     config.pp_stage_definitions.push_back(PPStageDefinition{
                         .stage_id = static_cast<int>(stage),
@@ -1398,7 +1490,7 @@ namespace llaminar2::test::parity
              * shape to validation and legacy fixture hooks, but it must not
              * synthesize a competing flat TP/PP map beside the named domains.
              */
-            if (topology.isExpertOverlay())
+            if (topology.expert_overlay_plan)
             {
                 applyRuntimePolicy(config);
                 return config;
@@ -1420,12 +1512,12 @@ namespace llaminar2::test::parity
             case ModelParityTopologyKind::NodeTensorParallel:
                 installExplicitRankDevices();
                 config.tp_scope = TPScope::NODE_LOCAL;
-                config.tp_degree = topology.mpi_ranks;
+                config.tp_degree = topology.executionRankCount();
                 break;
             case ModelParityTopologyKind::GlobalTensorParallel:
                 installExplicitRankDevices();
                 config.tp_scope = TPScope::GLOBAL;
-                config.tp_degree = topology.mpi_ranks;
+                config.tp_degree = topology.executionRankCount();
                 break;
             case ModelParityTopologyKind::NodePipelineParallel:
                 installPipeline(true);
@@ -1703,12 +1795,21 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "model parity model/topology ids must contain only letters, digits, and underscores");
         }
-        if (topology.test_id.empty() || topology.participants.empty() ||
+        if (topology.test_id.empty() ||
+            (topology.participants.empty() && !topology.needsObservedPipelineBinding()) ||
             topology.mpi_ranks <= 0)
         {
             throw std::invalid_argument(
                 "model parity requires a named topology, participants, and positive MPI size");
         }
+        if (topology.observed_native_pipeline &&
+            (topology.kind != ModelParityTopologyKind::RankLocalPipelineParallel ||
+             topology.observed_native_pipeline->backend == DeviceType::CPU ||
+             topology.observed_native_pipeline->native_isa.empty() ||
+             topology.observed_native_pipeline->native_isa.find(':') != std::string::npos ||
+             topology.pipeline_stage_sizes.empty() ||
+             topology.needsObservedPipelineBinding() == bool(topology.execution_rank_selection)))
+            throw std::invalid_argument("Observed parity pipeline needs a complete ISA request or its original bound membership");
         if (definition.precisions.activation.empty() ||
             definition.precisions.kv_cache.empty() ||
             definition.features.prefill_graph.empty())
@@ -1883,7 +1984,7 @@ namespace llaminar2::test::parity
                     "model parity recursive MTP cosine overrides must be unique by policy");
             }
         }
-        if (topology.isExpertOverlay() &&
+        if (topology.expert_overlay_plan &&
             !topology.expert_overlay_plan->enabled)
         {
             throw std::invalid_argument(
@@ -1963,6 +2064,10 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "single-device parity topology must declare exactly one participant");
         }
+        if (topology.execution_rank_selection)
+            for (const int rank : topology.execution_rank_selection->discoveryRanks())
+                if (rank >= topology.mpi_ranks)
+                    throw std::invalid_argument("parity execution selection exceeds its original discovery population");
         const bool cross_rank =
             topology.kind == ModelParityTopologyKind::NodeTensorParallel ||
             topology.kind == ModelParityTopologyKind::NodePipelineParallel ||
@@ -1996,7 +2101,7 @@ namespace llaminar2::test::parity
             topology.kind == ModelParityTopologyKind::GlobalTensorParallel)
         {
             require_uniform_cross_rank_head_shards(
-                topology.mpi_ranks, "cross-rank TP parity topology");
+                topology.executionRankCount(), "cross-rank TP parity topology");
         }
         else if (topology.kind ==
                  ModelParityTopologyKind::NodePipelineParallel)
@@ -2021,19 +2126,19 @@ namespace llaminar2::test::parity
                     "cross-rank pipeline stage " + std::to_string(stage));
             }
         }
-        if (cross_rank && topology.mpi_ranks < 2)
+        if (cross_rank && topology.executionRankCount() < 2)
         {
             throw std::invalid_argument(
                 "cross-rank parity topology requires at least two MPI ranks");
         }
-        if (!cross_rank && topology.mpi_ranks != 1)
+        if (!cross_rank && topology.executionRankCount() != 1)
         {
             throw std::invalid_argument(
                 "rank-local parity topology requires exactly one MPI rank");
         }
 
         std::vector<bool> rank_has_participant(
-            static_cast<std::size_t>(topology.mpi_ranks), false);
+            static_cast<std::size_t>(topology.executionRankCount()), false);
         bool has_inventory_bound_participant = false;
         for (std::size_t participant_index = 0;
              participant_index < topology.participants.size();
@@ -2064,7 +2169,7 @@ namespace llaminar2::test::parity
                 continue;
             }
             if (*participant.world_rank < 0 ||
-                *participant.world_rank >= topology.mpi_ranks)
+                *participant.world_rank >= topology.executionRankCount())
             {
                 throw std::invalid_argument(
                     "model parity participant names an out-of-range MPI rank");
@@ -2113,11 +2218,21 @@ namespace llaminar2::test::parity
                 topology.pipeline_stage_sizes.end(), std::size_t{0},
                 [](std::size_t total, int size)
                 { return total + static_cast<std::size_t>(size); });
-            if (grouped_participants != topology.participants.size())
+            if (!topology.needsObservedPipelineBinding() && grouped_participants != topology.participants.size())
             {
                 throw std::invalid_argument(
                     "pipeline stage sizes must cover every topology participant exactly once");
             }
+        }
+        if (!topology.pipeline_routed_compute_policies.empty())
+        {
+            if (!pipeline || topology.expert_overlay_plan ||
+                topology.pipeline_routed_compute_policies.size() != pipeline_stage_count ||
+                std::any_of(topology.pipeline_routed_compute_policies.begin(),
+                    topology.pipeline_routed_compute_policies.end(), [](auto policy) {
+                        return policy == RoutedExpertComputePolicy::Unspecified;
+                    }))
+                throw std::invalid_argument("pipeline expert policies require exactly one typed policy per stage and no model-wide overlay");
         }
         if (!topology.pipeline_tensor_parallel_collectives.empty() &&
             (!pipeline || topology.pipeline_tensor_parallel_collectives.size() !=

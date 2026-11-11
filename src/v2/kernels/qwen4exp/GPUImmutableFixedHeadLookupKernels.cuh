@@ -18,6 +18,7 @@
 #define QFN_HEAD_SUCCESS cudaSuccess
 #define QFN_HEAD_ERROR_TEXT cudaGetErrorString
 #define QFN_HEAD_FACTORY createCUDAImmutableFixedHeadLookupKernels
+#define QFN_HEAD_PIPELINE_FACTORY createCUDAImmutableFixedHeadPipelineKernels
 #define QFN_HEAD_NAMESPACE cuda_fixed_head_lookup
 #else
 #include <hip/hip_runtime.h>
@@ -27,6 +28,7 @@
 #define QFN_HEAD_SUCCESS hipSuccess
 #define QFN_HEAD_ERROR_TEXT hipGetErrorString
 #define QFN_HEAD_FACTORY createROCmImmutableFixedHeadLookupKernels
+#define QFN_HEAD_PIPELINE_FACTORY createROCmImmutableFixedHeadPipelineKernels
 #define QFN_HEAD_NAMESPACE rocm_fixed_head_lookup
 #endif
 #include "ImmutableFixedHeadLookupKernels.h"
@@ -123,7 +125,7 @@ __global__ __launch_bounds__(256,2) void validateOwnedIds(Frame a,HeadBounds bou
  * or model state is serialized. A stale successful transport extent is always
  * overwritten with zero before failure is published.
  */
-__global__ __launch_bounds__(1) void validateHeaders(Frame a)
+__device__ __forceinline__ void validateHeaderConsensus(Frame a)
 {
     *a.transport=0;
     const int rows=originalRows(a);
@@ -144,6 +146,8 @@ __global__ __launch_bounds__(1) void validateHeaders(Frame a)
     }
     else *a.transport=rows;
 }
+/** @brief Record the existing standalone fixed-head consensus. */
+__global__ __launch_bounds__(1) void validateHeaders(Frame a) { validateHeaderConsensus(a); }
 /** @brief Fail closed on stale/corrupt transport metadata before any payload address is evaluated. */
 __device__ __forceinline__ int payloadRows(const Frame &a)
 {
@@ -262,6 +266,7 @@ private:
     const NativeEmbeddingIQTables tables_;
     HeadBounds bounds_{};
 };
+#include "GPUImmutableFixedHeadPipelineKernels.inl"
 }
 
 std::unique_ptr<IImmutableFixedHeadLookupKernels> QFN_HEAD_FACTORY(ImmutableFixedHeadLookupPlan plan)
@@ -286,10 +291,33 @@ std::unique_ptr<IImmutableFixedHeadLookupKernels> QFN_HEAD_FACTORY(ImmutableFixe
     default:throw std::invalid_argument("Fixed-head lookup source format is unsupported");
     }
 }
+
+std::unique_ptr<IImmutableFixedHeadPipelineKernels> QFN_HEAD_PIPELINE_FACTORY(ImmutableResidentTableRangeView table,
+    NgramHashPolicy policy, FixedHeadPipelineHeads heads)
+{
+    requireImmutableFixedHeadPipelineRange(table, policy, heads);
+    NativeEmbeddingIQTables tables;
+#if defined(QFN_FIXED_HEAD_CUDA)
+    if (!table.device().is_cuda() || !prepareNativeEmbeddingTablesCUDA(table.device().ordinal, table.format(), tables))
+        throw std::runtime_error("Fixed pipeline CUDA source/codebook preparation failed");
+#else
+    if (!table.device().is_rocm() || !prepareNativeEmbeddingTablesROCm(table.device().ordinal, table.format(), tables))
+        throw std::runtime_error("Fixed pipeline ROCm source/codebook preparation failed");
+#endif
+    using namespace QFN_HEAD_NAMESPACE;
+    switch (table.format()) {
+#define QFN_PIPELINE_HEAD_CASE(F) case TensorType::F: return std::make_unique<PipelineKernels<TensorType::F>>(table, policy, heads, tables);
+        QFN_PIPELINE_HEAD_CASE(FP32) QFN_PIPELINE_HEAD_CASE(FP16) QFN_PIPELINE_HEAD_CASE(BF16)
+        QFN_LOOKUP_QUANT_FORMATS(QFN_PIPELINE_HEAD_CASE)
+#undef QFN_PIPELINE_HEAD_CASE
+    default: throw std::invalid_argument("Fixed pipeline native row format is unsupported");
+    }
+}
 }
 #undef QFN_HEAD_STREAM
 #undef QFN_HEAD_ERROR
 #undef QFN_HEAD_SUCCESS
 #undef QFN_HEAD_ERROR_TEXT
 #undef QFN_HEAD_FACTORY
+#undef QFN_HEAD_PIPELINE_FACTORY
 #undef QFN_HEAD_NAMESPACE

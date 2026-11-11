@@ -10,6 +10,7 @@
  * transport extent and must never replace original query/controller authority.
  */
 #pragma once
+#include "QwenFixedHeadPipelineCounters.h"
 #include "ImmutableResidentTableRangeView.h"
 #include "ImmutableResidentLookupKernels.h"
 #include "../common/DeviceRowRange.h"
@@ -205,4 +206,111 @@ std::unique_ptr<IImmutableFixedHeadLookupKernels> createCUDAImmutableFixedHeadLo
  * @param plan Checked ROCm range and source geometry.
  * @return Stateless original-native operation bundle. */
 std::unique_ptr<IImmutableFixedHeadLookupKernels> createROCmImmutableFixedHeadLookupKernels(ImmutableFixedHeadLookupPlan plan);
+
+/** @brief A retained exact-width launch with its independently ordered device publication. */
+struct FixedHeadPipelineRows {
+    int exact; ///< Exact positive width admitted by the selected graph, or zero for metadata only.
+    const std::int32_t *live; ///< Original device count. Null only for a declared fully active input.
+};
+/** @brief Canonical graph controller cells, borrowed without a new error owner. */
+struct FixedHeadPipelineError {
+    std::int32_t *healthy;
+    std::int32_t *error;
+    FixedHeadPipelineCounterRow counters{}; ///< Same original control row, optional for focused math replay.
+};
+/** @brief One immutable contiguous interval of original logical heads. */
+struct FixedHeadPipelineHeads {
+    int first;
+    int count;
+};
+/** @brief Producer-side checked request header and collective-owned transport extent. */
+struct FixedHeadPipelineConsensus {
+    FixedHeadPipelineRows rows;
+    FixedHeadPipelineError control;
+    FixedHeadValidationHeader *local;
+    const FixedHeadValidationHeader *gathered;
+    std::int32_t *transport;
+    int participants;
+};
+/** @brief Exact original ID subrange and compact destination for one addressed storage owner. */
+struct FixedHeadPipelineRequest {
+    FixedHeadPipelineRows rows;
+    FixedHeadPipelineHeads heads;
+    const std::int64_t *original;
+    std::int64_t *compact;
+};
+/** @brief Pack one exact admitted range into either a local contribution or a compact reply. */
+struct FixedHeadPipelinePack {
+    FixedHeadPipelineRows rows;
+    FixedHeadPipelineError control;
+    const std::int64_t *ids;
+    std::byte *destination;
+    int id_stride; ///< INT64 coordinates per token in this original or compact input.
+    int id_offset; ///< First owned head within each token's ID packet.
+    int destination_heads; ///< Exact destination native rows per token.
+    int destination_offset; ///< First owned head within each destination token.
+};
+/** @brief Merge one verified compact returned range into its actual PLE contribution. */
+struct FixedHeadPipelineMerge {
+    FixedHeadPipelineRows rows;
+    FixedHeadPipelineError control;
+    const std::byte *compact;
+    std::byte *destination;
+    int heads;
+    int destination_heads;
+    int destination_offset;
+};
+/** @brief An actual complete native packet and optional independently acquired extent. */
+struct FixedHeadPipelineDecodePacket {
+    const std::byte *data = nullptr;
+    const std::uint64_t *receipt_bytes = nullptr; ///< Unequal native broadcast's completed useful extent.
+    FixedHeadPipelineHeads heads{};
+};
+/** @brief Bounded exact model head topology, with no padded communication slots. */
+struct FixedHeadPipelineDecode {
+    FixedHeadPipelineRows rows;
+    FixedHeadPipelineError control;
+    FixedHeadPipelineDecodePacket packets[kNgramHeads];
+    int participants;
+    float *output;
+};
+/** @brief Shared native math over one actual original immutable table range. */
+class IImmutableFixedHeadPipelineKernels {
+public:
+    virtual ~IImmutableFixedHeadPipelineKernels() = default;
+    /** @brief Authenticate the selected width before publishing any usable request extent. */
+    virtual void prepareConsumer(FixedHeadPipelineConsensus args, void *stream) const = 0;
+    /** @brief Publish the current local status after every addressed exchange has drained. */
+    virtual void sealConsumer(FixedHeadPipelineConsensus args, void *stream) const = 0;
+    /** @brief Authenticate the original live count across the actual PLE consumer roster. */
+    virtual void validateConsensus(FixedHeadPipelineConsensus args, void *stream) const = 0;
+    /** @brief Pack only IDs the actual addressed range owner needs. */
+    virtual void projectRequest(FixedHeadPipelineRequest args, void *stream) const = 0;
+    /** @brief Gather exact native rows from this immutable range after per-head address validation. */
+    virtual void pack(FixedHeadPipelinePack args, void *stream) const = 0;
+    /** @brief Drain invalid storage work with a zero-row reply and preserve canonical first error. */
+    virtual void sealResponse(std::int32_t *rows, FixedHeadPipelineError control, void *stream) const = 0;
+    /** @brief Compare the completed producer extent to the original addressed request. */
+    virtual void validateResponse(FixedHeadPipelineRows request, const std::int32_t *received,
+        FixedHeadPipelineError control, void *stream) const = 0;
+    /** @brief Place completed remote native rows in the original global-head contribution order. */
+    virtual void merge(FixedHeadPipelineMerge args, void *stream) const = 0;
+    /** @brief Publish exact variable local byte extent before the original native collective. */
+    virtual void publishExtent(FixedHeadPipelineRows rows, int heads, std::uint64_t *extent, void *stream) const = 0;
+    /** @brief Decode complete gathered contributions using the original source codec. */
+    virtual void decode(FixedHeadPipelineDecode args, void *stream) const = 0;
+};
+/** @brief Bind actual original range and head metadata for this native backend. */
+std::unique_ptr<IImmutableFixedHeadPipelineKernels> createImmutableFixedHeadPipelineKernels(
+    DeviceId device, ImmutableResidentTableRangeView table, NgramHashPolicy policy,
+    FixedHeadPipelineHeads heads);
+/** @brief Shared checked bound for native range preparation; no GPU reads or allocation. */
+void requireImmutableFixedHeadPipelineRange(ImmutableResidentTableRangeView table,
+    const NgramHashPolicy &policy, FixedHeadPipelineHeads heads);
+/** @brief Prepare CUDA codebooks and exact native range before capture. */
+std::unique_ptr<IImmutableFixedHeadPipelineKernels> createCUDAImmutableFixedHeadPipelineKernels(
+    ImmutableResidentTableRangeView table, NgramHashPolicy policy, FixedHeadPipelineHeads heads);
+/** @brief Prepare HIP codebooks and exact native range before capture. */
+std::unique_ptr<IImmutableFixedHeadPipelineKernels> createROCmImmutableFixedHeadPipelineKernels(
+    ImmutableResidentTableRangeView table, NgramHashPolicy policy, FixedHeadPipelineHeads heads);
 }

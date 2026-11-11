@@ -24,6 +24,8 @@
 
 namespace llaminar2
 {
+    class PreparedGPUContextUsePermit;
+    class GPUCaptureDependencyRoster;
 
     /**
      * @brief The semantic purpose of a persistent native GPU event.
@@ -339,9 +341,48 @@ namespace llaminar2
         }
 
         /**
-         * @brief Destroy all named auxiliary streams owned by this context.
+         * @brief Resolve one original-PMA ordinary named stream before capture.
+         * @param name Immutable purpose shared by serial graph variants.
+         * @param original Exact source-prepared worker/PMA permit.
+         * @param created True only after a new native stream was created.
+         * @return Stream retained by this actual context until native teardown.
+         * @throws std::logic_error For missing implementation or authority mismatch.
+         */
+        virtual void *getOrCreateAdmittedAuxiliaryStream(
+            const std::string &name,const PreparedGPUContextUsePermit &original,bool *created = nullptr)
+        {return getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::Normal,original,created);}
+
+        /**
+         * @brief Resolve one original-PMA named stream with immutable native priority.
+         * @param name Stable context-owned stream purpose.
+         * @param scheduling_class Original scheduling class, unchanged on repeated lookup.
+         * @param original Exact prepared worker/PMA permit.
+         * @param created True only after a new native creator completed.
+         * @return Exact stream retained until its original context destroys the handle.
+         * @throws std::exception For unsupported implementation, class mismatch or foreign ownership.
+         */
+        virtual void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,const PreparedGPUContextUsePermit &original,bool *created = nullptr)
+        {throw std::logic_error("Backend lacks original-PMA scheduled auxiliary stream ownership");}
+
+        /** @brief Retain/grow the actual Batch capture-edge roster cold on its original source.
+         * @param lanes Actual simultaneous lane-admission edges, never model layers/families.
+         * @param shared_groups Actual simultaneous shared physical payload edges.
+         * @param original Exact admitted original context and PMA.
+         * @return Context-owned roster; only its scoped construction borrow permits event use.
+         */
+        virtual std::shared_ptr<GPUCaptureDependencyRoster> prepareBatchCaptureDependencies(
+            std::size_t,std::size_t,const PreparedGPUContextUsePermit&)
+        {throw std::logic_error("Backend lacks original Batch capture dependency roster");}
+
+        /**
+         * @brief Reset unadmitted named streams, or retire the full set during original context cleanup.
          *
-         * Primarily used during context cleanup and tests.
+         * An admitted stream has a context lifetime and may still be retained
+         * by lane/graph borrowers. Public reset rejects that set before mutation;
+         * actual context teardown destroys its handles under the existing guards.
+         * @throws std::logic_error For admitted streams outside native context teardown,
+         *         or retained graph/event obligations.
          * @thread_safety Thread-safe, can be called from any thread.
          */
         virtual void resetAuxiliaryStreams() = 0;

@@ -54,7 +54,8 @@ PooledImmutablePinEdge::PooledImmutablePinEdge(PooledImmutableCoordinatorNativeP
     identity_=combine(combine(combine(n::Version,a.identity),b.identity),coordinate());
 }
 bool PooledImmutablePinEdge::capturedChannelTransport()const noexcept
-{return remote() && ImmutableRowTableDirectedTransportPolicy::supports(sender(), receiver(), owner_.peerAccess());}
+{return remote() && sender().device.type!=receiver().device.type &&
+    ImmutableRowTableDirectedTransportPolicy::supports(sender(), receiver(), owner_.peerAccess());}
 size_t PooledImmutablePinEdge::maximumCommandBytes()const noexcept
 {return PooledImmutableDirectedMessageGeometry::fromPlan(owner_).commands();}
 PooledPinWireSpan PooledImmutablePinEdge::commandSource()const noexcept
@@ -120,16 +121,13 @@ PooledImmutableCapturedPinEdge::PooledImmutableCapturedPinEdge(PooledImmutablePi
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> c,std::shared_ptr<PooledImmutableOwnerPreparedStorage> o,
     std::shared_ptr<PhysicalMemoryAuthority> memory,PooledImmutableTransferChannel channel,PooledImmutableTransferBinding send,PooledImmutableTransferBinding receive,
     PooledImmutableTransferBinding frontierSend,PooledImmutableTransferBinding frontierReceive,
-    std::optional<PooledImmutableTransferBinding> commands,std::optional<PooledImmutableTransferBinding> received,
-    std::shared_ptr<const ClusterInventory> originalInventory)
+    std::optional<PooledImmutableTransferBinding> commands,std::optional<PooledImmutableTransferBinding> received)
     :declaration_(std::move(d)),coordinator_(std::move(c)),owner_(std::move(o)),memory_(std::move(memory)),
      coordinator_identity_(coordinator_->captureIdentity()),owner_identity_(owner_->captureIdentity()),
-     original_inventory_(std::move(originalInventory)),
      channel_(std::move(channel)),invocation_send_(std::move(send)),invocation_receive_(std::move(receive)),frontier_send_(std::move(frontierSend)),frontier_receive_(std::move(frontierReceive)),command_send_(std::move(commands)),command_receive_(std::move(received)){}
 std::shared_ptr<const PooledImmutableCapturedPinEdge> PooledImmutableCapturedPinEdge::bind(
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> c,std::shared_ptr<PooledImmutableOwnerPreparedStorage> o,
     std::shared_ptr<PhysicalMemoryAuthority> memory,void* sendStream,void* receiveStream,
-    std::shared_ptr<const ClusterInventory> originalInventory,
     std::shared_ptr<const PooledImmutableNativeCompletionStorage> nativeCompletion)
 {
     if(isGraphCaptureActive() || !c || !o || !memory || !sendStream || !receiveStream ||
@@ -145,14 +143,12 @@ std::shared_ptr<const PooledImmutableCapturedPinEdge> PooledImmutableCapturedPin
         channel=PooledImmutableTransferChannel::native(std::move(nativeCompletion),d.sender().device,d.receiver().device,
             PooledImmutableFreeEdge::fromOriginal(d).forwardChannelMaximum());
     } else {
+        if(d.sender().device.type==d.receiver().device.type)
+            throw std::invalid_argument("Homogeneous pooled Pin requires its original native completion cohort");
         (void)d.channelMemory();
-        auto& transfer=TransferEngine::instance();
-        const auto peer=ImmutableRowTableDirectedTransportPolicy::usesPeerPayload(d.sender(),d.receiver(),o->plan().peerAccess());
-        if(peer && !originalInventory)throw std::invalid_argument("Peer pooled edge requires its retained original rank inventory");
-        channel=peer?transfer.createPeerCapturedTransferChannel(*memory,DeviceId::cpu(),d.sender().device,sendStream,
-            d.receiver().device,receiveStream,PooledImmutableFreeEdge::fromOriginal(d).forwardChannelMaximum(),originalInventory->getRank(d.sender().world_rank)):
-            transfer.createCapturedTransferChannel(*memory,DeviceId::cpu(),d.sender().device,sendStream,d.receiver().device,
-                receiveStream,PooledImmutableFreeEdge::fromOriginal(d).forwardChannelMaximum());
+        channel=TransferEngine::instance().createCapturedTransferChannel(*memory,DeviceId::cpu(),
+            d.sender().device,sendStream,d.receiver().device,receiveStream,
+            PooledImmutableFreeEdge::fromOriginal(d).forwardChannelMaximum());
     }
     const auto source=c->roots(),destination=o->roots();const auto invocation=d.invocationSource(),ingress=d.invocationDestination();
     auto send=(channel).bind(CapturedTransferEndpoint::Producer,{d.messageKey(PooledPinWireRole::Invocation),sizeof(n::Invocation)},source.native,invocation.offset);
@@ -169,7 +165,7 @@ std::shared_ptr<const PooledImmutableCapturedPinEdge> PooledImmutableCapturedPin
     // Finish both fallible allocations before publishing the physical binding.
     // A later wave failure then unwinds through this SAME RAII edge.
     auto result = std::shared_ptr<PooledImmutableCapturedPinEdge>(new PooledImmutableCapturedPinEdge(std::move(d),std::move(c),std::move(o),std::move(memory),
-        std::move(channel),std::move(send),std::move(receive),std::move(frontierSend),std::move(frontierReceive),std::move(commands),std::move(received),std::move(originalInventory)));
+        std::move(channel),std::move(send),std::move(receive),std::move(frontierSend),std::move(frontierReceive),std::move(commands),std::move(received)));
     result->invocation_receive_.bindOriginalInvocation(*result->owner_);
     result->owns_invocation_ = true;
     return result;
@@ -195,10 +191,7 @@ void PooledImmutableCapturedPinEdge::requireCurrent()const
         if(channel_.endpointDevice(CapturedTransferEndpoint::Producer)!=declaration_.sender().device || channel_.endpointDevice(CapturedTransferEndpoint::Consumer)!=declaration_.receiver().device)
             throw std::logic_error("Pooled native endpoint changed its original participants");
     } else {
-    const auto route = ImmutableRowTableDirectedTransportPolicy::usesPeerPayload(declaration_.sender(),
-        declaration_.receiver(), owner_->plan().peerAccess()) ?
-        CapturedTransferPayloadStorage::PeerDevice : CapturedTransferPayloadStorage::MappedHost;
-    if (!channel_ || channel_.captured()->payloadStorage() != route ||
+    if(declaration_.sender().device.type==declaration_.receiver().device.type ||
         channel_.captured()->capacityBytes() != PooledImmutableFreeEdge::fromOriginal(declaration_).forwardChannelMaximum())
         throw std::logic_error("Pooled directed edge changed its original physical payload route/extent");
     }
@@ -248,13 +241,11 @@ std::shared_ptr<const PooledImmutableCapturedPinReturn> PooledImmutableCapturedP
         channel=PooledImmutableTransferChannel::native(forward->channel_.nativeStorage(),d.receiver().device,d.sender().device,
             PooledImmutableFreeEdge::fromOriginal(d).reverseChannelMaximum());
     } else {
+        if(d.sender().device.type==d.receiver().device.type)
+            throw std::invalid_argument("Homogeneous pooled Pin return requires its original native completion cohort");
         (void)d.returnChannelMemory();
-        const auto peer=ImmutableRowTableDirectedTransportPolicy::usesPeerPayload(d.sender(),d.receiver(),forward->ownerStorage()->plan().peerAccess());
-        if(peer && !forward->original_inventory_)throw std::invalid_argument("Peer pooled return requires the same retained original inventory");
-        channel=peer?transfer.createPeerCapturedTransferChannel(*memory,DeviceId::cpu(),d.receiver().device,ownerStream,
-            d.sender().device,coordinatorStream,PooledImmutableFreeEdge::fromOriginal(d).reverseChannelMaximum(),forward->original_inventory_->getRank(d.sender().world_rank)):
-            transfer.createCapturedTransferChannel(*memory,DeviceId::cpu(),d.receiver().device,ownerStream,d.sender().device,
-                coordinatorStream,PooledImmutableFreeEdge::fromOriginal(d).reverseChannelMaximum());
+        channel=transfer.createCapturedTransferChannel(*memory,DeviceId::cpu(),d.receiver().device,ownerStream,
+            d.sender().device,coordinatorStream,PooledImmutableFreeEdge::fromOriginal(d).reverseChannelMaximum());
     }
     const auto header=d.pinHeaderSource(),target=d.pinHeaderDestination();
     auto send=(channel).bind(CapturedTransferEndpoint::Producer,{d.messageKey(PooledPinWireRole::Header),header.bytes},source.native,header.offset);
@@ -278,10 +269,7 @@ void PooledImmutableCapturedPinReturn::requireCurrent()const
         if(channel_.endpointDevice(CapturedTransferEndpoint::Producer)!=forward_->declaration().receiver().device || channel_.endpointDevice(CapturedTransferEndpoint::Consumer)!=forward_->declaration().sender().device)
             throw std::logic_error("Pooled native endpoint changed its original participants");
     } else {
-    const auto route = ImmutableRowTableDirectedTransportPolicy::usesPeerPayload(forward_->declaration().sender(),
-        forward_->declaration().receiver(), forward_->ownerStorage()->plan().peerAccess()) ?
-        CapturedTransferPayloadStorage::PeerDevice : CapturedTransferPayloadStorage::MappedHost;
-    if (!channel_ || channel_.captured()->payloadStorage() != route ||
+    if(forward_->declaration().sender().device.type==forward_->declaration().receiver().device.type ||
         channel_.captured()->capacityBytes() != PooledImmutableFreeEdge::fromOriginal(forward_->declaration()).reverseChannelMaximum())
         throw std::logic_error("Pooled directed return changed its original physical payload route/extent");
     }

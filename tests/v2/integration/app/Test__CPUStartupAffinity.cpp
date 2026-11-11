@@ -52,10 +52,10 @@ namespace
             MPIBootstrapPhase bootstrap;
             (void)bootstrap.execute(config, 3, arguments);
         }
-        catch (const std::runtime_error &error)
+        catch (const std::invalid_argument &error)
         {
-            return std::string(error.what()).find("has no physical CPU set") !=
-                   std::string::npos;
+            return std::string(error.what()) ==
+                   "MPI placement cannot select an unknown/duplicate observed NUMA node";
         }
         return false;
     }

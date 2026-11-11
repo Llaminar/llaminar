@@ -36,14 +36,15 @@ struct OrdinaryGenerationGraphPlan
     static constexpr std::size_t child_recordings = 3;
 
     /**
-     * @brief Count sampler-free parents for the authored physical PP member.
+     * @brief Count sampler-free condition sources and parents for the authored physical PP member.
      * @param query_programs Exact immutable main-model program family.
      * @param owner Membership projected by the frozen rank/stage declaration.
-     * @return One parent per program for a participant, zero without ownership.
+     * @return One distinct zero-output source and one parent per program, zero without ownership.
      * @throws std::invalid_argument for an unknown program family or owner.
      *
-     * Native and captured-domain parents import existing model/transport
-     * recordings; neither creates independently instantiated child owners.
+     * The zero-output source has an explicit state-transaction identity so
+     * HIP cannot import the ordinary one-round cadence publication. Parents
+     * import that source without another independently instantiated child.
      */
     static std::size_t pipelineForwardOnlyExecutableCount(std::size_t query_programs,
         PipelineForwardOnlyGraphOwner owner)
@@ -53,7 +54,7 @@ struct OrdinaryGenerationGraphPlan
         switch (owner)
         {
         case PipelineForwardOnlyGraphOwner::None: return 0u;
-        case PipelineForwardOnlyGraphOwner::Participant: return query_programs;
+        case PipelineForwardOnlyGraphOwner::Participant: return 2u * query_programs;
         }
         throw std::invalid_argument("Pipeline forced graph inventory has an unknown physical owner");
     }

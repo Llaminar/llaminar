@@ -624,11 +624,16 @@ namespace llaminar2
         std::uint64_t projected_net_benefit_ns = 0u;
         std::uint32_t layer_scan_start = 0u;
         std::uint32_t layer_scan_next = 0u;
+        /** Native request namespace for transaction; zero for non-request-scoped authorities. */
+        std::uint64_t source_request_epoch = 0u;
+        /** False when the retained native policy proof has no rejection-count observation. */
+        bool rejected_cycles_observed = true;
 
         /** @return Whether the receipt names one completed decision window. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            return transaction > 0u && candidate_epoch > 0u;
+            return transaction > 0u && candidate_epoch > 0u &&
+                (rejected_cycles_observed || rejected_cycles == 0u);
         }
 
         /** @return Whether policy deliberately completed without movement. */

@@ -40,10 +40,13 @@ struct Qwen4ExpBufferDimensions
      * Production graph allocation requires an admitted concrete placement. */
     std::optional<ImmutableRowLookupExecution> ngram_lookup;
     int ngram_fixed_head_participants = 0; ///< Exact existing fixed cohort P2/4/8; zero for other execution modes.
+    int ngram_fixed_pipeline_local_heads = 0; ///< Assembled heads on this actual PLE consumer, zero for storage-only participants.
+    int ngram_fixed_pipeline_gathered_heads = 0; ///< Native rows received per token, zero on a singleton.
+    std::size_t ngram_fixed_pipeline_scratch_words = 0; ///< Exact aligned original local wire subspans in INT32 words.
 };
 
 /** @brief The graph placement that actually consumes a declaration. */
-enum class Qwen4ExpBufferPlacement { EveryParticipant, PLE, PLEHostStorage, PLEGPUHostStorage, PLEFixedHeadStorage, Sparse, SparseGPU, SparseMTP, PLEMTP };
+enum class Qwen4ExpBufferPlacement { EveryParticipant, PLE, PLEHostStorage, PLEGPUHostStorage, PLEFixedHeadStorage, FixedHeadPipelineWire, Sparse, SparseGPU, SparseMTP, PLEMTP };
 
 /** @brief One registered buffer and its immutable schema allocation contract. */
 struct Qwen4ExpBufferDeclaration

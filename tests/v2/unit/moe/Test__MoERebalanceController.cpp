@@ -7,6 +7,7 @@
  * These fixtures never allocate accelerator memory or load model weights.
  */
 
+#include "execution/moe/DeviceMoECommittedMaintenanceScope.h"
 #include <gtest/gtest.h>
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
@@ -310,9 +311,9 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    // Version 17 retains payload/lease identities and gives the former padding
-    // word explicit zero authority without enlarging the transport record.
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 17u);
+    // Version 18 appends completed decisions to the controller; v17's exact
+    // command payload/lease fields and zero-reserved word remain unchanged.
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 18u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(
@@ -2686,4 +2687,31 @@ TEST(DeviceMoERebalanceCommandABI, ReservedWordAndWholeRepresentationAreDetermin
         EXPECT_EQ(output.reserved, 0u);
         EXPECT_EQ(std::memcmp(&output, &expected, sizeof(output)), 0);
     }
+}
+
+/** @test Post-commit policy consumes every main layer without requiring speculative NextN evidence. */
+TEST(DeviceMoECommittedMaintenance, OriginalMainIntervalExcludesPredictorOnlyHistograms)
+{
+    for (const uint32_t main_layers : {1u, 2u, 3u, 5u, 17u})
+        for (const uint32_t predictor_layers : {0u, 1u, 3u})
+            for (const uint32_t first : {0u, 2u})
+            {
+                DeviceMoERebalanceConfig original;
+                original.num_layers = first + main_layers + predictor_layers;
+                original.layer_window_start = first + main_layers;
+                original.layer_window_count = predictor_layers;
+                original.layer_wave_count = 4;
+                const auto scoped = deviceMoECommittedMainLayerScope(original, first, main_layers);
+                EXPECT_EQ(scoped.num_layers, original.num_layers);
+                EXPECT_EQ(scoped.layer_window_start, first);
+                EXPECT_EQ(scoped.layer_window_count, main_layers);
+                EXPECT_EQ(scoped.layer_wave_count, original.layer_wave_count);
+                EXPECT_EQ(deviceMoECommittedMainLayerScope(scoped, first, main_layers).layer_window_start, first);
+            }
+    DeviceMoERebalanceConfig original;
+    original.num_layers = 3;
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 0, 0), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 3, 1), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, 2, 2), std::invalid_argument);
+    EXPECT_THROW(deviceMoECommittedMainLayerScope(original, UINT32_MAX, 1), std::invalid_argument);
 }

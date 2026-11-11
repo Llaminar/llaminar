@@ -7,16 +7,22 @@
  * the result enters the same snapshot installation and serving preparation
  * phases as a rank-local graph. Cross-rank transport remains explicit in the
  * GlobalOrchestrator, never hidden inside a participant compute stage.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../local_execution/orchestrators/IInferenceRunner.h"
+#include <span>
 
 namespace llaminar2
 {
     class ModelContext;
     class IMPIContext;
+    class MoEOverlayPipelineStageBinding;
 
     /**
      * @brief Detect named pipeline ownership that crosses MPI ranks.
@@ -33,6 +39,7 @@ namespace llaminar2
      * @param builder Topology authority used by ordinary planning.
      * @param model_ctx Already loaded, rank-owned model authority.
      * @param mpi_ctx Exact world context retained by the enclosing runner.
+     * @param stage_bindings Every actual local expert stage, already jointly admitted; empty for dense models.
      * @return Global graph with participant-local stages and explicit transfers.
      * @throws std::invalid_argument for incomplete construction dependencies.
      * @throws std::runtime_error for invalid topology or stage construction.
@@ -43,5 +50,6 @@ namespace llaminar2
         const ClusterInventory &inventory,
         IExecutionPlanBuilder &builder,
         const std::shared_ptr<ModelContext> &model_ctx,
-        const std::shared_ptr<IMPIContext> &mpi_ctx);
+        const std::shared_ptr<IMPIContext> &mpi_ctx,
+        std::span<const std::shared_ptr<const MoEOverlayPipelineStageBinding>> stage_bindings = {});
 }

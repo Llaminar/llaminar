@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <set>
+#include <tuple>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -77,6 +78,14 @@ namespace
         auto result = inventory();
         for (auto &rank : result.ranks)
         {
+            // Known remote host scope: this rank may first-touch pages, but
+            // its NUMA7 does not authorize the visible NUMA0 GPUs.
+            if (rank.rank == 0)
+            {
+                rank.cpu.numa_node = 7;
+                rank.cpu_socket_info.front().numa_node = 7;
+                rank.cpu_socket_info.front().physical_cores = {2, 3};
+            }
             const auto first = rank.gpus;
             for (const auto &gpu : first)
                 for (int index = 1; index < (rank.rank == 1 ? 3 : 2); ++index)
@@ -118,7 +127,7 @@ namespace
                         observed.phases.push_back({mechanism, direction, payload, 1,
                             PlanningServiceObservation(PlanningWorkUnit::Bytes, 3.0 * payload, .0003,
                                 "synthetic completed GPU/host codec sample")});
-            host_groups[request.rank()].emplace_back(index, std::move(observed));
+            host_groups[request.gpuRank()].emplace_back(index, std::move(observed));
         }
         std::vector<std::vector<uint8_t>> result;
         for (size_t rank = 0; rank < groups.size(); ++rank)
@@ -701,10 +710,14 @@ namespace
         for (auto &rank : cluster.ranks)
         {
             // Request arithmetic chooses rank zero; author its actual bound
-            // NUMA rather than borrowing the codec fixture's whole-host scope.
+            // NUMA rather than borrowing the codec fixture's separate host scope.
             rank.cpu.numa_node = 0;
             rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = size_t{16} << 30;
-            for (auto &socket : rank.cpu_socket_info) socket.memory_bytes = size_t{16} << 30;
+            for (auto &socket : rank.cpu_socket_info)
+            {
+                socket.numa_node = rank.cpu.numa_node;
+                socket.memory_bytes = size_t{16} << 30;
+            }
             for (auto &gpu : rank.gpus)
             {
                 gpu.memory_bytes = gpu.free_memory_bytes = size_t{16} << 30;
@@ -1184,7 +1197,7 @@ TEST(PlanningRequestCostModel, ProjectionPolicyRequiresActualFabricAndColumnPubl
             EXPECT_GT(estimate.requestSeconds(), 0);
             EXPECT_NE(estimate.evidence().find("all-expert down slices"), std::string::npos);
             EXPECT_NE(estimate.evidence().find("projection column gather"), std::string::npos);
-            EXPECT_NE(estimate.evidence().find(p2p ? "projection native intermediate" : "counted owner records"), std::string::npos);
+            EXPECT_NE(estimate.evidence().find(p2p ? "projection counted peer/mixed exchange" : "counted owner records"), std::string::npos);
             EXPECT_EQ(estimate.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
             const PlanningRequestCostModel missing_native(source.metadata(), cluster, requestWeights(source, cluster),
                 requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observations.host_device));
@@ -1212,19 +1225,19 @@ TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
         EXPECT_TRUE(PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision).hostDevice().empty());
         const auto projection = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-        ASSERT_EQ(projection.hostDevice().size(), 5u); // Only rank1/rank2 own local GPU execution.
+        ASSERT_EQ(projection.hostDevice().size(), 8u); // Owned GPUs retain every original same-machine host role.
         const auto automatic = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::Automatic);
         ASSERT_EQ(automatic.hostDevice().size(), projection.hostDevice().size());
         for (size_t index = 0; index < projection.hostDevice().size(); ++index)
             EXPECT_EQ(automatic.hostDevice()[index], projection.hostDevice()[index]);
-        std::set<std::pair<int, int>> scopes;
+        std::set<std::tuple<int, int, int>> scopes;
         for (const auto &sample : projection.hostDevice())
         {
             EXPECT_EQ(sample.device().type, backend);
-            EXPECT_EQ(sample, PlanningHostDeviceRequest::fromInventory(cluster.ranks.at(sample.rank()),
-                sample.device(), 257 * 31 * sizeof(float)));
-            EXPECT_TRUE(scopes.emplace(sample.rank(), sample.device().ordinal).second);
+            EXPECT_EQ(sample, PlanningHostDeviceRequest::fromInventory(cluster,
+                {sample.gpuRank(), sample.device()}, {sample.hostRank()}, 257 * 31 * sizeof(float)));
+            EXPECT_TRUE(scopes.emplace(sample.gpuRank(), sample.hostRank(), sample.device().ordinal).second);
         }
         const AutomaticOrchestrationRequest single({.only_backends = {{backend}},
             .only_strategies = {{OrchestrationStrategy::SingleDevice}}});
@@ -1270,7 +1283,7 @@ TEST(PlanningCommunicationService, SampleBasisIsPhysicalBoundedAndConstraintAwar
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precisions);
     EXPECT_EQ(plan.native().size(), 8u); // Two physical nodes, two vendors, two precisions.
     EXPECT_EQ(plan.mpi().size(), 18u); // Control plus two independently varied payload directions.
-    EXPECT_EQ(plan.hostDevice().size(), 10u); // Preserve each NUMA-local executor's host scope.
+    EXPECT_EQ(plan.hostDevice().size(), 16u); // Eight original executor/host pairs per backend.
     for (const auto &sample : plan.native())
     {
         EXPECT_EQ(sample.discovery_rank, sample.physical_node ? 2 : 1);
@@ -1504,8 +1517,10 @@ TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndM
 {
     auto cluster = communicationInventory();
     // Both first-touch scopes are real local executors of this physical GPU.
-    // The generic codec fixture intentionally leaves rank zero unqualified.
+    // This variation gives the otherwise remote host NUMA-local GPU authority.
     cluster.ranks[0].cpu.numa_node = 0;
+    cluster.ranks[0].cpu_socket_info.front().numa_node = 0;
+    cluster.ranks[0].cpu_socket_info.front().physical_cores = {0, 1};
     const std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto wire = nativeReceipts(plan, cluster.world_size);
@@ -1513,7 +1528,7 @@ TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndM
     for (auto &observed : evidence.host_device)
         for (auto &phase : observed.phases)
         {
-            const double time = .001 * (1 + 100 * observed.request.rank() + 10 * int(phase.mechanism) + 2 * int(phase.direction));
+            const double time = .001 * (1 + 100 * observed.request.hostRank() + 10 * int(phase.mechanism) + 2 * int(phase.direction));
             phase.service = {PlanningWorkUnit::Bytes, 3.0 * phase.payload_bytes,
                 3 * time * (phase.payload_bytes == 1 ? 1 : 2), "synthetic distinct direction/mechanism/first-touch times"};
         }
@@ -1534,6 +1549,14 @@ TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndM
         MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
     EXPECT_THROW(costs.hostTransfer(0, DeviceId::cuda(4), 1, PlanningHostTransferMechanism::DMA,
         MappedTransferDirection::HostToDevice, 0), std::invalid_argument);
+    auto incomplete = evidence.host_device;
+    std::erase_if(incomplete, [](const auto &sample) {
+        return sample.request.gpuRank() == 0 && sample.request.hostRank() == 1 &&
+            sample.request.device() == DeviceId::cuda(4);
+    });
+    const PlanningCommunicationCost missing_executor_scope(cluster, evidence.native, {}, incomplete);
+    EXPECT_THROW(missing_executor_scope.hostTransfer(0, DeviceId::cuda(4), 1, PlanningHostTransferMechanism::DMA,
+        MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
     const PlanningCommunicationCost no_host(cluster, evidence.native, {});
     EXPECT_THROW(no_host.hostTransfer(0, DeviceId::cuda(4), 0, PlanningHostTransferMechanism::DMA,
         MappedTransferDirection::HostToDevice, 1), std::invalid_argument);
@@ -1552,7 +1575,20 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto encoded = nativeReceipts(plan, cluster.world_size);
     ASSERT_FALSE(plan.hostDevice().empty());
-    const auto reporter = static_cast<std::size_t>(plan.hostDevice().front().rank());
+    const auto reporter = static_cast<std::size_t>(plan.hostDevice().front().gpuRank());
+    {
+        auto substituted = encoded;
+        auto source = nlohmann::json::parse(substituted[reporter]);
+        const int host = plan.hostDevice().front().hostRank();
+        ASSERT_NE(int(reporter), host);
+        auto destination = nlohmann::json::parse(substituted[host]);
+        destination["host_device"].push_back(source["host_device"][0]);
+        source["host_device"].erase(0);
+        const auto from = source.dump(), to = destination.dump();
+        substituted[reporter] = {from.begin(), from.end()};
+        substituted[host] = {to.begin(), to.end()};
+        EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(substituted)), std::exception);
+    }
     for (int defect = 0; defect < 12; ++defect)
     {
         SCOPED_TRACE(defect);
@@ -1620,7 +1656,7 @@ TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipFiltersNativeAndHostDevi
         for (const auto device : sample.request.devices())
             EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.discovery_rank), device, "native collective reporter"));
     for (const auto &sample : plan.hostDevice())
-        EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.rank()), sample.device(), "host/device reporter"));
+        EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.gpuRank()), sample.device(), "host/device reporter"));
     // CPU participants retain their legitimate cross-rank protocol samples.
     EXPECT_EQ(plan.mpi().size(), 18u);
     EXPECT_EQ(cluster.ranks[0].gpus.size(), 4u);

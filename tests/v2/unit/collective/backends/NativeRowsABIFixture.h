@@ -45,6 +45,7 @@ struct NativeRowsABICall final
     void *receive = nullptr;
     std::size_t elements = 0;
     int datatype = -1;
+    int reduction = -1; ///< Exact native reduction opcode observed at the loaded ABI boundary.
     void *communicator = nullptr;
     void *stream = nullptr;
     const std::int32_t *live_rows = nullptr;

@@ -41,6 +41,25 @@ namespace
         std::array<std::byte, 16> communicator_{}, stream_{};
     };
 
+    /** @test Header-compiled MIN/MAX ordinals reach the actual isolated loader ABI unchanged. */
+    TEST_F(NativeRowsABI, ReductionOpcodesMatchConfiguredHeaderAndNativeDispatch)
+    {
+        ASSERT_TRUE(native_rows_abi::configuredReductionABIContract());
+        for (const auto [operation, expected] : std::array{
+            std::pair{native_rows_abi::ncclMin, 3}, std::pair{native_rows_abi::ncclMax, 2}})
+        {
+            llaminarNativeRowsABIReset();
+            ASSERT_EQ(native_rows_abi::ncclAllReduce(source_.data(), destination_.data(), 1,
+                native_rows_abi::ncclInt32, operation, communicator_.data(), stream_.data()), native_rows_abi::ncclSuccess);
+            const auto call=llaminarNativeRowsABIObservation();
+            EXPECT_EQ(call.fixed_calls, 1u); EXPECT_EQ(call.unexpected_calls, 0u);
+            EXPECT_EQ(call.elements, 1u); EXPECT_EQ(call.reduction, expected);
+            EXPECT_EQ(call.datatype, int(native_rows_abi::ncclInt32));
+            EXPECT_EQ(call.send, source_.data()); EXPECT_EQ(call.receive, destination_.data());
+            EXPECT_EQ(call.communicator, communicator_.data()); EXPECT_EQ(call.stream, stream_.data());
+        }
+    }
+
     /** @test A real fixed M1 dispatch reaches ncclAllGather as62080 FP32 elements. */
     TEST_F(NativeRowsABI, FixedM1ForwardsExactVocabularyExtentAndOwnerIdentity)
     {

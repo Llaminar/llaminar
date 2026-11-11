@@ -9,6 +9,7 @@
  */
 #include "kernels/qwen4exp/PooledImmutableReplicatedReaderKernels.h"
 #include <algorithm>
+#include <map>
 #include <span>
 #ifdef HAVE_CUDA
 #include "collective/backends/NCCLDynamicLoader.h"
@@ -22,6 +23,8 @@ namespace ncr = llaminar2::qwen4exp::replicated_reader;
 namespace ncs = llaminar2::qwen4exp::adaptive_lookup::pooled;
 /** @brief Recorded component surface; wire tails never impersonate semantic PLE rows. */
 enum class NativeCompletedSurface { Wire, ReaderRows };
+/** @brief Authored missing endpoint; both roles retain the actual original communicator. */
+enum class NativeCompletedCancellation { SourceAbsent, ReaderAckAbsent };
 /** @brief Persistent diagnostic operands; only required metadata/payload crosses the wire. */
 struct alignas(64) NativeCompletedBank {
     ncs::LookupFrame frame{};
@@ -43,13 +46,18 @@ static_assert(std::is_trivially_copyable_v<NativeCompletedBank>);
  * @param surface Recorded wire-only or actual row-safe metadata/ACK obligations.
  * @param addressed_cohort Exact optional original communicator population, in native coordinate order.
  * @param deep_progress Retain a large original bank and verify tiny/empty native metadata economy with bounded terminal probes.
+ * @param cancellation Exact deliberately absent original endpoint for the terminal cancellation replay.
+ * @param authored_wire_capacity Explicit wire-only retained capacity; semantic row geometry keeps its original512-byte bound.
  * Nonempty cohorts use the public addressed path; unrelated actual participants
  * retain communicator resources without joining either endpoint graph.
  */
 void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompletedSurface surface,
-    std::span<const DeviceId> addressed_cohort = {}, bool deep_progress = false)
+    std::span<const DeviceId> addressed_cohort = {}, bool deep_progress = false,
+    NativeCompletedCancellation cancellation=NativeCompletedCancellation::SourceAbsent,
+    std::size_t authored_wire_capacity=512)
 {
-    const std::size_t capacity = deep_progress ? 256ULL * 1024 * 1024 : 512;
+    const std::size_t capacity = deep_progress ? 256ULL * 1024 * 1024 :
+        surface==NativeCompletedSurface::ReaderRows?512:authored_wire_capacity;
     const std::size_t source_bytes = 2 * capacity, guarded_bytes = capacity + 64;
     const std::size_t source_observed_bytes = deep_progress ? 64 : source_bytes;
     const std::size_t payload_observed_bytes = deep_progress ? 512 + 64 : guarded_bytes;
@@ -57,6 +65,8 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
     constexpr std::uint64_t table = 17, result_key = 51, return_key = 52;
     constexpr ncr::Geometry geometry{1, 2, 32, 4};
     const bool semantic = surface == NativeCompletedSurface::ReaderRows;
+    const auto wire_full=deep_progress?std::size_t(512):capacity;
+    const bool publication_cancellation=semantic && cancellation==NativeCompletedCancellation::ReaderAckAbsent;
     const std::array devices{source, reader};
     const std::vector original_devices = addressed_cohort.empty()
         ? std::vector<DeviceId>{reader, source}
@@ -77,7 +87,7 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
     }
     require(native_coordinates[0] >= 0 && native_coordinates[1] >= 0 && source != reader,
         "Completed replay endpoints must be distinct actual original participants");
-    auto original = test::PreparedNativeLookupFixture::prepare(original_devices);
+    auto original = test::PreparedNativeLookupFixture::prepare(original_devices, MPIContextFactory::global()->rank());
     require(!deep_progress || (surface == NativeCompletedSurface::Wire && !addressed_cohort.empty()),
         "Deep native progress replay needs original addressed wire ownership");
     // The retained original native cohort supplies immutable compiled geometry
@@ -110,7 +120,8 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
         plan.add(resource, PhysicalMemoryOwner::ActivationTransportStaging,
             sizeof(NativeCompletedBank) + 2 * progress_bytes + (device == source ? source_bytes + (semantic ? 0 : guarded_bytes) : guarded_bytes));
 
-        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), resource, 2);
+        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), resource,
+            semantic ? (device==source?(publication_cancellation?6:4):(publication_cancellation?5:3)) : 2);
         for (const auto& row : graphs.resources()) plan.add(row);
     }
     for (const auto device : original_devices)
@@ -197,10 +208,21 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
         };
         await();
         std::array<std::vector<std::shared_ptr<RetainedParticipantGraphExecutable>>, 2> owners;
+        // Submission order belongs to each retained executable, independently
+        // of recorded table epochs or metadata-probe order. Owners remain alive
+        // throughout this fixture, and only their original worker accesses its
+        // participant's counters, including after protocol cancellation.
+        std::array<std::map<const RetainedParticipantGraphExecutable*, std::uint64_t>, 2> submission_ordinals;
+        const auto submit_next = [&](std::size_t participant,
+                                     const std::shared_ptr<RetainedParticipantGraphExecutable>& owner) {
+            auto& ordinal = submission_ordinals.at(participant)[owner.get()];
+            return test::RetainedParticipantGraphExecutableFixtureAccess::submit(owner, ++ordinal);
+        };
         NativeReplayFailureDrain drain;
         drain.abort_and_join = [&] {
             require(collective->signalNativeCompletionAbort(), "Completed pair could not signal original native cancellation");
             await();
+
             for (const auto& endpoint : owners)
                 for (const auto& owner : endpoint)
                     require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owner), "Completed pair physical stream retirement unproved");
@@ -248,7 +270,12 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
         };
         std::array<std::size_t, 2> mixed_first_use{};
         std::array<NativeCompletedBank, 2> last_observed{};
-        for (int mode = 0; mode < 2; ++mode) {
+        // Modes0/1 remain complete original native transactions. Only the
+        // cancellation component proof additionally retains matching native
+        // payload and ACK phases, so a terminal phase join can prove physical
+        // publication before external cancellation. Inference never uses these
+        // fixture-only phase graphs as a generation implementation.
+        for (int mode = 0; mode < (publication_cancellation?4:2); ++mode) {
             for (std::size_t i = 0; i < 2; ++i)
                 owners[i].push_back(test::RetainedParticipantGraphExecutableFixtureAccess::original(original->permit(devices[i]), streams[i]));
             std::barrier begun(2), recorded(2), ended(2);
@@ -265,6 +292,7 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
                 } catch (...) { errors[i] = std::current_exception(); }
                 begun.arrive_and_wait();
                 if (began[0] && began[1]) try {
+                    if(mode!=3) {
                     if (semantic && i == 0) launch(i, ncr::Action::PrepareResultHeader);
                     require(move(i, i == 0 ? &banks0->outgoing : &banks1->incoming,
                         NativeCollectiveBytes::fixed(sizeof(ncr::Header)), true, "native_original_result_header"), "Native original header failed");
@@ -280,12 +308,13 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
                         (mode == 0 ? 0 : source_subspan_origin);
                     require(move(i, i == 0 ? source_subspan : output->mutableDeviceData(), bytes,
                         true, "native_original_result_payload"), "Native completed payload failed");
-                    if (semantic) {
+                    }
+                    if (semantic && mode!=2) {
                         if (i == 1) launch(i, ncr::Action::AcknowledgeResult);
                         require(move(i, i == 0 ? &banks0->acknowledgement : &banks1->reply,
                             NativeCollectiveBytes::fixed(sizeof(ncr::Header)), false, "native_original_reader_ack"), "Native original ACK failed");
                         if (i == 0) launch(i, ncr::Action::ConfirmAck);
-                    } else {
+                    } else if(!semantic) {
                         const auto reverse = NativeCollectiveBytes::prefix(i == 0 ? &banks0->returned_bytes : &banks1->received_bytes,
                             capacity, &banks[i]->return_operand);
                         require(move(i, i == 0 ? returned->mutableDeviceData() : output->mutableDeviceData(), reverse,
@@ -318,9 +347,10 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
             auto second = workers[1]->submitAsync([&] { capture(1); });
             first.get(); second.get();
             for (const auto& error : errors) if (error) std::rethrow_exception(error);
+            if(mode>=2)continue;
             for (std::size_t sample = 0; sample < 20; ++sample) {
                 const std::size_t live = sample == 19 ? 0 : semantic ? std::array<std::size_t, 5>{512, 0, 256, 0, 512}[sample % 5]
-                    : std::array<std::size_t, 8>{512, 0, 1, 17, 511, 3, 0, 257}[sample % 8];
+                    : std::array<std::size_t, 8>{wire_full, 0, 1, 17, wire_full-1, 3, 0, 257}[sample % 8];
                 const auto origin = mode == 0 ? 0 : live == 0 ? source_bytes : source_bytes - live;
                 SCOPED_TRACE(::testing::Message() << "surface=" << static_cast<unsigned>(surface)
                     << " mode=" << mode << " sample=" << sample << " live=" << live << " origin=" << origin);
@@ -356,7 +386,7 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
                     workers[i]->submitAndWait([&] { observe_progress(i, 0); });
                 // Both original endpoint graphs are submitted before either terminal is awaited.
                 for (const auto i : sample % 2 ? std::array<std::size_t, 2>{1, 0} : std::array<std::size_t, 2>{0, 1})
-                    workers[i]->submitAndWait([&] { require(test::RetainedParticipantGraphExecutableFixtureAccess::submit(owners[i].back(), sample + 1), "Completed native pair replay failed"); });
+                    workers[i]->submitAndWait([&] { require(submit_next(i, owners[i].back()), "Completed native pair replay failed"); });
                 for (std::size_t i = 0; i < 2; ++i)
                     workers[i]->submitAndWait([&] { observe_progress(i, 1); });
                 await();
@@ -435,6 +465,88 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
                 }
             }
         }
+        // Preserve every legacy recorded metadata rejection on the actual
+        // native reader owner. Each bank starts from a real completed native
+        // transaction; no host fabricates a successful native receipt. Dedicated
+        // metadata-only retained graphs mutate only the recorded validator input.
+        std::shared_ptr<RetainedParticipantGraphExecutable> accept_probe,confirm_probe,prepare_probe;
+        const auto capture_metadata=[&](std::size_t i,ncr::Action action) {
+            auto owner=test::RetainedParticipantGraphExecutableFixtureAccess::original(original->permit(devices[i]),streams[i]);
+            workers[i]->submitAndWait([&] {
+                auto &definition=test::RetainedParticipantGraphExecutableFixtureAccess::capture(owner);
+                ScopedBackendGraphCapture scope(*workers[i],definition,"native recorded reader metadata");
+                require(scope.begin(),"Native metadata probe begin failed");
+                launch(i,action);
+                scope.finish();
+                require(definition.prepareRuntimeContextStorage(memory) && definition.instantiate(),
+                    "Native metadata probe original storage/instantiate failed");
+                mixed_first_use[i]+=definition.residentMemoryBytes();
+            });
+            owners[i].push_back(owner);
+            return owner;
+        };
+        const auto replay_metadata=[&](std::size_t i,const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,
+                                       NativeCompletedBank input) {
+            input.healthy=1;input.published_bytes=0;
+            std::memcpy(host_base+i*sizeof(NativeCompletedBank),&input,sizeof(input));
+            workers[i]->submitAndWait([&] {
+                transfer.enqueueMappedHostToDevice(*host,i*sizeof(NativeCompletedBank),*metadata[i],0,sizeof(input),devices[i],streams[i]);
+                require(submit_next(i, owner),
+                    "Native recorded metadata replay failed");
+                transfer.enqueueDeviceToMappedHost(*metadata[i],0,*host,i*sizeof(NativeCompletedBank),sizeof(input),devices[i],streams[i]);
+            });
+            await();
+            require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owner),
+                "Native recorded metadata graph not terminal");
+            NativeCompletedBank output{};
+            std::memcpy(&output,host_base+i*sizeof(NativeCompletedBank),sizeof(output));
+            return output;
+        };
+        if(semantic) {
+            prepare_probe=capture_metadata(0,ncr::Action::PrepareResultHeader);
+            confirm_probe=capture_metadata(0,ncr::Action::ConfirmAck);
+            accept_probe=capture_metadata(1,ncr::Action::AcceptResultHeader);
+            const auto failure=static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure);
+            // Native fixed Header receives have an immutable actual sizeof(Header)
+            // extent. A stale mutable count cannot impersonate physical absence;
+            // the real absent-source/native abort case remains below.
+            for(int fault=0;fault<4;++fault) {
+                auto input=last_observed[1];input.error=0;
+                if(fault==0)input.header_bytes=0;
+                if(fault==1)input.original_rows=input.original_rows?0:16; // Force disagreement with the actual completed header.
+                if(fault==2)input.incoming.status=ncr::Status::Cancelled;
+                if(fault==3)input.error=37;
+                const auto observed=replay_metadata(1,accept_probe,input);
+                EXPECT_EQ(observed.error,fault==0?0:fault==3?37:failure);
+                EXPECT_EQ(observed.healthy,fault==0?1:0);
+                EXPECT_EQ(observed.published_bytes,0u);
+                if(fault!=0)EXPECT_EQ(observed.reply.status,ncr::Status::Cancelled);
+            }
+            // The actual source header producer must reject cancelled source
+            // state and preserve an unrelated sticky first error as well.
+            for(int fault=0;fault<2;++fault) {
+                auto input=last_observed[0];input.error=fault?37:0;
+                if(!fault)input.frame.status=ncr::Status::Cancelled;
+                const auto observed=replay_metadata(0,prepare_probe,input);
+                EXPECT_EQ(observed.error,fault?37:failure);
+                EXPECT_EQ(observed.healthy,0);
+                EXPECT_EQ(observed.outgoing.status,ncr::Status::Cancelled);
+            }
+            for(int fault=0;fault<5;++fault) {
+                auto input=last_observed[0];input.error=0;
+                if(fault==0)input.acknowledgement_bytes=0;
+                if(fault==1)--input.acknowledgement.interval.sequence;
+                if(fault==2)++input.acknowledgement.coordinate;
+                if(fault==3)input.acknowledgement.status=ncr::Status::Cancelled;
+                if(fault==4)input.error=37;
+                const auto observed=replay_metadata(0,confirm_probe,input);
+                EXPECT_EQ(observed.error,fault==0?0:fault==4?37:failure);
+                EXPECT_EQ(observed.healthy,fault==0?1:0);
+                EXPECT_EQ(observed.published_bytes,0u);
+            }
+            ::testing::Test::RecordProperty("native_recorded_metadata_faults",
+                "result_count_authority,row_mismatch,cancelled_header,sticky_error,source_cancel,late_ack,foreign_ack,cancelled_ack");
+        }
         // The final successful frame is empty. Replay its exact old Completed
         // receipt while the original source is deliberately not submitted. Only
         // the original native signal interrupts the reader; no flag is written
@@ -446,24 +558,81 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
                     0, sizeof(NativeCompletedBank), devices[i], streams[i]);
             });
         }
-        workers[1]->submitAndWait([&] {
-            require(test::RetainedParticipantGraphExecutableFixtureAccess::submit(owners[1].back(), 21),
-                "Completed pair missing-source cancellation submit failed");
+        const std::size_t cancelled_index=cancellation==NativeCompletedCancellation::SourceAbsent?1:0;
+        if(publication_cancellation) {
+            // Publish a positive512-byte sliced payload through BOTH actual
+            // original native participants, but deliberately omit the reader's
+            // ACK phase. This whole-phase terminal observation proves that
+            // publication occurred; it is not a live device-state poll.
+            for(std::size_t i=0;i<2;++i) {
+                auto input=last_observed[i];
+                input.frame.interval={table,3,1};input.frame.original_ids=32;
+                input.original_rows=32;input.error=0;input.healthy=1;
+                input.slice={source_bytes-capacity,capacity};
+                std::memcpy(host_base+i*sizeof(input),&input,sizeof(input));
+                workers[i]->submitAndWait([&] {
+                    transfer.enqueueMappedHostToDevice(*host,i*sizeof(input),*metadata[i],0,sizeof(input),devices[i],streams[i]);
+                });
+            }
+            for(std::size_t i=0;i<2;++i)workers[i]->submitAndWait([&] {
+                require(submit_next(i, owners[i][2]),
+                    "Native publication phase submit failed");
+            });
+            await();
+            for(std::size_t i=0;i<2;++i) {
+                require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owners[i][2]),
+                    "Native publication phase not terminal");
+                workers[i]->submitAndWait([&] {
+                    transfer.enqueueDeviceToMappedHost(*metadata[i],0,*host,i*sizeof(NativeCompletedBank),sizeof(NativeCompletedBank),devices[i],streams[i]);
+                });
+            }
+            workers[1]->submitAndWait([&] {
+                transfer.enqueueDeviceToMappedHost(*output,0,*host,output_offset,payload_observed_bytes,reader,streams[1]);
+            });
+            await();
+            for(std::size_t i=0;i<2;++i) {
+                std::memcpy(&last_observed[i],host_base+i*sizeof(NativeCompletedBank),sizeof(NativeCompletedBank));
+                ASSERT_TRUE(ncclLlaminarCompletionMatches(last_observed[i].forward,table,3,1,capacity,
+                    result_key,authorities[i].binding(),0,last_observed[i].error));
+            }
+            for(std::size_t byte=0;byte<payload_observed_bytes;++byte)
+                ASSERT_EQ(host_base[output_offset+byte],byte<capacity?
+                    std::byte(((source_bytes-capacity+byte)*7+3)%251):std::byte{0xa5});
+        }
+        workers[cancelled_index]->submitAndWait([&] {
+            require(submit_next(cancelled_index, owners[cancelled_index][publication_cancellation?3:1]),
+                "Completed pair missing-endpoint cancellation submit failed");
         });
         require(collective->signalNativeCompletionAbort(), "Original native signal-only cancellation failed");
         await();
+        if(publication_cancellation) {
+            workers[1]->submitAndWait([&] {
+                require(submit_next(1, owners[1][3]),
+                    "Late original native ACK phase submit failed");
+            });
+            await();
+            workers[1]->submitAndWait([&] {
+                transfer.enqueueDeviceToMappedHost(*metadata[1],0,*host,sizeof(NativeCompletedBank),sizeof(NativeCompletedBank),reader,streams[1]);
+            });
+            await();
+            NativeCompletedBank late_ack{};
+            std::memcpy(&late_ack,host_base+sizeof(NativeCompletedBank),sizeof(late_ack));
+            EXPECT_EQ(late_ack.reply.status,ncr::Status::Cancelled);
+            EXPECT_EQ(late_ack.error,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+            EXPECT_EQ(late_ack.healthy,0);
+        }
         for (const auto& endpoint : owners)
             for (const auto& owner : endpoint)
                 require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owner),
                     "Cancelled native pair lacks original physical stream proof");
         NativeCompletedBank cancelled{};
         std::uint32_t native_abort = 0;
-        workers[1]->submitAndWait([&] {
-            transfer.enqueueDeviceToMappedHost(*metadata[1], 0, *host, 3 * sizeof(NativeCompletedBank),
-                sizeof(NativeCompletedBank), reader, streams[1]);
-            require(backends[1]->deviceToHostOnStream(&native_abort,
-                const_cast<const std::uint32_t*>(authorities[1].binding().abortFlag), sizeof(native_abort),
-                reader.ordinal, streams[1]), "Cancelled native abort observation failed");
+        workers[cancelled_index]->submitAndWait([&] {
+            transfer.enqueueDeviceToMappedHost(*metadata[cancelled_index], 0, *host, 3 * sizeof(NativeCompletedBank),
+                sizeof(NativeCompletedBank), devices[cancelled_index], streams[cancelled_index]);
+            require(backends[cancelled_index]->deviceToHostOnStream(&native_abort,
+                const_cast<const std::uint32_t*>(authorities[cancelled_index].binding().abortFlag), sizeof(native_abort),
+                devices[cancelled_index].ordinal, streams[cancelled_index]), "Cancelled native abort observation failed");
         });
         await();
         std::memcpy(&cancelled, host_base + 3 * sizeof(NativeCompletedBank), sizeof(cancelled));
@@ -474,27 +643,68 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
         // its external abort/error becomes nonzero. Require a newly native-written
         // terminal disposition and its exact original communicator provenance.
         const auto expect_aborted = [&](const ncclLlaminarByteCompletion& receipt,
-                                        std::uint64_t expected_message) {
+                                        std::uint64_t expected_message,std::size_t participant) {
             EXPECT_EQ(receipt.phase, ncclLlaminarCompletionPhase::Aborted);
             EXPECT_EQ(receipt.bytes, 0u);
-            EXPECT_EQ(receipt.nativeAbortFlag, authorities[1].binding().abortFlag);
-            EXPECT_EQ(receipt.nativeCommunicator, authorities[1].binding().deviceCommunicator);
+            EXPECT_EQ(receipt.nativeAbortFlag, authorities[participant].binding().abortFlag);
+            EXPECT_EQ(receipt.nativeCommunicator, authorities[participant].binding().deviceCommunicator);
             EXPECT_EQ(receipt.message, expected_message);
             EXPECT_EQ(receipt.reserved, 0u);
         };
-        expect_aborted(cancelled.forward, result_key);
-        if (!semantic) expect_aborted(cancelled.returned, return_key);
+        if(cancelled_index==1)expect_aborted(cancelled.forward,result_key,cancelled_index);
+        if (!semantic) expect_aborted(cancelled.returned,return_key,cancelled_index);
         // The raw count receive may retain stale FIFO bits after abort; only the
         // native resolved receipt, checked above, certifies the zero live extent.
-        ASSERT_FALSE(ncclLlaminarCompletionMatches(cancelled.forward, table, 2, 10, 0,
-            result_key, authorities[1].binding(), native_abort, cancelled.error));
-        if (semantic) {
+        ASSERT_FALSE(ncclLlaminarCompletionMatches(cancelled.forward, table, publication_cancellation?3:2, publication_cancellation?1:10, publication_cancellation?capacity:0,
+            result_key, authorities[cancelled_index].binding(), native_abort, cancelled.error));
+        if (semantic && cancelled_index==1) {
             ASSERT_EQ(cancelled.reply.status, qwen4exp::adaptive_lookup::Status::Cancelled);
             EXPECT_EQ(cancelled.reply.interval.table, 0u);
             EXPECT_EQ(cancelled.reply.interval.admission, 0u);
             EXPECT_EQ(cancelled.reply.interval.sequence, 0u);
         }
-        ::testing::Test::RecordProperty("cancelled_empty_replay", "original_signal_absent_source_no_success");
+        // An endpoint arriving after original cancellation must never revive
+        // a stale successful frame. Submit the actual retained native graph,
+        // including its native work, twenty times with clean recorded input.
+        const std::size_t late=1-cancelled_index;
+        for(int repeat=0;repeat<20;++repeat) {
+            auto input=last_observed[late];input.error=0;input.healthy=1;
+            std::memcpy(host_base+late*sizeof(input),&input,sizeof(input));
+            workers[late]->submitAndWait([&] {
+                transfer.enqueueMappedHostToDevice(*host,late*sizeof(input),*metadata[late],0,sizeof(input),devices[late],streams[late]);
+                require(submit_next(late, owners[late][1]),
+                    "Late original native endpoint replay failed");
+                transfer.enqueueDeviceToMappedHost(*metadata[late],0,*host,late*sizeof(input),sizeof(input),devices[late],streams[late]);
+            });
+            await();
+            require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owners[late][1]),
+                "Late native endpoint lacks physical retirement proof");
+            NativeCompletedBank observed{};
+            std::memcpy(&observed,host_base+late*sizeof(observed),sizeof(observed));
+            EXPECT_EQ(observed.error,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+            expect_aborted(observed.forward,result_key,late);
+            EXPECT_EQ(observed.forward_bytes,input.forward_bytes);
+            EXPECT_EQ(observed.return_bytes,input.return_bytes);
+            if(semantic) {
+                EXPECT_EQ(observed.healthy,0);
+                EXPECT_EQ(observed.published_bytes,0u);
+            }
+            workers[1]->submitAndWait([&] {
+                transfer.enqueueDeviceToMappedHost(*output,0,*host,output_offset,payload_observed_bytes,reader,streams[1]);
+            });
+            await();
+            for(std::size_t byte=0;byte<payload_observed_bytes;++byte)
+                EXPECT_EQ(host_base[output_offset+byte],publication_cancellation && byte<capacity?
+                    std::byte(((source_bytes-capacity+byte)*7+3)%251):std::byte{0xa5});
+        }
+        if(semantic)for(int repeat=0;repeat<20;++repeat) {
+            auto input=last_observed[0];input.error=0;
+            const auto observed=replay_metadata(0,confirm_probe,input);
+            EXPECT_EQ(observed.error,static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+            EXPECT_EQ(observed.healthy,0);
+            EXPECT_EQ(observed.published_bytes,0u);
+        }
+        ::testing::Test::RecordProperty("cancelled_native_replay", cancellation==NativeCompletedCancellation::SourceAbsent?"original_signal_absent_source_and_late_source":"original_published_payload_absent_ack_and_late_reader");
         for (std::size_t i = 0; i < 2; ++i)
             ::testing::Test::RecordProperty("native_first_use_mixed_bytes_" + std::to_string(i), std::to_string(mixed_first_use[i]));
         drain.completed = true;
@@ -516,23 +726,34 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
  */
 void nativeCompletedAddressedReplay(bool cuda, int degree, int source_coordinate, bool deep_progress = false)
 {
-    std::vector<DeviceId> devices;
-    for (int ordinal = 0; ordinal < degree; ++ordinal)
-        devices.push_back(cuda ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal));
+    originalRankLocalReplay(cuda ? DeviceType::CUDA : DeviceType::ROCm, degree, [&](const auto &devices) {
     require(source_coordinate >= 0 && source_coordinate < degree, "Invalid declared addressed source coordinate");
     const int consumer_coordinate = (source_coordinate + 1) % degree;
     nativeCompletedPairReplay(devices[source_coordinate], devices[consumer_coordinate],
         NativeCompletedSurface::Wire, devices, deep_progress);
+    });
 }
 } // namespace
 
 #ifdef HAVE_CUDA
-TEST(NativeCompletedCollective, CUDA_WireReplay) { nativeCompletedPairReplay(DeviceId::cuda(0), DeviceId::cuda(1), NativeCompletedSurface::Wire); }
-TEST(NativeCompletedCollective, CUDA_ReaderAckReplay) { nativeCompletedPairReplay(DeviceId::cuda(0), DeviceId::cuda(1), NativeCompletedSurface::ReaderRows); }
+TEST(NativeCompletedCollective, CUDA_WireReplay) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { nativeCompletedPairReplay(cohort[0], cohort[1], NativeCompletedSurface::Wire);
+    });
+}
+TEST(NativeCompletedCollective, CUDA_ReaderAckReplay) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { nativeCompletedPairReplay(cohort[0], cohort[1], NativeCompletedSurface::ReaderRows);
+    });
+}
 #endif
 #ifdef HAVE_ROCM
-TEST(NativeCompletedCollective, ROCm_WireReplay) { nativeCompletedPairReplay(DeviceId::rocm(0), DeviceId::rocm(1), NativeCompletedSurface::Wire); }
-TEST(NativeCompletedCollective, ROCm_ReaderAckReplay) { nativeCompletedPairReplay(DeviceId::rocm(0), DeviceId::rocm(1), NativeCompletedSurface::ReaderRows); }
+TEST(NativeCompletedCollective, ROCm_WireReplay) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { nativeCompletedPairReplay(cohort[0], cohort[1], NativeCompletedSurface::Wire);
+    });
+}
+TEST(NativeCompletedCollective, ROCm_ReaderAckReplay) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { nativeCompletedPairReplay(cohort[0], cohort[1], NativeCompletedSurface::ReaderRows);
+    });
+}
 #endif
 
 #ifdef HAVE_CUDA
@@ -558,4 +779,38 @@ TEST(NativeCompletedCollective, CUDA_Addressed2LiveProgressReplay) { nativeCompl
 #endif
 #ifdef HAVE_ROCM
 TEST(NativeCompletedCollective, ROCm_Addressed2LiveProgressReplay) { nativeCompletedAddressedReplay(false, 2, 0, true); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test A terminal positive payload publication precedes cancellation of its absent reader ACK and late original native reader. */
+TEST(NativeCompletedCollective,CUDA_SourceWaitReaderAckReplay) {
+    originalRankLocalReplay(DeviceType::CUDA,2,[&](const auto& cohort){
+        nativeCompletedPairReplay(cohort[0],cohort[1],NativeCompletedSurface::ReaderRows,{},false,NativeCompletedCancellation::ReaderAckAbsent);
+    });
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Symmetric original RCCL source-wait/late-reader absorbing cancellation. */
+TEST(NativeCompletedCollective,ROCm_SourceWaitReaderAckReplay) {
+    originalRankLocalReplay(DeviceType::ROCm,2,[&](const auto& cohort){
+        nativeCompletedPairReplay(cohort[0],cohort[1],NativeCompletedSurface::ReaderRows,{},false,NativeCompletedCancellation::ReaderAckAbsent);
+    });
+}
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Preserve the retired peer source-slice4099-byte geometry on the actual native NCCL owner. */
+TEST(NativeCompletedCollective,CUDA_WideWireReplay) {
+    originalRankLocalReplay(DeviceType::CUDA,2,[&](const auto& cohort){
+        nativeCompletedPairReplay(cohort[0],cohort[1],NativeCompletedSurface::Wire,{},false,NativeCompletedCancellation::SourceAbsent,4099);
+    });
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Exact native RCCL source slices and guarded full/empty/partial4099-byte replays. */
+TEST(NativeCompletedCollective,ROCm_WideWireReplay) {
+    originalRankLocalReplay(DeviceType::ROCm,2,[&](const auto& cohort){
+        nativeCompletedPairReplay(cohort[0],cohort[1],NativeCompletedSurface::Wire,{},false,NativeCompletedCancellation::SourceAbsent,4099);
+    });
+}
 #endif

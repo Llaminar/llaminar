@@ -6,6 +6,9 @@
  * metadata and observed resources. No weights, GPU context or prefix payload is
  * allocated. Shared archive backing must appear once while every actual stage
  * cache and channel endpoint remains represented in the joint fixed BOM.
+ * Incoming cross-backend TP stages additionally retain one native live-payload
+ * fanout frame and immutable host operand per member; this ownership is distinct
+ * from the two boundary leaders and never priced on sender-only stages.
  */
 #include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
@@ -254,7 +257,7 @@ TEST(MoEPipelineFixedMemory, NoPeerHostTailRequiresNoRoutingEvidenceAllocation)
         }
 }
 
-/** @test The real fixed planner carries all caches and exactly the two channel leaders. */
+/** @test The fixed planner carries caches, exact boundary leaders and every receiving TP fanout owner. */
 TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProjection)
 {
     for (const bool reverse : {false, true})
@@ -289,6 +292,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                                 ? PipelineBoundarySide::EarlierDomain : PipelineBoundarySide::LaterDomain);
                         }
                         else EXPECT_TRUE(config.captured_pipeline_boundaries.empty());
+                        EXPECT_EQ(config.pipeline_native_activation_fanout, stage == 1 && width > 1);
                     }
                     for (const auto &bom : plans[stage].physical_memory_admission->plan().resources()) aggregate.add(bom);
                 }
@@ -298,15 +302,19 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixHostTier), size_t(2 * width) * (16ULL << 30));
                 EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
                 const auto channel = PipelineTransferMemory::forRows(fixture.model.d_model, 32, 1);
-                EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), channel.host_bytes_per_boundary);
+                const size_t receiving_fanout_members = width > 1 ? size_t(width) : 0u;
+                const size_t transport_host_bytes = channel.host_bytes_per_boundary +
+                    receiving_fanout_members * PipelineTransferMemory::fanoutHostBytes();
+                EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), transport_host_bytes);
                 for (size_t stage = 0; stage < 2; ++stage)
                     for (int member = 0; member < width; ++member)
                     {
                         const auto device = fixture.parent.local_pp_stage_tp_info[stage].devices[member].toLocalDeviceId();
                         const auto *gpu = admitted.plan().find({0, device});
                         ASSERT_NE(gpu, nullptr);
+                        const size_t fanout_bytes = stage == 1 && width > 1 ? PipelineTransferMemory::fanoutDeviceBytes() : 0u;
                         EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                            member == 0 ? channel.device_bytes_per_boundary : 0u);
+                            (member == 0 ? channel.device_bytes_per_boundary : 0u) + fanout_bytes);
                     }
                 const auto complete = fixture.admit(plans);
                 ASSERT_EQ(complete.size(), 2u);
@@ -315,7 +323,7 @@ TEST(MoEPipelineFixedMemory, SharedArchiveAndPhysicalChannelsSurviveStageProject
                 ASSERT_NE(complete_host, nullptr);
                 EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::PrefixHostTier), size_t(2 * width) * (16ULL << 30));
                 EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
-                EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), channel.host_bytes_per_boundary);
+                EXPECT_EQ(complete_host->bytes(PhysicalMemoryOwner::ActivationTransportStaging), transport_host_bytes);
             }
 }
 
@@ -435,6 +443,7 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
             EXPECT_EQ(host->bytes(PhysicalMemoryOwner::PrefixArchiveStaging), PrefixArchiveIOGeometry::scratchBytes());
             const auto channel = PipelineTransferMemory::forRows(fixture.model.d_model, 32, 1);
             size_t cross_backend_boundaries = 0;
+            size_t receiving_fanout_members = 0;
             size_t actual_members = 0;
             for (size_t stage = 0; stage < plans.size(); ++stage)
             {
@@ -446,6 +455,11 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
                 const auto &members = plans[stage].device_inputs;
                 ASSERT_EQ(members.size(), size_t(shapes[shape][stage].width));
                 actual_members += members.size();
+                // Native fanout belongs to each actual receiving TP member,
+                // including a middle stage with an independent outgoing edge.
+                // Authored shape/adjacency supplies the oracle, not the planner's flag.
+                const bool native_fanout = incoming && shapes[shape][stage].width > 1;
+                if (native_fanout) receiving_fanout_members += members.size();
                 for (size_t member = 0; member < members.size(); ++member)
                 {
                     const auto &config = members[member];
@@ -454,14 +468,17 @@ TEST_P(MoEPipelineMultiDeviceMemory, CompleteFixedOwnersAndExactBoundaryExtents)
                     EXPECT_EQ(config.first_layer, fixture.ranks[stage].first_layer);
                     EXPECT_EQ(config.last_layer, fixture.ranks[stage].last_layer);
                     EXPECT_EQ(config.captured_pipeline_boundaries.size(), member == 0 ? incoming + outgoing : 0);
+                    EXPECT_EQ(config.pipeline_native_activation_fanout, native_fanout);
                     EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                        member == 0 ? size_t(incoming + outgoing) * channel.device_bytes_per_boundary : 0u);
+                        (member == 0 ? size_t(incoming + outgoing) * channel.device_bytes_per_boundary : 0u) +
+                            (native_fanout ? PipelineTransferMemory::fanoutDeviceBytes() : 0u));
                 }
             }
             EXPECT_EQ(actual_members, size_t(count));
             EXPECT_EQ(physical.resources().size(), size_t(count + 1));
             EXPECT_EQ(host->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
-                cross_backend_boundaries * channel.host_bytes_per_boundary);
+                cross_backend_boundaries * channel.host_bytes_per_boundary +
+                    receiving_fanout_members * PipelineTransferMemory::fanoutHostBytes());
         }
     }
 }

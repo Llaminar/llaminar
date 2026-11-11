@@ -1,6 +1,6 @@
 /**
  * @file MoEPipelineMemoryAdmission.h
- * @brief One metadata-to-PMA transaction for every local MoE pipeline stage.
+ * @brief One metadata-to-PMA transaction for every physically local MoE pipeline stage.
  *
  * The topology compiler owns stage boundaries; the GGUF manifest owns routed
  * source geometry. This adapter composes their existing fixed and expert BOM
@@ -8,6 +8,10 @@
  * GPU context, weight payload or mutable inference state. A serving policy only
  * retains the original already-created native source through its planning copies.
  * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 
@@ -19,6 +23,7 @@ namespace llaminar2
     class ModelLoader;
     class PlanningModelMetadata;
     class NativeContextPreparation;
+    class IMPIContext;
 
     /** @brief Frozen setup policy shared by discovery and live runner admission. */
     struct MoEPipelineMemoryPolicy
@@ -33,6 +38,8 @@ namespace llaminar2
         RetainedHostServiceBudgetProjection retained_host_services=RetainedHostServiceBudgetProjection::installed({});
         /** @brief Exact serving source created after topology compilation; null only for source-free planning/CPU admission. */
         std::shared_ptr<NativeContextPreparation> native_context_preparation;
+        /** Same original parent used for all-rank fixed contribution/candidate/final admission metadata. */
+        std::shared_ptr<IMPIContext> original_parent;
     };
 
     /**
@@ -74,7 +81,7 @@ namespace llaminar2
         std::shared_ptr<const MoEOverlayResolvedCapacityPlan> capacity_;
     };
 
-    /** @brief Complete local pipeline admission, never a list of independent admissions. */
+    /** @brief Complete rank-owned pipeline admission, never a list of independent admissions. */
     class AdmittedMoEPipelineMemory final
     {
     public:
@@ -97,6 +104,8 @@ namespace llaminar2
             const PlanningModelMetadata &model, const ModelLoader &loader,
             const ClusterInventory &inventory, const MoEPipelineMemoryPolicy &policy);
 
+        /** @return Exact original global stage topology, absent for local PP. */
+        const std::optional<GlobalPPTopology> &globalPipeline() const noexcept { return global_pipeline_; }
         /** @return Parent PP geometry with the jointly admitted row envelope. */
         const RankExecutionPlan &rankPlan() const noexcept { return rank_plan_; }
         /**
@@ -121,6 +130,7 @@ namespace llaminar2
         /** @brief Only admit() can return a fully sealed pipeline transaction. */
         explicit AdmittedMoEPipelineMemory(RankExecutionPlan parent) : rank_plan_(std::move(parent)) {}
         RankExecutionPlan rank_plan_;
+        std::optional<GlobalPPTopology> global_pipeline_;
         std::vector<AdmittedMoEPipelineStage> stages_;
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admission_;
     };

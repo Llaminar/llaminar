@@ -108,6 +108,7 @@
 namespace llaminar2
 {
     class PipelineForwardGraphEdges;
+    class PipelineMaintenanceAdmission;
     struct PipelinePublicationTransport;
     class MoEOverlayInferenceParticipantGraphScope;
 
@@ -1328,12 +1329,15 @@ namespace llaminar2
          * @param batch_size Positive configured request capacity.
          * @param pipeline_hidden_input Stable previous-stage activation owner
          *        required by a non-embedding PP graph; null for graph roots.
+         * @param fixed_head_port Original fixed PLE source port during cold pipeline
+         *        declaration before the final directed edge owner is installed.
          * @return True once the complete family owns stable workspace addresses.
          */
         bool materializeForwardGraphForShape(
             int seq_len,
             int batch_size = 1,
-            TensorBase *pipeline_hidden_input = nullptr);
+            TensorBase *pipeline_hidden_input = nullptr,
+            std::shared_ptr<const Qwen4ExpFixedHeadPipelinePort> fixed_head_port = {});
 
         /**
          * @brief Prepare CPU MoE expert slabs used only by MTP/nextn sidecars.
@@ -5971,6 +5975,11 @@ namespace llaminar2
          *         production graph is complete and ready to join family planning.
          */
         bool materializeDeviceMoERebalanceMaintenanceGraphForFamily();
+        /** @brief Capture the original stage maintenance/cadence family without publishing a fake first commit.
+         * @param original Exact existing stage-local native context. @param participant Original member coordinate.
+         * @return True after strict complete source capture; no GPU graph is launched.
+         */
+        bool materializePipelineMaintenanceWithoutLaunch(ILocalTPContext &original, int participant);
 
         /**
          * @brief Append HIP serial-decode cadence ownership to a main graph.
@@ -8127,6 +8136,7 @@ namespace llaminar2
         struct MTPSpeculativeStatePublicationGraphCache
         {
             std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::RetainedParentCompositionHook publication_composer; ///< Cold immutable source proof, shared without replay allocation.
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             MTPSpeculativeStatePublicationStage *stage = nullptr;
             uint64_t workspace_generation = 0;
@@ -8189,6 +8199,7 @@ namespace llaminar2
                  * cannot follow the retained stream into the new identity. */
                 segment_cache.snapshot_manifest.clear();
                 segment_cache.snapshot_configuration_epoch = 0;
+                publication_composer = {};
                 graph.reset();
                 stage = nullptr;
                 workspace_generation = 0;
@@ -8211,6 +8222,7 @@ namespace llaminar2
                 segment_cache.reset(
                     DeviceGraphExecutor::GraphSegmentCache::
                         StreamResetPolicy::Destroy);
+                publication_composer = {};
                 graph.reset();
                 stage = nullptr;
                 workspace_generation = 0;
@@ -8478,6 +8490,10 @@ namespace llaminar2
                         });
             }
         };
+
+        /** Original derived-budget storage/source recordings outlive every dependent model/helper parent cache below. */
+        std::shared_ptr<PipelineMaintenanceAdmission> pipeline_maintenance_admission_;
+        std::size_t pipeline_maintenance_participant_ = 0;
 
         struct MTPDeviceGenerationLoopGraphCache
         {
@@ -11239,6 +11255,8 @@ namespace llaminar2
          * @brief Return the current workspace generation for a device.
          */
         uint64_t workspaceGeneration(DeviceId device) const override;
+        /** @return Admitted exact fixed-pipeline cache entries or the ordinary cache policy. */
+        std::optional<std::size_t> retainedExactPrefillCacheEntries() const override;
         int residentGraphRows() const override
         {
             return state_.activation_seq_len;
@@ -12200,15 +12218,19 @@ namespace llaminar2
             const Hosted *hosted() const noexcept { return std::get_if<Hosted>(&owner); }
         };
 
+        /** @brief Immutable semantic purpose of a retained resident-token body. */
+        enum class OrdinaryForwardPurpose { OutputGeneratingDecode, ForwardOnlyCondition };
         /** @brief Record one participant's resident-token forward without launching.
          * Non-head pipeline stages receive into their own stable hidden bank.
          * @param condition Exact participant-local logical token mailbox.
          * @param retention Explicit admitted hosted-body or native-child export.
          * @param error Receives the first invalid binding or capture diagnostic.
+         * @param purpose Frozen emitted-output or already-emitted condition topology.
          * @return Complete local retained owner, never a cross-device subgraph.
          * @throws std::logic_error For missing or divergent admitted overlay ownership. */
         std::optional<OrdinaryGenerationForward> materializeOrdinaryGenerationForward(
-            const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error);
+            const int32_t *condition, OrdinaryForwardRetentionKind retention, std::string *error,
+            OrdinaryForwardPurpose purpose = OrdinaryForwardPurpose::OutputGeneratingDecode);
 
         /** @brief Authenticate the immutable serving-domain export contract.
          * @return Hosted only for a declared host-serviced ExpertOverlay body.

@@ -21,8 +21,16 @@ struct PreparedNativeLookupFixtureReplayAccess;
 /** @brief Lexical original source session; all payload/native owners must die before retirement. */
 class PreparedNativeLookupFixture final {
 public:
-    /** @return Actual setup-only allocator observations before the first selected worker creator. */
-    static std::unique_ptr<PreparedNativeLookupFixture> prepare(std::span<const DeviceId> selected){
+    /** @brief Prepare only the original rank's selected native population.
+     * @param selected Exact GPU participants owned by this original MPI rank.
+     * @param original_rank Actual original MPI/discovery rank, not a NUMA or GPU ordinal.
+     * Existing single-rank owners retain their explicit rank-zero contract.
+     * @return Actual setup-only allocator observations before the first selected worker creator.
+     * @throws std::exception For invalid rank/participants, prior worker birth or incomplete native observations.
+     */
+    static std::unique_ptr<PreparedNativeLookupFixture> prepare(
+        std::span<const DeviceId> selected, const int original_rank = 0){
+        if(original_rank<0)throw std::invalid_argument("Lookup fixture requires its nonnegative original MPI rank");
         if(selected.empty())throw std::invalid_argument("Lookup fixture requires an explicit selected native population");
         std::vector<DeviceId> devices;
         for(const auto device:selected){
@@ -35,17 +43,17 @@ public:
         }
         const auto pages=::sysconf(_SC_PHYS_PAGES),available=::sysconf(_SC_AVPHYS_PAGES),page=::sysconf(_SC_PAGESIZE);
         if(pages<=0 || available<=0 || page<=0)throw std::runtime_error("Lookup fixture original CPU observation is unavailable");
-        std::vector<PhysicalMemoryResource> observations{{0,DeviceId::cpu(),std::size_t(pages)*std::size_t(page),std::size_t(available)*std::size_t(page)}};
+        std::vector<PhysicalMemoryResource> observations{{original_rank,DeviceId::cpu(),std::size_t(pages)*std::size_t(page),std::size_t(available)*std::size_t(page)}};
         for(const auto device:devices){
             auto* backend=getBackendFor(device);
             if(!backend || backend->deviceCount()<=device.ordinal)throw std::runtime_error("Lookup fixture selected native participant is unavailable");
             const auto total=backend->deviceMemoryTotal(device.ordinal),free=backend->deviceMemoryFree(device.ordinal);
             if(!total || !free || free>total)throw std::runtime_error("Lookup fixture original GPU observation is incomplete");
-            observations.push_back({0,device,total,free});
+            observations.push_back({original_rank,device,total,free});
         }
         auto result=std::unique_ptr<PreparedNativeLookupFixture>(new PreparedNativeLookupFixture(std::move(devices)));
         try{
-            result->bindSource(NativeContextPreparation::create(observations,0,result->devices_));
+            result->bindSource(NativeContextPreparation::create(observations,original_rank,result->devices_));
             return result;
         }catch(...){result->retire();throw;}
     }

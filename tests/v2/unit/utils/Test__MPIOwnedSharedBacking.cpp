@@ -117,12 +117,47 @@ TEST(MPIOwnedSharedBacking, MovedObjectsRejectUseAndRetainOnePhysicalDescriptor)
     EXPECT_THROW((void)source.identity(),std::logic_error);
     EXPECT_THROW((void)source.path(),std::logic_error);
     EXPECT_THROW((void)source.createExclusive(name()),std::logic_error);
+    EXPECT_THROW((void)source.createUnique(name()),std::logic_error);
     EXPECT_THROW((void)source.openExisting(name(),{},0),std::logic_error);
     auto first=destination.createExclusive(name());const int descriptor=first.descriptor();auto second=std::move(first);
     EXPECT_EQ(first.descriptor(),-1);
     EXPECT_EQ(second.descriptor(),descriptor);
     EXPECT_THROW(first.unlink(),std::logic_error);
     EXPECT_THROW(first.requireExtent(0),std::logic_error);
+}
+/** @test Independent launches under one ancestor retain distinct files and exact lifetime. */
+TEST(MPIOwnedSharedBacking, UniqueLaunchFilesCoexistAndRetireIndependently)
+{
+    auto root=directory();
+    const auto prefix=name()+"-";
+    std::vector<MPISessionOwner::SharedFile> files;
+    std::vector<std::string> paths;
+    for(int launch=0;launch<16;++launch)
+    {
+        auto file=root.createUnique(prefix);
+        const auto basename=std::filesystem::path(file.path()).filename().string();
+        ASSERT_EQ(basename.find(prefix),0u);
+        ASSERT_NE(::fcntl(file.descriptor(),F_GETFD)&FD_CLOEXEC,0);
+        ASSERT_EQ(::write(file.descriptor(),&launch,sizeof(launch)),sizeof(launch));
+        auto peer=root.openExisting(basename,file.identity(),sizeof(launch));
+        int actual=-1;
+        ASSERT_EQ(::pread(peer.descriptor(),&actual,sizeof(actual),0),sizeof(actual));
+        ASSERT_EQ(actual,launch);
+        for(const auto &prior:files)EXPECT_NE(prior.identity(),file.identity());
+        paths.push_back(file.path());files.push_back(std::move(file));
+    }
+    files.front().unlink();
+    EXPECT_FALSE(std::filesystem::exists(paths.front()));
+    for(size_t i=1;i<files.size();++i)
+    {
+        EXPECT_TRUE(std::filesystem::exists(paths[i]));
+        files[i].requireExtent(sizeof(int));
+    }
+    files.clear();
+    for(const auto &path:paths)EXPECT_FALSE(std::filesystem::exists(path));
+    for(const std::string &bad:{std::string(),std::string("../rank"),std::string("a/b"),
+        std::string("a\0b",3),std::string(250,'x')})
+        EXPECT_THROW((void)root.createUnique(bad),std::invalid_argument);
 }
 TEST(MPIOwnedSharedBacking, UnownedExternalProcessDoesNotAdoptInheritedPaths)
 {

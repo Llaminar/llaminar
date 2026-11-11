@@ -14,6 +14,7 @@
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "config/ConfigValidator.h"
 #include "config/OrchestrationConfig.h"
+#include "config/OrchestrationConfigDocument.h"
 
 #include <gtest/gtest.h>
 
@@ -411,6 +412,7 @@ namespace llaminar2::test
                 syntheticGpu(DeviceType::CUDA, 0, 0),
                 syntheticGpu(DeviceType::CUDA, 1, 0),
             };
+            rank.p2p_cuda_count=2;rank.p2p_cuda.assign(4,true);
             inventory.ranks.push_back(std::move(rank));
             inventory.buildNodeAggregations();
             return inventory;
@@ -453,6 +455,12 @@ namespace llaminar2::test
                         syntheticGpu(DeviceType::ROCm, 2, 1),
                         syntheticGpu(DeviceType::ROCm, 3, 1),
                     };
+                }
+                // This recorded declaration explicitly has complete native peer connectivity.
+                for(const auto type:{DeviceType::CUDA,DeviceType::ROCm}) {
+                    const auto count=std::count_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto& gpu){return gpu.type==type;});
+                    (type==DeviceType::CUDA?rank.p2p_cuda_count:rank.p2p_rocm_count)=count;
+                    (type==DeviceType::CUDA?rank.p2p_cuda:rank.p2p_rocm).assign(count*count,true);
                 }
                 inventory.total_gpus += static_cast<int>(rank.gpus.size());
                 inventory.ranks.push_back(std::move(rank));
@@ -1692,3 +1700,30 @@ namespace llaminar2::test
         }
     }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Apply retains saved typed intent but derives its policy again from the original peer publication. */
+TEST(Test__MoEExpertOverlayRuntimePlan, RestoredObservedRouteBindingAuthenticatesOriginalHardwareAndDiagnostic) {
+    auto inventory=syntheticSingleRankTwoCudaInventory();
+    const auto authored=rankAgnosticLocalCudaTPPlan();
+    const auto bound=bindMoEExpertOverlayPlanToClusterInventory(*authored,inventory,MoEOverlayNodeLocalRouteTransport::MappedSparse);
+    ASSERT_TRUE(bound->observed_route_transport);
+    EXPECT_EQ(bound->observed_route_transport->ordinary_prefill,MoEOverlayNodeLocalRouteTransport::MappedSparse);
+    EXPECT_EQ(bound->observed_route_transport->decode,MoEOverlayNodeLocalRouteTransport::NativeCollective);
+    OrchestrationConfig config;config.moe_routed_expert_plan=bound;
+    const auto restored=deserializeOrchestrationConfig(serializeOrchestrationConfig(config));
+    const auto rebound=bindMoEExpertOverlayPlanToClusterInventory(*restored.moe_routed_expert_plan,inventory);
+    EXPECT_EQ(rebound->observed_route_transport,bound->observed_route_transport);
+    EXPECT_EQ(rebound->observed_route_diagnostic,bound->observed_route_diagnostic);
+    EXPECT_NO_THROW((bindMoEExpertOverlayPlanToClusterInventory(*rebound,inventory,MoEOverlayNodeLocalRouteTransport::MappedSparse)));
+    EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(*rebound,inventory,MoEOverlayNodeLocalRouteTransport::NativeCollective)),std::invalid_argument);
+    auto no_peer=inventory;no_peer.ranks[0].p2p_cuda.assign(4,false);
+    EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(*rebound,no_peer)),std::invalid_argument);
+    auto orphan=*authored;orphan.observed_route_diagnostic=MoEOverlayNodeLocalRouteTransport::MappedSparse;
+    EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(orphan,inventory)),std::invalid_argument);
+    auto partial=*bound;partial.observed_route_transport->decode=MoEOverlayNodeLocalRouteTransport::Unresolved;
+    EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(partial,inventory)),std::invalid_argument);
+    const auto default_bound=bindMoEExpertOverlayPlanToClusterInventory(*authored,inventory);
+    EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(*default_bound,inventory,MoEOverlayNodeLocalRouteTransport::MappedSparse)),std::invalid_argument);
+}
+}

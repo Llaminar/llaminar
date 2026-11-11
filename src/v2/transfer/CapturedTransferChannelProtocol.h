@@ -120,7 +120,6 @@ namespace llaminar2
     };
 
     /** @brief Explicit physical payload route; a peer request never selects mapped-host payload. */
-    enum class CapturedTransferPayloadStorage : std::uint8_t { MappedHost, PeerDevice };
 
     /** @brief Immutable mapped-lane identity; new storage receives a new identity. */
     struct CapturedTransferChannelIdentity
@@ -188,6 +187,25 @@ namespace llaminar2
     static_assert(sizeof(CapturedTransferChannelControl) == 192);
     static_assert(offsetof(CapturedTransferChannelControl, producer) == 64);
 
+    /** @brief Checked lowering of a device-owned logical row count; no second scalar or wire authority. */
+    struct CapturedTransferRowBytes
+    {
+        bool valid;
+        std::uint64_t bytes;
+    };
+    /** @brief Convert exactly the original live rows, rejecting negative, overflow and capacity excess.
+     * @param rows Original signed INT32 device row count, including legitimate zero.
+     * @param row_bytes Positive immutable physical row stride in bytes.
+     * @param capacity Maximum captured message bytes, never the current live count.
+     * @return Checked uint64 byte extent for the existing producer publication. */
+    [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr CapturedTransferRowBytes capturedTransferRowBytes(
+        std::int32_t rows, std::uint64_t row_bytes, std::uint64_t capacity) noexcept
+    {
+        if (rows < 0 || !row_bytes || !capacity || std::uint64_t(rows) > capacity / row_bytes)
+            return {false, 0};
+        return {true, std::uint64_t(rows) * row_bytes};
+    }
+
     /**
      * @brief Exact aliases and immutable geometry passed to one CUDA/HIP boundary.
      *
@@ -204,7 +222,9 @@ namespace llaminar2
         CapturedTransferEndpoint role = CapturedTransferEndpoint::Producer;
         std::uint64_t timeout_ticks = 0;
         CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage;
-        std::uint64_t *device_extent = nullptr; ///< Producer input or consumer output; retained device storage.
+        std::uint64_t *device_extent = nullptr; ///< Existing byte-count input/output, absent for typed row counts.
+        const std::int32_t *device_rows = nullptr; ///< Retained local live-row input; never reinterpreted as uint64.
+        std::uint64_t row_bytes = 0; ///< Immutable checked bytes per row; zero on existing byte-count paths.
         const CapturedTransferSourceSlice *source_slice = nullptr; ///< Optional producer descriptor in its original retained Tensor.
         std::uint64_t source_span_bytes = 0; ///< Immutable local source region, independent of maximum/live wire bytes.
         std::uint64_t source_offset_origin = 0; ///< Coordinate origin of that source region in the original descriptor.
@@ -214,7 +234,9 @@ namespace llaminar2
         {
             return control && cursor && expected.valid() && message.fits(expected.capacity) && timeout_ticks != 0 &&
                 capturedTransferExtentMatchesRole(extent_source, role) &&
-                ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr)) &&
+                (device_rows ? !device_extent && row_bytes != 0 && message.bytes % row_bytes == 0 &&
+                    extent_source != CapturedTransferExtentSource::FixedMessage && !source_slice
+                    : row_bytes == 0 && ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr))) &&
                 (source_slice ? role == CapturedTransferEndpoint::Producer &&
                     extent_source == CapturedTransferExtentSource::ProducerDevice &&
                     device_extent == &source_slice->live_bytes && source_span_bytes != 0 && source_span_bytes >= message.bytes &&

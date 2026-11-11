@@ -37,7 +37,7 @@ MoEExpertOwner whole(int expert, int participant, int tier)
  * @brief Construct checked source geometry; no physical socket execution is asserted.
  * @param expert Logical expert coordinate within the original eight-expert source.
  * @param first First canonical participant ID, independent of its NUMA coordinate.
- * @param width Metadata cohort width, two through eight.
+ * @param width Positive source-bounded metadata cohort width; no physical qualification is implied.
  * @param tier Original logical tier coordinate.
  * @param intermediate Original full F extent, independent of local cuts.
  * @param storage Original floating weight precision.
@@ -245,7 +245,7 @@ TEST(MoEOverlayPlacementTargets, AlternativesPreserveCompleteMembershipAndReject
     EXPECT_EQ(one->participantCount(), 1u);
     EXPECT_EQ(one->participantId(0), 3);
     EXPECT_THROW((void)one->participantId(1), std::out_of_range);
-    for (int width = 2; width <= 8; ++width)
+    for (int width = 2; width <= 17; ++width)
     {
         SCOPED_TRACE(width);
         auto original = cohort(0, 10, width, 2);

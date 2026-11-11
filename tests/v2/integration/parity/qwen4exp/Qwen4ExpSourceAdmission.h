@@ -20,6 +20,7 @@
 #include "Qwen4ExpSourceAdmissionCases.h"
 #include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "utils/MPIContext.h"
+#include "planning/ExecutionRankMembership.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "integration/parity/ParityPredictorSource.h"
 #include "Qwen4ExpSourceAdmissionEvidence.h"
@@ -42,7 +43,10 @@
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
+#include "models/qwen4exp/Qwen4ExpConfig.h"
+#include "loaders/ImmutableFixedHeadPipelineProjection.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "utils/PerfStatsCollector.h"
 #include "loaders/ImmutableLookupSetupObservation.h"
@@ -420,49 +424,39 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 EXPECT_NO_THROW(permit->requireWorker(existing.worker()));
             }
             EXPECT_EQ((*reader)->originalSource().device(),coordinator.device);
-            if (readers.nativeCollective()) {
-                ASSERT_TRUE((*reader)->nativeCollective());
-                EXPECT_FALSE((*reader)->result());
-                EXPECT_FALSE((*reader)->acknowledgement());
-                const auto& result = (*reader)->nativeResult();
-                const auto& ack = (*reader)->nativeAcknowledgement();
-                ASSERT_TRUE(result.nativeStorage());
-                EXPECT_EQ(result.nativeStorage(), ack.nativeStorage());
-                EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Producer), coordinator.device);
-                EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Consumer), gpu.device);
-                EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Producer), gpu.device);
-                EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Consumer), coordinator.device);
-                if(request.local_hot_cache) {
-                    ASSERT_TRUE(transport->localHotGeometry());
-                    EXPECT_EQ(result.maximumBytes(),std::max(transport->localHotGeometry()->resultCapacityBytes(),
-                        sizeof(::llaminar2::qwen4exp::local_hot_transport::ResultHeader)));
-                    EXPECT_EQ(ack.maximumBytes(),std::max(transport->localHotGeometry()->keyCapacityBytes(),
-                        sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader)));
-                } else {
-                    EXPECT_FALSE(transport->localHotGeometry());
-                    EXPECT_EQ(result.maximumBytes(), std::max(readers.resultMaximum(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
-                    EXPECT_EQ(ack.maximumBytes(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
-                }
-                EXPECT_TRUE(result.nativeStorage()->authority(gpu.device).valid());
-                EXPECT_EQ(result.nativeStorage()->cohort()->modelOwner(), context);
+
+            ASSERT_TRUE((*reader)->nativeCollective());
+            const auto& result = (*reader)->nativeResult();
+            const auto& ack = (*reader)->nativeAcknowledgement();
+            ASSERT_TRUE(result.nativeStorage());
+            EXPECT_EQ(result.nativeStorage(), ack.nativeStorage());
+            EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Producer), coordinator.device);
+            EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Consumer), gpu.device);
+            EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Producer), gpu.device);
+            EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Consumer), coordinator.device);
+            if(request.local_hot_cache) {
+                ASSERT_TRUE(transport->localHotGeometry());
+                EXPECT_EQ(result.maximumBytes(),std::max(transport->localHotGeometry()->resultCapacityBytes(),
+                    sizeof(::llaminar2::qwen4exp::local_hot_transport::ResultHeader)));
+                EXPECT_EQ(ack.maximumBytes(),std::max(transport->localHotGeometry()->keyCapacityBytes(),
+                    sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader)));
             } else {
-                EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Producer),coordinator.device);
-                EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Consumer),gpu.device);
-                EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Producer),gpu.device);
-                EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Consumer),coordinator.device);
-                if(request.local_hot_cache) {
-                    ASSERT_TRUE(transport->localHotGeometry());
-                    EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(transport->localHotGeometry()->resultCapacityBytes(),
-                        sizeof(::llaminar2::qwen4exp::local_hot_transport::ResultHeader)));
-                    EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),std::max(transport->localHotGeometry()->keyCapacityBytes(),
-                        sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader)));
-                } else {
-                EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(readers.resultMaximum(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
-                EXPECT_EQ((*reader)->result()->payloadStorage(), readers.payloadStorage(gpu));
-                EXPECT_EQ((*reader)->acknowledgement()->payloadStorage(), readers.payloadStorage(gpu));
-                EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
-                }
+                EXPECT_FALSE(transport->localHotGeometry());
+                EXPECT_EQ(result.maximumBytes(), std::max(readers.resultMaximum(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
+                EXPECT_EQ(ack.maximumBytes(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
             }
+            EXPECT_TRUE(result.nativeStorage()->authority(gpu.device).valid());
+            // The context-owned source/participants above prove model identity.
+            // Native transport membership additionally includes storage-only GPUs.
+            EXPECT_EQ((*reader)->consumerCount(),layout.consumers().size());
+            const auto nativeCoordinate=result.nativeStorage()->coordinate(gpu.device);
+            {
+                // Release the context borrow before transport validation takes
+                // its own borrow; shared_mutex does not promise recursive use.
+                const auto nativeUse=result.nativeStorage()->context();
+                EXPECT_EQ(nativeUse.context().devices().at(nativeCoordinate).toLocalDeviceId(),gpu.device);
+            }
+
             if(request.local_hot_cache) {
                 ASSERT_TRUE(transport->localHotGeometry());
                 const auto control=transport->localHotControl(gpu.device,(*reader)->coordinate());
@@ -721,6 +715,73 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
 }
 
 /**
+ * @brief Authenticate the original PLE consumer stage and every fixed storage owner.
+ * @param cell Inventory-bound numerical/source case.
+ * @param runner Original initialized pipeline runner.
+ * @param model Same retained model that owns the native table ranges.
+ * @param placement Exact frozen execution placement from that model.
+ */
+inline void expectQwen4ExpFixedPipelineOwners(const ModelParityCase& cell,
+    const IOrchestrationRunner& runner,const ModelContext& model,
+    const ResolvedImmutableRowTablePlacement& placement)
+{
+    const auto* pipeline=placement.fixedHeadPipeline();
+    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(cell.topology.observed_native_pipeline && cell.topology.execution_rank_selection);
+    ASSERT_EQ(runner.config().execution_rank_selection,cell.topology.execution_rank_selection);
+    const auto& stages=runner.config().pp_stage_definitions;
+    ASSERT_EQ(stages.size(),cell.topology.pipeline_stage_sizes.size());
+    const auto source=::llaminar2::Qwen4ExpConfig(model.model()).ngrams();
+    const auto ple=std::find_if(stages.begin(),stages.end(),[&](const auto& stage){
+        return stage.first_layer<=int(source.decoder_layer) && int(source.decoder_layer)<=stage.last_layer;});
+    ASSERT_NE(ple,stages.end());
+    const auto ple_stage=static_cast<std::size_t>(ple-stages.begin());
+    ASSERT_EQ(pipeline->consumerStage(),static_cast<int>(ple_stage));
+    ASSERT_EQ(pipeline->owners().size(),cell.topology.participants.size());
+    ASSERT_EQ(placement.allocators().size(),pipeline->owners().size());
+    ASSERT_EQ(placement.consumers().size(),static_cast<size_t>(cell.topology.pipeline_stage_sizes[ple_stage]));
+    ASSERT_TRUE(std::equal(placement.consumers().begin(),placement.consumers().end(),
+        pipeline->consumers().begin(),pipeline->consumers().end()));
+
+    std::vector<std::size_t> offsets(stages.size());
+    for(size_t stage=1;stage<stages.size();++stage)
+        offsets[stage]=offsets[stage-1]+static_cast<size_t>(cell.topology.pipeline_stage_sizes[stage-1]);
+    std::set<DeviceId> owners;
+    std::uint64_t next_row=0;
+    int next_head=0;
+    for(const auto& owner:pipeline->owners()) {
+        ASSERT_GE(owner.stage_index,0);
+        const auto stage=static_cast<std::size_t>(owner.stage_index);
+        ASSERT_LT(stage,stages.size());
+        ASSERT_GE(owner.participant_index,0);
+        ASSERT_LT(owner.participant_index,cell.topology.pipeline_stage_sizes[stage]);
+        const auto& original=cell.topology.participants.at(offsets[stage]+static_cast<size_t>(owner.participant_index));
+        ASSERT_TRUE(original.world_rank);
+        EXPECT_EQ(owner.allocator.world_rank,*original.world_rank);
+        EXPECT_EQ(owner.allocator.device,original.address.toLocalDeviceId());
+        EXPECT_TRUE(owners.insert(owner.allocator.device).second);
+        EXPECT_TRUE(placement.containsAllocator(owner.allocator));
+        ASSERT_GE(owner.consumer_index,0);
+        ASSERT_LT(static_cast<size_t>(owner.consumer_index),pipeline->consumers().size());
+        if(stage==ple_stage) {
+            EXPECT_EQ(owner.consumer_index,owner.participant_index);
+            EXPECT_EQ(pipeline->consumers()[owner.consumer_index],owner.allocator);
+        } else {
+            EXPECT_EQ(std::count(placement.consumers().begin(),placement.consumers().end(),owner.allocator),0);
+            EXPECT_THROW((void)placement.lookupForConsumer(owner.allocator),std::invalid_argument);
+        }
+        ASSERT_EQ(owner.first_head,next_head);
+        ASSERT_GT(owner.head_count,0);
+        next_head+=owner.head_count;
+        const auto range=placement.fixedHeadSourceRangeFor(owner.allocator);
+        ASSERT_EQ(range.firstRow(),next_row);
+        next_row+=range.rows();
+    }
+    EXPECT_EQ(next_head,static_cast<int>(source.heads));
+    EXPECT_EQ(next_row,placement.extent().rows());
+}
+
+/**
  * @brief Authenticate the selected lookup layout and actual retained owners.
  * @param cell Canonical table policy, without inferred tier substitutions.
  * @param runner Successfully initialized production runner and model authority.
@@ -796,7 +857,10 @@ inline void expectQwen4ExpSourceLookup(const ModelParityCase &cell, IOrchestrati
         {
             EXPECT_TRUE(cell.ngram_table_policy->isFixedHeadSharded());
             EXPECT_EQ(total, placement->extent().nativeBytes());
-            EXPECT_EQ(placement->allocators().size(), placement->consumers().size());
+            if (cell.topology.observed_native_pipeline)
+                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpFixedPipelineOwners(cell,runner,*context,*placement));
+            else
+                EXPECT_EQ(placement->allocators().size(), placement->consumers().size());
         }
         return;
     }
@@ -866,11 +930,11 @@ class Qwen4ExpSourceAdmissionLifetime final
 {
 public:
     /** @brief Construct the normal runner under one owned cache namespace. @param config Public request. @param cache Owned prefix child.
-     * @param original_context Same original observed MPI owner for CPU-joint setup; absent preserves ordinary construction. */
+     * @param original_context Same original observed/selected MPI owner through setup and cold recreation; absent preserves ordinary construction. */
     Qwen4ExpSourceAdmissionLifetime(const OrchestrationConfig &config, std::filesystem::path cache,
         std::shared_ptr<IMPIContext> original_context = {})
-        : cache_(std::move(cache)), runner_(original_context
-            ? createOrchestrationRunnerFactory(std::move(original_context))->createFromOrchestrationConfig(config)
+        : original_context_(std::move(original_context)), cache_(std::move(cache)), runner_(original_context_
+            ? createOrchestrationRunnerFactory(original_context_)->createFromOrchestrationConfig(config)
             : test::TestOrchestrationHelper::create(config))
     {
         if (!runner_) throw std::runtime_error("QFN source admission factory returned no runner");
@@ -905,7 +969,9 @@ public:
         runner_->shutdown();
         if (runner_->isInitialized()) throw std::runtime_error("Original runner native retirement remains unproven");
         runner_.reset();
-        runner_ = test::TestOrchestrationHelper::create(config, *reuse_);
+        runner_ = original_context_
+            ? createOrchestrationRunnerFactory(original_context_)->createFromOrchestrationConfig(config, *reuse_)
+            : test::TestOrchestrationHelper::create(config, *reuse_);
         if (!runner_) throw std::runtime_error("Original source reuse factory returned no second runner");
     }
     /** @brief Close runner, final model and owned disk in that order. @throws std::exception On any unproven retirement. */
@@ -933,6 +999,7 @@ public:
 private:
     // Reverse member destruction is also safe if construction or finish fails:
     // runner first, retained model second, disposable directory last.
+    std::shared_ptr<IMPIContext> original_context_; ///< Same original selected owner through cold recreation and retirement.
     Qwen4ExpAdmissionPrefixDirectory cache_;
     std::optional<ModelContextReuseContract> reuse_;
     std::unique_ptr<IOrchestrationRunner> runner_;
@@ -1143,6 +1210,7 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell, 
  * @param cell Original typed source/topology request, never a rewritten fallback.
  * @param observe Void observer selecting successful admission or precise rejection.
  * @param gpu_memory_cap_mb Optional explicitly authored public binary-MiB ceiling.
+ * @param execution Exact production-selected original context; inactive ranks never enter this admission.
  *
  * Observer-local aliases expire before finish(). Fatal assertions and exceptions
  * retain their failed outcome while explicit final retirement and disposable-cache
@@ -1150,12 +1218,25 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell, 
  */
 template<class Observe>
 void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
-    std::optional<std::size_t> gpu_memory_cap_mb = std::nullopt)
+    std::optional<std::size_t> gpu_memory_cap_mb = std::nullopt,
+    std::shared_ptr<MPIContext> execution = {})
 {
     int rank = -1, ranks = 0;
-    ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &rank), MPI_SUCCESS);
-    ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &ranks), MPI_SUCCESS);
-    ASSERT_EQ(ranks, cell.topology.mpi_ranks);
+    if (execution)
+    {
+        rank = execution->rank(); ranks = execution->world_size();
+        ASSERT_TRUE(execution->executionMembership());
+        ASSERT_TRUE(cell.topology.execution_rank_selection);
+        ASSERT_EQ(execution->executionMembership()->selection(), *cell.topology.execution_rank_selection);
+    }
+    else
+    {
+        ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &rank), MPI_SUCCESS);
+        ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &ranks), MPI_SUCCESS);
+        ASSERT_FALSE(cell.topology.execution_rank_selection)
+            << "Selected source admission requires its actual original execution context";
+    }
+    ASSERT_EQ(ranks, cell.topology.executionRankCount());
     auto config = qwen4ExpSourceAdmissionCapacityConfig(cell, cell.model.model_path, rank, gpu_memory_cap_mb);
     publishOrchestrationStartupPolicy(config);
     initCPUBackend(-1);
@@ -1183,19 +1264,20 @@ void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
     const auto base = artifact_root ? std::filesystem::path(artifact_root)
         : std::filesystem::current_path() / "parity-results" / "qwen-flash-next";
     ASSERT_TRUE(base.is_absolute());
-    const auto output = base / "source-admission" / parity::artifactIdentityPath(cell.testName()) / ("rank-" + std::to_string(rank));
+    const int discovery_rank = execution ? execution->executionMembership()->discoveryRanks().at(rank) : rank;
+    const auto output = base / "source-admission" / parity::artifactIdentityPath(cell.testName()) / ("rank-" + std::to_string(discovery_rank));
     ASSERT_NO_THROW(prepareQwen4ExpAdmissionEvidenceDirectory(output));
     config.prefix_cache.disk_dir = (output / "prefix-cache").string();
     auto authored = config;
     if (config.moe_routed_expert_plan)
         authored.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
-    std::shared_ptr<IMPIContext> original_cpu_joint_context;
+    std::shared_ptr<IMPIContext> original_execution_context = execution;
     if(!qwen4ExpCPUJointSocketMembers(cell).empty()) {
         // Keep the SAME factory/context alive through the Runner: its one
         // published rank observation is consumed here and later by planning.
-        original_cpu_joint_context=MPIContextFactory::global();
-        ASSERT_TRUE(original_cpu_joint_context);
-        const auto inventory=original_cpu_joint_context->clusterInventory();ASSERT_TRUE(inventory);
+        original_execution_context=MPIContextFactory::global();
+        ASSERT_TRUE(original_execution_context);
+        const auto inventory=original_execution_context->clusterInventory();ASSERT_TRUE(inventory);
         std::vector<test::CPUExpertSocketEndpoint> endpoints;
         ASSERT_NO_THROW(endpoints=requireOriginalCPUJointSocketRanks(cell,*inventory));
         const auto endpoint=std::find_if(endpoints.begin(),endpoints.end(),[&](const auto& item){return item.rank==rank;});
@@ -1209,7 +1291,7 @@ void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
             << ',' << endpoint->socket << ',' << original_rank->cpu_worker_threads << '\n';
         socket_evidence.flush();ASSERT_TRUE(socket_evidence.good());
     }
-    Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache",original_cpu_joint_context);
+    Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache",original_execution_context);
     observeQwen4ExpAdmissionThenRetire(
         [&] { observe(rank, config, authored, lifetime, output); },
         [&] {
@@ -1292,10 +1374,11 @@ using Qwen4ExpSourceInspection = std::function<void(const IOrchestrationRunner&,
  * @param cell Original real-model source request; no test creates a model authority.
  * @param recreation Require original role eligibility and execute the same cold lifecycle assertions.
  * @param inspect Optional read-only observation after the original mandatory phase checks; failures do not skip recreation/retirement.
+ * @param execution Exact selected original MPI context, retained across source cold recreation.
  */
 inline void admitQwen4ExpSource(const ModelParityCase &cell,
     Qwen4ExpSourceRecreationProof recreation = Qwen4ExpSourceRecreationProof::FromOriginalRoles,
-    const Qwen4ExpSourceInspection &inspect = {})
+    const Qwen4ExpSourceInspection &inspect = {}, std::shared_ptr<MPIContext> execution = {})
 {
     ASSERT_TRUE(recreation==Qwen4ExpSourceRecreationProof::FromOriginalRoles ||
         recreation==Qwen4ExpSourceRecreationProof::Required);
@@ -1338,6 +1421,29 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
     ASSERT_NE(reuse->context, nullptr);
     ASSERT_NE(reuse->physical_memory_authority, nullptr);
     ASSERT_NE(reuse->physical_memory_authority->admission(), nullptr);
+    if (!cell.topology.pipeline_routed_compute_policies.empty())
+    {
+        ASSERT_TRUE(reuse->pipeline_prepared_plan);
+        const auto &prepared = reuse->pipeline_prepared_plan->stages();
+        ASSERT_EQ(prepared.size(), authored.pp_stage_definitions.size());
+        ASSERT_EQ(prepared.size(), cell.topology.pipeline_routed_compute_policies.size());
+        for (size_t stage = 0; stage < prepared.size(); ++stage)
+        {
+            const auto &scope = authored.pp_stage_definitions[stage];
+            const auto domain = std::find_if(authored.domain_definitions.begin(), authored.domain_definitions.end(),
+                [&](const auto &value) { return value.name == scope.domain_name; });
+            ASSERT_NE(domain, authored.domain_definitions.end());
+            ASSERT_TRUE(prepared[stage].placement);
+            EXPECT_EQ(prepared[stage].placement->first_model_layer, scope.first_layer);
+            ASSERT_EQ(prepared[stage].placement->domains.size(), 1u);
+            const auto &actual = prepared[stage].placement->domains.front();
+            EXPECT_EQ(actual.owner_rank, rank);
+            EXPECT_EQ(actual.routed_compute_policy, domain->toExecutionDomainDefinition().resolveRoutedComputePolicy(1));
+            EXPECT_EQ(actual.routed_phase_policy, RoutedExpertPhasePolicy::Uniform);
+            ASSERT_NO_THROW(requireQwen4ExpSourceEndpoints(domain->devices, actual.participants,
+                runner->executionPlan().hostname, *DeviceManager::instance().hardware()));
+        }
+    }
     const auto model = reuse->context;
     EXPECT_EQ(runner->modelContextForDiagnostics(), model.get());
     EXPECT_EQ(model->path(), config.model_path);
@@ -1503,7 +1609,7 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         if(!::testing::Test::HasFailure())
             ::testing::Test::RecordProperty("original_shared_source_cold_recreation","completed");
     }
-    });
+    }, std::nullopt, std::move(execution));
 }
 
 /**

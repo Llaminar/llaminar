@@ -10,6 +10,8 @@
  */
 #include "PooledImmutableReadGraphFixture.h"
 #include "execution/qwen4exp/PooledImmutableCompleteCohort.h"
+#include "collective/OriginalNativeGraphCaptureGroup.h"
+#include "mocks/MockLocalTPContext.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include <barrier>
 #include <future>
@@ -52,7 +54,15 @@ public:
         if(ownsCurrentThread())work();else submitAsync(std::move(work)).get();
     }
     inline static std::atomic<bool> forbidCrossWait=false;
+    std::atomic<bool> failNextAsyncBeforeEntry=false; ///< Return a worker-wrapper failure without invoking its callback.
+    std::atomic<bool> rejectNextAsync=false; ///< Inject only CPU queue admission failure, never native execution state.
     std::future<void> submitAsync(std::function<void()> work)override{
+        if(rejectNextAsync.exchange(false))throw std::runtime_error("original queued worker rejected submission");
+        if(failNextAsyncBeforeEntry.exchange(false)) {
+            std::promise<void> failed;auto result=failed.get_future();
+            failed.set_exception(std::make_exception_ptr(std::runtime_error("original worker wrapper failed before callback")));
+            return result;
+        }
         std::packaged_task<void()> job(std::move(work));auto result=job.get_future();
         {std::lock_guard lock(mutex_);if(stopping_)throw std::logic_error("Queued fixture worker retired");jobs_.push_back(std::move(job));}changed_.notify_one();return result;
     }
@@ -78,7 +88,7 @@ public:
     explicit CohortPrograms(std::vector<CohortRecipe> recipes):backends(std::make_shared<OwnerChainBackendScope>()),recipes_(std::move(recipes)){
         if(active_ || recipes_.empty())throw std::logic_error("Cohort recipe scope must be original and nonempty");
         std::vector<PhysicalMemoryPlan> payloads;std::map<unsigned,PhysicalMemoryPlanBuilder> groups;
-        PhysicalMemoryPlanBuilder retained;std::vector<DeviceId> devices;
+        PhysicalMemoryPlanBuilder retained;
         std::uint64_t ioOrdinal=0;
         for(const auto& recipe:recipes_){
             SourceGraphCase declaration(recipe.capacities,true,recipe.local,true,recipe.source,backends,nullptr,{},SourceGraphRecipePhase::DeclareOnly,ioOrdinal++);
@@ -91,7 +101,7 @@ public:
             std::vector<DeviceId> members{DeviceId{recipe.source,0}};
             for(const auto& owner:declaration.physical.owners())if(std::find(members.begin(),members.end(),owner.allocator.device)==members.end())members.push_back(owner.allocator.device);
             for(const auto device:members){
-                if(std::find(devices.begin(),devices.end(),device)==devices.end())devices.push_back(device);
+                if(std::find(devices_.begin(),devices_.end(),device)==devices_.end())devices_.push_back(device);
                 retained.add({0,device,1ULL<<30,1ULL<<30},PhysicalMemoryOwner::NativeGraphExecutable,recipe.definitions*GPUGraphMemoryContract::reservationBytesPerExecutable(device));
             }
             for(unsigned claim=0;claim<recipe.retirementClaims;++claim)for(size_t i=0;i<declaration.physical.owners().size();++i)if(i!=recipe.local)
@@ -99,14 +109,18 @@ public:
         }
         for(auto& [_,group]:groups)payloads.push_back(group.build());
         std::vector<PhysicalMemoryResource> observed{{0,DeviceId::cpu(),1ULL<<30,1ULL<<30}};
-        for(const auto device:devices){observed.push_back({0,device,1ULL<<30,1ULL<<30});NativeContextPreparationReplayAccess::seed(device,[device](auto stack){return NativeContextPreparationReplayAccess::construct<QueuedCohortWorker>(std::move(stack),device.ordinal);});}
-        source_=NativeContextPreparationReplayAccess::source<QueuedCohortWorker>(devices,observed);
-        for(const auto device:devices)permits_.push_back(source_->acquire(device));source_->freezeForPlanning();
+        for(const auto device:devices_){observed.push_back({0,device,1ULL<<30,1ULL<<30});NativeContextPreparationReplayAccess::seed(device,[device](auto stack){return NativeContextPreparationReplayAccess::construct<QueuedCohortWorker>(std::move(stack),device.ordinal);});}
+        source_=NativeContextPreparationReplayAccess::source<QueuedCohortWorker>(devices_,observed);
+        for(const auto device:devices_)permits_.push_back(source_->acquire(device));source_->freezeForPlanning();
         PhysicalMemoryPlanBuilder plan(source_->mandatoryBOM());plan.addMutuallyExclusive(payloads);const auto native=retained.build();for(const auto& row:native.resources())plan.add(row);
         source_->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
         active_=this;
     }
-    ~CohortPrograms(){active_=nullptr;permits_.clear();PooledImmutableFactoryReplayAccess::retireFixtureGenerations();}
+    /** @brief Retire the exact source roster after graph/worker borrows are gone. */
+    ~CohortPrograms(){
+        active_=nullptr;permits_.clear();
+        for(const auto device:devices_)PooledImmutableFactoryReplayAccess::retireFixtureGeneration(device);
+    }
     /** @return The original recorded case token; later constructors cannot add an undeclared program. */
     std::shared_ptr<SourceGraphCase> make(const std::vector<uint32_t>& capacities,uint32_t local,DeviceType type){
         if(next_>=recipes_.size())throw std::logic_error("Undeclared original cohort case");
@@ -120,6 +134,7 @@ public:
 private:
     inline static thread_local CohortPrograms* active_=nullptr;
     std::vector<CohortRecipe> recipes_;size_t next_=0;
+    std::vector<DeviceId> devices_; ///< Exact original source roster, including ordinals beyond the legacy mock sweep.
     std::shared_ptr<NativeContextPreparation> source_;std::vector<PreparedGPUContextUsePermit> permits_;
 };
 
@@ -355,20 +370,38 @@ TEST(PooledImmutableCompleteCohort, ActualRecorderVisitsEveryDeclaredStageAndRej
     CohortPrograms programs({{{2,0,3,1},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
     CohortCase c({2,0,3,1});const auto births=CohortCase::capturesCreated.load();c.bind();
     EXPECT_EQ(CohortCase::capturesCreated.load(),births);
-    unsigned codeNodes=0;
-    const auto count=[&](const ComputeGraph& graph){for(const auto& name:graph.getExecutionOrder()){
-        const auto* stage=graph.getNode(name)->stage.get();
-        if(dynamic_cast<const PooledImmutableSourcePhaseStage*>(stage) || dynamic_cast<const PooledImmutableNativePhaseStage*>(stage))++codeNodes;
-    }};
-    count(c.original->graph);size_t allNodes=c.original->graph.size();
-    for(const auto& graph:c.original->ownerGraphs)if(graph){count(*graph);allNodes+=graph->size();}
-    const auto* sourceCode=dynamic_cast<const SourceGuardCode*>(&c.original->boundary->pooledKernels());ASSERT_NE(sourceCode,nullptr);
-    EXPECT_EQ(c.original->coordCode->recorded+c.original->ownerCode->recorded+sourceCode->launches,codeNodes);
-    EXPECT_EQ(c.original->backends.cuda.capturedTransfers+c.original->backends.rocm.capturedTransfers,allNodes-codeNodes);
+    const auto declaredCodeNodes = [](const ComputeGraph &graph) {
+        unsigned count = 0;
+        for (const auto &name : graph.getExecutionOrder()) {
+            const auto *stage = graph.getNode(name)->stage.get();
+            if (dynamic_cast<const PooledImmutableSourcePhaseStage *>(stage) ||
+                dynamic_cast<const PooledImmutableNativePhaseStage *>(stage))
+                ++count;
+        }
+        return count;
+    };
+    const auto sourceCodeNodes = declaredCodeNodes(c.original->graph);
+    unsigned ownerCodeNodes = 0;
+    std::size_t ownerNodes = 0;
+    for (const auto &graph : c.original->ownerGraphs)
+        if (graph) {
+            ownerCodeNodes += declaredCodeNodes(*graph);
+            ownerNodes += graph->size();
+        }
+    const auto *sourceCode = dynamic_cast<const SourceGuardCode *>(&c.original->boundary->pooledKernels());
+    ASSERT_NE(sourceCode, nullptr);
+    EXPECT_EQ(c.original->coordCode->recordedCount() + sourceCode->launches, sourceCodeNodes);
+    EXPECT_EQ(c.original->ownerCode->recordedCount(), ownerCodeNodes);
+    const auto sourceTransfers = c.original->backends.cuda.capturedTransferCount();
+    const auto ownerTransfers = c.original->backends.rocm.capturedTransferCount();
+    EXPECT_EQ(sourceTransfers, c.original->graph.size() - sourceCodeNodes);
+    EXPECT_EQ(ownerTransfers, ownerNodes - ownerCodeNodes);
     const auto ownerEvents=c.original->backends.rocm.getEventRecords().size();const auto sourceEvents=c.original->backends.cuda.getEventRecords().size();
     const auto captured=CohortCase::capturesCreated.load();auto held=c.binding;
     EXPECT_THROW(c.bind(),std::logic_error);EXPECT_EQ(c.binding,held);
     EXPECT_EQ(CohortCase::capturesCreated.load(),captured);
+    EXPECT_EQ(c.original->backends.cuda.capturedTransferCount(), sourceTransfers);
+    EXPECT_EQ(c.original->backends.rocm.capturedTransferCount(), ownerTransfers);
     EXPECT_EQ(c.original->backends.rocm.getEventRecords().size(),ownerEvents);EXPECT_EQ(c.original->backends.cuda.getEventRecords().size(),sourceEvents);
     c.admit(1);c.binding->launch();c.terminalJoin();
 }
@@ -513,6 +546,7 @@ TEST(PooledImmutableCompleteCohort, DirectedOwnerProgramSealsActualRolesAndEdges
                 const auto endpoints=appendPooledImmutableDirectedOwnerGraph(graph,arena,remote,c.ownerCode,program,"actual_owner");
                 EXPECT_FALSE(endpoints.first.empty());EXPECT_FALSE(endpoints.last.empty());
                 EXPECT_NO_THROW(q::PooledImmutableDirectedOwnerProgram::requireActual(graph,c.owners[1]->plan(),c.coordinator->plan(),program));
+                EXPECT_THROW(q::PooledImmutableDirectedOwnerProgram::requireNativeActual(graph,c.owners[1]->plan(),c.coordinator->plan()),std::invalid_argument);
                 const auto order=graph.getExecutionOrder();ASSERT_GT(order.size(),2u);
                 const auto collectives=graph.collectiveNodeNames();ASSERT_FALSE(collectives.empty());
                 for(const auto& name:collectives){const auto* stage=graph.getNode(name)->stage.get();EXPECT_TRUE(stage->isCollectiveStage());EXPECT_TRUE(stage->isParticipantLocalCapturedTransfer());}
@@ -581,6 +615,95 @@ TEST(PooledImmutableCompleteCohort, RetainedFacadeRejectsMutationAfterCohortReti
         }
         std::_Exit(::testing::Test::HasFailure()?2:0);
     }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @brief SDK-free original LocalTP phase API; only native rendezvous/abort calls are doubled. */
+class RecordingGroupContext final:public MockLocalTPContext {
+public:
+    /** @brief Wake every original actor before its failed future may be joined. */
+    bool signalNativeCompletionAbort()override {
+        {std::lock_guard lock(phaseMutex);aborted=true;}changed.notify_all();return true;
+    }
+    /** @brief Model the existing strict cyclic native capture phase boundary. */
+    bool graphCaptureBoundaryRendezvous(const std::string& name,int member,int timeout)override {
+        std::unique_lock lock(phaseMutex);
+        if(aborted)return false;
+        if(arrivals==0){phase=name;seen.assign(degree(),false);}
+        if(phase!=name || member<0 || member>=degree() || seen[member])throw std::logic_error("capture replay phase/coordinate mismatch");
+        seen[member]=true;const auto epoch=generation;
+        if(++arrivals==degree()) {arrivals=0;++generation;changed.notify_all();return true;}
+        if(!changed.wait_for(lock,std::chrono::milliseconds(timeout),[&]{return aborted || generation!=epoch;}))
+            throw std::runtime_error("capture replay did not dispatch every original worker");
+        return !aborted;
+    }
+    std::atomic<bool> aborted=false;
+    unsigned generation=0;
+private:
+    std::mutex phaseMutex;std::condition_variable changed;std::string phase;
+    std::vector<bool> seen;int arrivals=0;
+};
+/** @brief Exercise actual production capture grouping on original queued workers with no SDK. */
+TEST(PooledImmutableCompleteCohort, NativeCaptureGroupMatchesAllPhasesAndRepeatedOriginalRosters) {
+    constexpr std::size_t members=9;
+    CohortPrograms programs({{std::vector<std::uint32_t>(members),q::adaptive_lookup::None,DeviceType::ROCm,0,1}});
+    for(const std::size_t count:{2u,3u,9u})for(unsigned replay=0;replay<20;++replay) {
+        RecordingGroupContext context;std::vector<GlobalDeviceAddress> devices;
+        std::vector<std::shared_ptr<IWorkerGPUContext>> workers;
+        std::vector<std::unique_ptr<IGPUGraphCapture>> captures;
+        std::vector<OriginalNativeGraphRecording> jobs;
+        std::atomic<unsigned> recorded=0;
+        for(std::size_t i=0;i<count;++i)devices.push_back(GlobalDeviceAddress::cuda(static_cast<int>(i)));
+        context.setDevices(devices);context.setBackend(CollectiveBackendType::NCCL);
+        for(std::size_t i=0;i<count;++i) {
+            const auto worker=programs.permit(DeviceId::cuda(static_cast<int>(i))).worker();workers.push_back(worker);
+            worker->submitAndWait([&]{captures.push_back(worker->createGraphCapture(worker->defaultStream()));});
+        }
+        for(std::size_t i=0;i<count;++i)jobs.push_back({workers[i],DeviceId::cuda(static_cast<int>(i)),captures[i].get(),nullptr,[&] {
+            for(const auto& worker:workers)EXPECT_TRUE(worker->isDeviceGraphCaptureActive());
+            ++recorded;
+        }});
+        EXPECT_NO_THROW(OriginalNativeGraphCaptureGroup::record(jobs,context.borrowOriginalNativeContext(),"original native replay"));
+        EXPECT_EQ(recorded,count);EXPECT_EQ(context.generation,3u);EXPECT_FALSE(context.aborted);
+        for(const auto& worker:workers)EXPECT_FALSE(worker->isDeviceGraphCaptureActive());
+        for(const auto& capture:captures)EXPECT_EQ(capture->nodeCount(),1u);
+        auto missing=jobs;missing.pop_back();
+        EXPECT_THROW(OriginalNativeGraphCaptureGroup::record(missing,context.borrowOriginalNativeContext(),"missing original"),std::invalid_argument);
+        auto duplicate=jobs;duplicate.back()=duplicate.front();
+        EXPECT_THROW(OriginalNativeGraphCaptureGroup::record(duplicate,context.borrowOriginalNativeContext(),"duplicate original"),std::invalid_argument);
+    }
+}
+/** @brief Failure before a peer starts and failure during recording both abort before joining peers. */
+TEST(PooledImmutableCompleteCohort, NativeCaptureGroupAbortsBeforePartialDispatchOrRecordingJoin) {
+    CohortPrograms programs({{{0,0,0},q::adaptive_lookup::None,DeviceType::ROCm,0,1}});
+    for(unsigned defect=0;defect<3;++defect) {
+        RecordingGroupContext context;
+        context.setDevices({GlobalDeviceAddress::cuda(0),GlobalDeviceAddress::cuda(1),GlobalDeviceAddress::cuda(2)});
+        context.setBackend(CollectiveBackendType::NCCL);
+        std::vector<std::shared_ptr<IWorkerGPUContext>> workers;
+        std::vector<std::unique_ptr<IGPUGraphCapture>> captures;
+        std::vector<OriginalNativeGraphRecording> jobs;
+        for(int i=0;i<3;++i) {
+            workers.push_back(programs.permit(DeviceId::cuda(i)).worker());
+            workers.back()->submitAndWait([&]{captures.push_back(workers.back()->createGraphCapture(workers.back()->defaultStream()));});
+        }
+        for(int i=0;i<3;++i)jobs.push_back({workers[i],DeviceId::cuda(i),captures[i].get(),nullptr,[&,i] {
+            if(defect==1 && i==1)throw std::runtime_error("original recording failure");
+        }});
+        if(defect!=1) {
+            const auto queued=std::dynamic_pointer_cast<QueuedCohortWorker>(workers[1]);
+            if(!queued)throw std::logic_error("Failure replay lost its original queued worker");
+            if(defect==0)queued->rejectNextAsync=true;
+            else queued->failNextAsyncBeforeEntry=true;
+        }
+        try {
+            OriginalNativeGraphCaptureGroup::record(jobs,context.borrowOriginalNativeContext(),"failure replay");
+            FAIL()<<"Original failure must propagate";
+        }catch(const std::runtime_error& error) {
+            EXPECT_STREQ(error.what(),defect==0?"original queued worker rejected submission":defect==1?"original recording failure":"original worker wrapper failed before callback");
+        }
+        EXPECT_TRUE(context.aborted);
+        for(const auto& worker:workers)EXPECT_FALSE(worker->isDeviceGraphCaptureActive());
+    }
 }
 
 }

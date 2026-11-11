@@ -9,16 +9,27 @@
  */
 #include "CapturedTransferChannel.h"
 #include "CapturedTransferChannelBatch.h"
+#include "PipelineActivationFanoutProtocol.h"
 #include "CapturedTransferKernelPlan.h"
+#include "planning/PlanningPublication.h"
+#include "planning/RankHardwareOwnership.h"
+#include "execution/moe/MoEOverlaySharedBackingStartup.h"
+#include "interfaces/IMPIContext.h"
+#include "interfaces/IMPITopology.h"
+#include <nlohmann/json.hpp>
+#include <sys/mman.h>
+#include <cerrno>
+#include <system_error>
 #include "utils/PerfStatsCollector.h"
 #include <algorithm>
 #include "collective/CollectiveTimeoutPolicy.h"
-#include "collective/LocalTPCollectiveInventory.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/WorkspaceBufferLease.h"
 #include "tensors/TensorClasses.h"
 
 #include <atomic>
+#include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <limits>
 #include <new>
@@ -57,16 +68,347 @@ namespace llaminar2
          * @param count Exact device address of a retained uint64 count.
          * @param payload Exact start of the bound device payload.
          * @param capacity Capture-frozen maximum payload extent. */
-        void validateExtentAddress(void *count, void *payload, size_t capacity)
+        void validateExtentAddress(void *count, void *payload, size_t capacity,
+            size_t count_bytes = sizeof(std::uint64_t), size_t alignment = alignof(std::uint64_t))
         {
             const auto address = reinterpret_cast<std::uintptr_t>(count);
             const auto start = reinterpret_cast<std::uintptr_t>(payload);
-            if (address % alignof(std::uint64_t) != 0)
+            if (address % alignment != 0)
                 throw std::invalid_argument("Device-counted transfer extent must be uint64 aligned");
             // Difference comparisons avoid overflowing one-past-end arithmetic.
-            if (address >= start ? address - start < capacity : start - address < sizeof(std::uint64_t))
+            if (address >= start ? address - start < capacity : start - address < count_bytes)
                 throw std::invalid_argument("Device-counted transfer extent overlaps its payload capacity");
         }
+    }
+
+    CapturedTransferRankPlan CapturedTransferRankPlan::fromInventory(const ClusterInventory &inventory,
+        CapturedTransferRankChannelId id, CapturedTransferRankGPU producer,
+        CapturedTransferRankGPU consumer, size_t capacity, CapturedTransferEndpoint host_endpoint)
+    {
+        (void)endpointIndex(host_endpoint);
+        if (!id.generation || !id.boundary || producer.rank == consumer.rank || inventory.world_size <= 0 ||
+            inventory.ranks.size() != size_t(inventory.world_size))
+            throw std::invalid_argument("Rank channel requires original positive generation/key and distinct rank roles");
+        const auto connection = inventory.connectionBetweenRanks(producer.rank, consumer.rank);
+        if (connection.locality() != RankConnectionLocality::SameNode)
+            throw std::invalid_argument("Rank captured channel requires authenticated same-node original ranks");
+        std::array<std::string, 2> uuids;
+        const std::array roles{producer, consumer};
+        for (size_t index = 0; index < roles.size(); ++index)
+        {
+            const auto role = roles[index];
+            const auto &original = inventory.getRank(role.rank);
+            requireRankLocalGPUOwnership(original, role.device, "Rank captured channel endpoint");
+            const auto found = std::find_if(original.gpus.begin(), original.gpus.end(), [&](const auto &gpu) {
+                return gpu.type == role.device.type && gpu.local_device_id == role.device.ordinal;
+            });
+            if (found == original.gpus.end() || found->uuid.empty())
+                throw std::invalid_argument("Rank channel endpoint lacks its original physical GPU identity");
+            uuids[index] = found->uuid;
+        }
+        (void)CapturedTransferChannel::memoryFor(capacity);
+        return {id, producer, consumer, connection.sourceNode(), capacity, std::move(uuids), host_endpoint};
+    }
+
+    CapturedTransferRankGPU CapturedTransferRankPlan::endpoint(CapturedTransferEndpoint role) const
+    { return endpoints_[endpointIndex(role)]; }
+
+    std::optional<CapturedTransferEndpoint> CapturedTransferRankPlan::localRole(int rank) const noexcept
+    {
+        if (rank == endpoints_[0].rank) return CapturedTransferEndpoint::Producer;
+        if (rank == endpoints_[1].rank) return CapturedTransferEndpoint::Consumer;
+        return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> CapturedTransferRankPlan::serialize() const
+    {
+        const auto text = nlohmann::json{{"generation", id_.generation}, {"boundary", id_.boundary},
+            {"node", node_}, {"capacity", capacity_}, {"host_endpoint", int(host_endpoint_)},
+            {"producer", {endpoints_[0].rank, int(endpoints_[0].device.type), endpoints_[0].device.ordinal, uuids_[0]}},
+            {"consumer", {endpoints_[1].rank, int(endpoints_[1].device.type), endpoints_[1].device.ordinal, uuids_[1]}}}.dump();
+        return {text.begin(), text.end()};
+    }
+
+    void CapturedTransferRankPlan::contributeMemory(CapturedTransferEndpoint role, PhysicalMemoryResource gpu,
+        std::optional<PhysicalMemoryResource> host, PhysicalMemoryPlanBuilder &builder) const
+    {
+        const auto original = endpoint(role);
+        if (gpu.world_rank != original.rank || gpu.device != original.device ||
+            (role == host_endpoint_
+                ? !host || host->world_rank != original.rank || host->device != DeviceId::cpu()
+                : host.has_value()))
+            throw std::invalid_argument("Rank channel BOM does not match its original GPU/host owner");
+        const auto geometry = CapturedTransferChannel::memoryFor(capacity_);
+        constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
+        if (host) builder.add(*host, owner, geometry.mapped_host_bytes);
+        builder.add(gpu, owner, geometry.cursor_bytes_per_device);
+    }
+
+    namespace
+    {
+        /** @brief Original authenticated node-local shared backing, retained through alias teardown.
+         * The declared allocator owns the file name; a peer only closes its descriptor/mapping.
+         * No object state or process-local pointer is sent to the other rank.
+         */
+        class RankCapturedPages final
+        {
+        public:
+            /** @brief Authenticate and map one original exact file; declared allocator initializes control once.
+             * @param plan Same positive immutable declaration used by PMA.
+             * @param mpi Original context, only the two actual endpoint ranks enter this P2P step.
+             * @param creator_identity Nonzero only on the original host allocator that minted this identity.
+             */
+            RankCapturedPages(const CapturedTransferRankPlan &plan, const IMPIContext &mpi,
+                CapturedTransferChannelIdentity creator_identity)
+                : bytes_(CapturedTransferChannel::memoryFor(plan.capacityBytes()).mapped_host_bytes)
+            {
+                const auto source = plan.endpoint(CapturedTransferEndpoint::Producer);
+                const auto target = plan.endpoint(CapturedTransferEndpoint::Consumer);
+                if (!mpi.topology()) throw std::invalid_argument("Rank channel has no original node topology");
+                std::array<int, 2> participants{source.rank, target.rank};
+                std::sort(participants.begin(), participants.end());
+                const auto id = plan.originalId();
+                const auto name = "pipeline-channel-" + std::to_string(id.generation) + "-" +
+                    std::to_string(id.boundary) + "-" + std::to_string(source.rank) + "-" + std::to_string(target.rank);
+                file_ = establishMoEOverlaySharedBacking(mpi,
+                    {.kind = MoEOverlaySharedBackingKind::PipelineActivation,
+                     .node_namespace = mpi.topology()->node_shared_memory_namespace(), .generation = id.generation,
+                     .fingerprint_low = id.boundary,
+                     .fingerprint_high = (std::uint64_t(source.rank) << 32) | std::uint32_t(target.rank)},
+                    plan.hostRank(), participants, name, bytes_);
+                file_.requireExtent(bytes_);
+                if (mpi.rank() == plan.hostRank() && !creator_identity.valid())
+                    throw std::logic_error("Rank source has no original allocation identity");
+                allocation_ = ::mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, file_.descriptor(), 0);
+                if (allocation_ == MAP_FAILED)
+                {
+                    allocation_ = nullptr;
+                    throw std::system_error(errno, std::generic_category(), "Cannot map original rank channel backing");
+                }
+                if (mpi.rank() == plan.hostRank())
+                {
+                    // Complete first touch remains the declared host allocator's work.
+                    std::memset(allocation_, 0, bytes_);
+                    auto *control = ::new (allocation_) CapturedTransferChannelControl{};
+                    control->identity.capacity = creator_identity.capacity;
+                    std::atomic_ref(control->identity.nonce).store(creator_identity.nonce, std::memory_order_release);
+                }
+            }
+            /** @brief Unmap only after native graphs/aliases retire; SharedFile performs creator-only unlink. */
+            ~RankCapturedPages() { if (allocation_ && ::munmap(allocation_, bytes_) != 0) std::terminate(); }
+            /** @return Exact local process alias, never another process's pointer. */
+            void *allocation() const noexcept { return allocation_; }
+            /** @return Actual original file identity carried into the native capture seal. */
+            std::array<std::uint64_t, 3> identity() const
+            {
+                const auto original = file_.identity();
+                return {original.device, original.inode, original.uid};
+            }
+        private:
+            MPISessionOwner::SharedFile file_;
+            size_t bytes_;
+            void *allocation_ = nullptr;
+        };
+    }
+
+    struct CapturedTransferRankSession::Entry final
+    {
+        PhysicalMemoryAllocationLease host_lease; ///< Released only after original global unmap consensus.
+        std::shared_ptr<RankCapturedPages> pages; ///< Retains each original file/map beyond every local GPU alias.
+        std::weak_ptr<CapturedTransferChannel> channel; ///< A live original graph binding prevents retirement.
+    };
+
+    std::shared_ptr<CapturedTransferRankSession> CapturedTransferRankSession::create(std::shared_ptr<IMPIContext> original)
+    {
+        if (!original) throw std::invalid_argument("Rank channel session requires its original shared MPI owner");
+        std::uint64_t generation = 0;
+        std::shared_ptr<CapturedTransferRankSession> result;
+        // Reuse the existing allocation-identity authority once for the whole
+        // enclosing cold cohort. No request/epoch counter or communicator is added.
+        exchangePlanningSamples(original, [](int count) {
+            const auto text = nlohmann::json(nextChannelIdentity()).dump();
+            return std::vector<std::vector<uint8_t>>(count, std::vector<uint8_t>(text.begin(), text.end()));
+        }, [&](auto identity) {
+            const auto value = nlohmann::json::parse(identity);
+            if (!value.is_number_unsigned() || !(generation = value.template get<std::uint64_t>()) ||
+                generation == kCapturedTransferAbortEpoch)
+                throw std::invalid_argument("Original rank channel session has an invalid allocation scope");
+            result = std::shared_ptr<CapturedTransferRankSession>(new CapturedTransferRankSession(original, generation));
+            return std::vector<uint8_t>(identity.begin(), identity.end());
+        }, [&](auto receipts) {
+            for (const auto &receipt : receipts)
+                if (nlohmann::json::parse(receipt.bytes) != generation)
+                    throw std::invalid_argument("Original rank channel session scope disagrees");
+        });
+        // topology() is lazy and may construct original WORLD collectives.
+        // Every rank initializes it here, never inside a two-role file branch
+        // while uninvolved ranks enter another phase's completion collective.
+        exchangePlanningSamples(original, [](int count) {
+            return std::vector<std::vector<uint8_t>>(count, std::vector<uint8_t>{1});
+        }, [&](auto identity) {
+            // No asymmetric validation/role branch precedes lazy discovery:
+            // its original internal WORLD collectives require every rank.
+            const auto *topology = original->topology();
+            if (identity.size() != 1 || identity[0] != 1 || !topology ||
+                !topology->node_shared_memory_namespace())
+                throw std::invalid_argument("Original rank channel session has no authenticated node topology");
+            return std::vector<uint8_t>{1};
+        }, [](auto) {});
+        return result;
+    }
+
+    CapturedTransferRankSession::~CapturedTransferRankSession()
+    {
+        if (!retired_ && !entries_.empty())
+        {
+            // Never free a source charge while an original remote mapping may
+            // still exist. Existing process/session fatal cleanup owns this edge.
+            std::fputs("[FATAL] Original rank channel session abandoned before graph/alias retirement consensus\n", stderr);
+            std::terminate();
+        }
+    }
+
+    void CapturedTransferRankSession::requireOriginalContext(const std::shared_ptr<IMPIContext> &original) const
+    {
+        if (retired_ || !original || original.get() != original_.get() || original.owner_before(original_) ||
+            original_.owner_before(original))
+            throw std::invalid_argument("Rank channel session requires the same original MPI ownership control block");
+    }
+
+    void CapturedTransferRankSession::retireAfterOriginalGraphRelease()
+    {
+        if (retired_) return;
+        const auto phase = [&](const auto &operation) {
+            exchangePlanningSamples(original_, [&](int count) {
+                const auto text = nlohmann::json(generation_).dump();
+                return std::vector<std::vector<uint8_t>>(count, std::vector<uint8_t>(text.begin(), text.end()));
+            }, [&](auto identity) {
+                if (nlohmann::json::parse(identity) != generation_)
+                    throw std::invalid_argument("Original rank channel retirement cohort disagrees");
+                operation();
+                return std::vector<uint8_t>{1};
+            }, [](auto receipts) {
+                for (const auto &receipt : receipts)
+                    if (receipt.bytes.size() != 1 || receipt.bytes[0] != 1)
+                        throw std::invalid_argument("Original rank channel retirement omitted an endpoint");
+            });
+        };
+        phase([&] {
+            for (const auto &entry : entries_)
+                if (!entry->channel.expired())
+                    throw std::logic_error("Original rank channel graph/alias borrow is still live at model retirement");
+        });
+        // Every original channel/registration is gone BEFORE any process
+        // unmaps/closes its file. The completion consensus then proves no peer
+        // VMA/FD can keep source-owned physical pages live behind a zero claim.
+        phase([&] { for (const auto &entry : entries_) entry->pages.reset(); });
+        phase([&] { for (const auto &entry : entries_) entry->host_lease = PhysicalMemoryAllocationLease{}; });
+        entries_.clear();
+        retired_ = true;
+    }
+
+    std::shared_ptr<CapturedTransferChannel> TransferEngine::createRankCapturedTransferChannel(
+        const CapturedTransferRankPlan &plan, const std::shared_ptr<CapturedTransferRankSession> &session,
+        const std::shared_ptr<PhysicalMemoryAuthority> &local_authority, void *local_setup_stream) const
+    {
+        if (!session) throw std::invalid_argument("Rank channel setup requires its original model retirement owner");
+        const auto mpi = session->original_;
+        std::shared_ptr<CapturedTransferRankSession::Entry> retained;
+        std::shared_ptr<CapturedTransferChannel> channel;
+        std::shared_ptr<RankCapturedPages> pages;
+        std::optional<CapturedTransferEndpoint> role;
+        const auto phase = [&](const auto &execute) {
+            exchangePlanningSamples(mpi, [&](int count) {
+                return std::vector<std::vector<uint8_t>>(count, plan.serialize());
+            }, [&](auto identity) {
+                if (std::vector<uint8_t>(identity.begin(), identity.end()) != plan.serialize())
+                    throw std::invalid_argument("Original rank channel declarations disagree");
+                execute();
+                return std::vector<uint8_t>{1};
+            }, [](auto receipts) {
+                for (const auto &receipt : receipts)
+                    if (receipt.bytes.size() != 1 || receipt.bytes[0] != 1)
+                        throw std::invalid_argument("Rank channel setup has an incomplete original receipt");
+            });
+        };
+        phase([&] {
+            if (session->retired_ || plan.originalId().generation != session->generation_ || !mpi || isGraphCaptureActive())
+                throw std::invalid_argument("Original rank channel construction requires its existing context outside capture");
+            const auto inventory = mpi->clusterInventory();
+            if (!inventory || plan != CapturedTransferRankPlan::fromInventory(*inventory, plan.originalId(),
+                    plan.endpoint(CapturedTransferEndpoint::Producer), plan.endpoint(CapturedTransferEndpoint::Consumer), plan.capacityBytes(), plan.hostEndpoint()))
+                throw std::invalid_argument("Rank channel does not match the original discovery publication");
+            role = plan.localRole(mpi->rank());
+            if (!role)
+            {
+                if (local_authority || local_setup_stream)
+                    throw std::invalid_argument("Uninvolved rank cannot own a channel GPU or PMA claim");
+                return;
+            }
+            if (!local_authority || local_authority->worldRank() != mpi->rank() ||
+                reinterpret_cast<std::uintptr_t>(local_setup_stream) <= 2)
+                throw std::invalid_argument("Rank endpoint requires its original stage PMA and exact local stream");
+            const auto geometry = CapturedTransferChannel::memoryFor(plan.capacityBytes());
+            retained = std::make_shared<CapturedTransferRankSession::Entry>();
+            session->entries_.push_back(retained);
+            channel = std::shared_ptr<CapturedTransferChannel>(new CapturedTransferChannel);
+            retained->channel = channel;
+            channel->rank_plan_ = plan;
+            channel->rank_role_ = role;
+            for (const auto endpoint_role : {CapturedTransferEndpoint::Producer, CapturedTransferEndpoint::Consumer})
+                channel->endpoints_[endpointIndex(endpoint_role)].device = plan.endpoint(endpoint_role).device;
+            auto &endpoint = channel->endpoints_[endpointIndex(*role)];
+            endpoint.original.emplace(GPUDeviceContextPool::instance().retainExistingContextProvenance(endpoint.device));
+            if (endpoint.original->worker()->ownsCurrentThread())
+                throw std::invalid_argument("Rank channel construction requires the original setup caller");
+            endpoint.backend = resolveBackend(endpoint.device);
+            endpoint.setup_stream = local_setup_stream;
+            const auto validate = [&] {
+                (void)endpoint.original->worker()->queryStreamExecutionState(local_setup_stream, "rank channel original setup stream");
+            };
+            endpoint.original->worker()->submitAndWait(validate);
+            endpoint.runtime_generation = endpoint.backend ? endpoint.backend->deviceRuntimeGeneration(endpoint.device.ordinal) : 0;
+            if (!endpoint.runtime_generation) throw std::invalid_argument("Rank endpoint has no original native runtime");
+            constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
+            if (*role == plan.hostEndpoint())
+            {
+                retained->host_lease = local_authority->claimNewAllocation(DeviceId::cpu(), owner, geometry.mapped_host_bytes);
+                channel->identity_ = {nextChannelIdentity(), plan.capacityBytes()};
+            }
+            endpoint.lease = local_authority->claimNewAllocation(endpoint.device, owner, geometry.cursor_bytes_per_device);
+            if (!endpoint.backend->prepareCapturedTransferChannelKernels(endpoint.device.ordinal,
+                    collective_timeout_policy::kDefaultCollectiveTimeoutMs, &endpoint.timeout_ticks) || !endpoint.timeout_ticks)
+                throw std::runtime_error("Original rank endpoint kernel preparation failed");
+        });
+        phase([&] {
+            if (role)
+            {
+                pages = std::make_shared<RankCapturedPages>(plan, *mpi, channel->identity_);
+                retained->pages = pages;
+            }
+        });
+        phase([&] {
+            if (!role) return;
+            auto *control = static_cast<CapturedTransferChannelControl *>(pages->allocation());
+            const auto nonce = std::atomic_ref(control->identity.nonce).load(std::memory_order_acquire);
+            if (!nonce || nonce == kCapturedTransferAbortEpoch || control->identity.capacity != plan.capacityBytes())
+                throw std::invalid_argument("Rank endpoint acquired an incomplete shared allocation identity");
+            channel->identity_ = {nonce, control->identity.capacity};
+            channel->backing_identity_ = pages->identity();
+            auto &endpoint = channel->endpoints_[endpointIndex(*role)];
+            const std::array devices{endpoint.device};
+            const auto geometry = CapturedTransferChannel::memoryFor(plan.capacityBytes());
+            channel->mapped_ = registerExternalMappedHostRegion(pages->allocation(), geometry.mapped_host_bytes, devices, pages);
+            endpoint.cursor = allocateDeviceTransferBuffer(geometry.cursor_bytes_per_device, endpoint.device);
+            endpoint.initialization_deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+            endpoint.initialization = CapturedTransferChannel::Endpoint::Initialization::Pending;
+            if (!endpoint.backend->memset(endpoint.cursor->mutableDeviceData(), 0, geometry.cursor_bytes_per_device,
+                    endpoint.device.ordinal, local_setup_stream))
+                throw std::runtime_error("Original rank endpoint cursor initialization failed");
+            CapturedTransferChannel::completeColdInitialization(endpoint);
+        });
+        return channel;
     }
 
     CapturedTransferChannelMemory CapturedTransferChannel::memoryFor(size_t capacity)
@@ -81,8 +423,12 @@ namespace llaminar2
     void CapturedTransferChannel::beginInvocation(CapturedTransferInvocation original)
     {
         if (!original.valid()) throw std::invalid_argument("Captured channel requires an original admission identity");
-        requireOriginalEndpoint(CapturedTransferEndpoint::Producer);
-        requireOriginalEndpoint(CapturedTransferEndpoint::Consumer);
+        if (rank_role_) requireOriginalEndpoint(*rank_role_);
+        else
+        {
+            requireOriginalEndpoint(CapturedTransferEndpoint::Producer);
+            requireOriginalEndpoint(CapturedTransferEndpoint::Consumer);
+        }
         std::lock_guard lock(invocation_mutex_);
         if (terminal_cancelled_ || invocation_active_ ||
             original.generation < original_invocation_.generation ||
@@ -148,15 +494,6 @@ namespace llaminar2
         return channel->cancelInvocation(original);
     }
 
-    CapturedTransferChannelMemory CapturedTransferChannel::memoryFor(size_t capacity, CapturedTransferPayloadStorage storage)
-    {
-        if (storage == CapturedTransferPayloadStorage::MappedHost) return memoryFor(capacity);
-        if (storage != CapturedTransferPayloadStorage::PeerDevice || !capacity)
-            throw std::invalid_argument("Captured transfer requires a valid explicit payload route and positive capacity");
-        return {TransferEngine::mappedHostRegionAllocationBytes(sizeof(CapturedTransferChannelControl)),
-            sizeof(CapturedTransferCursor), capacity};
-    }
-
     void CapturedTransferChannel::completeColdInitialization(Endpoint& endpoint)
     {
         if(endpoint.initialization!=Endpoint::Initialization::Pending || !endpoint.original || !endpoint.setup_stream)
@@ -176,6 +513,8 @@ namespace llaminar2
     void CapturedTransferChannel::requireOriginalEndpoint(CapturedTransferEndpoint role)const
     {
         const auto& endpoint=endpoints_[endpointIndex(role)];
+        if (rank_role_ && role != *rank_role_)
+            throw std::invalid_argument("Rank channel cannot bind or execute the original peer's endpoint");
         if(endpoint.initialization!=Endpoint::Initialization::Ready || !endpoint.original)
             throw std::logic_error("Captured channel endpoint was not originally initialized");
         const auto current=GPUDeviceContextPool::instance().retainExistingContextProvenance(endpoint.device);
@@ -197,46 +536,24 @@ namespace llaminar2
     }
 
     DeviceId CapturedTransferChannel::endpointDevice(CapturedTransferEndpoint role) const
-    { requireOriginalEndpoint(role);return endpoints_[endpointIndex(role)].device; }
+    {
+        const auto index = endpointIndex(role);
+        if (!rank_role_ || role == *rank_role_) requireOriginalEndpoint(role);
+        else if (!rank_plan_) throw std::logic_error("Remote endpoint lacks its original rank declaration");
+        return endpoints_[index].device;
+    }
 
     std::shared_ptr<CapturedTransferChannel> TransferEngine::createCapturedTransferChannel(
         PhysicalMemoryAuthority &authority, DeviceId host_device,
         DeviceId producer, void *producer_setup_stream,
         DeviceId consumer, void *consumer_setup_stream, size_t capacity) const
     {
-        return createCapturedTransferChannelWithStorage(authority, host_device, producer, producer_setup_stream,
-            consumer, consumer_setup_stream, capacity, CapturedTransferPayloadStorage::MappedHost);
-    }
-
-    std::shared_ptr<CapturedTransferChannel> TransferEngine::createPeerCapturedTransferChannel(
-        PhysicalMemoryAuthority &authority, DeviceId host_device,
-        DeviceId producer, void *producer_setup_stream,
-        DeviceId consumer, void *consumer_setup_stream, size_t capacity,
-        const RankInventory &original_inventory) const
-    {
-        // Reuse the original discovery matrix before claiming or materializing
-        // any byte. A one-way edge is Partial, never a peer or mapped substitute.
-        if(original_inventory.rank!=authority.worldRank() ||
-           localTPPeerAccessCoverage(original_inventory,{producer,consumer})!=PeerAccessCoverage::Complete)
-            throw std::invalid_argument("Captured peer payload requires original cached complete bidirectional coverage");
-        return createCapturedTransferChannelWithStorage(authority,host_device,producer,producer_setup_stream,
-            consumer,consumer_setup_stream,capacity,CapturedTransferPayloadStorage::PeerDevice);
-    }
-
-    std::shared_ptr<CapturedTransferChannel> TransferEngine::createCapturedTransferChannelWithStorage(
-        PhysicalMemoryAuthority &authority, DeviceId host_device,
-        DeviceId producer, void *producer_setup_stream,
-        DeviceId consumer, void *consumer_setup_stream, size_t capacity, CapturedTransferPayloadStorage storage) const
-    {
         if (isGraphCaptureActive() || !host_device.is_cpu() || !producer.is_gpu() || !consumer.is_gpu() || producer == consumer ||
             reinterpret_cast<std::uintptr_t>(producer_setup_stream)<=2 || reinterpret_cast<std::uintptr_t>(consumer_setup_stream)<=2)
             throw std::invalid_argument("Captured transfer requires CPU backing, distinct local GPUs and explicit setup streams");
-        if (storage == CapturedTransferPayloadStorage::PeerDevice && producer.type != consumer.type)
-            throw std::invalid_argument("Peer payload requires distinct same-vendor original GPU endpoints");
-        const auto geometry = CapturedTransferChannel::memoryFor(capacity, storage);
+        const auto geometry = CapturedTransferChannel::memoryFor(capacity);
         auto channel = std::shared_ptr<CapturedTransferChannel>(new CapturedTransferChannel);
         channel->identity_ = {nextChannelIdentity(), capacity};
-        channel->payload_storage_ = storage;
         constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
         const std::array devices{producer, consumer};
         const std::array streams{producer_setup_stream, consumer_setup_stream};
@@ -261,26 +578,7 @@ namespace llaminar2
                     collective_timeout_policy::kDefaultCollectiveTimeoutMs, &endpoint.timeout_ticks) || !endpoint.timeout_ticks)
                 throw std::runtime_error("Captured transfer kernel preparation failed on " + devices[i].toString());
         }
-        if (storage == CapturedTransferPayloadStorage::PeerDevice) {
-            // Admission occurs on both original workers; unknown/absent peer
-            // connectivity cannot silently select host payload storage.
-            for (std::size_t i = 0; i < devices.size(); ++i) {
-                auto& endpoint = channel->endpoints_[i];
-                const auto enable = [&] {
-                    if (!endpoint.backend->enableCapturedTransferPeerAccess(devices[i].ordinal, devices[1-i].ordinal))
-                        throw std::runtime_error("Captured peer payload requires complete enabled native peer access");
-                };
-                if (endpoint.original->worker()->ownsCurrentThread()) enable();
-                else endpoint.original->worker()->submitAndWait(enable);
-            }
-            channel->peer_payload_lease_ = authority.claimNewAllocation(producer, owner, geometry.producer_payload_bytes);
-            auto& originalProducer=channel->endpoints_[endpointIndex(CapturedTransferEndpoint::Producer)];
-            const auto allocatePayload=[&]{
-                channel->peer_payload_=allocateDeviceTransferBuffer(geometry.producer_payload_bytes,producer);
-            };
-            if(originalProducer.original->worker()->ownsCurrentThread())allocatePayload();
-            else originalProducer.original->worker()->submitAndWait(allocatePayload);
-        }
+
         channel->mapped_ = allocateMappedHostRegion(geometry.mapped_host_bytes, devices);
         // The first-touch allocator zeroes every page; placement construction
         // publishes only the immutable identity before either GPU can run.
@@ -471,6 +769,45 @@ namespace llaminar2
         return binding;
     }
 
+    CapturedTransferBinding TransferEngine::bindDeviceRowCountedTransfer(
+        CapturedTransferBinding binding, std::shared_ptr<ITensor> tensor, size_t offset, std::uint64_t row_bytes) const
+    {
+        auto *view = dynamic_cast<TensorBase *>(tensor.get());
+        auto *owner = view ? view->transferStorageOwner() : nullptr;
+        if (isGraphCaptureActive() || !binding.channel_ || !binding.native_.valid() ||
+            binding.native_.extent_source != CapturedTransferExtentSource::FixedMessage ||
+            !owner || owner->transferStorageOwner() != owner || owner->native_type() != TensorType::INT32 ||
+            !row_bytes || binding.native_.message.bytes % row_bytes != 0)
+            throw std::invalid_argument("Row-counted tensor extent requires setup-time fixed capacity and a canonical owner");
+        binding.channel_->requireOriginalEndpoint(binding.native_.role);
+        const auto &endpoint = binding.channel_->endpoints_[endpointIndex(binding.native_.role)];
+        void *address = nullptr;
+        {
+            std::lock_guard lock(owner->coherence_mutex_);
+            if (!owner->gpu_data_ptr_ || !owner->gpu_device_ || *owner->gpu_device_ != binding.device_ ||
+                owner->resolveBackend(binding.device_) != endpoint.backend || resolveBackend(binding.device_) != endpoint.backend)
+                throw std::invalid_argument("Row-counted tensor extent has foreign endpoint/backend ownership");
+            if (offset > owner->size_bytes() || sizeof(std::int32_t) > owner->size_bytes() - offset)
+                throw std::out_of_range("Row-counted tensor extent exceeds its original physical owner");
+            address = static_cast<unsigned char *>(owner->gpu_data_ptr_) + offset;
+            validateExtentAddress(address, binding.device_bytes_, binding.native_.message.bytes,
+                sizeof(std::int32_t), alignof(std::int32_t));
+        }
+        // Retain the allocator's existing record outside the coherence lock.
+        // This borrow forbids physical free/reuse; replay never reacquires it.
+        auto captured = retainCapturedDeviceStorage(*owner, binding.device_, owner->size_bytes());
+        if (static_cast<unsigned char *>(owner->gpu_data_ptr()) + offset != address)
+            throw std::logic_error("Row-counted tensor extent changed during preparation");
+        binding.extent_storage_ = std::shared_ptr<TensorBase>(std::move(tensor), owner);
+        binding.extent_capture_ = std::move(captured);
+        binding.extent_offset_ = offset;
+        binding.native_.device_rows = static_cast<const std::int32_t *>(address);
+        binding.native_.row_bytes = row_bytes;
+        binding.native_.extent_source = binding.native_.role == CapturedTransferEndpoint::Producer
+            ? CapturedTransferExtentSource::ProducerDevice : CapturedTransferExtentSource::ProducerPublication;
+        return binding;
+    }
+
     CapturedTransferBinding TransferEngine::bindDeviceSlicedTransfer(
         CapturedTransferBinding binding, std::shared_ptr<ITensor> tensor,
         size_t slice_offset, size_t source_span_bytes, std::uint64_t source_offset_origin) const
@@ -520,8 +857,18 @@ namespace llaminar2
         const auto& endpoint=channel_->endpoints_[endpointIndex(native_.role)];
         std::uint64_t identity = 1469598103934665603ULL;
         const auto mix = [&](std::uint64_t word) { identity = (identity ^ word) * 1099511628211ULL; };
-        mix(3); mix(static_cast<std::uint64_t>(channel_->payload_storage_));
-        mix(reinterpret_cast<std::uintptr_t>(channel_->peer_payload_ ? channel_->peer_payload_->mutableDeviceData() : nullptr));
+        mix(5); // Payload identity is now exclusively the original mapped allocation.
+        if (channel_->rank_plan_)
+        {
+            const auto &plan = *channel_->rank_plan_;
+            mix(plan.originalId().generation); mix(plan.originalId().boundary); mix(plan.physicalNode());
+            for (const auto word : channel_->backing_identity_) mix(word);
+            for (const auto role : {CapturedTransferEndpoint::Producer, CapturedTransferEndpoint::Consumer})
+            {
+                const auto endpoint = plan.endpoint(role);
+                mix(endpoint.rank); mix(static_cast<std::uint64_t>(endpoint.device.type)); mix(endpoint.device.ordinal);
+            }
+        }
         mix(static_cast<std::uint64_t>(device_.type)); mix(device_.ordinal);
         mix(endpoint.original->generation());mix(endpoint.runtime_generation);
         mix(reinterpret_cast<std::uintptr_t>(endpoint.original->worker().get()));mix(reinterpret_cast<std::uintptr_t>(endpoint.setup_stream));
@@ -529,6 +876,7 @@ namespace llaminar2
         mix(native_.expected.nonce); mix(native_.expected.capacity); mix(native_.message.key); mix(native_.message.bytes);
         mix(static_cast<std::uint64_t>(native_.role)); mix(native_.timeout_ticks);
         mix(static_cast<std::uint64_t>(native_.extent_source)); mix(reinterpret_cast<std::uintptr_t>(native_.device_extent));
+        mix(reinterpret_cast<std::uintptr_t>(native_.device_rows)); mix(native_.row_bytes);
         mix(reinterpret_cast<std::uintptr_t>(native_.source_slice)); mix(native_.source_span_bytes); mix(native_.source_offset_origin);
         mix(reinterpret_cast<std::uintptr_t>(device_bytes_)); mix(offset_); mix(extent_offset_);
         mix(storage_.index()); std::visit([&](const auto &owner) { mix(reinterpret_cast<std::uintptr_t>(owner.get())); }, storage_);
@@ -540,6 +888,15 @@ namespace llaminar2
         // a reset/free cannot recycle those bytes while a captured borrower lives.
         mix(reinterpret_cast<std::uintptr_t>(extent_capture_.get())); mix(reinterpret_cast<std::uintptr_t>(source_capture_.get()));
         return identity ? identity : 1;
+    }
+
+    void TransferEngine::enqueuePipelineActivationFanoutValidation(
+        const PipelineActivationFanoutValidation &binding, DeviceId device, void *stream) const
+    {
+        auto *backend = resolveBackend(device);
+        if (!device.is_gpu() || !binding.valid() || reinterpret_cast<std::uintptr_t>(stream) <= 2 || !backend ||
+            !backend->enqueuePipelineActivationFanoutValidation(binding, device.ordinal, stream))
+            throw std::runtime_error("Original pipeline native fanout validation enqueue failed");
     }
 
     void TransferEngine::enqueueCapturedTransfer(const CapturedTransferBinding &binding, void *stream) const
@@ -635,13 +992,16 @@ namespace llaminar2
             throw std::logic_error("Captured transfer backend identity changed after binding");
         if (binding.native_.extent_source != CapturedTransferExtentSource::FixedMessage)
         {
+            const size_t count_bytes = binding.native_.device_rows ? sizeof(std::int32_t) : sizeof(std::uint64_t);
+            const void *count_address = binding.native_.device_rows
+                ? static_cast<const void *>(binding.native_.device_rows) : binding.native_.device_extent;
             const bool retained = std::visit([&](const auto &storage) {
                 using Owner = std::decay_t<decltype(storage)>;
                 if constexpr (std::is_same_v<Owner, std::monostate>) return false;
                 else if constexpr (std::is_same_v<Owner, std::shared_ptr<DeviceTransferBuffer>>)
                     return storage && storage->device_ == binding.device_ && storage->backend_ == backend &&
-                        storage->contains(binding.extent_offset_, sizeof(std::uint64_t)) &&
-                        storage->mutableDeviceData(binding.extent_offset_) == binding.native_.device_extent;
+                        storage->contains(binding.extent_offset_, count_bytes) &&
+                        storage->mutableDeviceData(binding.extent_offset_) == count_address;
                 else if constexpr (std::is_same_v<Owner, std::shared_ptr<TensorBase>>)
                 {
                     if (!storage || !binding.extent_capture_ || storage->transferStorageOwner() != storage.get() ||
@@ -650,11 +1010,10 @@ namespace llaminar2
                         return false;
                     requireCapturedDeviceStorage(*binding.extent_capture_, *storage, binding.device_, storage->size_bytes());
                     if (binding.extent_offset_ > storage->size_bytes() ||
-                        sizeof(std::uint64_t) > storage->size_bytes() - binding.extent_offset_ ||
-                        static_cast<unsigned char *>(storage->gpu_data_ptr()) + binding.extent_offset_ !=
-                            reinterpret_cast<unsigned char *>(binding.native_.device_extent))
+                        count_bytes > storage->size_bytes() - binding.extent_offset_ ||
+                        static_cast<unsigned char *>(storage->gpu_data_ptr()) + binding.extent_offset_ != count_address)
                         return false;
-                    if (binding.native_.role == CapturedTransferEndpoint::Producer)
+                    if (binding.native_.role == CapturedTransferEndpoint::Producer || binding.native_.device_rows)
                     {
                         if (fork)
                         {
@@ -674,8 +1033,8 @@ namespace llaminar2
                 }
                 else
                     return storage && storage->device() == binding.device_ && storage->backend() == backend &&
-                        storage->contains(binding.extent_offset_, sizeof(std::uint64_t)) &&
-                        storage->data(binding.extent_offset_) == binding.native_.device_extent;
+                        storage->contains(binding.extent_offset_, count_bytes) &&
+                        storage->data(binding.extent_offset_) == count_address;
             }, binding.extent_storage_);
             if (!retained) throw std::logic_error("Device-counted transfer lost its retained extent owner");
         }
@@ -720,9 +1079,7 @@ namespace llaminar2
         // Setup certified initialization. Submit one complete typed operation;
         // the backend may fuse nodes without splitting ownership or making
         // TransferEngine dictate a needlessly fragmented native graph.
-        auto *mapped_bytes = binding.channel_->payload_storage_ == CapturedTransferPayloadStorage::PeerDevice
-            ? binding.channel_->peer_payload_->mutableDeviceData()
-            : binding.channel_->mapped_->deviceAlias(binding.device_, CapturedTransferChannel::payload_offset);
+        auto *mapped_bytes = binding.channel_->mapped_->deviceAlias(binding.device_, CapturedTransferChannel::payload_offset);
         const bool outbound = binding.native_.role == CapturedTransferEndpoint::Producer;
         void *destination = outbound ? mapped_bytes : binding.device_bytes_;
         const void *source = outbound ? binding.device_bytes_ : mapped_bytes;
@@ -740,7 +1097,7 @@ namespace llaminar2
         if (const auto *storage = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_))
             if (binding.native_.role == CapturedTransferEndpoint::Consumer && !fork)
                 publishDeviceWrite(storage->get(), binding.device_, stream);
-        if (binding.native_.role == CapturedTransferEndpoint::Consumer && !fork)
+        if (binding.native_.role == CapturedTransferEndpoint::Consumer && !fork && !binding.native_.device_rows)
             if (const auto *extent = std::get_if<std::shared_ptr<TensorBase>>(&binding.extent_storage_))
             {
                 const auto *packet = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_);
@@ -770,8 +1127,7 @@ namespace llaminar2
             const auto &binding = bindings[i];
             if (binding.device_ != device || binding.native_.role != role)
                 throw std::invalid_argument("Captured endpoint batch mixes physical devices or endpoint roles");
-            const auto current = resolveCapturedTransferEndpoint(binding, stream, fork);
-            const auto begin = reinterpret_cast<std::uintptr_t>(current.destination);
+            const auto begin = reinterpret_cast<std::uintptr_t>(binding.device_bytes_);
             for (size_t j = 0; j < i; ++j)
             {
                 const auto &prior = bindings[j];
@@ -786,20 +1142,33 @@ namespace llaminar2
                     // Publication counts are mutable outputs, unlike shared
                     // producer count inputs. Authenticate their complete byte
                     // ranges against every other endpoint before any enqueue.
-                    const auto count = reinterpret_cast<std::uintptr_t>(binding.native_.device_extent);
-                    const auto previous_count = reinterpret_cast<std::uintptr_t>(prior.native_.device_extent);
+                    const auto count = reinterpret_cast<std::uintptr_t>(binding.native_.device_rows
+                        ? static_cast<const void *>(binding.native_.device_rows) : binding.native_.device_extent);
+                    const auto previous_count = reinterpret_cast<std::uintptr_t>(prior.native_.device_rows
+                        ? static_cast<const void *>(prior.native_.device_rows) : prior.native_.device_extent);
                     const auto overlaps = [](std::uintptr_t first, size_t first_bytes,
                                              std::uintptr_t second, size_t second_bytes) {
                         return first <= second ? second - first < first_bytes : first - second < second_bytes;
                     };
-                    constexpr size_t count_bytes = sizeof(std::uint64_t);
-                    if ((count && previous_count && overlaps(count, count_bytes, previous_count, count_bytes)) ||
+                    const size_t count_bytes = binding.native_.device_rows ? sizeof(std::int32_t) : sizeof(std::uint64_t);
+                    const size_t previous_count_bytes = prior.native_.device_rows ? sizeof(std::int32_t) : sizeof(std::uint64_t);
+                    const bool count_output = binding.native_.device_extent != nullptr;
+                    const bool previous_count_output = prior.native_.device_extent != nullptr;
+                    // Shared expected-row INPUTS may alias each other. They may
+                    // never overlap any receive payload or byte-count OUTPUT.
+                    if ((count && previous_count && (count_output || previous_count_output) &&
+                            overlaps(count, count_bytes, previous_count, previous_count_bytes)) ||
                         (count && overlaps(count, count_bytes, previous, prior.native_.message.bytes)) ||
-                        (previous_count && overlaps(previous_count, count_bytes, begin, binding.native_.message.bytes)))
+                        (previous_count && overlaps(previous_count, previous_count_bytes, begin, binding.native_.message.bytes)))
                         throw std::invalid_argument("Captured endpoint batch count publication overlaps another count or payload capacity");
                 }
             }
         }
+        // Reject every cross-endpoint alias before importing a producer event.
+        // Endpoint resolution may enqueue those legitimate dependency waits;
+        // immutable geometry must therefore be valid for the entire batch first.
+        for (const auto &binding : bindings)
+            (void)resolveCapturedTransferEndpoint(binding, stream, fork);
     }
 
     void TransferEngine::enqueueCapturedTransferBatchImpl(
@@ -832,7 +1201,7 @@ namespace llaminar2
                 if (const auto *storage = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_))
                     if (role == CapturedTransferEndpoint::Consumer && !fork)
                         publishDeviceWrite(storage->get(), device, stream);
-                if (role == CapturedTransferEndpoint::Consumer && !fork)
+                if (role == CapturedTransferEndpoint::Consumer && !fork && !binding.native_.device_rows)
                     if (const auto *extent = std::get_if<std::shared_ptr<TensorBase>>(&binding.extent_storage_))
                     {
                         const auto *payload = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_);

@@ -102,7 +102,7 @@ private:
    * @throws std::exception For a foreign role/root, unsupported producer or changed original pointer.
    * @note Workspace declarations use their permanent request/verifier roots but remain non-executable.
    */
-  std::optional<Qwen4ExpIntBinding> adaptiveCountBinding(const ForwardInput &input,
+  std::optional<Qwen4ExpIntBinding> nativePLECountBinding(const ForwardInput &input,
                                                          const DeviceRowRange &rows) const;
   friend struct Qwen4ExpPLEProjectionTestPeer;
   /**

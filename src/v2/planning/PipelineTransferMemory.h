@@ -1,6 +1,6 @@
 /**
  * @file PipelineTransferMemory.h
- * @brief Shared physical geometry for captured cross-backend pipeline channels.
+ * @brief Useful pipeline message geometry and exact cross-backend mapped storage BOM.
  *
  * An adjacent boundary has one forward activation slot and one reverse metadata
  * slot. Each GPU leader owns two private cursors; the earlier domain contributes
@@ -37,5 +37,15 @@ struct PipelineTransferMemory
      * @throws std::overflow_error for unrepresentable physical allocation sizes. */
     static PipelineTransferMemory forRows(std::size_t width, std::size_t prefill_rows,
         std::size_t verifier_rows);
+    /** @brief Resolve useful native message maxima without quoting mapped payload/control storage.
+     * @param width Actual full residual row width. @param prefill_rows Admitted prefill row maximum.
+     * @param verifier_rows Admitted exact verifier maximum. @return Useful maxima and zero mapped storage.
+     */
+    static PipelineTransferMemory nativeForRows(std::size_t width, std::size_t prefill_rows,
+        std::size_t verifier_rows);
+    /** @return Exact participant-private device receipt/header/error bytes for an incoming native TP fanout. */
+    static std::size_t fanoutDeviceBytes() noexcept;
+    /** @return Exact page-rounded immutable native fanout operand backing per receiving TP member. */
+    static std::size_t fanoutHostBytes();
 };
 }

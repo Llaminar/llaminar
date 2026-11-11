@@ -153,6 +153,11 @@ option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging
 # Required Platform Dependencies
 # =============================================================================
 find_package(MPI REQUIRED COMPONENTS CXX)
+# OpenMPI CPU-set arguments name hwloc logical cores, not Linux OS CPU IDs.
+# Canonical cold CPU discovery publishes that conversion once; this explicit
+# dependency does not enable the older optional HAVE_HWLOC NUMA detector.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LLAMINAR_CPU_PLACEMENT_HWLOC REQUIRED IMPORTED_TARGET hwloc>=2.1)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/OpenMPRuntimeBinding.cmake")
 llaminar_openmp_runtime_soname(LLAMINAR_OPENMP_RUNTIME_SONAME)
@@ -644,6 +649,19 @@ if(HAVE_CUDA)
     if(LLAMINAR_NCCL_LIBRARY)
         set(NCCL_LIBRARY "${LLAMINAR_NCCL_LIBRARY}")
         set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
+        # Resolve the configured DSO before locating its own build/install header;
+        # a relocated lib-only symlink must not select an unrelated system ABI.
+        get_filename_component(_nccl_abi_dso "${NCCL_LIBRARY}" REALPATH)
+        get_filename_component(_nccl_abi_libdir "${_nccl_abi_dso}" DIRECTORY)
+        find_file(_nccl_abi_header NAMES llaminar-nccl/nccl.h nccl.h
+            HINTS "${_nccl_abi_libdir}/../include" "${_nccl_abi_libdir}/include"
+            NO_DEFAULT_PATH NO_CACHE)
+        if(NOT _nccl_abi_header)
+            message(FATAL_ERROR "Configured NCCL dependency has no associated nccl.h: ${_nccl_abi_dso}")
+        endif()
+        target_sources(cuda_backend PRIVATE collective/backends/NCCLHeaderABIContract.cpp)
+        set_property(SOURCE collective/backends/NCCLHeaderABIContract.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS "LLAMINAR_NCCL_ABI_HEADER=\"${_nccl_abi_header}\"")
         add_compile_definitions(HAVE_NCCL)
         message(STATUS "V2: NCCL found")
         message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
@@ -651,7 +669,8 @@ if(HAVE_CUDA)
         # CRITICAL: NCCL is now loaded dynamically via dlopen() in NCCLDynamicLoader.cpp
         # to avoid symbol conflicts with RCCL, which exports identical symbol names.
         # NCCLDynamicLoader owns the isolated ABI declarations and loads NCCL
-        # with RTLD_LOCAL. No consumer includes nccl.h; exporting the vendor's
+        # with RTLD_LOCAL. Only the isolated ABI contract TU includes nccl.h;
+        # exporting the vendor's
         # include directory would leak its conflicting global names to RCCL.
         target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
         # The runtime must consume the exact library authenticated by dependency
@@ -1175,6 +1194,15 @@ if(HAVE_ROCM)
     
     if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
         set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
+        # This is the actual configured RCCL compilation header, not a runtime search.
+        find_file(_rccl_abi_header NAMES rccl/rccl.h rccl.h
+            HINTS "${RCCL_INCLUDE_DIR}" NO_DEFAULT_PATH NO_CACHE)
+        if(NOT _rccl_abi_header)
+            message(FATAL_ERROR "Configured RCCL dependency has no selected rccl.h: ${RCCL_INCLUDE_DIR}")
+        endif()
+        target_sources(rocm_backend PRIVATE collective/backends/RCCLHeaderABIContract.cpp)
+        set_property(SOURCE collective/backends/RCCLHeaderABIContract.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS "LLAMINAR_RCCL_ABI_HEADER=\"${_rccl_abi_header}\"" "__HIP_PLATFORM_AMD__=1")
         add_compile_definitions(HAVE_RCCL)
 
         # Dynamic loading isolates RCCL's NCCL-named symbols, but must not
@@ -1711,6 +1739,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayRetainedActivationTransaction.cpp
     execution/moe/MoEOverlayRetainedParentComposer.cpp
     execution/moe/MoEOverlayRankBatchTransport.cpp
+    execution/moe/MoEOverlayRankBatchPreparation.cpp
     execution/moe/MoEOverlayNodeLocalRankBatchTransport.cpp
     execution/moe/MoEOverlayNodeLocalRouteExchange.cpp
     execution/moe/MoEOverlaySparseCollective.cpp
@@ -1794,6 +1823,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp
     execution/local_execution/orchestrators/PipelineForwardGraphEdges.cpp
     execution/local_execution/orchestrators/PipelineActivationExchange.cpp
+    execution/local_execution/orchestrators/PipelineNativeByteChannel.cpp
+    execution/local_execution/orchestrators/Qwen4ExpFixedHeadPipelinePort.cpp
+    execution/local_execution/orchestrators/PipelineMaintenanceAdmission.cpp
     execution/local_execution/orchestrators/PipelineMetadataExchange.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
@@ -1883,6 +1915,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/MoEOverlayPlanningInputs.cpp
     planning/MoEOverlayMemoryPlanInputs.cpp
     planning/MoEPipelineMemoryAdmission.cpp
+    planning/OriginalRankCapacityExchange.cpp
     planning/PlanningModelMetadata.cpp
     planning/PlanningPublication.cpp
     planning/PlanningHostServiceEvidence.cpp
@@ -2334,7 +2367,7 @@ endif()
 
 # Required dependencies
 target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
-target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer)
+target_link_libraries(llaminar2_core PRIVATE llaminar2_text_pre_tokenizer PkgConfig::LLAMINAR_CPU_PLACEMENT_HWLOC)
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX

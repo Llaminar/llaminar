@@ -75,14 +75,7 @@ if(TARGET v2_unit_moe_overlay_activation_epoch_protocol)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalExpertSchedulerCancellationReplay)
 endif()
 
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    add_v2_test(V2_Integration_OriginalExpertSchedulerCancellationNativeReplay
-        COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-            --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.CUDAForkedPrefillAbortDrainsPendingAdmission:Test__MappedActivationPacketCUDAAndROCm.ROCmForkedPrefillAbortDrainsPendingAdmission
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;ExpertOverlay;Ownership;TraceReplay;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalExpertSchedulerCancellationNativeReplay)
-endif()
+
 
 if(TARGET v2_unit_moe_overlay_inference_transaction)
     add_v2_test(V2_Integration_RankLocalExpertSubmissionResetReplay

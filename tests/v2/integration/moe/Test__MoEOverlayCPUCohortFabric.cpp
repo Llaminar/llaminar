@@ -5,8 +5,8 @@
  * One original GGUF/context/preparation supplies all real prepared banks and
  * PMA roots. Polling gates delay/fail an actual piece, retaining its copy, ACK
  * and abort/drain. Explicit native cases replace only the whole tier with a
- * genuine rank-zero GPU owner; no global candidate publication is invented.
- * Joined calibration opts into one original source-admitted GPU worker and
+ * genuine original inventory-owned GPU endpoint; no global candidate publication is invented.
+ * Every native variant retains one original source-admitted GPU worker; joined calibration adds the
  * native CPU domain before weights/probe scratch are materialized.
  */
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
@@ -29,7 +29,10 @@
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/GPUVramPreflight.h"
-#include "../../utils/ScopedGPUStream.h"
+#include "planning/RankHardwareOwnership.h"
+#include "execution/moe/ExpertTierGpuPeerTransferLane.h"
+#include "collective/CollectiveTimeoutPolicy.h"
+#include <iostream>
 #include "tensors/NativeWeightSourceRange.h"
 #include "backends/HostMemoryCapacity.h"
 #include "backends/BackendManager.h"
@@ -89,20 +92,21 @@ std::vector<CPUExpertSocketEndpoint> originalFabricSockets(const MPIContext& mpi
  * @brief Declare fixed tiers/cuts against observed original socket endpoints.
  * @param sockets Genuine world-rank ordered physical CPU endpoints.
  * @param whole_device Explicit whole-owner backend; CPU preserves the original host-only fixture.
+ * @param whole_owner Original inventory rank owning the exact whole endpoint.
  * @return Fixed admitted tiers with no fabricated rank/socket execution.
  */
 MoERoutedExpertPlacementPlan fabricOriginalPlan(const std::vector<CPUExpertSocketEndpoint>& sockets,
-    DeviceId whole_device=DeviceId::cpu()) {
+    DeviceId whole_device=DeviceId::cpu(),int whole_owner=0) {
     MoERoutedExpertPlacementPlan plan;
     plan.enabled=true;plan.first_model_layer=0;plan.topology=RoutedExpertPlacementTopology::TieredOverlay;
     plan.continuation_domain=plan.base_model_domain=plan.shared_expert_domain="whole";
     RoutedExpertDomain whole;
     whole.name="whole";whole.scope=ExecutionDomainScope::RANK_LOCAL;
     whole.backend=whole_device.is_cuda()?CollectiveBackendType::NCCL:
-        whole_device.is_rocm()?CollectiveBackendType::RCCL:CollectiveBackendType::UPI;whole.owner_rank=0;
+        whole_device.is_rocm()?CollectiveBackendType::RCCL:CollectiveBackendType::UPI;whole.owner_rank=whole_owner;
     whole.participants={whole_device.is_cuda()?GlobalDeviceAddress::cuda(whole_device.ordinal):
         whole_device.is_rocm()?GlobalDeviceAddress::rocm(whole_device.ordinal):
-        GlobalDeviceAddress::cpu(sockets.at(0).numa_node)};
+        GlobalDeviceAddress::cpu(sockets.at(size_t(whole_owner)).numa_node)};
     whole.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
     RoutedExpertDomain cohort;
     cohort.name="cohort";cohort.scope=ExecutionDomainScope::NODE_LOCAL;
@@ -146,17 +150,36 @@ struct FabricOriginal {
     int whole=-1,last_shard=-1;
     ModelContextId model;
     DeviceId whole_device=DeviceId::cpu();
+    int whole_owner=0; ///< Original observed GPU owner; CPU-only keeps its established rank-zero whole tier.
+    std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_demand;
     /**
      * @brief Parse once, admit exact source/shadow/lane roots and publish genuine initial banks.
-     * @param device Explicit whole-owner backend; only rank zero prepares native GPU storage.
+     * @param device Exact whole GPU identity; its original UUID/NUMA owner alone prepares native storage.
      * @param joined_service Admit the actual service probe/domain on the same original PMA.
      */
     explicit FabricOriginal(DeviceId device=DeviceId::cpu(),bool joined_service=false):whole_device(device) {
+        try {
         if(!device.is_cpu() && !device.is_gpu())
             throw std::invalid_argument("Fabric whole endpoint must be CPU or explicit native GPU");
         int rank=-1,size=0;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
-        mpi=std::make_shared<MPIContext>(rank,size,MPI_COMM_WORLD);
+        mpi=MPIContextFactory::global();
+        if(!mpi || mpi->rank()!=rank || mpi->world_size()!=size)
+            throw std::invalid_argument("CPU cohort fabric lost its original owned MPI context");
         const auto sockets=originalFabricSockets(*mpi);
+        if(device.is_gpu()) {
+            const auto inventory=mpi->clusterInventory();
+            if(!inventory || inventory->world_size!=size || inventory->ranks.size()!=size_t(size))
+                throw std::invalid_argument("GPU/CPU fabric requires its complete original inventory");
+            int matches=0;
+            for(const auto& owner:inventory->ranks)for(const auto& gpu:owner.gpus)
+                if(gpu.type==device.type && gpu.local_device_id==device.ordinal && rankOwnsGPUDevice(owner,gpu)) {
+                    if(gpu.uuid.empty())throw std::invalid_argument("GPU/CPU fabric original device has no UUID");
+                    whole_owner=owner.rank;++matches;
+                }
+            if(matches!=1)throw std::invalid_argument("GPU/CPU fabric requires one exact original GPU UUID/NUMA owner");
+            service_inventory=inventory->getRank(rank);
+            if(rank==whole_owner)requireRankLocalGPUOwnership(service_inventory,device,"GPU/CPU fabric original source");
+        }
         if(joined_service && !device.is_gpu())
             throw std::invalid_argument("Joined prepared service requires disjoint GPUwhole and original CPUcohort");
         if(!hasCPUBackend())initCPUBackend(sockets.at(size_t(rank)).numa_node);
@@ -166,7 +189,7 @@ struct FabricOriginal {
         context=ModelContext::create(file.path(),source);
         if(!context)throw std::runtime_error("CPU cohort fabric original context did not load");
         model=ModelContextId{reinterpret_cast<uint64_t>(context.get())};
-        plan=std::make_shared<const MoERoutedExpertPlacementPlan>(fabricOriginalPlan(sockets,whole_device));
+        plan=std::make_shared<const MoERoutedExpertPlacementPlan>(fabricOriginalPlan(sockets,whole_device,whole_owner));
         const auto runtime=resolveMoEExpertOverlayRuntimePlan(plan,{.current_world_rank=rank,.validate_mvp_root_reachability=false});
         if(!runtime)throw std::runtime_error("CPU cohort fabric original runtime is absent");
         auto& loader=context->concreteLoader();
@@ -214,6 +237,17 @@ struct FabricOriginal {
             else if(charge.device==whole_device)gpu_migration_bytes+=charge.bytes;
             else throw std::runtime_error("Fabric staging introduced a foreign allocator");
         }
+        const auto execution_counts=MoEOverlayCapacityAdmission::executionStreamCounts(*plan,rank,storage.maximum_execution_streams);
+        if(!execution_counts.empty()) {
+            auto demand=std::make_shared<MoEOverlayPhysicalLaneDemandPlan>(configuredMoEOverlayLaneDemand(
+                *plan,manifests,kExperts,MoEOverlayPhysicalLaneScope::communicator(size),
+                storage.maximum_concurrent_cycles,storage.maximum_cycles_per_layer));
+            demand->original_execution_streams=execution_counts;
+            bindOriginalMoEOverlayGpuChoices(*demand,rank,[&](DeviceId accessor,DeviceId allocation) {
+                return originalMoEOverlayDirectedPeerAccess(service_inventory,accessor,allocation);
+            });
+            physical_demand=std::move(demand);
+        }
         const auto capacity=observeSystemMemoryCapacity();
         const PhysicalMemoryResource cpu{rank,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
         PhysicalMemoryPlanBuilder budget;
@@ -255,7 +289,7 @@ struct FabricOriginal {
                 ShmemSpinArena::allocationGeometry(2).mapped_bytes);
         }
 
-        if(whole_device.is_gpu() && rank==0) {
+        if(whole_device.is_gpu() && rank==whole_owner) {
             // The same preparation declares the genuine GPU source owners. GPU
             // upload rings coexist with CPU source/fabric staging and are additive.
             const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(manifests).front();
@@ -273,14 +307,27 @@ struct FabricOriginal {
             if(!backend)throw std::runtime_error("Explicit floating Fabric backend is unavailable");
             const PhysicalMemoryResource gpu{rank,whole_device,backend->deviceMemoryTotal(whole_device.ordinal),
                 backend->deviceMemoryFree(whole_device.ordinal)};
+            // Native movement, even without service calibration, must borrow
+            // the SAME original source which owns the final weights and PMA.
+            const std::array observations{cpu,gpu};
+            const std::array selected{whole_device};
+            service_native_source=NativeContextPreparation::create(observations,rank,selected);
+            service_native_use.emplace(service_native_source->acquire(whole_device));
+            context->bindNativeContextPreparation(service_native_source);
+            service_native_source->freezeForPlanning();
+            for(const auto& row:service_native_source->mandatoryBOM().resources())budget.add(row);
+            for(const auto& [endpoint,count]:execution_counts) {
+                if(endpoint!=whole_device)throw std::invalid_argument("GPU/CPU fixture stream plan introduced a foreign GPU");
+                const auto streams=TransferEngine::persistentTransferExecutionLanesBOM(count,cpu,gpu);
+                for(const auto& row:streams.resources())budget.add(row);
+            }
+            for(const auto& [endpoint,count]:originalMoEOverlayPeerEventCounts(*physical_demand)) {
+                if(endpoint!=whole_device)throw std::invalid_argument("GPU/CPU fixture event plan introduced a foreign GPU");
+                const auto unit=ExpertTierGpuPeerTransferLane::nativeEventsBOM(cpu,gpu,false);
+                for(size_t instance=0;instance<count;++instance)
+                    for(const auto& row:unit.resources())budget.add(row);
+            }
             if(joined_service) {
-                const std::array observations{cpu,gpu};
-                const std::array selected{whole_device};
-                service_native_source=NativeContextPreparation::create(observations,rank,selected);
-                service_native_use.emplace(service_native_source->acquire(whole_device));
-                context->bindNativeContextPreparation(service_native_source);
-                service_native_source->freezeForPlanning();
-                for(const auto& row:service_native_source->mandatoryBOM().resources())budget.add(row);
                 const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu);
                 const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(cpu,gpu);
                 for(const auto& row:general.resources())budget.add(row);
@@ -317,7 +364,7 @@ struct FabricOriginal {
         if(!manager->prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&frozen,nullptr,
             PreparedWeightAdmission::AllocateCompleteSet,preparation))
             throw std::runtime_error("CPU cohort fabric original preparation did not complete");
-        if(whole_device.is_gpu() && rank==0) {
+        if(whole_device.is_gpu() && rank==whole_owner) {
             auto gpu_loading=preparation->filteredForDevice(whole_device).sourceWeightPlan(loader,model);
             const auto gpu_frozen=manager->materialize(gpu_loading);
             if(!manager->prepareMoEExpertOverlayWeights(*runtime,whole_device,&gpu_frozen,nullptr,
@@ -330,14 +377,29 @@ struct FabricOriginal {
         std::string error;
         if(!registry->bindOriginalPreparedContext(context,preparation,&error) ||
             !registry->finalizeInitialBanksFromPreparedRegistry(manager->expertGemmRegistry(),&error))throw std::runtime_error(error);
-        const auto demand=configuredMoEOverlayLaneDemand(*plan,manifests,kExperts,2,1,1);
+        const auto demand=physical_demand?*physical_demand:configuredMoEOverlayLaneDemand(
+            *plan,manifests,kExperts,MoEOverlayPhysicalLaneScope::communicator(size),
+            storage.maximum_concurrent_cycles,storage.maximum_cycles_per_layer);
         remote=std::make_shared<MoEOverlayMPIRemoteProjectionTransport>(MoEOverlayMPIRemoteProjectionTransport::Config{
             .mpi_context=mpi,.lane_budget=remoteMoEOverlayProjectionLaneBudget(demand),
             .staging_capacity_bytes=kStaging,.perf_device="native-cpu-cohort-fabric"});
         fabric=MoEOverlayPhysicalResidencyFabric::create({.memory_authority=memory,.registry=registry,
-            .initial_snapshot=authority->snapshot(),.layer_weight_manifest=manifests,.remote_projection_transport=remote,
+            .initial_snapshot=authority->snapshot(),.physical_gpu_lane_demand=physical_demand,
+            .layer_weight_manifest=manifests,.remote_projection_transport=remote,
             .shadow_slots_per_endpoint_layer=1,.staging_capacity_bytes=kStaging,.maximum_concurrent_cycles=1,
             .maximum_execution_streams=1,.maximum_cycles_per_layer=1,.perf_device="native-cpu-cohort-fabric"});
+        if(physical_demand) {
+            size_t original_events=0;
+            for(const auto& [endpoint,count]:originalMoEOverlayPeerEventCounts(*physical_demand)) {
+                if(endpoint!=whole_device)throw std::logic_error("Physical event materialization introduced a foreign GPU");
+                original_events=checkedMoEOverlayLaneAdd(original_events,count);
+            }
+            if(fabric->stats().direct_gpu_peer_lanes!=original_events)
+                throw std::logic_error("Physical peer event incidence disagrees with the original shared demand");
+            if(!service_native_source || service_native_source->memory()!=memory ||
+                context->nativeContextPreparation()!=service_native_source)
+                throw std::logic_error("Physical GPU fabric lost its original prepared source/PMA");
+        }
         if(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
             PhysicalMemoryMaterializationKind::NewAllocation)!=resident_bytes ||
             memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExpertShadowSlots,
@@ -349,6 +411,47 @@ struct FabricOriginal {
             service_domain=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,*service_program,std::move(use));
             if(!service_domain)throw std::runtime_error("Joined service original CPU domain was not created");
         }
+        } catch(...) {
+            try { retireOriginal(); } catch(const std::exception& error) {
+                std::cerr<<"GPU/CPU fabric cold retirement failed: "<<error.what()<<'\n';std::terminate();
+            }
+            throw;
+        }
+    }
+    /** @brief Retire every actual borrower before the one original native context. */
+    ~FabricOriginal() noexcept {
+        try { retireOriginal(); } catch(const std::exception& error) {
+            std::cerr<<"GPU/CPU fabric original retirement failed: "<<error.what()<<'\n';std::terminate();
+        }
+    }
+    /** @brief Existing joined cleanup also applies to ordinary native physical movement. */
+    void retireOriginal() {
+        if(service_domain) {
+            if(!service_domain->retireOriginalCPUExpertDomain())
+                throw std::runtime_error("GPU/CPU fabric original CPU domain did not retire");
+            service_domain.reset();
+        }
+        fabric.reset();registry.reset();remote.reset();authority.reset();preparation.reset();context.reset();
+        if(service_native_source) {
+            const bool had_worker=service_native_use.has_value();service_native_use.reset();
+            const auto retired=service_native_source->retireReleasedContexts();
+            if(had_worker && retired!=1)throw std::runtime_error("GPU/CPU fabric failed exact original GPU retirement");
+            service_native_source.reset();
+        }
+    }
+    /** @brief Copy only an observed terminal tensor through the retained original worker stream. */
+    void readTerminalWeights(DeviceId device,const void* source,size_t bytes,void* destination) const {
+        if(!service_native_use || service_native_use->device()!=device || service_native_use->memory()!=memory)
+            throw std::invalid_argument("GPU/CPU fabric terminal read lost original device/source/PMA");
+        const auto worker=service_native_use->worker();
+        worker->submitAndWait([&] {
+            auto* backend=getBackendFor(device);void* stream=worker->defaultStream();
+            if(!backend || reinterpret_cast<uintptr_t>(stream)<=2 ||
+                !backend->deviceToHost(destination,source,bytes,device.ordinal,stream) ||
+                !backend->synchronizeStream(stream,device.ordinal)) {
+                std::cerr<<"GPU/CPU fabric exact terminal copy could not retire\n";std::terminate();
+            }
+        });
     }
     /** @return Original authority-authored swap, without publishing any candidate bank. */
     MoEOverlayResidencyTransaction transaction() const {
@@ -515,11 +618,8 @@ void expectDestination(const FabricOriginal& original,const MoEOverlayResidencyT
             // Diagnostic final-byte observation only, after every actual Fabric
             // operation is Ready. This is not a production copy/substitute lane.
             const auto device=destination_device;
-            ScopedGPUStream stream(device);
             downloaded.resize(size_t(bytes.n)*bytes.k);
-            auto* backend=getBackendFor(device);
-            ASSERT_TRUE(backend->deviceToHost(downloaded.data(),bytes.data,bytes.bytes,device.ordinal,stream.get()));
-            ASSERT_TRUE(backend->synchronizeStream(stream.get(),device.ordinal));
+            original.readTerminalWeights(device,bytes.data,bytes.bytes,downloaded.data());
         }
         const auto* values=downloaded.empty()?static_cast<const float*>(bytes.data):downloaded.data();
         for(int row=0;row<owned.rows;++row)for(int column=0;column<owned.columns;++column)
@@ -550,7 +650,7 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketStageDelaysFinalPieceAndExecutesExa
     ASSERT_EQ(transaction.migrations.size(),2u);
     ComponentWave wave(original,transaction);auto* gate=delayLastPiece(wave,original,transaction);ASSERT_TRUE(gate);
     pollComponent(wave,gate);
-    if(original.mpi->rank()==0)
+    if(original.mpi->rank()==original.whole_owner)
         for(size_t index=0;index<wave.prepared.migrations.size();++index)if(transaction.migrations[index].expert_id==2)
             for(const auto& destination:wave.prepared.migrations[index].destination_arrivals) {
                 MoEOverlayPreparedExpertPayload incomplete;std::string error;
@@ -792,7 +892,7 @@ std::vector<FloatingSourceObservation> observeFloatingSources(const FabricOrigin
  * @brief Check every original logical source byte after destination writes complete.
  * @param sources Weak observations: the actual Fabric bank leases must still own them.
  */
-void expectFloatingSourcesUnchanged(const std::vector<FloatingSourceObservation>& sources)
+void expectFloatingSourcesUnchanged(const FabricOriginal& original,const std::vector<FloatingSourceObservation>& sources)
 {
     for(const auto& source:sources) {
         auto engine=source.engine.lock();ASSERT_TRUE(engine);
@@ -803,10 +903,8 @@ void expectFloatingSourcesUnchanged(const std::vector<FloatingSourceObservation>
         ASSERT_EQ(bytes.n,owned.rows);ASSERT_EQ(bytes.k,owned.columns);
         std::vector<float> downloaded;
         if(source.device.is_gpu()) {
-            ScopedGPUStream stream(source.device);downloaded.resize(size_t(bytes.n)*bytes.k);
-            auto* backend=getBackendFor(source.device);
-            ASSERT_TRUE(backend->deviceToHost(downloaded.data(),bytes.data,bytes.bytes,source.device.ordinal,stream.get()));
-            ASSERT_TRUE(backend->synchronizeStream(stream.get(),source.device.ordinal));
+            downloaded.resize(size_t(bytes.n)*bytes.k);
+            original.readTerminalWeights(source.device,bytes.data,bytes.bytes,downloaded.data());
         }
         const auto* values=downloaded.empty()?static_cast<const float*>(bytes.data):downloaded.data();
         for(int row=0;row<bytes.n;++row)for(int column=0;column<bytes.k;++column)
@@ -817,7 +915,7 @@ void expectFloatingSourcesUnchanged(const std::vector<FloatingSourceObservation>
 }
 /**
  * @brief Stage actual floating whole/cohort rectangles in both directions.
- * @param device Exact CUDA/ROCm whole-owner on rank zero; both ranks retain
+ * @param device Exact CUDA/ROCm whole-owner resolved from inventory; both ranks retain
  * their original physical CPU socket/member. No extra GPU-only rank exists.
  *
  * Gate/up split F rows and down splits K columns. Full destination-byte checks
@@ -836,7 +934,7 @@ void proveFloatingGPUCohort(DeviceId device)
     auto* gate=delayLastPiece(wave,original,transaction);ASSERT_TRUE(gate);
     pollComponent(wave,gate);
     // A finalized prefix cannot satisfy the complete destination triplet.
-    if(original.mpi->rank()==0)
+    if(original.mpi->rank()==original.whole_owner)
         for(size_t index=0;index<wave.prepared.migrations.size();++index)
             if(transaction.migrations[index].expert_id==2)
                 for(const auto& destination:wave.prepared.migrations[index].destination_arrivals) {
@@ -861,7 +959,7 @@ void proveFloatingGPUCohort(DeviceId device)
     for(size_t index=0;index<wave.prepared.migrations.size();++index)
         for(const auto& destination:wave.prepared.migrations[index].destination_arrivals)
             expectDestination(original,transaction,index,destination);
-    expectFloatingSourcesUnchanged(sources);
+    expectFloatingSourcesUnchanged(original,sources);
     for(const auto& migration:wave.prepared.migrations)
         for(const auto& piece:migration.operations) {
             SCOPED_TRACE("rank="+std::to_string(original.mpi->rank())+
@@ -904,7 +1002,7 @@ void proveFloatingGPUCohort(DeviceId device)
     original.context.reset();manager.reset();
     for(const auto& source:sources)EXPECT_TRUE(source.engine.expired());
     for(const auto allocator:{DeviceId::cpu(),device}) {
-        if(allocator.is_gpu() && original.mpi->rank()!=0)continue; // Remote GPU is not a local PMA resource.
+        if(allocator.is_gpu() && original.mpi->rank()!=original.whole_owner)continue; // Remote GPU is not a local PMA resource.
         EXPECT_EQ(original.memory->claimedBytes(allocator,PhysicalMemoryOwner::RoutedExpertWeights,
             PhysicalMemoryMaterializationKind::NewAllocation),0u);
         EXPECT_EQ(original.memory->claimedBytes(allocator,PhysicalMemoryOwner::ExpertShadowSlots,

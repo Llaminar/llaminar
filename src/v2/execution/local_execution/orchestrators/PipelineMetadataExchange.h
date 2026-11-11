@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "PipelineNativeDomain.h"
+#include "PipelineNativeByteChannel.h"
 
 #include "execution/compute_stages/IComputeStage.h"
 #include "collective/ILocalTPContext.h"
@@ -26,7 +27,7 @@ class PipelineMetadataLayout final
 {
 public:
     /** @brief Exactly the metadata families consumed by captured pipeline graphs. */
-    enum class Kind : uint8_t { Condition = 1, Verifier, CommittedState, NextToken };
+    enum class Kind : uint8_t { Condition = 1, Verifier, CommittedState, NextToken, CommittedStateWithMoERounds };
     /** @brief Validate a semantic family and its physical row extent.
      * @param kind Terminal-produced family; no sampler/controller payload is allowed.
      * @param rows Physical verifier rows, or one for every scalar family. */
@@ -72,11 +73,18 @@ public:
     /** @brief Bind this original owner through the canonical transfer authority. */
     CapturedTransferBinding bind(TransferEngine &transfer, std::shared_ptr<CapturedTransferChannel> channel,
         CapturedTransferEndpoint endpoint, CapturedTransferMessage message) const;
+    /** @brief Retain this exact original field behind its typed native byte endpoint.
+     * @param channel Original native directed edge. @param participant Exact native coordinate.
+     * @param message Exact semantic field geometry. @return Binding retaining the same physical bank.
+     */
+    PipelineNativeByteBinding bindNative(std::shared_ptr<PipelineNativeByteChannel> channel,
+        int participant, CapturedTransferMessage message) const;
     /** @brief Prepare native broadcast output on the exact stream, without allocation. */
     void requireOutput(void *stream) const;
     /** @brief Publish native broadcast completion on the same explicit stream. */
     void publishOutput(void *stream) const;
 private:
+    friend class PipelineForwardGraphEdges; ///< Closed publication proof verifies the original owner and exact received subrange.
     /** @brief Validate positive, aligned, non-overflowing subregion geometry. */
     void validateGeometry(size_t available) const;
     std::variant<std::shared_ptr<TensorBase>, std::shared_ptr<const WorkspaceBufferLease>> owner_;
@@ -91,11 +99,12 @@ private:
 class PipelineMetadataExchange final : public IComputeStage
 {
 public:
-    /** @brief Native pipeline-wide broadcast; terminal is the last participant. */
+    /** @brief Native pipeline-wide broadcast from the explicit terminal vocabulary authority. */
     struct Native
     {
         ILocalTPContext &context;
         int participant;
+        int root = -1; ///< Explicit original vocabulary authority; negative preserves singleton legacy root.
     };
     /**
      * @brief Reverse-domain chain carrying only terminal-authored metadata.
@@ -111,6 +120,8 @@ public:
         int participant = 0;
         std::shared_ptr<CapturedTransferChannel> inbound;
         std::shared_ptr<CapturedTransferChannel> outbound;
+        std::shared_ptr<PipelineNativeByteChannel> native_inbound, native_outbound;
+        int native_participant = -1;
     };
     /** @brief Retain the existing homogeneous metadata protocol and exact local pointers. */
     PipelineMetadataExchange(DeviceId device, PipelineMetadataLayout layout, Native native,
@@ -139,6 +150,8 @@ public:
     CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
     /** @return Exact arena reads/writes for normal executor-owned capture dependency planning. */
     StageBufferContract bufferContract() const override;
+    /** @return Exact original incoming banks; empty for local/outbound-only metadata. */
+    std::span<const PipelineMetadataBank> receivedBanks() const noexcept;
     /** @return Immutable geometry only; never downloads model or controller state. */
     StageDumpInfo buildDumpInfoImpl() const override;
 private:
@@ -150,12 +163,13 @@ private:
         std::vector<CapturedTransferBinding> inbound;
         std::vector<CapturedTransferBinding> outbound;
         TransferEngine *transfer;
+        std::vector<PipelineNativeByteBinding> native_inbound, native_outbound;
     };
     /** @brief Reject foreign or changed native membership before any native submission. */
     void validateMembership() const;
     PipelineMetadataLayout layout_;
     std::variant<Native, DomainBinding> transport_;
-    std::array<LocalTPCollectiveSidebandBuffer, 4> fields_{};
+    std::array<LocalTPCollectiveSidebandBuffer, 7> fields_{}; ///< Maximum semantic schema fields, independent of participant count.
     PipelineNativeDomain membership_;
 };
 }

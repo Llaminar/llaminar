@@ -187,8 +187,8 @@ class HistoryReplaySelection:
                  _tokens(text, 'decode_tokens')[:len(expected)] == expected,
                  'Frozen full-stage reference prompt or D+1 teacher IDs differ')
 
-    def require_binding(self, artifact_directories):
-        """Require the actual fixture's projection receipt in its original output."""
+    def require_binding(self, artifact_directories, declaration=None):
+        """Require the actual fixture receipt and its original discovered declaration."""
         expected = dict(schema='llaminar.model-kld-history-binding.v1', descriptor_sha256=self.sha256,
             **{key:self.descriptor[key] for key in ('canonical_cell', 'history_id', 'source_digest',
                 'full_stage_metadata_digest', 'prompt', 'prompt_ids', 'continuation_ids',
@@ -200,9 +200,13 @@ class HistoryReplaySelection:
         geometry_path = Path(artifact_directories[0]) / 'history_replay_prefill_geometry.json'
         _, raw = _sha(geometry_path, MAXIMUM_DESCRIPTOR_BYTES)
         geometry = json.loads(raw)
+        config = self.descriptor['expected_config']['configuration']
+        observed_pipeline = ((declaration or {}).get('runtime', {}).get('configuration_policy') ==
+                             'observed_pipeline_binding_required_v1')
         fixed = dict(schema='llaminar.model-kld-history-prefill-geometry.v1',
                      descriptor_sha256=self.sha256, canonical_cell=self.descriptor['canonical_cell'],
-                     history_id=self.descriptor['history_id'], capture_mode='production_serving_ladder',
+                     history_id=self.descriptor['history_id'],
+                     capture_mode='production_exact_retained' if observed_pipeline else 'production_serving_ladder',
                      logical_rows=len(self.descriptor['prompt_ids']))
         _require(type(geometry) is dict and all(geometry.get(k) == v for k, v in fixed.items()),
                  'Actual fixture omitted its frozen production-serving geometry identity')
@@ -215,14 +219,17 @@ class HistoryReplaySelection:
                  buckets == sorted(set(buckets)) and type(floor) is int and floor > 0 and
                  type(physical) is int and type(native) is bool and type(observed) is bool and native == observed,
                  'Actual fixture has incomplete production-serving replay geometry')
-        selected = next((n for n in buckets if n >= len(self.descriptor['prompt_ids'])), None)
-        _require(selected is not None and (physical == selected if native else physical == len(self.descriptor['prompt_ids'])),
-                 'Actual fixture replayed a different physical bucket from its declared serving ladder')
+        if observed_pipeline:
+            self._require_exact_pipeline_geometry(Path(artifact_directories[0]), declaration, config, geometry)
+        else:
+            selected = next((n for n in buckets if n >= fixed['logical_rows']), None)
+            _require(selected is not None and (physical == selected if native else physical == fixed['logical_rows']),
+                     'Actual fixture replayed a different physical bucket from its declared serving ladder')
 
         from model_kld_corpus import physical_workers
         cpu = geometry.get('cpu_execution')
-        workers = self.descriptor['expected_config'].get('configuration', {}).get('n_threads')
-        participants = self.descriptor['expected_config']['configuration']['mpi_procs']
+        workers = config.get('n_threads')
+        participants = config['mpi_procs']
         _require(type(cpu) is dict and type(workers) is int and workers > 0 and
                  cpu.get('requested_workers') == workers and cpu.get('max_workers') == workers and
                  cpu.get('dynamic') is False and cpu.get('unbound') is True and cpu.get('places') == 'cores' and
@@ -236,7 +243,10 @@ class HistoryReplaySelection:
                  (not cpu['cpu_compute_required'] or cpu['parallel_work_observed']),
                  'Frozen replay did not prove the declared workers and original unbound CPU resources')
 
-        if participants > 1:
+        if observed_pipeline:
+            _require(cpu['cpu_compute_required'] is False,
+                     'Frozen fixed pipeline CPU resources must belong to its selected GPU scheduler')
+        elif participants > 1:
             masks = []; sockets = set(); nodes = set()
             for rank in range(participants):
                 _, raw = _sha(Path(artifact_directories[0]) / f'history_replay_cpu_rank_{rank}.json', MAXIMUM_DESCRIPTOR_BYTES)
@@ -267,6 +277,34 @@ class HistoryReplaySelection:
                 masks.append(set(mask))
                 if rank == 0:
                     _require(observed_cpu == cpu, 'Frozen history root resource record differs from measured prefill')
+
+    def _require_exact_pipeline_geometry(self, directory, declaration, config, geometry):
+        """Join real retained replay rows to the canonical original owner and all participant receipts."""
+        from model_parity_inventory import bind_observed_pipeline_artifacts
+        bound = bind_observed_pipeline_artifacts(self.descriptor['canonical_cell'], declaration, directory)
+        binding = bound['observed_pipeline_binding']
+        bound_config = bound['runtime']['configuration_document']['configuration']
+        ownership_fields = ('mpi_procs', 'execution_rank_selection', 'pp_stage_definitions',
+                            'domain_definitions', 'ngram_table_policy')
+        _require(all(key in config and config[key] == bound_config.get(key) for key in ownership_fields),
+                 'Frozen exact pipeline changed its original selected ownership configuration')
+        native_devices = sorted({'cuda': 'CUDA', 'rocm': 'ROCm'}[entry['backend']] + ':' + str(entry['ordinal'])
+                                for entry in binding['participants'])
+        logical = len(self.descriptor['prompt_ids'])
+        chunks = geometry.get('chunks')
+        _require(geometry['minimum_rows'] == 1 and geometry['bucket_rows'][0] == 1 and
+                 geometry['physical_rows'] == logical and geometry['native_replay_required'] is True and
+                 geometry.get('native_devices') == native_devices and type(chunks) is list and bool(chunks),
+                 'Frozen exact pipeline lacks complete original native participants or live geometry')
+        cursor = 0
+        for chunk in chunks:
+            _require(type(chunk) is dict and set(chunk) == {'token_offset', 'logical_rows', 'physical_rows'} and
+                     all(type(value) is int for value in chunk.values()) and chunk['token_offset'] == cursor and
+                     chunk['logical_rows'] == chunk['physical_rows'] and
+                     chunk['logical_rows'] in geometry['bucket_rows'],
+                     'Frozen exact pipeline reported a padded, missing or unordered native chunk')
+            cursor += chunk['logical_rows']
+        _require(cursor == logical, 'Frozen exact pipeline did not cover the complete original prompt')
 
     def bind(self, artifact_root):
         """Publish an exact immutable handoff beside the original campaign artifacts."""

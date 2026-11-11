@@ -10,6 +10,7 @@
 #pragma once
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "collective/ILocalTPContext.h"
+#include "collective/IGlobalTPContext.h"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -111,6 +112,7 @@ public:
      * @param cpu_ownership Explicit colocated CPU ownership by the continuation root.
      * @return The same source-bound scope used by materialization and graph lookup.
      * @throws std::invalid_argument For stale TP indices or absent/ambiguous endpoints.
+     * @note CPU NodeTP validates both the stage-local index and original parent rank.
      */
     static MoEExpertOverlayGraphScope resolveForTPParticipant(
         const MoEExpertOverlayRuntimePlan &runtime, DeviceId device, const ITPContext *context,
@@ -123,6 +125,36 @@ public:
             if (participant < 0 || static_cast<size_t>(participant) >= local.devices().size())
                 throw std::invalid_argument("ExpertOverlay graph scope has a stale LocalTP participant index");
             endpoint = local.devices()[participant];
+        }
+        else if (context && device.is_cpu())
+        {
+            const auto& continuation = runtime.continuationDomain();
+            if (continuation.scope == ExecutionDomainScope::NODE_LOCAL &&
+                continuation.participants.size() > 1 &&
+                std::all_of(continuation.participants.begin(), continuation.participants.end(),
+                    [](const auto& member) { return member.address.isCPU(); }))
+            {
+                const auto* global = dynamic_cast<const IGlobalTPContext*>(context);
+                if (!global || participant < 0 || participant != global->myIndex() ||
+                    static_cast<std::size_t>(participant) >= continuation.participants.size() ||
+                    global->degree() != static_cast<int>(continuation.participants.size()) ||
+                    global->worldRanks().size() != continuation.participants.size())
+                    throw std::invalid_argument("ExpertOverlay CPU graph scope has a stale original NodeTP index");
+
+                // The index names one ordered member of the dense split. The
+                // runtime uses parent ranks to own sparse sources; neither
+                // coordinate can stand in for the other on CPU0 storage.
+                for (std::size_t index = 0; index < continuation.participants.size(); ++index)
+                {
+                    const auto& member = continuation.participants[index];
+                    if (!member.world_rank_known || member.world_rank != global->worldRanks()[index])
+                        throw std::invalid_argument("ExpertOverlay CPU graph scope changed original NodeTP membership");
+                }
+                const auto& member = continuation.participants[participant];
+                if (member.world_rank != runtime.currentWorldRank() || member.address != global->localDevice())
+                    throw std::invalid_argument("ExpertOverlay CPU graph scope changed its original rank/NUMA endpoint");
+                endpoint = member.address;
+            }
         }
         return resolve(runtime, device, std::move(endpoint), cpu_ownership);
     }

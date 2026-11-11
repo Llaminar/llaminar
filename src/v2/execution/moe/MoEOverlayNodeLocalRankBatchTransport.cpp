@@ -8,11 +8,15 @@
  */
 
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
+#include "MoEOverlayActivationBatchResources.h"
+#include "transfer/TransferEngine.h"
 #include "MoECPUExpertShardReturnRole.h"
 #include "MoEOverlaySharedBackingStartup.h"
 #include "MoEOverlayRankBatchTelemetry.h"
 
 #include "backends/BackendManager.h"
+#include "backends/NativeContextPreparation.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
 #include "interfaces/IMPITopology.h"
@@ -536,6 +540,54 @@ namespace llaminar2
         return result;
     }
 
+    WorkspaceRequirements MoEOverlayActivationBatchStorage::workspaceRequirements(std::size_t bytes)
+    {
+        if(!bytes)throw std::invalid_argument("Batch workspace requires positive actual storage");
+        WorkspaceRequirements result;
+        result.buffers.emplace_back("activation_batch_storage",bytes,256,true,
+            WorkspaceExecutionRegime::Any,WorkspaceContentLifetime::SerialGraphFamily);
+        return result;
+    }
+    CPUTensorStorageDeclaration MoEOverlayActivationBatchStorage::uploadDeclaration(std::size_t bytes)
+    {
+        if(!bytes || bytes%sizeof(std::int32_t))throw std::invalid_argument("Batch upload requires whole native INT32 words");
+        return {1,bytes/sizeof(std::int32_t),BufferTensorType::INT32,PhysicalMemoryOwner::ActivationTransportStaging,DeviceId::cpu()};
+    }
+    MoEOverlayActivationBatchStorage::MoEOverlayActivationBatchStorage(Config config):config_(std::move(config))
+    {
+        if(!config_.physical_memory_authority || !config_.context_resources || !config_.device.is_gpu() ||
+           config_.identity.empty() || config_.shape.empty() || isGraphCaptureActive())
+            throw std::invalid_argument("Batch storage requires original cold PMA/context/geometry");
+        config_.context_resources->requireOriginalMemory(config_.physical_memory_authority);
+        std::size_t words=1;
+        for(const auto extent:config_.shape){
+            if(!extent || extent>std::numeric_limits<std::size_t>::max()/words)throw std::overflow_error("Batch storage shape overflow");
+            words*=extent;
+        }
+        if(words>std::numeric_limits<std::size_t>::max()/sizeof(std::int32_t))throw std::overflow_error("Batch storage byte overflow");
+        bytes_=words*sizeof(std::int32_t);
+        const auto declaration=workspaceRequirements(bytes_);
+        workspace_=std::make_unique<DeviceWorkspaceManager>(config_.device,declaration.total_bytes_with_alignment(),
+            config_.physical_memory_authority,PhysicalMemoryOwner::ActivationTransportStaging);
+        if(!workspace_->allocate(declaration))throw std::runtime_error("Batch workspace materialization failed");
+        lease_=workspace_->retainBuffer("activation_batch_storage",0,bytes_);
+        if(config_.immutable_input)upload_=uploadDeclaration(bytes_).materialize(config_.physical_memory_authority);
+    }
+    MoEOverlayActivationBatchStorage::~MoEOverlayActivationBatchStorage()=default;
+    bool MoEOverlayActivationBatchStorage::publishImmutableBytes(const void* source,std::size_t bytes,void* stream)
+    {
+        if(!config_.immutable_input || !source || bytes!=bytes_ || !upload_ || reinterpret_cast<std::uintptr_t>(stream)<=2)return false;
+        if(published_)return std::memcmp(upload_->raw_data(),source,bytes)==0;
+        std::memcpy(upload_->raw_mutable_data(),source,bytes);
+        TransferEngine::instance().initializeWorkspaceMetadata(*lease_,
+            std::span(static_cast<const std::byte*>(upload_->raw_data()),bytes),stream,*config_.context_resources);
+        published_=true;return true;
+    }
+    bool MoEOverlayActivationBatchStorage::requireInput(void* stream)const
+    {return config_.immutable_input && published_ && lease_ && reinterpret_cast<std::uintptr_t>(stream)>2;}
+    bool MoEOverlayActivationBatchStorage::requireOutput(void* stream)const
+    {return !config_.immutable_input && lease_ && reinterpret_cast<std::uintptr_t>(stream)>2;}
+
     MoEOverlayPersistentGraphStorage::MoEOverlayPersistentGraphStorage(
         Config config)
         : config_(std::move(config))
@@ -687,157 +739,65 @@ namespace llaminar2
     /**
      * @brief Own one endpoint-private grant at a stable CPU or GPU address.
      *
-     * Construction is setup-only. TransferEngine publishes the zero generation
-     * asynchronously on a persistent setup stream, and one persistent event
-     * carries that edge into every stage-zero packet stream. The tensor, stream,
-     * and event remain alive until every retained executable referencing the
-     * grant has been destroyed; no host or stream synchronization is required.
+     * Construction is setup-only. TransferEngine completes zero initialization
+     * on the actual original worker setup stream using its separate admitted
+     * cold-publication event. Every grant keeps a distinct stable workspace
+     * lease and exact CPU upload root. No per-family queues are created and no
+     * inference-time reset uses this cold publication stream/event.
      */
     class MoEOverlayNodeLocalRankBatchTransport::DeviceGrantStorage final
     {
     public:
-        /** @brief Allocate one grant for an exact lane/family/device identity. */
-        DeviceGrantStorage(
-            DeviceId device,
-            int participant_id,
-            size_t graph_family_ordinal)
-            : device_(device),
-              participant_id_(participant_id),
-              graph_family_ordinal_(graph_family_ordinal)
+        /** @brief Allocate one exact lane/family grant under the original authority. */
+        DeviceGrantStorage(DeviceId device,int participant_id,size_t family,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+            :device_(device),participant_id_(participant_id),graph_family_ordinal_(family)
         {
-            if (!device_.is_valid() || participant_id_ < 0)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay device grant requires a valid endpoint and payload identity");
-            }
-            if (device_.is_gpu())
-            {
-                constexpr size_t words =
-                    sizeof(MoEOverlayActivationDeviceEpochGrant) /
-                    sizeof(std::int32_t);
-                static_assert(
-                    words * sizeof(std::int32_t) ==
-                    sizeof(MoEOverlayActivationDeviceEpochGrant));
-                gpu_storage_ =
-                    std::make_unique<INT32Tensor>(std::vector<size_t>{words});
-                std::memset(
-                    gpu_storage_->raw_mutable_data(),
-                    0,
-                    sizeof(MoEOverlayActivationDeviceEpochGrant));
-
-                /*
-                 * Stage zero ordinarily overwrites the complete grant, but its
-                 * monotonic generation is also the device-side anti-ABA cursor
-                 * for overlapping retained submissions. Establish the initial
-                 * Idle/zero generation through TransferEngine before any graph
-                 * can embed the address. The persistent event carries that
-                 * publication into each exact packet stream; inference never
-                 * blocks the host or transfers grant bytes back to it.
-                 */
-                backend_ = getBackendFor(device_);
-                device_ordinal_ = device_.gpu_ordinal();
-                setup_stream_ = backend_
-                                    ? backend_->createStream(device_ordinal_)
-                                    : nullptr;
-                initialization_event_ = backend_
-                                            ? backend_->createEvent(
-                                                  device_ordinal_)
-                                            : nullptr;
-                if (!backend_ || !setup_stream_ || !initialization_event_)
-                {
-                    releaseAsyncResources();
-                    throw std::runtime_error(
-                        "ExpertOverlay device grant could not create its asynchronous setup edge");
-                }
-                try
-                {
-                    TransferEngine::prepareDeviceInput(
-                        gpu_storage_.get(), device_, setup_stream_);
-                    if (!backend_->recordEvent(
-                            initialization_event_,
-                            device_ordinal_,
-                            setup_stream_))
-                    {
-                        throw std::runtime_error(
-                            "ExpertOverlay device grant initialization event was not recorded");
-                    }
-                }
-                catch (...)
-                {
-                    releaseAsyncResources();
-                    throw;
-                }
-                grant_ = static_cast<MoEOverlayActivationDeviceEpochGrant *>(
-                    gpu_storage_->gpu_data_ptr());
-            }
-            else
-            {
-                cpu_storage_ =
-                    std::make_unique<MoEOverlayActivationDeviceEpochGrant>();
-                grant_ = cpu_storage_.get();
-            }
-            if (!grant_)
-            {
-                throw std::runtime_error(
-                    "ExpertOverlay device grant allocation returned a null address");
-            }
+            if(!memory || !device.is_valid() || participant_id<0)
+                throw std::invalid_argument("Activation grant requires its original physical authority and exact lane identity");
+            upload_=MoEOverlayActivationBatchResources::grantUploadDeclaration().materialize(memory);
+            if(device.is_gpu()){
+                original_=std::make_unique<PreparedGPUContextUsePermit>(
+                    GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory));
+                resources_=original_->worker()->prepareBatchCaptureDependencies(0,0,*original_);
+                const auto declaration=MoEOverlayActivationBatchStorage::workspaceRequirements(sizeof(MoEOverlayActivationDeviceEpochGrant));
+                workspace_=std::make_unique<DeviceWorkspaceManager>(device,declaration.total_bytes_with_alignment(),memory,
+                    PhysicalMemoryOwner::ActivationTransportStaging);
+                if(!workspace_->allocate(declaration))throw std::runtime_error("Activation grant original workspace materialization failed");
+                lease_=workspace_->retainBuffer("activation_batch_storage",0,sizeof(MoEOverlayActivationDeviceEpochGrant));
+                // This stream has no runtime/reset user: only the original
+                // constructor zeroed the grant. Use the actual prepared setup
+                // stream and retain the separate context publication event.
+                // Its exact copy completes before any graph can embed a grant;
+                // no per-family queue/event creator or hot synchronization is introduced.
+                original_->worker()->submitAndWait([&]{
+                    auto* stream=original_->worker()->defaultStream();
+                    TransferEngine::instance().initializeWorkspaceMetadata(*lease_,
+                        std::span(static_cast<const std::byte*>(upload_->raw_data()),sizeof(MoEOverlayActivationDeviceEpochGrant)),
+                        stream,*resources_);
+                });
+                grant_=static_cast<MoEOverlayActivationDeviceEpochGrant*>(lease_->data());
+            }else grant_=reinterpret_cast<MoEOverlayActivationDeviceEpochGrant*>(upload_->raw_mutable_data());
+            if(!grant_)throw std::runtime_error("Activation grant materialized no original address");
         }
-
-        /** @brief Retire persistent setup ordering after all graph users drain. */
-        ~DeviceGrantStorage()
-        {
-            releaseAsyncResources();
+        /** @brief Workspace/CPU roots retire only after all graph users are gone. */
+        ~DeviceGrantStorage()=default;
+        /** @return Whether this is the exact originally declared lane/family. */
+        bool matches(DeviceId device,int participant,size_t family)const noexcept{
+            return device==device_ && participant==participant_id_ && family==graph_family_ordinal_;
         }
-
-        /** @return Whether this owner exactly matches a requested lane. */
-        [[nodiscard]] bool matches(
-            DeviceId device,
-            int participant_id,
-            size_t graph_family_ordinal) const noexcept
-        {
-            return device_ == device && participant_id_ == participant_id &&
-                   graph_family_ordinal_ == graph_family_ordinal;
-        }
-
-        /** @return Stable endpoint-local address embedded during graph capture. */
-        [[nodiscard]] MoEOverlayActivationDeviceEpochGrant *grant() const noexcept
-        {
-            return grant_;
-        }
-
-        /** @return Persistent event publishing the complete zero grant. */
-        [[nodiscard]] void *initializationEvent() const noexcept
-        {
-            return initialization_event_;
-        }
-
+        /** @return Exact backend-local mutable request authority. */
+        MoEOverlayActivationDeviceEpochGrant* grant()const noexcept{return grant_;}
+        /** @return Completed cold publication event; CPU participants have no GPU edge. */
+        void* initializationEvent()const noexcept{return resources_?resources_->coldPublicationEvent():nullptr;}
     private:
-        /** @brief Release setup-only stream/event ownership without waiting. */
-        void releaseAsyncResources() noexcept
-        {
-            if (backend_ && initialization_event_)
-            {
-                backend_->destroyEvent(
-                    initialization_event_, device_ordinal_);
-            }
-            if (backend_ && setup_stream_)
-                backend_->destroyStream(setup_stream_, device_ordinal_);
-            initialization_event_ = nullptr;
-            setup_stream_ = nullptr;
-            backend_ = nullptr;
-            device_ordinal_ = -1;
-        }
-
-        DeviceId device_ = DeviceId::invalid(); ///< Exact allocation device.
-        int participant_id_ = -1; ///< Logical packet lane.
-        size_t graph_family_ordinal_ = 0u; ///< Main/MTP graph family.
-        IBackend *backend_ = nullptr; ///< Exact setup event/stream backend.
-        int device_ordinal_ = -1; ///< Backend-local grant device.
-        void *setup_stream_ = nullptr; ///< Persistent async initialization stream.
-        void *initialization_event_ = nullptr; ///< Zero-generation publication.
-        std::unique_ptr<INT32Tensor> gpu_storage_; ///< Canonical GPU allocation owner.
-        std::unique_ptr<MoEOverlayActivationDeviceEpochGrant> cpu_storage_; ///< CPU authority.
-        MoEOverlayActivationDeviceEpochGrant *grant_ = nullptr; ///< Stable captured address.
+        DeviceId device_;int participant_id_;size_t graph_family_ordinal_;
+        std::unique_ptr<PreparedGPUContextUsePermit> original_;
+        std::shared_ptr<GPUCaptureDependencyRoster> resources_;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+        std::shared_ptr<const WorkspaceBufferLease> lease_;
+        std::unique_ptr<TensorBase> upload_;
+        MoEOverlayActivationDeviceEpochGrant* grant_=nullptr;
     };
 
     std::vector<MoEOverlayActivationGraphFamilyManifest>
@@ -936,6 +896,17 @@ namespace llaminar2
                     "Node-local MoE channel runtime geometry disagrees with its admitted mapping layout");
             }
             layout_ = config.activation_layout;
+            const auto rank=config.mpi_ctx->rank();
+            std::size_t owned=rank==config.source_world_rank?layout_.sourceOwnedBytes():0;
+            if(rank==config.target_world_rank){
+                if(layout_.targetOwnedBytes()>std::numeric_limits<std::size_t>::max()-owned)
+                    throw std::overflow_error("Activation mapping first-touch bytes overflow");
+                owned+=layout_.targetOwnedBytes();
+            }
+            if(!config.physical_memory_authority || !owned)
+                throw std::invalid_argument("Activation mapping requires original first-touch memory ownership");
+            owned_mapping_claim_.emplace(config.physical_memory_authority->claimNewAllocation(
+                DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,owned));
             try { mapOrCreate(config); }
             catch(...) {
                 if(base_) { ::munmap(base_,layout_.mapping_bytes);base_=nullptr; }
@@ -1543,6 +1514,7 @@ namespace llaminar2
         MoEOverlayNodeLocalActivationLayout layout_;
         uint64_t channel_hash_ = 0;
         std::string shm_name_;
+        std::optional<PhysicalMemoryAllocationLease> owned_mapping_claim_; ///< Original physical pages, released after munmap.
         MPISessionOwner::SharedFile file_;
         void *base_ = nullptr;
         SharedChannelHeader *header_ = nullptr;
@@ -1626,7 +1598,8 @@ namespace llaminar2
                 static_cast<size_t>(
                     std::numeric_limits<std::uint32_t>::max()) ||
             !config_.activation_layout.valid() ||
-            config_.local_lanes.empty())
+            config_.local_lanes.empty() || !config_.physical_memory_authority ||
+            config_.physical_memory_authority->worldRank()!=config_.mpi_ctx->rank())
         {
             throw std::invalid_argument(
                 "Node-local MoE rank-batch transport requires a complete rank, topology, and geometry contract");
@@ -1709,7 +1682,8 @@ namespace llaminar2
                     std::make_unique<DeviceGrantStorage>(
                         lane.device,
                         lane.participant_id,
-                        family));
+                        family,
+                        config_.physical_memory_authority));
             }
         }
         dispatch_ledger_.resize(config_.transaction_slot_count);

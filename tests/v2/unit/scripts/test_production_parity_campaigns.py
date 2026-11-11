@@ -48,12 +48,14 @@ campaigns = load_campaign_module("production_parity_campaigns")
 
 
 def native_mpi_helper_target() -> str:
-    """Import the build-owned process helper into a metadata-only CMake fixture.
+    """Import the real selection policy and process helper into a CMake fixture.
 
     The installed runner carries this CPU-only executable, so these Unit tests
-    need neither a compiler nor another implementation of the launch policy.
+    need neither a compiler nor another implementation of registration or
+    launch policy. The extracted add_v2_test retains its actual selector call.
     """
-    return f'include("{REPO_ROOT}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
+    return (f'include("{REPO_ROOT}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
+            f'include("{REPO_ROOT}/tests/v2/cmake/V2TestTargetSelection.cmake")\n')
 
 
 def production_parity_sources_without_typed_expansion(repo_root: Path) -> list[str]:
@@ -860,7 +862,9 @@ class PreflightIndexSelectionTests(unittest.TestCase):
             (root / "new-tests.cmake").write_text((build / "CTestTestfile.cmake").read_text())
             self.write_inventory(build, [("V2_Unit_Actual", False), ("V2_Integration_Old", True), ("V2_Model_Excluded", False)])
             with mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None):
-                code, _, names = campaigns.run_production_test_preflight(build, 20)
+                preflight_result = campaigns.run_production_test_preflight(build, 20)
+                code = preflight_result.return_code
+                names = preflight_result.tests
             self.assertEqual(code, 0)
             self.assertEqual(names, ("V2_Unit_Actual", "V2_Integration_Added", "V2_Integration_New"))
             executed = [json.loads(line) for line in (build / "executed.jsonl").read_text().splitlines()]
@@ -1330,6 +1334,588 @@ class ProductionParityCampaignTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
             campaigns.discover_production_test_preflight_tests(Path("build"))
 
+    def test_directed_peer_optional_geometry_uses_original_complete_asymmetric_facts(self):
+        """One original directed edge suffices; absent observations never mean false."""
+        row = campaigns.PreflightRegistration("V2_Integration_DirectedPeer", frozenset(
+            ("HardwareOptional", "CUDA", "Devices2", "DirectedPeerEdge")), 2,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[row.name]
+        self.assertEqual(requirement["peer_access"], "directed-edge")
+        def hardware(nodes=(0, 0), available=(False, False)):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks",
+                "devices": [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (0, 1)] +
+                    [{"backend": "cuda", "ordinal": i, "numa_node": node} for i, node in enumerate(nodes)],
+                "directed_peer_access": [{"backend": "cuda", "accessor": a, "peer": b, "available": value}
+                    for (a, b), value in zip(((0, 1), (1, 0)), available)]}
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware()))
+        for direction in ((True, False), (False, True)):
+            self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, hardware(available=direction)))
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement,
+            hardware(nodes=(0, 1), available=(True, True))))
+        missing_cpu = hardware(available=(True, False)); missing_cpu["devices"].pop(1)
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, missing_cpu))
+        unknown_cpu = hardware(available=(True, False)); unknown_cpu["devices"][1]["numa_node"] = -1
+        with self.assertRaisesRegex(ValueError, "identity"):
+            campaigns.optional_native_cohort_absence(requirement, unknown_cpu)
+        for mutate in (lambda h: h.pop("directed_peer_access"),
+                       lambda h: h["directed_peer_access"].pop(),
+                       lambda h: h["directed_peer_access"].append(dict(h["directed_peer_access"][0])),
+                       lambda h: h["directed_peer_access"][0].update(peer=99),
+                       lambda h: h["directed_peer_access"][0].update(peer=0)):
+            malformed = hardware(); mutate(malformed)
+            with self.assertRaisesRegex(ValueError, "peer"):
+                campaigns.optional_native_cohort_absence(requirement, malformed)
+        later = hardware()
+        later["devices"] += [{"backend": "cuda", "ordinal": i, "numa_node": 1} for i in (2, 3)]
+        later["directed_peer_access"] = [{"backend": "cuda", "accessor": a, "peer": b,
+            "available": a == 3 and b == 2} for a in range(4) for b in range(4) if a != b]
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, later))
+        for changed in ({"degree": 1}, {"mpi_ranks": 0}, {"peer_access": "clique"},
+                        {"locality": "two-distinct-numa-local-ranks"}):
+            with self.assertRaises(ValueError):
+                campaigns.validate_optional_native_cohort_requirement({**requirement, **changed})
+        campaigns.validate_optional_native_cohort_requirement({**requirement, "degree": 3, "mpi_ranks": 1})
+
+    def test_no_peer_pair_requires_two_original_absent_directions_and_one_owner(self):
+        """No native edge is disabled: qualify only an observed bidirectionally absent pair."""
+        row = campaigns.PreflightRegistration("V2_Integration_NoPeerPair", frozenset(
+            ("HardwareOptional", "CUDA", "Devices2", "NoDirectedPeerPair")), 2,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[row.name]
+        self.assertEqual(requirement["peer_access"], "no-directed-pair")
+        def hardware(available=(False, False), nodes=(0, 0)):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks",
+                "devices": [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (0, 1)] +
+                    [{"backend": "cuda", "ordinal": ordinal, "numa_node": node}
+                     for ordinal, node in zip((3, 9), nodes)],
+                "directed_peer_access": [{"backend": "cuda", "accessor": a, "peer": b, "available": value}
+                    for (a, b), value in zip(((3, 9), (9, 3)), available)]}
+        original = hardware()
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, original))
+        reordered = hardware()
+        reordered["devices"].reverse()
+        reordered["directed_peer_access"].reverse()
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, reordered))
+        for available in ((True, False), (False, True), (True, True)):
+            self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware(available)))
+        self.assertIsNotNone(campaigns.optional_native_cohort_absence(requirement, hardware(nodes=(0, 1))))
+        later = hardware((True, True))
+        later["devices"] += [{"backend": "cuda", "ordinal": ordinal, "numa_node": 1} for ordinal in (14, 21)]
+        later["directed_peer_access"] = [{"backend": "cuda", "accessor": a, "peer": b,
+            "available": {a, b} != {14, 21}} for a in (3, 9, 14, 21) for b in (3, 9, 14, 21) if a != b]
+        self.assertIsNone(campaigns.optional_native_cohort_absence(requirement, later))
+        for mutate in (lambda h: h.pop("directed_peer_access"),
+                       lambda h: h["directed_peer_access"].pop(),
+                       lambda h: h["directed_peer_access"].append(dict(h["directed_peer_access"][0])),
+                       lambda h: h["directed_peer_access"][0].update(peer=99)):
+            malformed = hardware(); mutate(malformed)
+            with self.assertRaisesRegex(ValueError, "peer"):
+                campaigns.optional_native_cohort_absence(requirement, malformed)
+        with self.assertRaises(ValueError):
+            campaigns.validate_optional_native_cohort_requirement({**requirement, "degree": 3})
+        conflicting = campaigns.PreflightRegistration(row.name, row.labels | {"DirectedPeerEdge"},
+            row.mpi_ranks, row.lane, row.ctest_index)
+        with self.assertRaisesRegex(RuntimeError, "geometry"):
+            campaigns.preflight_optional_hardware_requirements((conflicting,))
+
+    def test_optional_mixed_families_authenticate_original_local_and_distinct_rank_geometry(self):
+        """Visible vendor counts cannot admit a fictional original local GPU owner."""
+        local_name = "V2_Integration_MixedLocalTransfer"
+        remote_name = "V2_Integration_MixedRankTransfer"
+        labels = frozenset(("Integration", "ProductionTestPreflight", "HardwareOptional",
+                            "CUDA", "ROCm", "Devices2", "CUDADevices1", "ROCmDevices1"))
+        rows = (campaigns.PreflightRegistration(local_name, labels, 2,
+                    campaigns.PreflightExecutionLane.EXCLUSIVE, 1),
+                campaigns.PreflightRegistration(remote_name, labels | {"DistinctNUMARanks"}, 2,
+                    campaigns.PreflightExecutionLane.EXCLUSIVE, 2))
+        requirements = campaigns.preflight_optional_hardware_requirements(rows)
+        self.assertEqual(requirements[local_name],
+            {"backend_degrees": {"cuda": 1, "rocm": 1}, "mpi_ranks": 2,
+             "locality": "original-numa-local-rank"})
+        self.assertEqual(requirements[remote_name]["locality"], "two-distinct-numa-local-ranks")
+        cpus = [{"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)]
+        def hardware(cuda_node, rocm_node):
+            return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *cpus, {"backend": "cuda", "ordinal": 3, "numa_node": cuda_node, "uuid": "original-cuda"},
+                {"backend": "rocm", "ordinal": 9, "numa_node": rocm_node, "uuid": "original-rocm"}]}
+        for cuda, rocm, selected in ((7, 11, [remote_name]), (11, 7, [remote_name]),
+                                    (7, 7, [local_name]), (11, 11, [local_name]),
+                                    (-1, 11, []), (7, -1, []), (7, 13, []), (13, 13, [])):
+            with self.subTest(cuda=cuda, rocm=rocm):
+                result = campaigns.preflight_hardware_qualification(
+                    (local_name, remote_name), requirements, hardware(cuda, rocm))
+                self.assertEqual(result["selected"], selected)
+                campaigns.validate_preflight_qualification([local_name, remote_name], result)
+                for name in set((local_name, remote_name)) - set(selected):
+                    self.assertEqual(result["unqualified"][name]["qualification"], "hardware-ineligible-unqualified")
+                forged = {**result, "selected": [local_name, remote_name], "unqualified": {}}
+                with self.assertRaises(ValueError):
+                    campaigns.validate_preflight_qualification([local_name, remote_name], forged)
+        observed = hardware(7, 11)
+        observed["devices"] = [device for device in observed["devices"]
+                               if device["backend"] != "cpu" or device["numa_node"] == 7]
+        self.assertFalse(campaigns.preflight_hardware_qualification(
+            (local_name, remote_name), requirements, observed)["selected"])
+
+    def test_optional_rank_populations_preserve_distinct_original_owners(self):
+        """Unequal native domains cannot borrow cards from another original NUMA owner."""
+        name = "V2_Integration_OriginalUnequalRanks"
+        def row(first, second):
+            return campaigns.PreflightRegistration(name, frozenset(("HardwareOptional", "ROCm",
+                "DistinctNUMARanks", f"Devices{first + second}", f"RankSizes{first}x{second}")),
+                2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        for first, second in ((1, 1), (2, 4), (3, 5), (7, 2)):
+            requirement = campaigns.preflight_optional_hardware_requirements((row(first, second),))[name]
+            self.assertEqual(requirement["rank_sizes"], [first, second])
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *({"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)),
+                *({"backend": "rocm", "ordinal": 3 * ordinal + offset, "numa_node": node}
+                  for node, count, offset in ((7, first, 1), (11, second, 100)) for ordinal in range(count))]}
+            self.assertEqual(campaigns.preflight_hardware_qualification((name,), {name: requirement}, hardware)["selected"], [name])
+            for device in hardware["devices"]:
+                if device["backend"] == "rocm":
+                    device["numa_node"] = 7
+            self.assertFalse(campaigns.preflight_hardware_qualification((name,), {name: requirement}, hardware)["selected"])
+        for requirement in ({"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 3], "mpi_ranks": 2},
+                            {"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 4], "mpi_ranks": 1}):
+            with self.assertRaises(ValueError):
+                campaigns.validate_optional_native_cohort_requirement(requirement)
+
+    def test_optional_mixed_family_degrees_are_generic_and_fail_closed(self):
+        """Positive per-family widths are exact; the legacy receipt arm remains strict."""
+        name = "V2_Integration_ArbitraryMixedLocal"
+        def registration(cuda, rocm):
+            return campaigns.PreflightRegistration(name, frozenset((
+                "HardwareOptional", "CUDA", "ROCm", f"Devices{cuda + rocm}",
+                f"CUDADevices{cuda}", f"ROCmDevices{rocm}")), 2,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        for cuda, rocm in ((1, 1), (1, 3), (4, 4), (5, 2), (3, 9)):
+            row = registration(cuda, rocm)
+            requirement = campaigns.preflight_optional_hardware_requirements((row,))[name]
+            self.assertEqual(requirement["backend_degrees"], {"cuda": cuda, "rocm": rocm})
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                *({"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)),
+                *({"backend": family, "ordinal": 3 * ordinal + 1, "numa_node": 11}
+                  for family, degree in (("cuda", cuda), ("rocm", rocm)) for ordinal in range(degree))]}
+            self.assertEqual(campaigns.preflight_hardware_qualification(
+                (name,), {name: requirement}, hardware)["selected"], [name])
+            hardware["devices"].pop()
+            self.assertEqual(campaigns.preflight_hardware_qualification(
+                (name,), {name: requirement}, hardware)["selected"], [])
+        row = registration(1, 3)
+        for labels, ranks in (
+            (row.labels - {"HardwareOptional"}, 2), (row.labels - {"CUDADevices1"}, 2),
+            (row.labels | {"CUDADevices2"}, 2), (row.labels | {"NativeISA-gfx906"}, 2),
+            (row.labels | {"StageSizes1x3"}, 2),
+            (row.labels - {"Devices4"} | {"Devices3"}, 2),
+            (row.labels - {"ROCmDevices3"} | {"ROCmDevices0"}, 2),
+            (row.labels - {"CUDADevices1"} | {"CUDADevices01"}, 2),
+            (row.labels, None), (row.labels | {"DistinctNUMARanks"}, 1)):
+            invalid = campaigns.PreflightRegistration(name, labels, ranks,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+            with self.subTest(labels=labels, ranks=ranks), self.assertRaisesRegex(RuntimeError, "optional|HardwareOptional"):
+                campaigns.preflight_optional_hardware_requirements((invalid,))
+        requirement = campaigns.preflight_optional_hardware_requirements((row,))[name]
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cpu", "ordinal": 0, "numa_node": 7}]}
+        for invalid in ({**requirement, "degree": 4},
+                        {**requirement, "backend_degrees": {"cuda": True, "rocm": 3}},
+                        {**requirement, "backend_degrees": {"cuda": 1, "rocm": 0}},
+                        {**requirement, "backend_degrees": {"cuda": 1}},
+                        {**requirement, "backend_degrees": {"cpu": 1, "rocm": 3}},
+                        {**requirement, "mpi_ranks": True}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification((name,), {name: invalid}, hardware)
+
+    def test_optional_native_geometry_uses_actual_inventory_and_keeps_required_cells_strict(self):
+        """Original scheduler selects exact eligible indices and retains all absent cases in its receipt."""
+        rows = []
+        for backend, degrees in (("CUDA", (2, 4, 8)), ("ROCm", (2, 4, 8))):
+            for degree in degrees:
+                for source in (0, degree - 1):
+                    optional = (backend, degree) in (("CUDA", 4), ("CUDA", 8), ("ROCm", 8))
+                    labels = {"Integration", "ProductionTestPreflight", backend, f"Devices{degree}"}
+                    if optional:
+                        labels.add("HardwareOptional")
+                    rows.append(campaigns.PreflightRegistration(
+                        f"V2_Integration_NativeCompleted_{backend}_Addressed{degree}Source{source}Replay",
+                        frozenset(labels), 1, campaigns.PreflightExecutionLane.EXCLUSIVE, len(rows) + 2))
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": backend, "ordinal": ordinal, "numa_node": 0}
+            for backend, count in (("cuda", 2), ("rocm", 5)) for ordinal in range(count)]}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+             mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=tuple(rows)), \
+             mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe, \
+             mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+             mock.patch.object(campaigns, "_run_process", return_value=0):
+            result = campaigns.run_production_test_preflight(Path(directory), None,
+                artifact_directory=Path(directory) / "evidence")
+            self.assertEqual(result.return_code, 0)
+            self.assertEqual(len(result.tests), 13)
+            self.assertEqual(len(result.qualification["unqualified"]), 6)
+            self.assertEqual(len(result.qualification["selected"]), 7)
+            executed = set().union(*(set(names) for names in self.selected_names.values()))
+            self.assertEqual(executed, set(result.qualification["selected"]) - {"V2_Unit_A"})
+            self.assertFalse(executed & set(result.qualification["unqualified"]))
+            observe.assert_called_once()
+            report = json.loads((Path(directory) / "evidence/prerequisites.json").read_text())
+            self.assertEqual(report["preflight_qualification"], result.qualification)
+            campaigns.validate_preflight_qualification(list(result.tests), result.qualification)
+        # Losing a required board does not silently turn required2 or ROCm4 into absence.
+        missing_required = {**hardware, "devices": [d for d in hardware["devices"]
+            if (d["backend"] == "cuda" and d["ordinal"] == 0) or
+               (d["backend"] == "rocm" and d["ordinal"] < 3)]}
+        tests = tuple(row.name for row in rows)
+        required = campaigns.preflight_optional_hardware_requirements(rows)
+        q = campaigns.preflight_hardware_qualification(tests, required, missing_required)
+        for row in rows:
+            if "HardwareOptional" not in row.labels:
+                self.assertIn(row.name, q["selected"])
+        all_present = {**hardware, "devices": [{"backend": b, "ordinal": i, "numa_node": 0}
+            for b in ("cuda", "rocm") for i in range(8)]}
+        self.assertFalse(campaigns.preflight_hardware_qualification(tests, required, all_present)["unqualified"])
+
+    def test_optional_native_geometry_rejects_bad_hardware_and_dropped_receipt_evidence(self):
+        """Actual schema/identity reader and receipt validator reject ambiguous or erased proof."""
+        name = "V2_Integration_NativeCompleted_CUDA_Addressed4Source0Replay"
+        tests = ("V2_Unit_A", name)
+        required = {name: {"backend": "cuda", "degree": 4, "locality": "original-numa-local-rank"}}
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": 0, "numa_node": 0},
+            {"backend": "cuda", "ordinal": 1, "numa_node": 0}]}
+        q = campaigns.preflight_hardware_qualification(tests, required, hardware)
+        # Native coordinates select real cohort positions; sparse physical ordinals are valid.
+        gap = {**hardware, "devices": [{"backend": "cuda", "ordinal": i, "numa_node": 0}
+            for i in (0, 1, 4, 5)]}
+        gap_q = campaigns.preflight_hardware_qualification(tests, required, gap)
+        self.assertFalse(gap_q["unqualified"])
+        split = {**hardware, "devices": [{"backend": "cuda", "ordinal": i,
+            "numa_node": i // 2} for i in range(4)]}
+        split_q = campaigns.preflight_hardware_qualification(tests, required, split)
+        self.assertEqual(split_q["unqualified"][name]["observed_numa_cohorts"], [
+            {"numa_node": 0, "ordinals": [0, 1]}, {"numa_node": 1, "ordinals": [2, 3]}])
+        self.assertEqual(split_q["selected"], ["V2_Unit_A"])
+        unknown = {**hardware, "devices": [{"backend": "cuda", "ordinal": i,
+            "numa_node": -1} for i in range(4)]}
+        unknown_q = campaigns.preflight_hardware_qualification(tests, required, unknown)
+        self.assertEqual(unknown_q["unqualified"][name]["unknown_locality_ordinals"], [0, 1, 2, 3])
+        from production_artifacts import validate_preflight_qualification
+        validate_preflight_qualification(list(tests), split_q)
+        with self.assertRaises(ValueError):
+            validate_preflight_qualification(list(tests), {**split_q, "selected": list(tests), "unqualified": {}})
+        from production_artifacts import validate_prerequisites
+        report = {"preflight_return_code": 0, "preflight_tests": list(tests),
+            "preflight_test_count": len(tests), "preflight_qualification": q}
+        validate_prerequisites(report)
+        for mutation in (None, {**q, "selected": list(tests)}, {**q, "unqualified": {}},
+                         {**q, "registered": list(tests)[1:]}, {**q, "schema": True}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate_prerequisites({**report, "preflight_qualification": mutation})
+        for mutation in ({}, {**hardware, "devices": hardware["devices"] * 2},
+                         {**hardware, "scope": "filtered"}):
+            with self.subTest(hardware=mutation), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification(tests, required, mutation)
+        generic = campaigns.PreflightRegistration(name,
+            frozenset(("HardwareOptional", "ROCm", "Devices4")), 1,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((generic,))[name],
+                         {"backend": "rocm", "degree": 4, "locality": "original-numa-local-rank"})
+
+    def test_optional_observed_pipeline_isa_selects_exact_original_cohort(self):
+        """Seven gfx906 boards plus a different ISA cannot certify EP4+EP4."""
+        name = "V2_Integration_MoEPipelinePreparation_MI50_EP4_MI50_EP4_Ordinal_Static_DisabledMTP"
+        labels = frozenset(("Integration", "ProductionTestPreflight", "HardwareOptional",
+                            "ROCm", "Devices8", "NativeISA-gfx906", "StageSizes4x4"))
+        row = campaigns.PreflightRegistration(name, labels, 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+        host = campaigns.PreflightRegistration("V2_Integration_RequiredHost", frozenset(("Integration",)),
+            None, campaigns.PreflightExecutionLane.HOST, 2)
+        requirement = {"backend": "rocm", "degree": 8, "locality": "original-numa-local-rank",
+                       "native_isa": "gfx906", "stage_sizes": [4, 4], "mpi_ranks": 2}
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((row,)), {name: requirement})
+        cpus = [{"backend": "cpu", "ordinal": 0, "numa_node": numa} for numa in (0, 1)]
+        mi50 = [{"backend": "rocm", "ordinal": i, "numa_node": 1,
+                 "native_isa": "gfx906:sramecc+:xnack-", "uuid": f"MI50-{i}"} for i in range(8)]
+        xtx = {"backend": "rocm", "ordinal": 9, "numa_node": 1, "native_isa": "gfx1100", "uuid": "XTX"}
+        for eligible, devices in ((False, cpus + mi50[:7] + [xtx]), (True, cpus + mi50 + [xtx])):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": devices}
+            self.selected_names.clear()
+            with self.subTest(eligible=eligible), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+                 mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=(host, row)), \
+                 mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe, \
+                 mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
+                 mock.patch.object(campaigns, "_run_process", return_value=0):
+                result = campaigns.run_production_test_preflight(Path(directory), None)
+                self.assertEqual(result.return_code, 0)
+                self.assertIn(name, result.tests)
+                self.assertEqual(name in result.qualification["selected"], eligible)
+                executed = set().union(*(set(names) for names in self.selected_names.values()))
+                self.assertIn(host.name, executed)
+                self.assertEqual(name in executed, eligible)
+                observe.assert_called_once()
+                campaigns.validate_preflight_qualification(list(result.tests), result.qualification)
+                if not eligible:
+                    absent = result.qualification["unqualified"][name]
+                    self.assertEqual(absent["qualification"], "hardware-ineligible-unqualified")
+                    self.assertEqual(absent["observed_pipeline_cohort"]["observed_eligible_devices_by_numa"], {"1": 7})
+                else:
+                    self.assertFalse(result.qualification["unqualified"])
+                    forged = {**result.qualification,
+                        "selected": [test for test in result.tests if test != name],
+                        "unqualified": {name: {"qualification": "hardware-ineligible-unqualified"}}}
+                    with self.assertRaises(ValueError):
+                        campaigns.validate_preflight_qualification(list(result.tests), forged)
+        # Full visible ISA capacity still needs one complete original rank and
+        # enough observed CPU discovery participants for the authored MPI width.
+        for devices in (cpus[1:] + mi50,
+                        cpus + mi50[:4] + [{**gpu, "numa_node": 0} for gpu in mi50[4:]]):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": devices}
+            qualified = campaigns.preflight_hardware_qualification((host.name, name), {name: requirement}, hardware)
+            self.assertEqual(qualified["selected"], [host.name])
+            self.assertIn(name, qualified["unqualified"])
+
+    def test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels(self):
+        """Original local widths are generic; optional declarations stay exact and fail closed."""
+        name = "V2_Integration_ArbitraryNativeGeometry"
+        def registration(*labels, ranks=2):
+            return campaigns.PreflightRegistration(name, frozenset(labels), ranks,
+                campaigns.PreflightExecutionLane.EXCLUSIVE, 1)
+        base = ("HardwareOptional", "ROCm")
+        for width in (1, 3, 5, 9, 17):
+            req = campaigns.preflight_optional_hardware_requirements((registration(*base, f"Devices{width}"),))[name]
+            self.assertEqual(req, {"backend": "rocm", "degree": width, "locality": "original-numa-local-rank"})
+        row = registration(*base, "Devices9", "NativeISA-gfx906", "StageSizes3x1x5")
+        odd = campaigns.preflight_optional_hardware_requirements((row,))[name]
+        self.assertEqual(odd["stage_sizes"], [3, 1, 5])
+        self.assertEqual(odd["mpi_ranks"], 2)
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            *({"backend": "cpu", "ordinal": 0, "numa_node": i} for i in range(2)),
+            *({"backend": "rocm", "ordinal": 3 * i, "numa_node": 1,
+               "native_isa": "gfx906", "uuid": f"original-{i}"} for i in range(9))]}
+        for required in (odd, {key: value for key, value in odd.items() if key != "native_isa"},
+                         {key: value for key, value in odd.items() if key not in ("stage_sizes", "mpi_ranks")}):
+            self.assertEqual(campaigns.preflight_hardware_qualification((name,), {name: required}, hardware)["selected"], [name])
+        for labels, ranks in (
+            ((*base, "Devices0"), 2), ((*base, "Devices03"), 2), ((*base, "Devices3", "Devices4"), 2),
+            ((*base, "Devices3", "NativeISA-gfx906:xnack-"), 2),
+            ((*base, "Devices3", "NativeISA-gfx906", "NativeISA-gfx1100"), 2),
+            (("HardwareOptional", "CUDA", "Devices3", "NativeISA-gfx906"), 2),
+            ((*base, "Devices3", "StageSizes1x0"), 2), ((*base, "Devices3", "StageSizes3"), 2),
+            ((*base, "Devices3", "StageSizes1x3"), 2),
+            ((*base, "Devices3", "StageSizes1x2", "StageSizes2x1"), 2),
+            ((*base, "Devices3", "StageSizes1x2"), None),
+            ((*base, "Devices2", "StageSizes1x1", "DistinctNUMARanks"), 2),
+            (("ROCm", "Devices3", "NativeISA-gfx906", "StageSizes1x2"), 2),
+        ):
+            with self.subTest(labels=labels, ranks=ranks), self.assertRaisesRegex(RuntimeError, "optional|HardwareOptional"):
+                campaigns.preflight_optional_hardware_requirements((registration(*labels, ranks=ranks),))
+        for invalid in ({**odd, "degree": True}, {**odd, "stage_sizes": [3, False, 5]},
+                        {**odd, "mpi_ranks": 0}, {**odd, "native_isa": "gfx906:xnack-"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                campaigns.preflight_hardware_qualification((name,), {name: invalid}, hardware)
+
+    def test_observed_pipeline_cmake_registrations_emit_exact_optional_geometry(self):
+        """Discover one exact original-source MPI process per body from actual CMake registrations."""
+        include = REPO_ROOT / "tests/v2/cmake/V2ObservedNativePipelineTests.cmake"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            build = Path(directory) / "build"
+            source.mkdir()
+            launcher = source / "mpiexec"
+            launcher.write_text("#!/bin/sh\nexit 99\n") # Inventory only; no fabricated native pass.
+            launcher.chmod(0o755)
+            (source / "CMakeLists.txt").write_text(r'''
+cmake_minimum_required(VERSION 3.20)
+project(ObservedNativePipelineRegistration NONE)
+enable_testing()
+set(HAVE_ROCM TRUE)
+add_executable(v2_integration_moe_pipeline_weight_preparation IMPORTED)
+set_target_properties(v2_integration_moe_pipeline_weight_preparation PROPERTIES IMPORTED_LOCATION "${CMAKE_COMMAND}")
+function(add_v2_test name)
+    cmake_parse_arguments(ENTRY "NO_MODELS" "MPI_PROCS;TIMEOUT" "COMMAND;LABELS" ${ARGN})
+    if(NOT ENTRY_NO_MODELS OR ENTRY_UNPARSED_ARGUMENTS OR NOT ENTRY_MPI_PROCS)
+        message(FATAL_ERROR "Malformed native fixture declaration: ${name}")
+    endif()
+    add_test(NAME "${name}" COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/mpiexec" -np ${ENTRY_MPI_PROCS} -- ${ENTRY_COMMAND})
+    set_tests_properties("${name}" PROPERTIES LABELS "${ENTRY_LABELS}" TIMEOUT "${ENTRY_TIMEOUT}")
+endfunction()
+''' + f'include({json.dumps(str(include))})\n' + r'''
+v2_mi50_pipeline_optional_hardware_labels("MI50_EP3_MI50_EP1_MI50_EP5" _odd)
+add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COMMAND}" -E false
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;${_odd}" MPI_PROCS 2 NO_MODELS TIMEOUT 30)
+''')
+            configured = subprocess.run(["cmake", "-S", str(source), "-B", str(build)],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            rows = campaigns.discover_production_test_preflight_registrations(build)
+            requirements = campaigns.preflight_optional_hardware_requirements(rows)
+            self.assertEqual(len(rows), 131) # 128 exact bodies, two focused aliases and one odd probe.
+            self.assertEqual(set(requirements), {row.name for row in rows})
+            listing = json.loads(subprocess.check_output(
+                ["ctest", "--test-dir", str(build), "--show-only=json-v1"], text=True, timeout=10))
+            filters = {"Preparation": "MoEPipelineWeightPreparation.NativePreparationContract/",
+                       "Lifecycle": "MoEPipelineRequestLifecycle.FirstDecodeResetAndPrefixReuse/"}
+            exact_bodies = set()
+            for test in listing["tests"]:
+                self.assertNotIn("ProcessResident", test["name"])
+                for role, body in filters.items():
+                    prefix = f"V2_Integration_MoEPipeline{role}_"
+                    if not test["name"].startswith(prefix):
+                        continue
+                    expected = "--gtest_filter=Topologies/" + body + test["name"].removeprefix(prefix)
+                    self.assertEqual(test["command"][1:3], ["-np", "2"])
+                    self.assertEqual(test["command"][-1], expected)
+                    self.assertFalse(any(character in expected for character in "*?:"))
+                    self.assertNotIn(expected, exact_bodies)
+                    exact_bodies.add(expected)
+            self.assertEqual(len(exact_bodies), 128)
+            for row in rows:
+                widths = ([3, 1, 5] if row.name.endswith("OddGeometryProbe") else
+                          [int(width) for width in re.findall(r"MI50_EP(\d+)", row.name)])
+                self.assertEqual(requirements[row.name], {"backend": "rocm", "degree": sum(widths),
+                    "locality": "original-numa-local-rank", "native_isa": "gfx906",
+                    "stage_sizes": widths, "mpi_ranks": 2})
+            malformed = source / "malformed.cmake"
+            malformed.write_text(f'include({json.dumps(str(include))})\n'
+                'v2_mi50_pipeline_optional_hardware_labels("MI50_EP0_MI50_EP4" _bad)\n')
+            rejected = subprocess.run(["cmake", "-P", str(malformed)], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Malformed original MI50 pipeline geometry", rejected.stderr)
+
+    def test_optional_rank_transfer_geometry_requires_distinct_known_numa_owners(self):
+        """Captured rank transport needs actual separate NUMA owners, never two visible ordinals."""
+        name = "V2_Integration_CapturedTransferRank_ROCm"
+        row = campaigns.PreflightRegistration(name, frozenset(("Integration", "HardwareOptional",
+            "ROCm", "Devices2", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        mixed = campaigns.PreflightRegistration("V2_Integration_CapturedTransferRank_MixedCUDA_ROCm",
+            frozenset(("Integration", "CUDA", "ROCm")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+        local = campaigns.PreflightRegistration("V2_Integration_NativeCompleted_ROCm4",
+            frozenset(("Integration", "ROCm", "Devices4")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 4)
+        tests = ("V2_Unit_A", name, mixed.name, local.name)
+        requirements = campaigns.preflight_optional_hardware_requirements((row, mixed, local))
+        self.assertEqual(requirements, {name: {"backend": "rocm", "degree": 2,
+            "locality": "two-distinct-numa-local-ranks"}})
+        same_socket = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "rocm", "ordinal": ordinal, "numa_node": 1} for ordinal in range(5)]}
+        from production_artifacts import validate_preflight_qualification
+        for nodes, eligible in (((1, 1, 1, 1, 1), False), ((1, 1, 1, 1, 0), True),
+                                ((-1, -1, -1, -1, -1), False), ((1, 1, 1, 1, -1), False)):
+            with self.subTest(nodes=nodes):
+                hardware = {**same_socket, "devices": [{"backend": "rocm", "ordinal": ordinal,
+                    "numa_node": numa} for ordinal, numa in enumerate(nodes)]}
+                qualified = campaigns.preflight_hardware_qualification(tests, requirements, hardware)
+                self.assertEqual(name in qualified["selected"], eligible)
+                self.assertEqual(name in qualified["unqualified"], not eligible)
+                self.assertIn(mixed.name, qualified["selected"])
+                self.assertIn(local.name, qualified["selected"])
+                validate_preflight_qualification(list(tests), qualified)
+                forged = {**qualified, "selected": [test for test in tests if test != name] if eligible else list(tests),
+                    "unqualified": {} if not eligible else {name: {"qualification": "hardware-ineligible-unqualified"}}}
+                with self.assertRaises(ValueError):
+                    validate_preflight_qualification(list(tests), forged)
+        # Sparse/reordered ordinals do not change actual physical NUMA ownership.
+        sparse = {**same_socket, "devices": [{"backend": "rocm", "ordinal": ordinal, "numa_node": numa}
+            for ordinal, numa in ((19, 7), (3, 2))]}
+        self.assertIn(name, campaigns.preflight_hardware_qualification(tests, requirements, sparse)["selected"])
+        bad_rank_count = campaigns.PreflightRegistration(row.name, row.labels, 1, row.lane, row.ctest_index)
+        with self.assertRaisesRegex(RuntimeError, "unsupported optional"):
+            campaigns.preflight_optional_hardware_requirements((bad_rank_count,))
+
+    def test_optional_native_geometry_reuse_requires_same_current_hardware(self):
+        """The original reuse authority rejects an erased or changed eligibility partition."""
+        name = "V2_Integration_NativeCompleted_CUDA_Addressed4Source0Replay"
+        tests = ("V2_Unit_A", name)
+        row = campaigns.PreflightRegistration(name,
+            frozenset(("Integration", "HardwareOptional", "CUDA", "Devices4")), 1,
+            campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": i, "numa_node": 0} for i in range(2)]}
+        q = campaigns.preflight_hardware_qualification(tests,
+            campaigns.preflight_optional_hardware_requirements((row,)), hardware)
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / "build"
+            build.mkdir()
+            for filename in (".ninja_log", "build.ninja", "CTestTestfile.cmake"):
+                path = build / filename
+                path.write_text("original boundary\n")
+                os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            report = Path(directory) / "prerequisites.json"
+            document = {"schema": 1, "mode": "model-free-prerequisites", "certification_eligible": False,
+                "preflight_return_code": 0, "preflight_tests": list(tests), "preflight_test_count": 2,
+                "preflight_build_directory": str(build.resolve()), "preflight_completed_ns": 2_000_000_000,
+                "preflight_qualification": q}
+            report.write_text(json.dumps(document))
+            with mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=tests[:1]), \
+                 mock.patch.object(campaigns, "discover_production_test_preflight_registrations", return_value=(row,)), \
+                 mock.patch.object(campaigns, "observe_preflight_hardware", return_value=hardware) as observe:
+                result = campaigns.reuse_unchanged_production_test_preflight(build, report)
+                self.assertEqual(result, campaigns.PreflightResult(0, 0.0, tests, q))
+                observe.return_value = {**hardware, "devices": [
+                    {"backend": "cuda", "ordinal": i, "numa_node": 0} for i in range(4)]}
+                with self.assertRaisesRegex(ValueError, "hardware qualification changed"):
+                    campaigns.reuse_unchanged_production_test_preflight(build, report)
+                document.pop("preflight_qualification")
+                report.write_text(json.dumps(document))
+                with self.assertRaisesRegex(ValueError, "hardware qualification"):
+                    campaigns.reuse_unchanged_production_test_preflight(build, report)
+
+    def test_optional_native_exporter_uses_original_owner_and_preserves_native_failure(self):
+        """Observe through the original fresh-file mode; a failed native query is never absence."""
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+            {"backend": "cuda", "ordinal": 0, "numa_node": 0}]}
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            binary = build / "relocated" / "tests" / "v2_integration_parity_qwen4exp_production_matrix"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            # A plausible but unregistered build-root binary is never selected.
+            (build / binary.name).touch()
+            properties = {"LABELS": ["Admission", "RealModel", "FullModel"],
+                "FIXTURES_REQUIRED": ["V2_Models"], "RESOURCE_LOCK": ["Integration_Serial"],
+                "RUN_SERIAL": True, "TIMEOUT": 900, "REQUIRED_FILES": ["/canonical/model.gguf"]}
+            registration = {"name": "V2_Integration_Parity_Qwen4Exp_Production_Opaque",
+                "command": ["mpirun", "-np", "1", str(binary),
+                    "--gtest_filter=Source.FullSourceAdmission/Opaque"],
+                "properties": [{"name": key, "value": value} for key, value in properties.items()]}
+            listing = {"tests": [registration]}
+            def ctest(command, **kwargs):
+                self.assertEqual(command, ["ctest", "--test-dir", str(build), "--show-only=json-v1"])
+                self.assertEqual(kwargs, {"text": True, "timeout": 30})
+                return json.dumps(listing)
+            def export(command, **kwargs):
+                self.assertEqual(command[0], str(binary.resolve()))
+                self.assertEqual(len(command), 2)
+                option = "--qfn-source-hardware-inventory="
+                self.assertTrue(command[1].startswith(option))
+                output = Path(command[1][len(option):])
+                self.assertFalse(output.exists())
+                self.assertEqual(kwargs["timeout"], 30)
+                for key in ("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "LLAMINAR_SKIP_CUDA_STARTUP", "LLAMINAR_SKIP_ROCM_STARTUP"):
+                    self.assertEqual(kwargs["env"][key], "0")
+                output.write_text(json.dumps(hardware))
+                return subprocess.CompletedProcess(command, 0, "")
+            with mock.patch.object(campaigns.subprocess, "check_output", side_effect=ctest):
+                with mock.patch.object(campaigns.subprocess, "run", side_effect=export):
+                    self.assertEqual(campaigns.observe_preflight_hardware(build, None), hardware)
+                with mock.patch.object(campaigns.subprocess, "run", side_effect=subprocess.CalledProcessError(2, [str(binary)])):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        campaigns.observe_preflight_hardware(build, None)
+                duplicate = dict(registration, name=registration["name"] + "Other",
+                    command=["mpirun", "-np", "1", str(build / binary.name),
+                        "--gtest_filter=Source.FullSourceAdmission/Other"])
+                listing["tests"].append(duplicate)
+                with mock.patch.object(campaigns.subprocess, "run") as native:
+                    with self.assertRaisesRegex(ValueError, "more than one executable"):
+                        campaigns.observe_preflight_hardware(build, None)
+                    native.assert_not_called()
+                listing["tests"].pop()
+                binary.unlink()
+                with mock.patch.object(campaigns.subprocess, "run") as native:
+                    with self.assertRaises(FileNotFoundError):
+                        campaigns.observe_preflight_hardware(build, None)
+                    native.assert_not_called()
+
     def test_preflight_execution_plan_only_overlaps_single_rank_homogeneous_backends(self) -> None:
         """Mixed and multi-rank GPU tests retain exclusive package ownership."""
 
@@ -1394,9 +1980,11 @@ class ProductionParityCampaignTest(unittest.TestCase):
             mock.patch.object(campaigns, "_run_process", side_effect=[0, 8, 8, 0, 8, 0]) as execute,
         ):
             artifact = Path(folder) / "evidence"
-            code, _, inventory = campaigns.run_production_test_preflight(
+            preflight_result = campaigns.run_production_test_preflight(
                 Path(folder), None, artifact_directory=artifact
             )
+            code = preflight_result.return_code
+            inventory = preflight_result.tests
             self.assertEqual(code, 8)
             self.assertEqual(execute.call_count, 6)
             selectors = [
@@ -1441,7 +2029,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ),
             mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
         ):
-            code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+            code = preflight_result.return_code
             self.assertEqual(code, 8)
             self.assertEqual(execute.call_count, 4)
             self.assertEqual(self.selected_names[execute.call_args_list[-1].args[0][-1]], ("V2_Integration_exclusive",))
@@ -1461,7 +2050,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 ),
                 mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as execute,
             ):
-                code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+                preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+                code = preflight_result.return_code
                 self.assertEqual(code, outcomes[-1])
                 self.assertEqual(execute.call_count, expected_calls)
 
@@ -1493,7 +2083,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ),
             mock.patch.object(campaigns, "_run_process", return_value=0) as execute,
         ):
-            code, _, _ = campaigns.run_production_test_preflight(Path("build"), None)
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+            code = preflight_result.return_code
             self.assertEqual(code, 7)
             self.assertEqual(execute.call_count, 3)  # Build, Unit, host; no EXCLUSIVE.
 
@@ -1597,7 +2188,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.PreflightExecutionLane.CUDA_SOCKET: 0,
             campaigns.PreflightExecutionLane.ROCM_SOCKET: 0,
         }
-        code, _, names = campaigns.run_production_test_preflight(Path("build"), 60.0)
+        preflight_result = campaigns.run_production_test_preflight(Path("build"), 60.0)
+        code = preflight_result.return_code
+        names = preflight_result.tests
         self.assertEqual(code, 0)
         self.assertEqual(names, (
             "V2_Unit_One", "V2_Integration_Host", "V2_Integration_CUDA",
@@ -1635,9 +2228,11 @@ class ProductionParityCampaignTest(unittest.TestCase):
         discover: mock.Mock,
         run_process: mock.Mock,
     ) -> None:
-        return_code, _, tests = campaigns.run_production_test_preflight(
+        preflight_result = campaigns.run_production_test_preflight(
             Path("build"), 60.0
         )
+        return_code = preflight_result.return_code
+        tests = preflight_result.tests
 
         self.assertEqual(return_code, 0)
         self.assertEqual(
@@ -1679,7 +2274,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
             side_effect=lambda _build: preflight_registrations(
                 "V2_Integration_New" if built else "V2_Integration_Old"),
         ), mock.patch.object(campaigns, "_run_process", side_effect=execute):
-            return_code, _, tests = campaigns.run_production_test_preflight(Path("build"), 60.0)
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), 60.0)
+            return_code = preflight_result.return_code
+            tests = preflight_result.tests
         self.assertEqual(return_code, 0)
         self.assertEqual(tests, ("V2_Unit_New", "V2_Unit_Added", "V2_Integration_New"))
 
@@ -1708,7 +2305,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
                         campaigns.run_production_test_preflight(Path("build"), None)
                     self.assertEqual(run.call_count, 1)  # Build only; no unchecked CTest execution.
                 else:
-                    code, _, tests = campaigns.run_production_test_preflight(Path("build"), None)
+                    preflight_result = campaigns.run_production_test_preflight(Path("build"), None)
+                    code = preflight_result.return_code
+                    tests = preflight_result.tests
                     self.assertEqual(code, 0)
                     self.assertEqual(tests, ("V2_Unit_Bootstrap", "V2_Integration_Bootstrap"))
                     self.assertEqual(run.call_args_list[0].args[0][0], "cmake")
@@ -1728,7 +2327,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
              mock.patch.object(campaigns, "discover_production_test_preflight_registrations", side_effect=registrations) as discover, \
              mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=None), \
              mock.patch.object(campaigns, "_run_process", return_value=0) as run:
-            code, _, tests = campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            preflight_result = campaigns.run_production_test_preflight(Path("build"), None, Path("receipt.json"))
+            code = preflight_result.return_code
+            tests = preflight_result.tests
             self.assertEqual(code, 0)
             self.assertEqual(tests, ("V2_Unit_Installed", "V2_Integration_Installed"))
             self.assertTrue(all(call.args[0][0] != "cmake" for call in run.call_args_list))
@@ -1742,8 +2343,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
 
     @mock.patch.object(
         campaigns,
-        "discover_production_test_preflight_tests",
-        return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
+        "discover_production_test_preflight_registrations",
+        return_value=preflight_registrations("V2_Integration_ParityCellLifecycle_MPI1"),
     )
     @mock.patch.object(
         campaigns,
@@ -1780,6 +2381,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
                         "mode": "sequential_unseen_exact_cells",
                         "certification_eligible": False,
                         "preflight_return_code": 0,
+                        "preflight_qualification": campaigns.preflight_hardware_qualification(
+                            ("V2_Unit_PhysicalMemoryAuthority", "V2_Integration_ParityCellLifecycle_MPI1"), {}, None),
                         "preflight_test_count": 2,
                         "preflight_tests": [
                             "V2_Unit_PhysicalMemoryAuthority",
@@ -1791,12 +2394,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
             )
             os.utime(report, ns=(2_000_000_000, 2_000_000_000))
 
-            return_code, elapsed, tests = (
-                campaigns.reuse_unchanged_production_test_preflight(
+            preflight_result = campaigns.reuse_unchanged_production_test_preflight(
                     build,
                     report,
                 )
-            )
+            return_code = preflight_result.return_code
+            elapsed = preflight_result.elapsed_seconds
+            tests = preflight_result.tests
 
             self.assertEqual(return_code, 0)
             self.assertEqual(elapsed, 0.0)
@@ -1815,6 +2419,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             generation = {
                 "schema": 1, "mode": "collect-controls", "certification_eligible": False,
                 "passed": False, "preflight_return_code": 0, "preflight_test_count": 2,
+                "preflight_qualification": campaigns.preflight_hardware_qualification(tests, {}, None),
                 "preflight_tests": list(tests), "preflight_build_directory": str(build.resolve()),
                 "preflight_completed_ns": 2_000_000_000,
             }
@@ -1822,7 +2427,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 receipt = {**generation, "mode": mode}
                 report.write_text(json.dumps(receipt))
                 os.utime(report, ns=(4_000_000_000, 4_000_000_000))
-                self.assertEqual(campaigns.reuse_unchanged_production_test_preflight(build, report), (0, 0.0, tests))
+                self.assertEqual(campaigns.reuse_unchanged_production_test_preflight(build, report),
+                    campaigns.PreflightResult(0, 0.0, tests, receipt["preflight_qualification"]))
                 for mutation in ({"preflight_completed_ns": None}, {"preflight_completed_ns": 5_000_000_000},
                                  {"preflight_build_directory": str(root)}, {"preflight_test_count": 1},
                                  {"preflight_tests": list(reversed(tests))},
@@ -1858,9 +2464,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 ), mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as run, mock.patch.object(
                     campaigns.time, "time_ns", return_value=123456789
                 ):
-                    code, elapsed, inventory = campaigns.run_production_test_preflight(
+                    preflight_result = campaigns.run_production_test_preflight(
                         directory, None, artifact_directory=directory / "gate"
                     )
+                    code = preflight_result.return_code
+                    elapsed = preflight_result.elapsed_seconds
+                    inventory = preflight_result.tests
                     report = json.loads((directory / "gate/prerequisites.json").read_text())
                     self.assertEqual(report["mode"], "model-free-prerequisites")
                     self.assertEqual(report["preflight_return_code"], outcomes[-1])

@@ -236,3 +236,89 @@ TEST(Test__PrefixCacheCoordinatorMPI, RankLocalMissClampsWholeDomainToZero)
     EXPECT_FALSE(result.common_terminal_logits);
     EXPECT_FALSE(result.common_terminal_hidden);
 }
+
+/**
+ * @test Original stage ownership stays local while shared terminal admission
+ * follows the vocabulary tail, including missing owner state and reset replay.
+ * The final minimum models independently observed runtime/window constraints
+ * after that shared lookup; it is committed before any stage may restore.
+ */
+TEST(Test__PrefixCacheCoordinatorMPI, OriginalPipelineRequiredOwnerAdmissionReplay)
+{
+    ASSERT_EQ(mpiWorldSize(), 2);
+    const int rank = mpiWorldRank();
+    MPIPrefixCollectiveCoordinator coordinator(MPI_COMM_WORLD);
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        for (int tail_rank = 0; tail_rank < 2; ++tail_rank)
+        {
+            for (int scenario = 0; scenario < 6; ++scenario)
+            {
+                const bool tail = rank == tail_rank;
+                const int tokens = scenario == 3 && !tail ? 64 : 96;
+                auto participant = rankParticipant(
+                    rank, tokens,
+                    tail && scenario != 2,
+                    tail && scenario != 1,
+                    0xabcdu + static_cast<uint64_t>(rank),
+                    static_cast<uint64_t>(replay));
+                participant.requires_terminal_logits = tail;
+                participant.requires_terminal_hidden = tail;
+                participant.fingerprint_policy =
+                    PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally;
+                const auto local = makePrefixLookupResult(
+                    coordinatePrefixLookups({participant}), 32);
+                EXPECT_EQ(local.requires_terminal_hidden, tail);
+                EXPECT_EQ(local.has_terminal_hidden, tail && scenario != 1);
+                const auto shared = makePrefixLookupResult(coordinatePrefixLookups({
+                    makePrefixParticipantLookup(rank, DeviceId::cpu(), local, {},
+                        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally)
+                }, &coordinator), 32);
+                ASSERT_TRUE(shared.supported);
+                EXPECT_EQ(shared.cached_tokens, scenario == 3 ? 64 : 96);
+                EXPECT_TRUE(shared.requires_terminal_logits);
+                EXPECT_TRUE(shared.requires_terminal_hidden);
+                EXPECT_EQ(shared.has_terminal_logits, scenario != 2);
+                EXPECT_EQ(shared.has_terminal_hidden, scenario != 1);
+                // Shared evidence never changes this participant's physical row.
+                EXPECT_EQ(local.has_terminal_hidden, tail && scenario != 1);
+                EXPECT_EQ(shared.placement_epochs,
+                          PrefixPlacementEpochSpan::at(static_cast<uint64_t>(replay)));
+
+                // Each stage proves its own image; one missing image removes
+                // the full-hit stable-window exemption for the whole pipeline.
+                const bool local_runtime =
+                    !(scenario == 4 && tail) && !(scenario == 5 && !tail);
+                bool all_runtime = false;
+                ASSERT_TRUE(coordinator.allAndBool(local_runtime, &all_runtime));
+                EXPECT_EQ(all_runtime, scenario < 4);
+                int candidate = shared.cached_tokens;
+                if (scenario == 1 || scenario == 2)
+                    candidate -= 32;
+                if (!all_runtime)
+                    candidate = (candidate / 64) * 64;
+                int committed = -1;
+                ASSERT_TRUE(coordinator.allMinInt(candidate, &committed));
+                bool all_admitted = false;
+                ASSERT_TRUE(coordinator.allAndBool(candidate == committed, &all_admitted));
+                EXPECT_TRUE(all_admitted);
+                EXPECT_EQ(committed, scenario == 0 ? 96 : 64);
+
+                // Incompatible immutable routing windows, or an endpoint that
+                // cannot restore the proposal, reject on BOTH ranks before
+                // either may import state or submit its first suffix edge.
+                for (const bool missing_endpoint : {false, true})
+                {
+                    const int incompatible_candidate = rank == 0 ? 64 : 96;
+                    ASSERT_TRUE(coordinator.allMinInt(
+                        missing_endpoint ? 64 : incompatible_candidate, &committed));
+                    const bool local_admitted = missing_endpoint
+                        ? rank != tail_rank
+                        : incompatible_candidate == committed;
+                    ASSERT_TRUE(coordinator.allAndBool(local_admitted, &all_admitted));
+                    EXPECT_FALSE(all_admitted);
+                }
+            }
+        }
+    }
+}

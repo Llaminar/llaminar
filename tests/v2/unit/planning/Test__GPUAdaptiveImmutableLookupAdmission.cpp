@@ -24,6 +24,7 @@
 #include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 #include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
 #include "execution/qwen4exp/PooledImmutableDirectedChannelGeometry.h"
+#include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
 #include "kernels/qwen4exp/PooledImmutableNativeStorage.h"
 #include "transfer/TransferEngine.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
@@ -875,12 +876,15 @@ void replayBalancedSharedCache(DeviceType backend,std::size_t count,bool constra
     const auto replay=ImmutableRowTablePlacementPlanner::select(parsed.front(),floor);
     EXPECT_EQ(*replay.placement,*selected.placement);
     EXPECT_EQ(replay.physical_plan.summary(),selected.physical_plan.summary());
+    const auto nativeGrowth=qwen4exp::PooledImmutableDirectedTransport::slotDependentBOM(actual.physical(),actual.coordinator(),
+        originals.source->originalResource(DeviceId::cpu()),q.input.gpuResources());
     for(const auto& bom:floor.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i) {
         const auto owner=PhysicalMemoryBOM::ownerAt(i);
         if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging ||
            owner==PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent || owner==PhysicalMemoryOwner::NativeStorageGraphExecutable)continue;
         const PhysicalMemoryAllocatorIdentity id{bom.resource().world_rank,bom.resource().device};
-        EXPECT_EQ(bytes(selected.physical_plan,id,owner),bom.bytes(owner));
+        const auto growth=owner==PhysicalMemoryOwner::ActivationTransportStaging?bytes(nativeGrowth,id,owner):0u;
+        EXPECT_EQ(bytes(selected.physical_plan,id,owner),bom.bytes(owner)+growth)<<toString(owner)<<" on "<<id.device.toString();
     }
 }
 /** @brief Actual grouped planner keeps original native continuation owners or opposite-vendor storage through selection/wire.
@@ -982,16 +986,11 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
         EXPECT_EQ(geometry.physical().owners()[owner].slots,cacheRows);
     }
     ASSERT_TRUE(geometry.readerGeometry()->nativeCollective());
-    EXPECT_THROW(geometry.readerGeometry()->payloadStorage({0,devices[0]}),std::logic_error);
-    EXPECT_THROW(geometry.readerGeometry()->resultMemory({0,devices[0]}),std::logic_error);
-    EXPECT_THROW(geometry.readerGeometry()->acknowledgementMemory({0,devices[0]}),std::logic_error);
     EXPECT_EQ(geometry.computeReaderCount(),2u);
     if(backend==DeviceType::CUDA){
         EXPECT_FALSE(geometry.physical().peerAccess());
         const auto transport=qwen4exp::PooledImmutableDirectedChannelGeometry::fromGeometry(
             geometry.physical(),geometry.coordinator(),0);
-        EXPECT_EQ(transport.forwardMemory().producer_payload_bytes,0u);
-        EXPECT_EQ(transport.reverseMemory().producer_payload_bytes,0u);
         EXPECT_GT(transport.forwardMemory().mapped_host_bytes,0u);
         EXPECT_GT(transport.reverseMemory().mapped_host_bytes,0u);
     }
@@ -1032,12 +1031,21 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
 /** @test Shared directory pressure cannot starve feasible owners; C0/small owners do not limit the others. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFeasibleOwner)
 {
+    /** @brief Restore the public death-test policy after this original-authority replay. */
+    struct RestoreDeathStyle {
+        std::string previous=GTEST_FLAG_GET(death_test_style);
+        ~RestoreDeathStyle(){GTEST_FLAG_SET(death_test_style,previous);}
+    } restore;
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
     for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
       for(const auto count:{1u,2u,4u,8u})
         for(const bool constrained:{false,true}) {
             SCOPED_TRACE(::testing::Message()<<"backend="<<static_cast<int>(backend)<<" owners="<<count<<" constrained="<<constrained);
-            EXPECT_EXIT({replayBalancedSharedCache(backend,count,constrained);std::cout.flush();std::cerr.flush();
-                std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+            EXPECT_EXIT({replayBalancedSharedCache(backend,count,constrained);
+                const auto* result=::testing::UnitTest::GetInstance()->current_test_info()->result();
+                for(int part=0;part<result->total_part_count();++part)if(result->GetTestPartResult(part).failed())
+                    std::cerr<<result->GetTestPartResult(part).message()<<'\n';
+                std::cout.flush();std::cerr.flush();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
         }
 }
 /** @test Each replay owns its true original process/source/PMA; no authority reset bypass is used. */

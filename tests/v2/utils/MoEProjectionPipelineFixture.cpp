@@ -36,6 +36,7 @@
  * Counted rows retain their original two-bank declarations even at capacity one.
  */
 #include "MoEProjectionPipelineFixture.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include "integration/transfer/CapturedChannelGraphProof.h"
 #include "execution/moe/MoECountedTransferPolicy.h"
 #include "execution/moe/MoEProjectionRuntimeBinding.h"
@@ -836,18 +837,14 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
                     "captured projection did not remove exactly the scalar identity copy");
                 if (params.counted_exchange)
                 {
-                    // Inspect the actual retained graph at the same geometry
-                    // for each explicit phase. Live-count/poison/empty/reuse
-                    // observations below remain identical under both policies.
-                    const auto scheduling = moeCountedTransferScheduling(params.service_phase);
-                    const MoEGroupedIntermediateLayout captured_layout{maximum_layout.encoding,
-                        maximum_layout.columns, static_cast<std::uint32_t>(rows * top_k),
-                        static_cast<std::uint32_t>(participants)};
-                    const auto bytes = captured_layout.compactCapacityBytes();
-                    if (scheduling == CapturedTransferEndpointScheduling::Individual)
-                        counted_channel_test::verifyCapturedChannelGraph(*capture, bytes, 2 * (participants - 1));
-                    else
-                        counted_channel_test::verifyCapturedChannelBatchGraph(*capture, bytes, participants - 1, 2);
+                    std::size_t prepare=0,validate=0;
+                    for(const auto &node:native_nodes) {
+                        require(node.name.find("capturedTransfer")==std::string::npos,
+                            "Native projection exchange retained a custom peer transport");
+                        prepare+=node.name.find("prepareNativeCountedAllGatherFrame")!=std::string::npos;
+                        validate+=node.name.find("validateNativeCountedAllGatherFrame")!=std::string::npos;
+                    }
+                    require(prepare==1 && validate==1,"Projection must capture one complete original native counted composition");
                 }
                 require(capture->instantiate(), "projection capture instantiate");
             };
@@ -1328,9 +1325,14 @@ void proveFormat(DeviceId device, int participant, ILocalTPContext &tp, std::bar
 
 } // namespace
 
-void runProjectionPipelineFixture(DeviceId first, int participants,
+/** @brief Execute the declared graph on the original rank-local physical cohort. */
+void runProjectionPipelineFixtureOnCohort(const std::vector<DeviceId> &selected,
     const ProjectionPipelineFixtureConfig &config, ProjectionPipelineTiming *timing)
 {
+    require(selected.size() >= 2 && selected.size() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+        "projection fixture requires a representable original participant cohort");
+    const auto first = selected.front();
+    const int participants = static_cast<int>(selected.size());
     require(participants >= 2 && !config.rows.empty() &&
         std::all_of(config.rows.begin(), config.rows.end(), [](int rows) { return rows > 0; }) &&
         config.geometry.experts >= config.geometry.top_k && config.geometry.top_k > 0 &&
@@ -1359,9 +1361,9 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
     std::vector<GlobalDeviceAddress> addresses;
     for (int member = 0; member < participants; ++member)
     {
-        const int ordinal = config.participant_order == ProjectionParticipantOrder::Ordinal
+        const int index = config.participant_order == ProjectionParticipantOrder::Ordinal
             ? member : participants - 1 - member;
-        devices.push_back(first.is_cuda() ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal));
+        devices.push_back(selected.at(index));
         addresses.push_back(GlobalDeviceAddress::fromLocalDeviceId(devices.back()));
     }
     auto tp = createLocalTPContext(addresses, {},
@@ -1370,19 +1372,19 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
     std::shared_ptr<PhysicalMemoryAuthority> transport_authority;
     if (config.exchange == ProjectionExchangeProof::DeviceCounted)
     {
-        const auto coverage = localTPPeerAccessCoverage(rank, devices);
-        require(coverage == PeerAccessCoverage::None, "projection counted fixture must not bypass enabled native P2P");
+        const auto topology = DeviceCountedAllGatherTopology::resolve(rank, devices);
         const MoEGroupedIntermediateLayout maximum{MoEGroupedIntermediateEncoding::FP32,
             static_cast<std::uint32_t>(config.geometry.intermediate),
             static_cast<std::uint32_t>(*std::max_element(config.rows.begin(), config.rows.end()) * config.geometry.top_k),
             static_cast<std::uint32_t>(participants)};
         const auto capacity = maximum.compactCapacityBytes();
-        const auto memory = DeviceCountedAllGather::memoryFor(participants, capacity);
         PhysicalMemoryPlanBuilder bom;
-        bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
-            memory.host_bytes * participants);
-        for (auto device : devices) bom.add(planningObservedResource(rank, device),
-            PhysicalMemoryOwner::ActivationTransportStaging, memory.device_bytes);
+        for (std::size_t member = 0; member < devices.size(); ++member)
+        {
+            const auto memory = topology.memoryFor(member, capacity);
+            bom.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging, memory.host_bytes);
+            bom.add(planningObservedResource(rank, devices[member]), PhysicalMemoryOwner::ActivationTransportStaging, memory.device_bytes);
+        }
         transport_authority = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bom.build()), rank.rank);
         std::vector<void *> streams(devices.size());
@@ -1391,8 +1393,13 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
             auto &worker = GPUDeviceContextPool::instance().getContext(devices[i]);
             worker.submitAndWait([&] { streams[i] = worker.getOrCreateAuxiliaryStream("projection_counted_setup"); });
         }
-        tp->installDeviceCountedAllGather(DeviceCountedAllGather::create(*transport_authority,
-            DeviceId::cpu(), devices, streams, coverage, capacity));
+        const auto fabric = DeviceCountedAllGather::create(*transport_authority, *tp,
+            DeviceId::cpu(), topology, streams, capacity);
+        for (std::size_t from = 0; from < devices.size(); ++from)
+            for (std::size_t to = 0; to < devices.size(); ++to)
+                if (from != to) require(fabric->payloadStorage(from, to) == topology.payloadStorage(from, to),
+                    "Projection actual counted payload storage differs from original peer route");
+        tp->installDeviceCountedAllGather(fabric);
     }
     std::barrier rendezvous(participants);
     std::vector<std::exception_ptr> errors(participants);
@@ -1446,5 +1453,14 @@ void runProjectionPipelineFixture(DeviceId first, int participants,
             critical[critical.size() * 9 / 10], oracle_critical[oracle_critical.size() / 2],
             config.exchange == ProjectionExchangeProof::DeviceCounted};
     }
+}
+/** @brief Select actual original ownership before constructing native graph participants. */
+void runProjectionPipelineFixture(DeviceId first, int participants,
+    const ProjectionPipelineFixtureConfig &config, ProjectionPipelineTiming *timing)
+{
+    require(participants >= 2, "projection fixture participant count");
+    originalRankLocalReplay(first.type, static_cast<size_t>(participants), [&](const auto &selected) {
+        runProjectionPipelineFixtureOnCohort(selected, config, timing);
+    });
 }
 } // namespace llaminar2::test

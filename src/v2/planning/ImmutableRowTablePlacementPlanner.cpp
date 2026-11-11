@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <tuple>
 namespace llaminar2
@@ -286,6 +287,33 @@ const PhysicalMemoryPlan &ImmutableRowTableModeContributions::forStorage(Immutab
     }
     throw std::invalid_argument("Unknown concrete ngram storage contribution");
 }
+ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::withFixedHeadPipeline(
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> projection,
+    std::span<const PhysicalMemoryResource> resources) const
+{
+    if (!projection || fixed_head_pipeline_ || gpu_placement_ || !gpu_resources_.empty() ||
+        projection->worldRank() != host_.world_rank || resources.size() != projection->owners().size() ||
+        consumers_.size() != projection->consumers().size())
+        throw std::invalid_argument("Fixed PLE placement requires exact original pipeline resources");
+    ImmutableRowTablePlacementInput result(*this);
+    std::set<DeviceId> seen;
+    for (const auto& resource : resources) {
+        if (!resource.valid() || !seen.insert(resource.device).second)
+            throw std::invalid_argument("Fixed PLE placement has invalid or duplicated storage resource");
+        (void)projection->owner(identity(resource));
+    }
+    for (const auto& consumer : consumers_)
+        if (std::find(projection->consumers().begin(), projection->consumers().end(), identity(consumer)) ==
+                projection->consumers().end() ||
+            std::none_of(resources.begin(), resources.end(), [&](const auto& resource) {
+                return resource.sameAllocator(consumer);
+            }))
+            throw std::invalid_argument("Fixed PLE placement changed the original query resource");
+    result.gpu_resources_.assign(resources.begin(), resources.end());
+    result.fixed_head_pipeline_ = std::move(projection);
+    return result;
+}
+
 std::shared_ptr<const ResolvedImmutableRowTablePlacement> ImmutableRowTableExecutionProvision::fixedHeadPlacement(
     const ImmutableRowTablePlacementInput &input) const
 {
@@ -294,6 +322,51 @@ std::shared_ptr<const ResolvedImmutableRowTablePlacement> ImmutableRowTableExecu
         source_.ple_table_rows,static_cast<std::size_t>(source_.ple_table_row_bytes));
     if(source_extent!=input.extent() || source_.ple_table_native_bytes!=source_extent.nativeBytes())
         throw std::invalid_argument("Fixed head placement has a foreign original source extent");
+    if (const auto& pipeline = input.fixedHeadPipeline()) {
+        const auto& offsets = source_.ple_head_offsets;
+        const auto& sizes = source_.ple_head_vocab_sizes;
+        if (!requested_.isFixedHeadSharded() || !source_.ple_heads ||
+            offsets.size() != source_.ple_heads || sizes.size() != source_.ple_heads)
+            throw std::invalid_argument("Fixed PLE pipeline lost its original source heads");
+        std::uint64_t end = 0;
+        for (std::size_t head = 0; head < offsets.size(); ++head) {
+            if (!sizes[head] || offsets[head] < end || offsets[head] >= source_extent.rows() ||
+                sizes[head] > source_extent.rows() - offsets[head])
+                throw std::invalid_argument("Fixed PLE pipeline has overlapping or foreign source heads");
+            end = offsets[head] + sizes[head];
+        }
+        for (const auto& reader : consumers_) {
+            const auto& owner = pipeline->owner(identity(reader.resource));
+            if (owner.stage_index != pipeline->consumerStage() ||
+                reader.tp_coordinate != owner.participant_index ||
+                reader.tp_topology != ImmutableRowTableTPTopology::HomogeneousPipelineRankLocal ||
+                reader.shards != static_cast<int>(pipeline->consumers().size()) ||
+                reader.batch != 1 || reader.rows > pipeline->maximumRows() ||
+                reader.first_layer > static_cast<int>(source_.ple_decoder_layer) ||
+                reader.last_layer < static_cast<int>(source_.ple_decoder_layer))
+                throw std::invalid_argument("Fixed PLE reader changed its original stage/source coordinate");
+        }
+        std::vector<ImmutableRowTableLayoutOwner> owners;
+        std::vector<ImmutableRowTableFixedRange> ranges;
+        for (const auto& owner : pipeline->owners()) {
+            const auto first = static_cast<std::size_t>(owner.first_head);
+            const auto after = first + static_cast<std::size_t>(owner.head_count);
+            if (first >= offsets.size() || after > offsets.size())
+                throw std::invalid_argument("Fixed PLE owner heads exceed the original source");
+            const auto begin = first ? offsets[first] : 0;
+            const auto finish = after == offsets.size() ? source_extent.rows() : offsets[after];
+            const auto range = ImmutableRowTableSourceRange::checked(source_extent, begin, finish - begin);
+            const ImmutableRowTableOwnerKey key{owner.allocator, ImmutableRowStorage::VRAM};
+            owners.push_back({key, range.rows(), 0, std::nullopt});
+            ranges.push_back({range.firstRow(), range.rows(), key, ImmutableRowTableCopyRole::Primary});
+        }
+        const std::array tiers{ImmutableRowStorage::VRAM};
+        const auto readers = pipeline->consumers();
+        auto layout = ImmutableRowTableLayoutGeometry::checked(source_extent, ImmutableRowTableTiers::of(tiers),
+            ImmutableRowTableResidency::Fixed, std::move(owners), {readers.begin(), readers.end()}, std::move(ranges), {});
+        return std::shared_ptr<const ResolvedImmutableRowTablePlacement>(
+            new ResolvedImmutableRowTablePlacement(std::move(layout), pipeline));
+    }
     const auto p=input.consumers().size();
     if(!requested_.isFixedHeadSharded() || (p!=2 && p!=4 && p!=8) || source_.ple_heads!=16 ||
        source_.ple_head_offsets.size()!=16 || source_.ple_head_vocab_sizes.size()!=16)
@@ -382,7 +455,8 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
         candidate.add(request.input.host(),PhysicalMemoryOwner::ImmutableTableStorage,0u);
         for(const auto &r:request.input.consumers())candidate.add(r,PhysicalMemoryOwner::ImmutableTableStorage,0u);
         for(const auto &bom:request.contributions.vram->resources())candidate.add(bom);
-        const auto storage=placement->fixedHeadShardStorageBOM(request.input.consumers());
+        const auto storage=placement->fixedHeadShardStorageBOM(
+            request.input.fixedHeadPipeline() ? request.input.gpuResources() : request.input.consumers());
         for(const auto &bom:storage.resources())candidate.add(bom);
         auto complete=candidate.build();
         if (!complete.fits())

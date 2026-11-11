@@ -377,6 +377,7 @@ namespace llaminar2
             original->cpu_program_use_.emplace(std::move(std::get<NativeCPUCollectiveProgram::DomainUse>(use)));
             auto retained=std::shared_ptr<GlobalTPContext>(std::move(original));
             retained->original_cpu_owner_=retained;
+            retained->original_cpu_parent_=base;
             return retained;
         } catch(...) {
             // A failed native collective construction cannot publish reusable
@@ -388,6 +389,13 @@ namespace llaminar2
     bool GlobalTPContext::authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower) const noexcept {
         return borrower.get()==this && cpu_program_use_ && !cpu_program_retired_ && backend_ && domain_comm_!=MPI_COMM_NULL &&
             !original_cpu_owner_.owner_before(borrower) && !borrower.owner_before(original_cpu_owner_);
+    }
+
+    bool GlobalTPContext::authenticatesOriginalCPUExpertBorrow(
+        const std::shared_ptr<IGlobalTPContext>& borrower, MPI_Comm parent) const noexcept
+    {
+        return parent != MPI_COMM_NULL && parent == original_cpu_parent_ &&
+            authenticatesOriginalCPUExpertBorrow(borrower);
     }
 
     bool GlobalTPContext::retireOriginalCPUExpertDomain() {

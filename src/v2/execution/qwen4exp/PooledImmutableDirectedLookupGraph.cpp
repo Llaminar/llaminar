@@ -189,9 +189,12 @@ void requirePooledSourceRetirementCompletion(const ComputeGraph& graph,
         }
     },original);
 }
-PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& graph,BufferArena& arena,
-    const q::PooledImmutableRemoteTransport& remote,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
-    const PooledRemoteGraphProgram& program,const std::string& identity){
+namespace {
+/** @brief Detached exact source-authored owner fragment; publication follows the matching transport validator. */
+struct DirectedOwnerFragment final {ComputeGraph graph;PooledPinParticipantNodes endpoints;};
+/** @brief Reuse one original phase/message wiring for mapped and native owner validation. */
+DirectedOwnerFragment makeDirectedOwnerFragment(BufferArena& arena,const q::PooledImmutableRemoteTransport& remote,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& identity){
     if(isGraphCaptureActive() || !remote.pin || !remote.retirement || !code || identity.empty())
         throw std::invalid_argument("Directed owner program requires original addressed transport and native code before capture");
     remote.retirement->requireCurrent();
@@ -210,8 +213,22 @@ PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& 
     const auto read=appendPooledReadOwner(fragment,arena,remote.read,code,publication.last,identity+"/read");
     const auto retired=appendPooledRetirementOwner(fragment,arena,remote.retirement,code,read.last,identity+"/retirement");
     requirePooledRetirementOwnerCompletion(fragment,remote.retirement,retired.last);
-    q::PooledImmutableDirectedOwnerProgram::requireActual(fragment,remote.pin->ownerStorage()->plan(),remote.pin->coordinatorStorage()->plan(),program);
-    publishFragment(graph,std::move(fragment));return {pin.first,retired.last};
+    return {std::move(fragment),{pin.first,retired.last}};
+}
+}
+PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& graph,BufferArena& arena,
+    const q::PooledImmutableRemoteTransport& remote,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const PooledRemoteGraphProgram& program,const std::string& identity){
+    auto built=makeDirectedOwnerFragment(arena,remote,std::move(code),identity);
+    q::PooledImmutableDirectedOwnerProgram::requireActual(built.graph,remote.pin->ownerStorage()->plan(),remote.pin->coordinatorStorage()->plan(),program);
+    publishFragment(graph,std::move(built.graph));return built.endpoints;
+}
+PooledPinParticipantNodes appendPooledImmutableNativeOwnerGraph(ComputeGraph& graph,BufferArena& arena,
+    const q::PooledImmutableRemoteTransport& remote,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const std::string& identity){
+    auto built=makeDirectedOwnerFragment(arena,remote,std::move(code),identity);
+    q::PooledImmutableDirectedOwnerProgram::requireNativeActual(built.graph,remote.pin->ownerStorage()->plan(),remote.pin->coordinatorStorage()->plan());
+    publishFragment(graph,std::move(built.graph));return built.endpoints;
 }
 PooledPinParticipantNodes appendPooledImmutableInlineOwnerPrefix(
     ComputeGraph& graph, BufferArena& arena,

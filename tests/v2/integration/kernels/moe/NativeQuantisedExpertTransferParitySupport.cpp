@@ -6,6 +6,7 @@
  * object. Keeping the implementation outside any GTest registration unit
  * prevents missing definitions or accidental registration of another suite.
  */
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "NativeQuantisedExpertTransferParityTest.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -235,7 +236,7 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
                 .device = device,
                 .staging = transfer.allocatePersistentTransferStagingSlices(
                     layout.chunkBytes(layout.maximum_units_per_chunk), 1u, device).front(),
-                .execution = transfer.allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfer,
                     1u, device, "cross-tier-demotion").front(),
                 .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cross-tier-demotion",

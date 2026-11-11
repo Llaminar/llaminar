@@ -1,3 +1,4 @@
+#include "collective/NativeCountedAllGatherFrame.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 /**
  * @file MemoryPlanner.cpp
@@ -20,6 +21,8 @@
 #include "backends/NativeOrderingEventGroup.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "planning/MemoryPlanner.h"
+#include "execution/local_execution/orchestrators/PipelineMaintenanceAdmission.h"
+#include "execution/global/HostedPipelineActivationStorage.h"
 #include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
 #include "backends/NativeContextPreparation.h"
@@ -472,7 +475,7 @@ void requireGPUAdaptiveDomain(const ModelMemoryProfile &profile,const DevicePlan
         !cfg.device.is_gpu() || (cfg.total_shards!=1 && !exactTP) || cfg.batch_size!=1 || cfg.first_layer!=0 ||
         (cfg.last_layer>=0?cfg.last_layer:profile.mainLayerCount()-1)!=profile.mainLayerCount()-1 ||
         cfg.execution_role!=DeviceExecutionMemoryRole::ContinuationGraph || cfg.local_pipeline_backend ||
-        !cfg.captured_pipeline_boundaries.empty() || (!exactTP && cfg.ngram_tp_topology!=ImmutableRowTableTPTopology::None) ||
+        !cfg.captured_pipeline_boundaries.empty() || cfg.pipeline_native_activation_fanout || cfg.native_pipeline_byte_endpoints || (!exactTP && cfg.ngram_tp_topology!=ImmutableRowTableTPTopology::None) ||
         !cfg.associated_host_memory || !cfg.associated_host_memory->valid() ||
         !cfg.associated_host_memory->device.is_cpu() || cfg.associated_host_memory->world_rank!=cfg.world_rank)
         throw std::invalid_argument("AdaptiveVRAMRAMSSD requires full-main rank-local singleton or exact homogeneous adaptive compute provenance and one original CPU source");
@@ -563,6 +566,50 @@ std::optional<ImmutableRowLookupExecution> ngramLookup(const ModelMemoryProfile 
         throw std::invalid_argument("Resolved adaptive consumer locality differs from its shared provider");
     return cfg.ngram_table_placement->lookupForConsumer({cfg.world_rank, cfg.device});
 }
+/** @return Original pipeline projection for this device, before or after final storage admission. */
+const ImmutableFixedHeadPipelineProjection* fixedPLEPipeline(const DevicePlanConfig& cfg)
+{
+    const auto* resolved = cfg.ngram_table_placement ? cfg.ngram_table_placement->fixedHeadPipeline() : nullptr;
+    if (resolved && cfg.ngram_fixed_head_pipeline && *resolved != *cfg.ngram_fixed_head_pipeline)
+        throw std::invalid_argument("Fixed PLE execution changed its original pipeline roles after admission");
+    return resolved ? resolved : cfg.ngram_fixed_head_pipeline.get();
+}
+
+/** @return Exact assembled head count for an actual pipeline PLE reader. */
+int fixedPLEPipelineHeads(const DevicePlanConfig& cfg)
+{
+    const auto* pipeline = fixedPLEPipeline(cfg);
+    if (!pipeline)
+        return 0;
+    const auto& member = pipeline->owner({cfg.world_rank, cfg.device});
+    if (member.stage_index != pipeline->consumerStage())
+        return 0;
+    return pipeline->assembledHeadCount(member.consumer_index);
+}
+
+/** @return Exact native gathered head width for the real reader, including singleton absence. */
+int fixedPLEPipelineGatheredHeads(const DevicePlanConfig& cfg)
+{
+    const auto* pipeline = fixedPLEPipeline(cfg);
+    if (!pipeline)
+        return 0;
+    const auto& member = pipeline->owner({cfg.world_rank, cfg.device});
+    return member.stage_index == pipeline->consumerStage()
+        ? pipeline->gatheredHeadCount(member.consumer_index) : 0;
+}
+
+/** @return Exact INT32 arena words for one original participant's fixed native wire scratch. */
+std::size_t fixedPLEPipelineScratch(const ModelMemoryProfile& profile, const DevicePlanConfig& cfg)
+{
+    const auto* pipeline = fixedPLEPipeline(cfg);
+    if (!pipeline)
+        return 0;
+    if (!profile.flash_next)
+        throw std::invalid_argument("Fixed PLE scratch requires its original QFN source");
+    return pipeline->scratchBytes({cfg.world_rank, cfg.device}, pipeline->maximumRows(),
+        profile.flash_next->ple_table_row_bytes) / sizeof(std::int32_t);
+}
+
 /**
  * @brief Authenticate pre-quota fixed head execution against actual rank TP provenance.
  * @param profile Original full model source geometry.
@@ -581,7 +628,7 @@ int fixedHeadParticipants(const ModelMemoryProfile &profile,const DevicePlanConf
        !cfg.device.is_gpu() || (p!=2 && p!=4 && p!=8) || cfg.shard_index<0 || cfg.shard_index>=p ||
        cfg.first_layer!=0 || cfg.last_layer!=profile.mainLayerCount()-1 || cfg.batch_size!=1 ||
        cfg.execution_role!=DeviceExecutionMemoryRole::ContinuationGraph || cfg.local_pipeline_backend ||
-       !cfg.captured_pipeline_boundaries.empty() || !cfg.local_tp_backend ||
+       !cfg.captured_pipeline_boundaries.empty() || cfg.pipeline_native_activation_fanout || cfg.native_pipeline_byte_endpoints || !cfg.local_tp_backend ||
        *cfg.local_tp_backend!=(cfg.device.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL))
         throw std::invalid_argument("Fixed head lookup requires actual homogeneous full-main native rank-local GPU TP degree2/4/8");
     return p;
@@ -630,10 +677,14 @@ NgramModeMemory ngramModeMemory(const ModelMemoryProfile &profile, const DeviceP
             .generation_request_capacity = cfg.generation_request_capacity,
             .ngram_fixed_head_participants =
                 storage == ImmutableRowLookupExecution::FixedHeadShardGPU
-                    ? (cfg.ngram_table_placement
-                           ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-                           : fixedHeadParticipants(profile, cfg))
+                    ? (fixedPLEPipeline(cfg)
+                           ? static_cast<int>(fixedPLEPipeline(cfg)->consumers().size())
+                           : cfg.ngram_table_placement
+                               ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
+                               : fixedHeadParticipants(profile, cfg))
                     : 0,
+            .ngram_fixed_pipeline_local_heads = fixedPLEPipelineHeads(cfg),
+            .ngram_fixed_pipeline_gathered_heads = fixedPLEPipelineGatheredHeads(cfg),
             .attention_arithmetic = cfg.attention_arithmetic,
             .attention_phase_schedule = cfg.attention_phase_schedule,
             .local_hot_terminal_observation = hasLocalHotTerminalObservation(cfg)},
@@ -702,10 +753,15 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
             .generation_request_capacity = cfg.generation_request_capacity,
             .ngram_fixed_head_participants =
                 storage == ImmutableRowLookupExecution::FixedHeadShardGPU
-                    ? (cfg.ngram_table_placement
-                           ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
-                           : fixedHeadParticipants(profile, cfg))
+                    ? (fixedPLEPipeline(cfg)
+                           ? static_cast<int>(fixedPLEPipeline(cfg)->consumers().size())
+                           : cfg.ngram_table_placement
+                               ? static_cast<int>(cfg.ngram_table_placement->consumers().size())
+                               : fixedHeadParticipants(profile, cfg))
                     : 0,
+            .ngram_fixed_pipeline_local_heads = storage ? fixedPLEPipelineHeads(cfg) : 0,
+            .ngram_fixed_pipeline_gathered_heads = storage ? fixedPLEPipelineGatheredHeads(cfg) : 0,
+            .ngram_fixed_pipeline_scratch_words = fixedPLEPipelineScratch(profile, cfg),
             .attention_arithmetic = cfg.attention_arithmetic,
             .attention_phase_schedule = cfg.attention_phase_schedule,
             .mtp_shifted_kv_head_layout = cfg.mtp_shifted_kv_head_layout,
@@ -772,7 +828,8 @@ PhysicalMemoryPlan ngramExecutionArm(const ModelMemoryProfile &profile,const Dev
     {
         if(storage!=ImmutableRowStorage::VRAM)
             throw std::invalid_argument("Fixed head execution cannot enter a hosted tier arm");
-        (void)fixedHeadParticipants(profile,cfg);
+        if (!fixedPLEPipeline(cfg))
+            (void)fixedHeadParticipants(profile,cfg);
         execution=ImmutableRowLookupExecution::FixedHeadShardGPU;
     }
     if(cfg.ngram_execution_policy && cfg.ngram_execution_policy->isGPUAdaptive())
@@ -1109,10 +1166,10 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     throw std::invalid_argument("Grouped lookup retained roots differ from original concurrent BOM");
             }
         }
-        else if (ngram_lookup)
+        else if (ngram_lookup || (cfg.ngram_table_placement && cfg.ngram_table_placement->fixedHeadPipeline()))
         {
             const auto &placement = *cfg.ngram_table_placement;
-            const auto allocator = native_ngram_lookup
+            const auto allocator = (native_ngram_lookup || placement.fixedHeadPipeline())
                 ? PhysicalMemoryAllocatorIdentity{cfg.world_rank, cfg.device} : placement.allocators().front();
             if (shared.native_table_allocators.emplace(allocator.world_rank, allocator.device.toString()).second)
             {
@@ -1221,7 +1278,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         if((cfg.retained_immutable_source_table_bytes || cfg.retained_immutable_source_lookup_staging_bytes) &&
             (!cfg.ngram_table_placement || !cfg.ngram_table_placement->isGPUAdaptive()))
             throw std::invalid_argument("Retained subordinate source claims require the exact mixed placement arm");
-        if(cfg.retained_immutable_table_bytes && !ngram_lookup)
+        if(cfg.retained_immutable_table_bytes && !ngram_lookup &&
+            (!cfg.ngram_table_placement || !cfg.ngram_table_placement->fixedHeadPipeline()))
             throw std::invalid_argument("Retained native table credit requires its exact sealed concrete placement");
         if(gpu_adaptive && first_ngram_physical_owner && cfg.retained_immutable_table_bytes &&
             cfg.retained_immutable_table_bytes!=native_table_bytes)
@@ -1315,19 +1373,52 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         }
         size_t pipeline_device_bytes = 0u;
         size_t pipeline_host_bytes = 0u;
-        if (cfg.projection_peer_access == PeerAccessCoverage::None)
+        if (cfg.projection_exchange_topology)
         {
             if (!cfg.device.is_gpu() || cfg.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
                 cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || !cfg.local_tp_backend)
                 throw std::invalid_argument("Counted projection staging requires a rank-local GPU continuation domain");
             const auto rows = std::max(activation_seq, cfg.mtp_enabled ? std::max(1, cfg.mtp_target_query_rows) : 1);
             const auto arena = MoEProjectionArenaGeometry::resolve(profile, cfg.total_shards);
-            const auto staging = DeviceCountedAllGather::memoryFor(cfg.total_shards, arena.packetCapacityBytes(rows));
-            // Each producer contributes its outgoing mapped slots once. Every
-            // GPU owns both endpoint cursors and its exact extent bank. This is
-            // a typed BOM, never an independent capacity subtraction/reserve.
+            const auto &topology = *cfg.projection_exchange_topology;
+            if (topology.worldRank() != cfg.world_rank || topology.devices().size() != std::size_t(cfg.total_shards) ||
+                cfg.shard_index < 0 || std::size_t(cfg.shard_index) >= topology.devices().size() ||
+                topology.devices()[cfg.shard_index] != cfg.device)
+                throw std::invalid_argument("Counted projection BOM differs from its original participant topology");
+            const auto staging = topology.memoryFor(cfg.shard_index, arena.packetCapacityBytes(rows));
+            // The same route authority quotes outgoing host/control and peer
+            // payload plus both endpoint cursors. PMA alone admits these bytes.
             pipeline_device_bytes = staging.device_bytes;
             pipeline_host_bytes = staging.host_bytes;
+        }
+        if (cfg.native_pipeline_maintenance_budget) {
+            if (!cfg.device.is_gpu() || !cfg.mtp_enabled || !cfg.local_pipeline_backend || !cfg.native_pipeline_byte_endpoints)
+                throw std::invalid_argument("Pipeline cadence budget storage requires its original native MTP participant");
+            pipeline_device_bytes = checkedAdd(pipeline_device_bytes, PipelineMaintenanceAdmission::bytes(),
+                "original pipeline derived maintenance bound");
+        }
+        if(cfg.hosted_pipeline_activation_rows != 0) {
+            if(cfg.hosted_pipeline_activation_rows<0 || cfg.execution_role!=DeviceExecutionMemoryRole::ContinuationGraph)
+                throw std::invalid_argument("Hosted pipeline bank requires its actual original continuation graph owner");
+            const auto bytes=HostedPipelineActivationStorage::forRows(cfg.hosted_pipeline_activation_rows,profile.d_model).physicalBytes();
+            if(cfg.device.is_cpu()) pipeline_device_bytes=checkedAdd(pipeline_device_bytes,bytes,"original hosted CPU pipeline activation bank");
+            else pipeline_host_bytes=checkedAdd(pipeline_host_bytes,bytes,"original hosted GPU boundary CPU activation bank");
+        }
+        const auto* fixed_ple_pipeline = fixedPLEPipeline(cfg);
+        const auto native_byte_endpoints = checkedAdd(cfg.native_pipeline_byte_endpoints,
+            fixed_ple_pipeline ? fixed_ple_pipeline->endpointCount({cfg.world_rank, cfg.device}) : 0,
+            "original fixed PLE and pipeline byte endpoint count");
+        if (native_byte_endpoints) {
+            if (!cfg.device.is_gpu() || !cfg.local_pipeline_backend ||
+                *cfg.local_pipeline_backend != (cfg.device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL) ||
+                cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph ||
+                !cfg.captured_pipeline_boundaries.empty() || cfg.pipeline_native_activation_fanout)
+                throw std::invalid_argument("Native pipeline byte frames require their exact original GPU domain authority");
+            const auto frame_bytes = NativeCountedAllGatherLayout(1).bytes();
+            if (native_byte_endpoints > std::numeric_limits<std::size_t>::max() / frame_bytes)
+                throw std::overflow_error("Native pipeline endpoint frame BOM overflow");
+            pipeline_device_bytes = checkedAdd(pipeline_device_bytes,
+                native_byte_endpoints * frame_bytes, "native pipeline original byte endpoint frames");
         }
         if (!cfg.captured_pipeline_boundaries.empty())
         {
@@ -1354,6 +1445,18 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     pipeline_host_bytes = checkedAdd(pipeline_host_bytes,
                         geometry.host_bytes_per_boundary, "pipeline channel host mappings");
             }
+        }
+        if (cfg.pipeline_native_activation_fanout)
+        {
+            if (!cfg.device.is_gpu() || cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || !cfg.local_tp_backend ||
+                *cfg.local_tp_backend != (cfg.device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL) ||
+                cfg.local_pipeline_backend || !cfg.associated_host_memory || !cfg.associated_host_memory->valid() ||
+                cfg.associated_host_memory->world_rank != cfg.world_rank || !cfg.associated_host_memory->device.is_cpu())
+                throw std::invalid_argument("Pipeline live activation fanout requires its original receiving native TP member and host owner");
+            pipeline_device_bytes = checkedAdd(pipeline_device_bytes, PipelineTransferMemory::fanoutDeviceBytes(),
+                "pipeline native live fanout receipt bank");
+            pipeline_host_bytes = checkedAdd(pipeline_host_bytes, PipelineTransferMemory::fanoutHostBytes(),
+                "pipeline native live fanout immutable operand");
         }
         const bool replicated_dense_decode =
             std::find(
@@ -1427,6 +1530,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 prefill_executable_count,
                 cfg.captured_serving_graphs.fixed_executable_count,
                 "captured serving graph executable count");
+            auto graph_owners = cfg.captured_serving_graphs.mtp_graph_owners;
+            if (cfg.native_pipeline_maintenance_budget && graph_owners.ownsControllerExecutables())
+                graph_owners = graph_owners.withVerifierPreparationTopology(MTPGraphOwnerPlan::VerifierPreparationTopology::NativePipelineMaintenance);
             captured_graph_bytes =
                 estimateCapturedGraphExecutableBytes(
                     cfg.device,
@@ -1445,13 +1551,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                                         cfg.captured_serving_graphs.sparse_query_program_count,
                                         cfg.pipeline_forward_only_graph_owner)
                                 : 0u) +
-                            cfg.captured_serving_graphs
-                                .mtp_graph_owners
-                                .generalAuxiliaryExecutableSlotCount(),
+                            graph_owners.generalAuxiliaryExecutableSlotCount(),
                         .bounded_helper_executable_count =
-                            cfg.captured_serving_graphs
-                                .mtp_graph_owners
-                                .boundedHelperExecutableSlotCount(),
+                            graph_owners.boundedHelperExecutableSlotCount(),
                     });
         }
 
@@ -2086,6 +2188,13 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             // while the prefill weights remain TP-sharded.
             local_n_heads = profile.n_heads;
             local_d_ff = profile.d_ff;
+        }
+
+        if (fixed_ple_pipeline && ownsNgramLookup(profile, cfg)) {
+            const auto readers = fixed_ple_pipeline->consumers().size();
+            if (fixed_ple_pipeline->requiresVariableGather())
+                pipeline_device_bytes = checkedAdd(pipeline_device_bytes, NativeCountedAllGatherLayout(readers).bytes(),
+                    "original fixed PLE reader counted gather frame");
         }
 
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
@@ -2918,6 +3027,18 @@ std::optional<ImmutableRowTablePlacementInput> MemoryPlanner::immutableRowTableP
     (void)observations.build();
     if(consumers.empty()) return std::nullopt;
     auto input=ImmutableRowTablePlacementInput::forConsumers(ngramExtent(profile),host,consumers,host_placement);
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> fixed_pipeline;
+    std::vector<PhysicalMemoryResource> fixed_resources;
+    for (const auto& group : groups)
+        for (const auto& cfg : group)
+            if (cfg.ngram_fixed_head_pipeline) {
+                if (fixed_pipeline && fixed_pipeline != cfg.ngram_fixed_head_pipeline)
+                    throw std::invalid_argument("Fixed PLE execution mixed original pipeline declarations");
+                fixed_pipeline = cfg.ngram_fixed_head_pipeline;
+                fixed_resources.push_back({cfg.world_rank, cfg.device, cfg.device_total_bytes, cfg.device_free_bytes});
+            }
+    if (fixed_pipeline)
+        input = input.withFixedHeadPipeline(std::move(fixed_pipeline), fixed_resources);
     std::optional<ImmutableRowTablePolicy> policy;
     std::vector<PhysicalMemoryResource> originals;
     std::optional<PeerAccessCoverage> peerAccess;
@@ -2955,7 +3076,7 @@ std::vector<ImmutableRowTableUploadBinding> MemoryPlanner::immutableRowTableUplo
     std::vector<ImmutableRowTableUploadBinding> result;
     for(const auto &group:groups)for(const auto &cfg:group)
     {
-        if(!ownsNgramLookup(profile,cfg)||!cfg.device.is_gpu()||!cfg.ordinary_weight_load_geometry)continue;
+        if((!ownsNgramLookup(profile,cfg) && !fixedPLEPipeline(cfg))||!cfg.device.is_gpu()||!cfg.ordinary_weight_load_geometry)continue;
         const PhysicalMemoryAllocatorIdentity identity{cfg.world_rank,cfg.device};
         const auto found=std::find_if(result.begin(),result.end(),[&](const auto &binding){return binding.consumer==identity;});
         if(found==result.end())result.push_back({identity,*cfg.ordinary_weight_load_geometry});
@@ -3009,13 +3130,13 @@ ImmutableRowTableModeContributions MemoryPlanner::immutableRowTableModeContribut
         bool actual=false;
         for(const auto &group:groups)
             for(const auto &cfg:group)
-                actual=actual || (ownsNgramLookup(profile,cfg) &&
+                actual=actual || ((ownsNgramLookup(profile,cfg) || fixedPLEPipeline(cfg)) &&
                     binding.consumer==PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device});
         if(!actual) throw std::invalid_argument("Resident ngram upload binding names a non-PLE participant");
     }
     for(const auto &group:groups)
         for(const auto &cfg:group)
-            if(ownsNgramLookup(profile,cfg) && cfg.device.is_gpu())
+            if((ownsNgramLookup(profile,cfg) || fixedPLEPipeline(cfg)) && cfg.device.is_gpu())
             {
                 const auto found=std::find_if(ordinary_upload.begin(),ordinary_upload.end(),[&](const auto &binding) {
                     return binding.consumer==PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device}; });
@@ -3145,7 +3266,9 @@ std::optional<ImmutableRowTableAdmissionRequest> MemoryPlanner::immutableRowTabl
     for(const auto &group:groups)
     {
         std::vector<DevicePlanConfig> actual;
-        for(const auto &cfg:group)if(ownsNgramLookup(profile,cfg))actual.push_back(cfg);
+        for(const auto &cfg:group)
+            if(ownsNgramLookup(profile,cfg) || (input.fixedHeadPipeline() && cfg.ngram_fixed_head_pipeline))
+                actual.push_back(cfg);
         if(!actual.empty())consumer_groups.push_back(std::move(actual));
     }
     const auto fixed=planGroups(profile,consumer_groups);

@@ -32,19 +32,19 @@ namespace
      */
     void replayFinitePlacementCapture(DeviceType vendor,int count)
     {
+        originalRankLocalReplay(vendor, static_cast<std::size_t>(count), [&](const auto &devices) {
         IBackend *backend=vendor==DeviceType::CUDA?getCUDABackend():getROCmBackend();
-        if(!backend || backend->deviceCount()<count)
-            GTEST_SKIP()<<"Requires "<<count<<" actual "<<(vendor==DeviceType::CUDA?"CUDA":"ROCm")<<" devices";
         std::vector<std::unique_ptr<FinitePlacementCaptureEndpoint>> owners;
         for(int ordinal=0;ordinal<count;++ordinal) {
             auto owner=std::make_unique<FinitePlacementCaptureEndpoint>();
             owner->backend=backend;
-            owner->device=vendor==DeviceType::CUDA?DeviceId::cuda(ordinal):DeviceId::rocm(ordinal);
+            owner->device=devices.at(static_cast<std::size_t>(ordinal));
+            const int native_ordinal=owner->device.ordinal;
             owner->arena=std::make_unique<DeviceMoEOverlayEpochArena>(
                 admitEpochArenaForTest({.device_id=owner->device}));
             owner->stream=std::make_unique<ScopedGPUStream>(owner->device);
-            owner->terminal=std::shared_ptr<void>(backend->createEvent(ordinal),[backend,ordinal](void *event) {
-                if(event)backend->destroyEvent(event,ordinal);
+            owner->terminal=std::shared_ptr<void>(backend->createEvent(native_ordinal),[backend,native_ordinal](void *event) {
+                if(event)backend->destroyEvent(event,native_ordinal);
             });
             owner->kernel=llaminar::v2::kernels::KernelFactory::createMoEKernel(owner->device);
             ASSERT_TRUE(owner->kernel && owner->stream->get() && owner->terminal);
@@ -124,6 +124,7 @@ namespace
                 DeviceMoEOverlayEpochStatus result{};
                 ASSERT_TRUE(backend->deviceToHost(&result,owner->arena->requestStatus(0u),sizeof(result),
                     owner->device.gpu_ordinal(),owner->stream->get()));
+                ASSERT_TRUE(completeTerminalObservation(backend,owner->device,owner->stream->get(),owner->terminal.get()));
                 EXPECT_TRUE(result.succeeded());EXPECT_EQ(result.epoch,base_epoch);
                 EXPECT_EQ(result.operation,static_cast<std::uint32_t>(DeviceMoEOverlayEpochOperation::Release));
             }
@@ -135,12 +136,14 @@ namespace
                     owner->device.gpu_ordinal(),owner->stream->get()));
                 ASSERT_TRUE(backend->deviceToHost(&result,owner->arena->maintenanceStatus(),sizeof(result),
                     owner->device.gpu_ordinal(),owner->stream->get()));
+                ASSERT_TRUE(completeTerminalObservation(backend,owner->device,owner->stream->get(),owner->terminal.get()));
                 EXPECT_TRUE(result.succeeded());EXPECT_EQ(result.epoch,base_epoch);
                 EXPECT_EQ(control.bank_readers[0],0u);EXPECT_EQ(control.bank_readers[1],0u);
                 EXPECT_EQ(control.acquisitions_in_flight,0u);
                 EXPECT_EQ(control.bank_epochs[deviceMoEOverlayEpochSelectorBank(control.published_selector)],base_epoch+1u);
             }
         }
+        });
     }
 }
 

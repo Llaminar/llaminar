@@ -55,6 +55,18 @@ public:
     DeviceId leader() const noexcept
     { return context_ ? members_.front().toLocalDeviceId() : device_; }
 
+    /** @return The original member address, preserving the domain's host and NUMA identity.
+     * A singleton has no domain address authority and retains its local address.
+     * Native pipeline composition must borrow this address rather than rebuild
+     * it from a DeviceId, which deliberately carries no host or NUMA fields.
+     * @throws std::logic_error if the original ordered membership changed.
+     * @throws std::invalid_argument if the original domain binding is invalid. */
+    GlobalDeviceAddress memberAddress() const
+    {
+        validate();
+        return context_ ? members_[participant_] : GlobalDeviceAddress::fromLocalDeviceId(device_);
+    }
+
 private:
     const DeviceId device_;
     ILocalTPContext *const context_;

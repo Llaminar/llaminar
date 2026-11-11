@@ -10,6 +10,7 @@
 #pragma once
 #include "PooledImmutableSourceGeometry.h"
 #include "PooledImmutableNativeStorage.h"
+#include "backends/PooledRemoteGraphProgram.h"
 #include "backends/NativeContextPreparation.h"
 #include <optional>
 namespace llaminar2 {class ModelContext;}
@@ -74,12 +75,12 @@ public:
 private:
     friend class PooledImmutableRetainedParticipants;
     /** @brief Borrow the source's already-admitted serial remote definition, never another model's slot. */
-    std::shared_ptr<RetainedParticipantGraphExecutable> acquireOriginalRemoteDefinition(const PooledRemoteGraphProgram&,void*);
+    std::shared_ptr<RetainedParticipantGraphExecutable> acquireOriginalRemoteDefinition(const PooledStorageOwnerProgram&,void*);
     /** @brief Retire actual graph handles before the original runner arenas and native cohort disappear. */
-    void releaseOriginalRemoteDefinition(const PooledRemoteGraphProgram&,
+    void releaseOriginalRemoteDefinition(const PooledStorageOwnerProgram&,
         const std::shared_ptr<RetainedParticipantGraphExecutable>&);
     /** @brief Withdraw failed native handles before local construction releases its original operands. */
-    void abandonOriginalRemoteDefinition(const PooledRemoteGraphProgram&,
+    void abandonOriginalRemoteDefinition(const PooledStorageOwnerProgram&,
         const std::shared_ptr<RetainedParticipantGraphExecutable>&,std::exception_ptr);
     friend class ImmutableLookupService;
     friend class ::llaminar2::ModelContext;

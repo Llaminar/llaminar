@@ -10,6 +10,7 @@
  * balanced begin/end forwarding; no sparse-query numerical capability is mocked.
  */
 #include "execution/global/GlobalOrchestrator.h"
+#include "../../../utils/HostedPipelineTestAdmission.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "utils/MPIContext.h"
@@ -19,6 +20,7 @@
 #include <mpi.h>
 #include <array>
 #include <optional>
+#include <vector>
 
 namespace llaminar2::test
 {
@@ -65,10 +67,38 @@ namespace llaminar2::test
                     return false;
                 if (!terminal_ && !tokens)
                     return false;
-                hidden_ = TestTensorFactory::createFP32Ones({static_cast<size_t>(count), 4});
-                position_ += count;
+                return executeRows(count);
+            }
+            /**
+             * @brief Admit original prefill token metadata alongside the transferred hidden rows.
+             * @param tokens Exact immutable host row forwarded to every prefill participant.
+             * @param count Positive number of live prompt rows.
+             * @return True after the stage executes with its original activation input.
+             *
+             * Prefill carries token ingress even on a nonembedding stage. That
+             * metadata does not replace the preceding stage's hidden values;
+             * ordinary CPU decode retains the null-token guard in forward().
+             */
+            bool forwardPrefill(const int *tokens, int count) override
+            {
+                if (!tokens || count <= 0 || (terminal_ &&
+                        (!input_ || input_->numel() < static_cast<size_t>(count) * 4)))
+                    return false;
+                const auto *hidden = terminal_ ? static_cast<const float *>(input_->data()) : nullptr;
+                if (terminal_ && !hidden) return false;
+                if (!executeRows(count)) return false;
+                last_prefill_tokens_.assign(tokens, tokens + count);
+                last_prefill_hidden_.clear();
+                if (hidden) last_prefill_hidden_.assign(hidden, hidden + static_cast<size_t>(count) * 4);
+                ++prefill_count_;
                 return true;
             }
+            /** @return Successful explicit prefill count, retained across request resets. */
+            int prefillCount() const noexcept { return prefill_count_; }
+            /** @return Exact latest accepted token ingress; nonembedding stages keep the same row. */
+            const std::vector<int> &prefillTokens() const noexcept { return last_prefill_tokens_; }
+            /** @return Actual live transferred CPU values observed by the latest terminal prefill. */
+            const std::vector<float> &prefillHiddenValues() const noexcept { return last_prefill_hidden_; }
             /** Nonterminal ranks deliberately have no host logits. */
             const float *logits() const override { return terminal_ ? logits_.data() : nullptr; }
             /** Complete tiny vocabulary, identical to the outer plan. */
@@ -92,7 +122,22 @@ namespace llaminar2::test
             /** The fixture has no EOS token, so every requested step executes. */
             bool configureMTPRequestStopTokens(const std::vector<int32_t> &) override { return true; }
         private:
+            /**
+             * @brief Execute the fixture's deterministic row arithmetic for either phase.
+             * @param count Positive live row count, independent of retained input capacity.
+             * @return True after output publication and logical position advancement.
+             */
+            bool executeRows(int count)
+            {
+                if (count <= 0) return false;
+                hidden_ = TestTensorFactory::createFP32Ones({static_cast<size_t>(count), 4});
+                position_ += count;
+                return true;
+            }
             bool terminal_;
+            int prefill_count_ = 0;
+            std::vector<int> last_prefill_tokens_;
+            std::vector<float> last_prefill_hidden_;
             std::optional<DeviceGenerationAdmissionRequest> active_admission_;
             int admission_begins_ = 0;
             int admission_ends_ = 0;
@@ -153,7 +198,7 @@ namespace llaminar2::test
             plan.runtime.prefix_cache = config.prefix_cache;
             plan.runtime.mtp = config.mtp;
             OrchestrationRunner runner(config, plan,
-                std::make_unique<GlobalOrchestrator>(std::move(global)), mpi);
+                std::make_unique<GlobalOrchestrator>(admitHostedPipelineFixture(std::move(global), 3)), mpi);
 
             // All ranks check before entering the worker loop, so an unfixed
             // owner fails quickly rather than stranding a follower in Bcast.
@@ -162,6 +207,9 @@ namespace llaminar2::test
             if (rank != tail)
             {
                 runner.runMPIWorkerLoop();
+                EXPECT_EQ(local_observer->prefillCount(), 2);
+                EXPECT_EQ(local_observer->prefillTokens(), (std::vector<int>{1, 3, 1}));
+                EXPECT_TRUE(local_observer->prefillHiddenValues().empty());
                 EXPECT_EQ(local_observer->admissionBegins(), 16);
                 EXPECT_EQ(local_observer->admissionEnds(), 16);
                 EXPECT_FALSE(local_observer->hasActiveAdmission());
@@ -182,6 +230,9 @@ namespace llaminar2::test
                 EXPECT_TRUE(prefill) << runner.lastError();
                 if (!prefill)
                     break;
+                EXPECT_EQ(local_observer->prefillCount(), request + 1);
+                EXPECT_EQ(local_observer->prefillTokens(), (std::vector<int>{1, 3, 1}));
+                EXPECT_EQ(local_observer->prefillHiddenValues(), std::vector<float>(12, 1.0f));
                 for (int token = 0; token != 8; ++token)
                 {
                     const auto result = runner.decodeStep();
@@ -223,6 +274,57 @@ namespace llaminar2::test
         stage.endSparseQueryExecutionProgram();
         EXPECT_EQ(stage.admissionBegins(), 2);
         EXPECT_EQ(stage.admissionEnds(), 2);
+    }
+
+    /**
+     * @brief Prefill accepts token metadata and hidden input while CPU decode retains its own ingress law.
+     *
+     * The original failure called the inherited prefill-to-forward adapter,
+     * which applied the terminal CPU decode token guard to valid prefill ingress.
+     * Exercise that exact phase boundary without entering the MPI command loop.
+     * The containing integration test is explicitly registered in production preflight.
+     */
+    TEST(PipelineRequestAuthorityMPI, ExplicitPrefillSeparatesTokenIngressFromHiddenInput)
+    {
+        const std::array<int, 3> tokens{1, 3, 1};
+        PipelineStage terminal(true);
+        EXPECT_FALSE(terminal.forwardPrefill(tokens.data(), 3));
+        auto input = TestTensorFactory::createFP32({3, 4});
+        TestTensorFactory::fillValue(input.get(), 7.25f);
+        terminal.setHiddenState(input.get());
+        EXPECT_FALSE(terminal.forwardPrefill(nullptr, 3));
+        EXPECT_FALSE(terminal.forwardPrefill(tokens.data(), 0));
+        EXPECT_FALSE(terminal.forwardPrefill(tokens.data(), 4));
+        EXPECT_EQ(terminal.prefillCount(), 0);
+        EXPECT_EQ(terminal.get_position(), 0);
+        EXPECT_FALSE(terminal.forward(tokens.data(), 3));
+        ASSERT_TRUE(terminal.forwardPrefill(tokens.data(), 3));
+        EXPECT_EQ(terminal.prefillCount(), 1);
+        EXPECT_EQ(terminal.prefillTokens(), (std::vector<int>{1, 3, 1}));
+        EXPECT_EQ(terminal.prefillHiddenValues(), std::vector<float>(12, 7.25f));
+        EXPECT_EQ(terminal.get_position(), 3);
+        EXPECT_FALSE(terminal.forward(tokens.data(), 1));
+        EXPECT_TRUE(terminal.forward(nullptr, 1));
+        EXPECT_EQ(terminal.get_position(), 4);
+        terminal.clear_cache();
+        EXPECT_FALSE(terminal.forwardPrefill(tokens.data(), 3));
+        EXPECT_FALSE(terminal.forward(nullptr, 1));
+        TestTensorFactory::fillValue(input.get(), -3.0f);
+        const std::array<int, 3> replay_tokens{3, 1, 2};
+        terminal.setHiddenState(input.get());
+        ASSERT_TRUE(terminal.forwardPrefill(replay_tokens.data(), 3));
+        EXPECT_EQ(terminal.prefillCount(), 2);
+        EXPECT_EQ(terminal.prefillTokens(), (std::vector<int>{3, 1, 2}));
+        EXPECT_EQ(terminal.prefillHiddenValues(), std::vector<float>(12, -3.0f));
+        EXPECT_EQ(terminal.get_position(), 3);
+
+        PipelineStage head(false);
+        EXPECT_FALSE(head.forwardPrefill(nullptr, 3));
+        ASSERT_TRUE(head.forwardPrefill(tokens.data(), 3));
+        EXPECT_EQ(head.prefillTokens(), (std::vector<int>{1, 3, 1}));
+        EXPECT_TRUE(head.prefillHiddenValues().empty());
+        EXPECT_FALSE(head.forward(nullptr, 1));
+        EXPECT_TRUE(head.forward(tokens.data(), 1));
     }
 
     TEST(PipelineRequestAuthorityMPI, RankOneTailStochastic) { provePipeline(1, 0.7f); }

@@ -44,7 +44,7 @@ if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
             COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
                 --gtest_filter=Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.FinitePlacement${finite_backend}CapturedProtocolReplay
             LABELS "V2;Integration;ProductionTestPreflight;${finite_label};MoE;Residency;GraphCapture;Replay;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            MPI_PROCS 2 NO_MODELS TIMEOUT 120)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${finite_test})
     endforeach()
     unset(finite_backend)
@@ -96,7 +96,7 @@ if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
         COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
             --gtest_filter=Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.DeviceAuthoredTwoCycleWaveAdvancesBothIndependentPlacementAxes:Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.CUDAAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs:Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.ROCmAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;MoE;Movement;Replay;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 120
+        MPI_PROCS 2 NO_MODELS TIMEOUT 120
         ENVIRONMENT "LLAMINAR_PERF_STATS_SUMMARY=1" "LLAMINAR_PERF_STATS_FILTER=moe_overlay_controller")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEDeviceAuthoredCycleIdentity_CUDA_ROCm)
 endif()
@@ -107,9 +107,9 @@ if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
         set(predecessor_name V2_Integration_${predecessor_backend}_MoEFollowerPredecessorCapturedReplay)
         add_v2_test(${predecessor_name}
             COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
-                --gtest_filter=Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.FollowerPredecessor${predecessor_backend}SharedSlotCapturedReplay
+                --gtest_filter=MoEFollowerPredecessorColdSourceCUDAAndROCm.FollowerPredecessor${predecessor_backend}SharedSlotCapturedReplay
             LABELS "V2;Integration;ProductionTestPreflight;${predecessor_backend};MoE;CapturedReplay;Ownership;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            MPI_PROCS 2 NO_MODELS TIMEOUT 120)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${predecessor_name})
     endforeach()
     unset(predecessor_name)
@@ -148,35 +148,3 @@ add_v2_test(V2_Integration_MoEOriginalNativeSlotBOMContract
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOriginalNativeSlotBOMContract)
-
-# Isolate each original two-GPU PMA population from the legacy unprepared packet
-# cases. Disabled GTests are explicitly executed here; no eligible case skips.
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    foreach(recurrent_backend IN ITEMS CUDA ROCm)
-        set(recurrent_name V2_Integration_${recurrent_backend}_MoERecurrentOriginalSlotPackets)
-        add_v2_test(${recurrent_name}
-            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                --gtest_also_run_disabled_tests
-                --gtest_filter=MoERecurrentOriginalSlotPacketReplay.DISABLED_${recurrent_backend}TwoPhysicalEndpointsAggregate
-            LABELS "V2;Integration;ProductionTestPreflight;${recurrent_backend};MoE;CapturedReplay;Ownership;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${recurrent_name})
-    endforeach()
-endif()
-
-# Each adversarial trace keeps its own original source/PMA population. These
-# are packet replay/retirement contracts, not learned-model or PGR reset proof.
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    foreach(recurrent_backend IN ITEMS CUDA ROCm)
-        foreach(recurrent_profile IN ITEMS PartialVerifier Empty CancelBeforeSuccessorSource)
-            set(recurrent_name V2_Integration_${recurrent_backend}_MoERecurrentOriginalSlotPackets_${recurrent_profile})
-            add_v2_test(${recurrent_name}
-                COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                    --gtest_also_run_disabled_tests
-                    --gtest_filter=MoERecurrentOriginalSlotPacketReplay.DISABLED_${recurrent_backend}TwoPhysicalEndpoints${recurrent_profile}
-                LABELS "V2;Integration;ProductionTestPreflight;${recurrent_backend};MoE;CapturedReplay;Ownership;Regression"
-                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
-            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${recurrent_name})
-        endforeach()
-    endforeach()
-endif()

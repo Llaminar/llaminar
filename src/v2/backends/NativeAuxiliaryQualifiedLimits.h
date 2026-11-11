@@ -18,14 +18,40 @@
  * CUDA and ROCm. Their allowances deliberately exceed observed heap/queue
  * growth; ordinary graph storage remains independently charged. These family
  * allowances do not depend on application, runtime or hardware fingerprints.
- * Unmeasured programs cannot borrow another family's allowance.
+ * Completion/timestamp peer-event programs keep distinct native flag identities.
+ * Their conservative small-event envelope is a physical ceiling, not a claim
+ * that an ordering-only replay certifies timestamp semantics. Native peer-lane
+ * elapsed-time/byte/event replay separately qualifies those actual programs.
  */
 #pragma once
 #include "NativeAuxiliaryResourceCatalog.h"
 #include <array>
 namespace llaminar2::detail {
 /** @brief Supported backend/resource families own the stated units through their original physical lifetime. */
-inline constexpr std::array<NativeAuxiliaryQualifiedClass,18> kNativeAuxiliaryQualifiedClasses{{
+inline constexpr std::array<NativeAuxiliaryQualifiedClass,20> kNativeAuxiliaryQualifiedClasses{{
+    // One native nonblocking stream, without either ordering event. Normal,
+    // latency-critical and background-maintenance priorities use the same
+    // conservative physical family; immutable scheduling remains independently
+    // authenticated and native priority/flags replay qualifies each use.
+    // Retain its conservative stream/pool headroom through ProcessRuntime;
+    // do not infer a smaller allowance from a few observed native bytes.
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::CUDA,
+        .program = NativeAuxiliaryResourceProgram::auxiliaryStream(),
+        .hostBytes = 4u * 1024u * 1024u,
+        .deviceBytes = 16u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
+    },
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::ROCm,
+        .program = NativeAuxiliaryResourceProgram::auxiliaryStream(),
+        .hostBytes = 4u * 1024u * 1024u,
+        .deviceBytes = 16u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
+    },
+
     NativeAuxiliaryQualifiedClass{
         .backend = DeviceType::CUDA,
         .program = NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::pooledOwner(false)),

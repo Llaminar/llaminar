@@ -39,6 +39,7 @@
 
 namespace llaminar2
 {
+    class MoEOverlayActivationBatchInventory;
     class IMPIContext;
 
     /** @brief Physical transport selected for one rank-batched MoE boundary. */
@@ -374,6 +375,14 @@ namespace llaminar2
     class MoEOverlayRankBatchTransportRegistry final
     {
     public:
+        /** @brief Retain the same selected source declaration before any channel is published.
+         * @param inventory Original selected admission's immutable main/predictor source inventory.
+         * @throws std::logic_error For rebinding or publication after channel construction.
+         */
+        void installActivationBatchInventory(std::shared_ptr<const MoEOverlayActivationBatchInventory> inventory);
+        /** @return Same original declaration, with no reconstruction or native state. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activationBatchInventory()const;
+
         /**
          * @brief Install one fully constructed transport under its channel identity.
          * @param channel_identity Canonical value returned by
@@ -432,6 +441,7 @@ namespace llaminar2
             std::span<const int> complete_endpoint_ids) const;
         /** Protects setup publication from concurrent graph construction. */
         mutable std::mutex mutex_;
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory_;
         /** Exact canonical identity to process-local transport lifetime. */
         std::unordered_map<
             std::string,

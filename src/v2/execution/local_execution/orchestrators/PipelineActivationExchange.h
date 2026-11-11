@@ -12,6 +12,7 @@
 
 #include "execution/compute_stages/IComputeStage.h"
 #include "PipelineNativeDomain.h"
+#include "PipelineNativeByteChannel.h"
 #include "collective/ILocalTPContext.h"
 #include "transfer/CapturedTransferChannel.h"
 #include <optional>
@@ -19,6 +20,7 @@
 
 namespace llaminar2
 {
+class PipelineActivationFanout;
 /** @brief One exact physical activation exchange, frozen before graph capture. */
 class PipelineActivationExchange final : public IComputeStage
 {
@@ -29,6 +31,13 @@ public:
         ILocalTPContext &context;
         int participant;
         CollectiveP2POpKind direction;
+    };
+    /** @brief Canonical materializer-owned INT32 rows; immutable storage binding, never a host count. */
+    struct DeviceRows
+    {
+        std::shared_ptr<TensorBase> owner;
+        size_t offset = 0;
+        std::uint64_t row_bytes = 0;
     };
     /**
      * @brief Cross-backend channel endpoint and optional native TP domain.
@@ -45,6 +54,10 @@ public:
         std::shared_ptr<CapturedTransferChannel> channel;
         CapturedTransferMessage message;
         CapturedTransferEndpoint endpoint = CapturedTransferEndpoint::Producer;
+        std::optional<DeviceRows> rows; ///< Present only for the actual device-prefill live-row authority.
+        std::shared_ptr<PipelineActivationFanout> fanout; ///< Receiving native TP member's exact admitted bank.
+        std::shared_ptr<PipelineNativeByteChannel> native; ///< Original addressed native edge, exclusive with channel.
+        int native_participant = -1; ///< Actual complete pipeline context coordinate.
     };
 
     /** @brief Bind an existing native pipeline edge without changing its wire protocol.
@@ -91,6 +104,7 @@ private:
         std::shared_ptr<TensorBase> owner;
         std::optional<CapturedTransferBinding> endpoint;
         TransferEngine *transfer;
+        std::optional<PipelineNativeByteBinding> native_endpoint;
     };
     /** @brief Reject membership drift before any collective or channel submission. */
     void validateMembership() const;

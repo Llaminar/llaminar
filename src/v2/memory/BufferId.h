@@ -233,6 +233,7 @@ namespace llaminar2
         QFN_POOLED_SOURCE_NATIVE, ///< Existing source protocol, exact invocation and source outcome.
         GDN_PREPARED_QK, ///< Scalar producer-normalized Q/K; transient activation, not recurrent state.
         MTP_LOCAL_HOT_TERMINAL_OBSERVATION, ///< Separate terminal-only packed controller and local report; never execution state.
+        QFN_NGRAM_SHARD_PIPELINE_NATIVE, ///< Original fixed-range request/response subspans and storage-only receipt rows.
         _COUNT ///< Sentinel – must be last
     };
 
@@ -518,6 +519,7 @@ namespace llaminar2
         case BufferId::QFN_NGRAM_SHARD_TRANSPORT_ROWS: return "QFN_NGRAM_SHARD_TRANSPORT_ROWS";
         case BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE: return "QFN_NGRAM_SHARD_LOCAL_NATIVE";
         case BufferId::QFN_NGRAM_SHARD_GATHERED_NATIVE: return "QFN_NGRAM_SHARD_GATHERED_NATIVE";
+        case BufferId::QFN_NGRAM_SHARD_PIPELINE_NATIVE: return "QFN_NGRAM_SHARD_PIPELINE_NATIVE";
         case BufferId::QFN_PLE_EMBEDDING: return "QFN_PLE_EMBEDDING";
         case BufferId::QFN_PLE_KEY: return "QFN_PLE_KEY";
         case BufferId::QFN_PLE_VALUE: return "QFN_PLE_VALUE";

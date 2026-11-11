@@ -818,7 +818,7 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
 TEST(OrdinaryGenerationController, PipelineForwardOnlyAdmissionAndTerminalAreExact)
 {
     using namespace llaminar2;
-    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant), 1u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant), 2u);
     DeviceGenerationAdmissionRequest request{.request_count = 1, .max_new_tokens = 0,
         .depth_policy = DeviceGenerationPolicy::forwardOnly(),
         .initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::AlreadyEmitted};

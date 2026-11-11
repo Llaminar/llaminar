@@ -10,6 +10,8 @@
 #include "MTPDepthTraceReplay.h"
 #include "execution/mtp/MTPDepthReplayBuildIdentity.h"
 #include "execution/mtp/MTPDepthController.h"
+#include "kernels/qwen4exp/QwenFixedHeadPipelineCounters.h"
+#include "utils/MTPDepthTraceImmutableLookupObservation.h"
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -128,6 +130,43 @@ void identity(const Json &j, bool baseline)
     else for(const char *abi:{"control_layout","transaction_trace","policy_types","policy_scope","verifier_width_policy","publication_witness"})
         require(j.at("sources").at(abi)==own.at("sources").at(abi),"candidate trace/control ABI identity mismatch");
 }
+/**
+ * @brief Read the immutable layout tag owned by the original resident capture.
+ * @return No mode for untagged archived v3 traces, whose lookup words stay opaque.
+ * @throws std::invalid_argument If a host trace supplies a GPU layout or a label is unknown.
+ */
+std::optional<ImmutableRowTableObservationMode> lookupObservationMode(const Json &request)
+{
+    const auto &capture=request.at("capture");
+    if (!capture.contains(kMTPDepthTraceImmutableLookupObservation.data())) return {};
+    require(request.at("authority")=="native_resident","host depth trace cannot carry a resident immutable lookup layout");
+    const auto mode=parseMTPDepthTraceImmutableLookupName(text(capture.at(kMTPDepthTraceImmutableLookupObservation.data())));
+    require(mode.has_value(),"unknown immutable lookup layout in resident depth trace");
+    return mode;
+}
+/** @brief Check inactive lookup words without importing their data into controller replay. */
+void requireLookupObservationWords(const std::array<int,kDeviceGenerationControlCount>& words,
+    ImmutableRowTableObservationMode mode)
+{
+    using Mode=ImmutableRowTableObservationMode;
+    constexpr int pipeline_end=static_cast<int>(
+        qwen4exp::kFixedHeadPipelineFirstWord+qwen4exp::kFixedHeadPipelineCounterWords);
+    for (int word=kDeviceGenerationControlFixedHeadCallsLow; word<=kDeviceGenerationControlAdaptiveFailedFramesHigh; ++word) {
+        const bool legacy_fixed=word<kDeviceGenerationControlAdaptiveCallsLow;
+        const bool belongs=(mode==Mode::FixedHeadStandalone&&legacy_fixed) ||
+            (mode==Mode::GPUAdaptive&&!legacy_fixed) ||
+            (mode==Mode::FixedHeadPipeline&&word<pipeline_end);
+        require(belongs||words[word]==0,"resident depth trace has words from a foreign immutable lookup layout");
+    }
+}
+/** @brief Project lookup provenance without treating lookup words as controller results. */
+void publishLookupObservationMode(Json &result,const Json &request)
+{
+    if (request.at("authority")!="native_resident") return;
+    const auto mode=lookupObservationMode(request);
+    result[kMTPDepthTraceImmutableLookupObservation.data()]=
+        mode?std::string(mtpDepthTraceImmutableLookupName(*mode)):"legacy_unspecified";
+}
 /** @brief Validate closed request/custody/transaction framing before any controller call. */
 void envelope(const Json &j)
 {
@@ -136,7 +175,12 @@ void envelope(const Json &j)
     require(j.at("schema")=="llaminar.mtp.depth_trace_replay_request.v3","unknown replay schema");
     require(j.at("authority")=="native_resident"||j.at("authority")=="cpu_host","unknown trace authority");
     identity(j.at("compiled_identity"),j.at("intent")=="baseline");
-    const auto &capture=j.at("capture");keys(capture,{"observation_identity","device","receipt_sha256","configuration_sha256"});
+    const auto &capture=j.at("capture");
+    if (capture.contains(kMTPDepthTraceImmutableLookupObservation.data())) {
+        keys(capture,{"observation_identity","device","receipt_sha256","configuration_sha256",
+            kMTPDepthTraceImmutableLookupObservation.data()});
+        (void)lookupObservationMode(j);
+    } else keys(capture,{"observation_identity","device","receipt_sha256","configuration_sha256"});
     (void)text(capture.at("observation_identity"));(void)text(capture.at("device"));hash(capture.at("receipt_sha256"));hash(capture.at("configuration_sha256"));
     (void)text(j.at("output"));require(j.at("transactions").is_array(),"transactions must be an array");
     const int n=static_cast<int>(integer(j.at("terminal").at("transactions"),1,kMTPDepthTransactionTraceCapacity));
@@ -175,6 +219,10 @@ Json resident(const Json &j,const DeviceGenerationPolicy *candidate, bool candid
     keys(j.at("initial"),{"phase","control"});keys(j.at("terminal"),{"transactions","control"});
     require(j.at("initial").at("phase")=="validated_pre_first_response_append","wrong initial snapshot phase");
     auto c=control(j.at("initial").at("control"));const auto terminal=control(j.at("terminal").at("control"));
+    if (const auto mode=lookupObservationMode(j)) {
+        requireLookupObservationWords(c,*mode);
+        requireLookupObservationWords(terminal,*mode);
+    }
     const auto p=policy(c);
     require(c[kDeviceGenerationControlOk]==1&&c[kDeviceGenerationControlErrorCode]==0&&
         c[kDeviceGenerationControlTransactionCount]==0&&c[kDeviceGenerationControlResponseTokenCount]==0&&
@@ -431,7 +479,9 @@ Json replay(const Json &j)
     auto result=j.at("authority")=="native_resident"?resident(j,nullptr,candidate):host(j,candidate);
     result["intent"]=j.at("intent");result["origin_compiled_identity"]=j.at("compiled_identity");
     result["current_compiled_identity"]=compiledIdentity();result["capture"]=j.at("capture");
-    result["baseline_validated_by_this_executable"]=!candidate;result["initial_state_semantics"]="captured_actual_fresh_state";return result;
+    result["baseline_validated_by_this_executable"]=!candidate;result["initial_state_semantics"]="captured_actual_fresh_state";
+    publishLookupObservationMode(result,j);
+    return result;
 }
 Json replayResidentCandidate(const Json &j,const DeviceGenerationPolicy &candidate)
 {
@@ -439,7 +489,9 @@ Json replayResidentCandidate(const Json &j,const DeviceGenerationPolicy &candida
     require(request.at("authority")=="native_resident","candidate resident policy needs resident input");
     auto result=resident(request,&candidate,true);result["intent"]="candidate";
     result["origin_compiled_identity"]=request.at("compiled_identity");result["current_compiled_identity"]=compiledIdentity();
-    result["baseline_validated_by_this_executable"]=false;return result;
+    result["baseline_validated_by_this_executable"]=false;
+    publishLookupObservationMode(result,request);
+    return result;
 }
 int runCLI(int argc,char **argv)
 {

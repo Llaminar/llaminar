@@ -366,6 +366,22 @@ namespace llaminar2
                 generation_parent_graph_slots_ + speculative_publication_graph_slots_;
         }
 
+        /** @brief Preparation topology is part of executable admission, independent of request geometry. */
+        enum class VerifierPreparationTopology { LocalFlat, NativePipelineMaintenance };
+        /** @brief Return the same owner directory with its explicitly authored preparation topology.
+         * Native collectives exceed the flat-helper certificate; no slot is added or removed.
+         */
+        [[nodiscard]] MTPGraphOwnerPlan withVerifierPreparationTopology(VerifierPreparationTopology topology) const {
+            if ((topology != VerifierPreparationTopology::LocalFlat && topology != VerifierPreparationTopology::NativePipelineMaintenance) ||
+                (topology == VerifierPreparationTopology::NativePipelineMaintenance && (!retains_graph_capacity_ || !ownsControllerExecutables())))
+                throw std::invalid_argument("Native pipeline verifier preparation requires an original retained controller directory");
+            auto result = *this; result.verifier_preparation_topology_ = topology; return result;
+        }
+        /** @return The same class used by source capture and this owner's physical BOM. */
+        [[nodiscard]] GPUGraphExecutableClass verifierPreparationExecutableClassForOwner(int requests) const {
+            const auto local = verifierPreparationExecutableClass(requests);
+            return verifier_preparation_topology_ == VerifierPreparationTopology::NativePipelineMaintenance ? GPUGraphExecutableClass::General : local;
+        }
         /**
          * @brief Declare the verifier-preparation shape before native capture.
          * @param requests Logical requests represented by this cache slot.
@@ -403,7 +419,7 @@ namespace llaminar2
                 return 0u;
             const auto requests = std::min(
                 static_cast<std::size_t>(request_capacity_), kMaximumBoundedVerifierRequests);
-            const auto verifier_slots = checkedSizeMultiply(
+            const auto verifier_slots = verifier_preparation_topology_ == VerifierPreparationTopology::NativePipelineMaintenance ? 0u : checkedSizeMultiply(
                 kVerifierControlPolicyCount,
                 checkedSizeMultiply(requests,
                     static_cast<std::size_t>(verifier_rows_per_request_),
@@ -516,6 +532,7 @@ namespace llaminar2
             return left * right;
         }
 
+        VerifierPreparationTopology verifier_preparation_topology_ = VerifierPreparationTopology::LocalFlat;
         bool retains_graph_capacity_ = false;
         std::size_t query_programs_ = 1u; ///< Closed immutable main-query program inventory.
         int draft_depth_ = 1;

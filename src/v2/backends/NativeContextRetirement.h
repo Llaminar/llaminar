@@ -77,6 +77,10 @@ private:
     friend class ReadAheadNativeParentTerminal;
     friend class RetainedParticipantGraphExecutable;
     friend class NativeOrderingEventGroup;
+    friend class NativeAuxiliaryStreamOwnership;
+    friend class NativePeerTransferEventOwnership;
+    /** @brief Delegate construction-only events or a live stream only after its actual context record takes ownership. */
+    void delegateHandlesToContext()noexcept;
     /** @brief Borrow only the same original bounded process population before reserving again. */
     bool tryBorrowProcessRuntime(const std::string& population);
     /** @brief Freeze the unique original process population before adopting its first tokens. */

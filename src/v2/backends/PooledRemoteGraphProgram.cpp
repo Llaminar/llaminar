@@ -47,4 +47,29 @@ std::uint64_t PooledRemoteGraphProgram::captureIdentity()const noexcept{
     for(const auto byte:class_.dispatchSignature())mix(byte);
     mix(limits().maximumNodes);mix(limits().maximumEdges);mix(limits().allowedKinds);return value?value:1;
 }
+PooledNativeOwnerGraphProgram::PooledNativeOwnerGraphProgram(PooledRemoteGraphGeometry geometry,
+    std::array<std::uint8_t,32> semantic):geometry_(geometry),semantic_(semantic){
+    const auto& g=geometry_;
+    ImmutableRowTableDirectedTransportPolicy::require(g.coordinator,g.owner,g.peerAccess);
+    if(g.owner.device.type!=g.coordinator.device.type || g.owner==g.coordinator ||
+       g.owner.world_rank<0 || !g.participants || g.coordinate>=g.participants ||
+       !g.maximumOriginalIds || !g.maximumUniqueIds || g.maximumUniqueIds>g.maximumOriginalIds ||
+       !g.sourceRows || !g.rowBytes || g.slotStride<g.rowBytes || g.slotStride%4 ||
+       !g.nativeLayoutIdentity || (g.rowKeyBits!=32 && g.rowKeyBits!=64) ||
+       g.nonemptyRootMask!=(g.capacity?7u:6u) ||
+       std::none_of(semantic_.begin(),semantic_.end(),[](auto byte){return byte!=0;}))
+        throw std::invalid_argument("Native General storage program requires exact original homogeneous geometry/semantics");
+}
+std::uint64_t PooledNativeOwnerGraphProgram::captureIdentity()const noexcept{
+    std::uint64_t value=1469598103934665603ULL;
+    const auto mix=[&](std::uint64_t word){value=(value^word)*1099511628211ULL;};
+    const auto allocator=[&](PhysicalMemoryAllocatorIdentity a){mix(a.world_rank);mix(static_cast<unsigned>(a.device.type));mix(a.device.ordinal);};
+    mix(0x4e41544956454731ULL);allocator(geometry_.coordinator);allocator(geometry_.owner);
+    for(const auto word:{std::uint64_t(geometry_.coordinate),std::uint64_t(geometry_.participants),std::uint64_t(geometry_.capacity),
+        std::uint64_t(geometry_.maximumOriginalIds),std::uint64_t(geometry_.maximumUniqueIds),geometry_.sourceRows,geometry_.rowBytes,
+        geometry_.slotStride,geometry_.nativeLayoutIdentity,std::uint64_t(geometry_.rowKeyBits),std::uint64_t(geometry_.nonemptyRootMask)})mix(word);
+    mix(geometry_.peerAccess.has_value());if(geometry_.peerAccess)mix(static_cast<unsigned>(*geometry_.peerAccess));
+    for(const auto byte:semantic_)mix(byte);return value?value:1;
+}
+
 }

@@ -17,6 +17,7 @@
 
 #include "backends/DeviceId.h"
 #include "backends/PeerAccessCoverage.h"
+#include "utils/DebugEnv.h"
 
 #include <cstddef>
 #include <initializer_list>
@@ -258,6 +259,16 @@ namespace llaminar2
         throw std::invalid_argument(
             "LLAMINAR_DIAGNOSTIC_MOE_PREFILL_ROUTE_TRANSPORT requires "
             "native_collective or mapped_sparse (ordinary prefill only)");
+    }
+
+    /** @brief Resolve the startup diagnostic once, shared by hardware binding and runtime validation.
+     * @return Immutable typed process-startup choice; later environment edits cannot rewrite admission.
+     */
+    [[nodiscard]] inline const std::optional<MoEOverlayNodeLocalRouteTransport>&
+    resolvedMoEOverlayDiagnosticPrefillTransport() {
+        static const auto selected = parseMoEOverlayDiagnosticPrefillTransport(
+            DebugEnv::envValue(kMoEOverlayDiagnosticPrefillTransportEnv));
+        return selected;
     }
 
     /**

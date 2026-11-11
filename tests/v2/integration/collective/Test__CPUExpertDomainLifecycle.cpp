@@ -192,6 +192,23 @@ TEST_F(CPUExpertDomainNative, ROCmPreparedRootedVerifierReplay)
 { rooted_packet_lifecycle::run(DeviceId::rocm(0), rooted_packet_lifecycle::PacketPhaseScenario::GroupedVerifier); }
 #endif
 
+#ifdef HAVE_CUDA
+/** @test Actual original CPU2 cohort fanout across full, shrinking, empty and single-row native graphs. */
+TEST_F(CPUExpertDomainNative,CUDAPreparedRootedOriginalFanoutReplay)
+{ rooted_packet_lifecycle::run(DeviceId::cuda(0),rooted_packet_lifecycle::PacketPhaseScenario::OriginalFanout); }
+/** @test Original zero-hole/all-zero/subnormal compact route metadata and byte extents. */
+TEST_F(CPUExpertDomainNative,CUDAPreparedRootedZeroWeightCompactionReplay)
+{ rooted_packet_lifecycle::run(DeviceId::cuda(0),rooted_packet_lifecycle::PacketPhaseScenario::ZeroWeightCompaction); }
+#endif
+#ifdef HAVE_ROCM
+/** @test Symmetric actual original CPU2 cohort fanout. */
+TEST_F(CPUExpertDomainNative,ROCmPreparedRootedOriginalFanoutReplay)
+{ rooted_packet_lifecycle::run(DeviceId::rocm(0),rooted_packet_lifecycle::PacketPhaseScenario::OriginalFanout); }
+/** @test Symmetric original zero-hole/all-zero/subnormal compact route metadata. */
+TEST_F(CPUExpertDomainNative,ROCmPreparedRootedZeroWeightCompactionReplay)
+{ rooted_packet_lifecycle::run(DeviceId::rocm(0),rooted_packet_lifecycle::PacketPhaseScenario::ZeroWeightCompaction); }
+#endif
+
 }
 
 #include "CPUJointPreparedComputeServiceContract.inc"

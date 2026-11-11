@@ -21,6 +21,8 @@
 # to Google's complete JSON export, not this registration-name parser.
 #
 # Inputs (via -D):
+#   MODEL_FREE_NATIVE - Explicit model-free original singleton codec discovery
+#   NATIVE_BACKENDS  - Configured compiled CUDA/ROCm families (no codec roster)
 #   TEST_EXECUTABLE  - Full path to the GTest binary
 #   CTEST_FILE       - Output .cmake file to generate
 #   MPI_SESSION_HELPER - Exact built original native MPI owner executable
@@ -42,6 +44,12 @@
 #   SOURCE_ADMISSION_MTP_MODEL_FILES_SERIALIZED - External Paired predictor inputs only
 #   <BACKEND>_MODEL_FILES_SERIALIZED - Additional inputs for that backend
 # =============================================================================
+
+# A selected preflight-only placeholder must fail, while CTest inventory and
+# unrelated label selections remain usable before this target's first build.
+if(NATIVE_DISCOVERY_REQUIRED)
+    message(FATAL_ERROR "Build ${NATIVE_DISCOVERY_REQUIRED} before required native codec discovery")
+endif()
 
 # The 75-minute economy requirement is a reporting target, never an execution
 # timeout. This separate ceiling exists only to terminate a stuck standalone
@@ -121,18 +129,111 @@ if(_test_count EQUAL 0)
     message(FATAL_ERROR "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
 endif()
 
+# Shared startup environment remains identical for parity and native replay.
+include(${CMAKE_CURRENT_LIST_DIR}/V2ParityEnvironment.cmake)
+if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0)
+    set(CORES_PER_SOCKET 1)
+endif()
+
+set(_env_vars
+    "LLAMINAR_TEST_MPI_SESSION_HELPER=${MPI_SESSION_HELPER}"
+    "LLAMINAR_LOG_LEVEL=DEBUG"
+    "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
+    "HWLOC_COMPONENTS=-gl,-opencl"
+    "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
+    "OMP_PLACES=sockets"
+    "OMP_PROC_BIND=close"
+    "OMP_NESTED=false"
+    "OMP_DYNAMIC=false"
+    "KMP_AFFINITY=granularity=fine,compact,1,0"
+    "KMP_BLOCKTIME=0"
+    "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
+    "MKL_DYNAMIC=false"
+    "OMPI_MCA_mpi_leave_pinned=1"
+    "OMPI_MCA_btl_openib_allow_ib=1"
+)
+
+# Model-free native codecs reuse this parser and original process guardian.
+# The compiled ValuesIn(canonical formats) registration owns the codec roster;
+# CMake selects backend families only and never copies the format table.
+if(MODEL_FREE_NATIVE)
+    if(NOT NATIVE_BACKENDS OR NOT MPI_PROCS EQUAL 1 OR
+       NOT TIMEOUT MATCHES "^[1-9][0-9]*$" OR TIMEOUT GREATER 120)
+        message(FATAL_ERROR "Native codec discovery requires backends, singleton ownership and deadline <=120")
+    endif()
+    v2_parity_escape_literal(_native_working_directory "${WORKING_DIR}")
+    set(_seen_backends "")
+    set(_output "# Compiled model-free native codec registrations; do not edit.\n")
+    foreach(_backend IN LISTS NATIVE_BACKENDS)
+        if(NOT _backend MATCHES "^(CUDA|ROCm)$" OR _backend IN_LIST _seen_backends)
+            message(FATAL_ERROR "Invalid or duplicate native backend: ${_backend}")
+        endif()
+        list(APPEND _seen_backends "${_backend}")
+        string(TOLOWER "${_backend}" _family)
+        set(_selected "")
+        foreach(_full_name IN LISTS _all_tests)
+            if(_full_name MATCHES "^AllNativeCodecs/NativeFixedHeadPipelineFormats\\.${_backend}2/")
+                if(NOT _full_name MATCHES "^AllNativeCodecs/NativeFixedHeadPipelineFormats\\.${_backend}2/([A-Za-z0-9_]+)$")
+                    message(FATAL_ERROR "Malformed native codec selection: ${_full_name}")
+                endif()
+                set(_codec "${CMAKE_MATCH_1}")
+                if(_codec IN_LIST _selected)
+                    message(FATAL_ERROR "Duplicate native codec selection: ${_full_name}")
+                endif()
+                list(APPEND _selected "${_codec}")
+                set(_ctest_name "${TEST_PREFIX}_${_backend}2Formats_${_codec}")
+                string(SHA256 _session_component "${TEST_EXECUTABLE}\n${_ctest_name}")
+                set(_session_base "${MPI_SESSION_ROOT}/${_session_component}")
+                file(MAKE_DIRECTORY "${_session_base}")
+                set(_cmd "${MPI_SESSION_HELPER}" --session-base "${_session_base}" --
+                    "${TEST_EXECUTABLE}" "--pipeline-native-family=${_family}"
+                    --pipeline-native-degree=2 "--gtest_filter=${_full_name}")
+                set(_cmd_str "")
+                foreach(_arg IN LISTS _cmd)
+                    v2_parity_escape_literal(_escaped "${_arg}")
+                    string(APPEND _cmd_str " \"${_escaped}\"")
+                endforeach()
+                string(APPEND _output "add_test(\"${_ctest_name}\"${_cmd_str})\n")
+                set(_native_labels ${LABELS} ${_backend} ProcessOwned)
+                list(REMOVE_DUPLICATES _native_labels)
+                set(_native_environment ${_env_vars})
+                foreach(_property IN ITEMS _native_labels _native_environment)
+                    v2_parity_escape_literal(${_property} "${${_property}}")
+                endforeach()
+                string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n"
+                    " LABELS \"${_native_labels}\"\n ENVIRONMENT \"${_native_environment}\"\n"
+                    " WORKING_DIRECTORY \"${_native_working_directory}\"\n TIMEOUT ${TIMEOUT}\n"
+                    " TIMEOUT_SIGNAL_NAME SIGTERM\n TIMEOUT_SIGNAL_GRACE_PERIOD 36\n"
+                    " PROCESSORS 4\n RESOURCE_LOCK Integration_Serial\n"
+                    " FAIL_REGULAR_EXPRESSION \"0 tests? from 0 test suites?;\\\\[ *SKIPPED *\\\\]\"\n")
+                if(_backend STREQUAL "ROCm")
+                    string(APPEND _output " ENVIRONMENT_MODIFICATION \"HSA_OVERRIDE_GFX_VERSION=unset:\"\n")
+                endif()
+                string(APPEND _output ")\n")
+            endif()
+        endforeach()
+        if(NOT _selected)
+            message(FATAL_ERROR "Missing compiled native codec family: ${_backend}")
+        endif()
+        # Backend symmetry is checked from compiled names, without another roster.
+        list(SORT _selected)
+        if(DEFINED _original_codec_selection AND NOT _selected STREQUAL _original_codec_selection)
+            message(FATAL_ERROR "Native backend codec populations differ")
+        endif()
+        set(_original_codec_selection "${_selected}")
+    endforeach()
+    file(WRITE "${CTEST_FILE}" "${_output}")
+    return()
+endif()
+
 # --- Establish the default MPI world ----------------------------------------
 if(NOT MPI_PROCS)
     set(MPI_PROCS 1)
 endif()
 
-include(${CMAKE_CURRENT_LIST_DIR}/V2ParityEnvironment.cmake)
 v2_parity_environment_deserialize(_explicit_environment "${ENVIRONMENT_SERIALIZED}")
 
-# --- Build environment variables list ----------------------------------------
-if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0)
-    set(CORES_PER_SOCKET 1)
-endif()
+# --- Establish parity-only instrumentation policy ---------------------------
 
 if(NOT PRODUCTION_PERF_STATS_FILTER)
     # The standard campaign owns graph, MTP, prefix, and ExpertOverlay path
@@ -200,24 +301,6 @@ set(_all_production_model_files
     ${_production_model_files_CUDA}
     ${_production_model_files_ROCM})
 list(REMOVE_DUPLICATES _all_production_model_files)
-
-set(_env_vars
-    "LLAMINAR_TEST_MPI_SESSION_HELPER=${MPI_SESSION_HELPER}"
-    "LLAMINAR_LOG_LEVEL=DEBUG"
-    "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
-    "HWLOC_COMPONENTS=-gl,-opencl"
-    "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
-    "OMP_PLACES=sockets"
-    "OMP_PROC_BIND=close"
-    "OMP_NESTED=false"
-    "OMP_DYNAMIC=false"
-    "KMP_AFFINITY=granularity=fine,compact,1,0"
-    "KMP_BLOCKTIME=0"
-    "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
-    "MKL_DYNAMIC=false"
-    "OMPI_MCA_mpi_leave_pinned=1"
-    "OMPI_MCA_btl_openib_allow_ib=1"
-)
 
 # Graph-native parity is only meaningful when the captured production graph
 # path is admitted.  Keep the full KV context capacity independent from the

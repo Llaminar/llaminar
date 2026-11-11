@@ -11,7 +11,10 @@
  * separately registered canonical full-model Rank qualification.
  * CPU arena roots use an explicit model-free fixture admission authority.
  */
-#include "../../../utils/CPUActivationArenaFixture.h"
+#include "../../../fixtures/backends/PreparedNativeLookupFixture.h"
+#include "../../../fixtures/backends/OriginalRankLocalNativeReplay.h"
+#include "planning/PlanningObservedResource.h"
+#include "backends/GPUGraphMemoryContract.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -32,7 +35,6 @@
 #include "models/qwen4exp/Qwen4ExpPublishedGeometry.h"
 #include "tensors/TensorFactory.h"
 #include "transfer/TransferEngine.h"
-#include "../../../mocks/MockMPIContext.h"
 #include "../../../utils/EmbeddingVerifierFormats.h"
 #include <algorithm>
 #include <array>
@@ -44,6 +46,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <memory>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -244,29 +247,62 @@ std::vector<Role> roles(int capacity,int degree) {
 std::size_t arenaBytes(int capacity,int degree){std::size_t bytes=0;for(const auto &r:roles(capacity,degree))bytes+=r.rows*r.columns*4;return bytes;}
 /**
  * @brief Prove native component exchanges or their prelaunch host-failure retirement.
- * @param first Explicit backend selector. @param degree Actual homogeneous participant count2/4/8.
+ * @param devices Actual observed original cohort in explicit reversed stage order.
  * @param injection Typed fixture-only failure point; ordinary tests retain every existing replay.
  */
-void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureInjection::None) {
-    auto *backend=getBackendFor(first);if(!backend||backend->deviceCount()<degree)GTEST_SKIP()<<"Native TP"<<degree<<" hardware unavailable";
-    if(!hasCPUBackend())initCPUBackend(-1);NativeFile file;const auto source=file.source();const auto policy=sourcePolicy();
-    std::vector<DeviceId> devices;std::vector<GlobalDeviceAddress> members;std::vector<PhysicalMemoryAllocatorIdentity> owners;
+void proveOnOriginalRank(const std::vector<DeviceId> &devices,HostFailureInjection injection) {
+    require(!devices.empty(),"Fixed-head native proof requires its actual original cohort");
+    const auto first=devices.front();
+    auto *backend=getBackendFor(first);require(backend,"Native backend unavailable");
+    const int degree=static_cast<int>(devices.size());
+    const auto mpi=MPIContextFactory::global();
+    require(mpi && mpi->clusterInventory(),"Native proof has no original MPI inventory");
+    const auto &rank=mpi->clusterInventory()->getRank(mpi->rank());
+    if(!hasCPUBackend())initCPUBackend(rank.cpu.numa_node);
+    NativeFile file;const auto source=file.source();const auto policy=sourcePolicy();
+    auto prepared=test::PreparedNativeLookupFixture::prepare(devices,mpi->rank());
+    std::vector<GlobalDeviceAddress> members;std::vector<PhysicalMemoryAllocatorIdentity> owners;
     std::vector<PhysicalMemoryResource> resources;
-    for(int p=0;p<degree;++p){const auto d=first.is_cuda()?DeviceId::cuda(degree-1-p):DeviceId::rocm(degree-1-p);
-        devices.push_back(d);members.push_back(GlobalDeviceAddress::fromLocalDeviceId(d));owners.push_back({0,d});
-        resources.push_back({.world_rank=0,.device=d,.total_bytes=backend->deviceMemoryTotal(d.ordinal),.admission_available_bytes=backend->deviceMemoryFree(d.ordinal)});}
+    for(const auto device:devices){
+        requireRankLocalGPUOwnership(rank,device,"Original fixed-head cohort");
+        const auto gpu=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto &entry){
+            return entry.type==device.type && entry.local_device_id==device.ordinal;
+        });
+        require(gpu!=rank.gpus.end() && !gpu->uuid.empty(),"Original fixed-head participant lost UUID authority");
+        std::cout<<"FIXED_HEAD_NATIVE_PARTICIPANT rank="<<mpi->rank()<<" numa="<<rank.cpu.numa_node
+            <<" coordinate="<<members.size()<<" device="<<device.toString()<<" uuid="<<gpu->uuid
+            <<" bdf="<<gpu->pci_bus_address<<" isa="<<gpu->native_isa<<'\n';
+        members.push_back(GlobalDeviceAddress::fromLocalDeviceId(device));owners.push_back({mpi->rank(),device});
+        resources.push_back(prepared->resource(device));
+    }
     auto placement=Qwen4ExpFixedHeadShards::declare(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),policy.offsets,policy.moduli,owners);
-    auto tp=std::make_unique<ObservedCohort>(members,std::vector<float>{},first.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
-    constexpr std::size_t slot=4096;PhysicalMemoryPlanBuilder plan;
-    const auto host=PhysicalMemoryResource{.world_rank=0,.device=DeviceId::cpu(),.total_bytes=getCPUBackend()->deviceMemoryTotal(0),.admission_available_bytes=getCPUBackend()->deviceMemoryFree(0)};
+    constexpr std::size_t slot=4096;
+    // Vendor collectives retain their native graph structure. This fixture has
+    // not certified a flat node-kind/count bound, so its original executable
+    // owns the canonical General reservation on both backends.
+    constexpr auto executableClass=GPUGraphExecutableClass::General;
+    PhysicalMemoryPlanBuilder plan;
+    const auto host=prepared->resource(DeviceId::cpu());
     plan.add(host,PhysicalMemoryOwner::WeightLoadStaging,slot*degree);
-    // BufferArena's ordinary host allocations and device allocations share one
-    // owner inventory; the host mirror is test setup storage, never a service.
+    // This same original PMA prices setup host storage and actual GPU roots.
     plan.add(host,PhysicalMemoryOwner::ActivationArena,arenaBytes(17,degree)*degree);
     for(const auto &resource:resources){plan.add(resource,PhysicalMemoryOwner::PrimaryModelWeights,slot);
-        plan.add(resource,PhysicalMemoryOwner::WeightLoadStaging,slot);plan.add(resource,PhysicalMemoryOwner::ActivationArena,arenaBytes(17,degree));}
+        plan.add(resource,PhysicalMemoryOwner::WeightLoadStaging,slot);plan.add(resource,PhysicalMemoryOwner::ActivationArena,arenaBytes(17,degree));
+        plan.add(resource,PhysicalMemoryOwner::NativeGraphExecutable,GPUGraphMemoryContract::reservationBytesPerExecutable(resource.device,executableClass));}
     const auto native=placement->fixedHeadShardStorageBOM(resources);for(const auto &bom:native.resources())plan.add(bom);
-    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+    prepared->admit(plan.build());
+    const auto memory=prepared->memory();
+    auto tp=std::make_unique<ObservedCohort>(members,std::vector<float>{},first.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+    /** @brief Release actual native borrowers before the sole original source. */
+    struct OriginalRetirement final {
+        std::unique_ptr<test::PreparedNativeLookupFixture> &source;
+        std::unique_ptr<ObservedCohort> &collective;
+        /** @brief Prove payload release, then retire the actual original workers. */
+        ~OriginalRetirement()noexcept {
+            try{collective.reset();source->requirePayloadRetired();source->retire();source->requireExactRetired();}
+            catch(...){std::terminate();}
+        }
+    } originalRetirement{prepared,tp};
     std::barrier rendezvous(degree);std::vector<std::exception_ptr> errors(degree);std::vector<ParticipantObservation> observations(degree);std::vector<std::thread> threads;
     for(int participant=0;participant<degree;++participant)threads.emplace_back([&,participant]{bool dropped=false;
         try {auto &worker=GPUDeviceContextPool::instance().getContext(devices[participant]);worker.submitAndWait([&]{
@@ -278,14 +314,17 @@ void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureI
             const std::vector<float> ordinary(slot/sizeof(float),.25F);loader.addWeightJob(device.ordinal,{.name="ordinary.fixture",.host_raw_data=ordinary.data(),
                 .raw_bytes=slot,.format=RepackFormat::RAW_FP,.N=1,.K=slot/sizeof(float),.is_asymmetric=false});loader.load();loader.finalize();
             auto table=ResidentImmutableRowTable::prepareRange(source,*placement,memory,device,loader.releasedWeightLoadStaging(device.ordinal),uploadStream,TransferEngine::instance());
-            const auto assignment=Qwen4ExpFixedHeadShards::assignmentFor(*placement,{0,device});require(assignment.participant==static_cast<std::size_t>(participant),"Physical owner sort changed source/head coordinate");
+            const auto assignment=Qwen4ExpFixedHeadShards::assignmentFor(*placement,{mpi->rank(),device});require(assignment.participant==static_cast<std::size_t>(participant),"Physical owner sort changed source/head coordinate");
             require(table->source()==source&&table->sourceRange()==assignment.source&&table->nativeBytes()==assignment.source.nativeBytes(),"Range owner changed original source");
             auto read=table->acquire(stream,TransferEngine::instance());
             TransferEngine::instance().requireImmutableNativeDeviceInput(read,device,stream);const auto view=table->rangeView();
             for(const int capacity:{1,17}) {
+                // Every registered root has GPU home placement. BufferArena's
+                // factory branch creates ordinary host/GPU tensors and has no
+                // owned-root PMA claim; this fixture owns both exact claims.
                 auto hostClaim=memory->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ActivationArena,arenaBytes(capacity,degree));
                 auto deviceClaim=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,arenaBytes(capacity,degree));
-                test::MockMPIContext mpi;TensorFactory factory(mpi);BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
+                TensorFactory factory(*mpi);BufferArena arena({.factory=&factory,.physical_memory_authority=memory});
                 for(const auto &r:roles(capacity,degree))require(arena.registerBuffer(r.id,r.rows,r.columns,r.type,device),"Register component role");require(arena.allocate(),"Allocate component arena");
                 SetupStreamRetirement setupRetirement(worker,*tp,stream,observations[participant]);
                 for(const auto &r:roles(capacity,degree)){auto *t=arena.getTensor(r.id);std::memset(t->raw_mutable_data(),0,t->size_bytes());
@@ -354,12 +393,17 @@ void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureI
                 std::vector<std::int64_t> originalIds(static_cast<std::size_t>(capacity)*16,-1);
                 std::vector<int> controlWords(sampling_math::kDeviceGenerationControlCount);
                 int originalCount=0;
+                auto graphReservation=memory->reserveNewAllocations(device,PhysicalMemoryOwner::NativeGraphExecutable,GPUGraphMemoryContract::reservationBytesPerExecutable(device,executableClass));
                 Retirement retirement(worker,*tp,graph,stream,rendezvous,dropped,observations[participant]);graph=worker.createGraphCapture(stream);rendezvous.arrive_and_wait();
                 // A dropped peer satisfies the host barrier but cannot participate
                 // in native capture. Abort is not permission to enqueue without it.
                 require(!tp->isAbortRequested(),"Peer failed before native component capture");
                 {ScopedBackendGraphCapture recording(worker,*graph,"fixed_native_two_allgathers",&ledger);require(recording.begin(),"Begin real component capture");
                     for(auto &node:nodes){ScopedGraphCaptureStage stage(node.get());require(node->execute(context.get()),"Record actual component operation");stage.complete();}recording.finish();}
+                std::string classError;
+                const bool classValid=graph->validateExecutableMemoryClass(executableClass,&classError);
+                require(classValid,classError.c_str());
+                require(graph->prepareRuntimeContextStorage(memory),"Prepare original component graph context storage");
                 require(graph->instantiate(),"Instantiate real component graph");++observations[participant].instantiated;
                 std::vector<GPUGraphKernelNodeInfo> kernelNodes;std::string resourceDetail;
                 require(graph->inspectKernelNodes(kernelNodes,&resourceDetail),"Inspect actual component kernels/resources");
@@ -457,7 +501,6 @@ void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureI
             table.reset();require(memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableTableStorage,PhysicalMemoryMaterializationKind::NewAllocation)==assignment.source.nativeBytes(),"Actual read token failed to retain native storage");
         });}catch(...){errors[participant]=std::current_exception();tp->requestAbort();if(!dropped)rendezvous.arrive_and_drop();}});
     for(auto &thread:threads)thread.join();
-    for(const auto &owner:memory->rankAttestation())require(!owner.materialized_new_bytes&&!owner.committed_new_bytes,"Component retirement leaked a PMA allocation");
     if(injection==HostFailureInjection::DuringArenaUpload) {
         require(tp->isAbortRequested(),"Initial upload failure did not publish cancellation");
         std::size_t injected=0,guarded=0;
@@ -497,24 +540,47 @@ void prove(DeviceId first,int degree,HostFailureInjection injection=HostFailureI
     }
     for(const auto &error:errors)if(error)std::rethrow_exception(error);
 }
+/**
+ * @brief Execute the component only on its actual original NUMA owner.
+ * @param family Original backend family selected by the explicit test case.
+ * @param degree Required discovered local population.
+ * @param injection Existing typed host-failure variant.
+ */
+void prove(DeviceType family,int degree,HostFailureInjection injection=HostFailureInjection::None)
+{
+    test::originalRankLocalReplay(family,degree,[&](const auto &cohort){
+        std::vector<DeviceId> reversed(cohort.rbegin(),cohort.rend());
+        proveOnOriginalRank(reversed,injection);
+    });
+}
+/** @return Explicit fixture-only failure point selected by the isolated original-case driver.
+ * @throws std::invalid_argument If the required reproducible failure declaration is absent or malformed.
+ */
+HostFailureInjection originalHostDropFailure()
+{
+    const char *raw=std::getenv("LLAMINAR_TEST_FIXED_HEAD_FAULT");
+    if(!raw)throw std::invalid_argument("Fixed-head hostdrop requires its original isolated failure declaration");
+    const std::string_view value(raw);
+    if(value=="upload")return HostFailureInjection::DuringArenaUpload;
+    if(value=="launch1" || value=="launch2" || value=="launch3")return HostFailureInjection::BeforeFirstRetainedLaunch;
+    throw std::invalid_argument("Unknown original fixed-head hostdrop failure declaration");
+}
 } // namespace
 /** @test CUDA2 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, CUDA2OriginalPackets){prove(DeviceId::cuda(0),2);}
+TEST(ImmutableFixedHeadNativeCohort, CUDA2OriginalPackets){prove(DeviceType::CUDA,2);}
 /** @test CUDA4 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, CUDA4OriginalPackets){prove(DeviceId::cuda(0),4);}
+TEST(ImmutableFixedHeadNativeCohort, CUDA4OriginalPackets){prove(DeviceType::CUDA,4);}
 /** @test CUDA8 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, CUDA8OriginalPackets){prove(DeviceId::cuda(0),8);}
+TEST(ImmutableFixedHeadNativeCohort, CUDA8OriginalPackets){prove(DeviceType::CUDA,8);}
 /** @test ROCm2 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, ROCm2OriginalPackets){prove(DeviceId::rocm(0),2);}
+TEST(ImmutableFixedHeadNativeCohort, ROCm2OriginalPackets){prove(DeviceType::ROCm,2);}
 /** @test ROCm4 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, ROCm4OriginalPackets){prove(DeviceId::rocm(0),4);}
+TEST(ImmutableFixedHeadNativeCohort, ROCm4OriginalPackets){prove(DeviceType::ROCm,4);}
 /** @test ROCm8 original source ranges and real two-allgather captured component. */
-TEST(ImmutableFixedHeadNativeCohort, ROCm8OriginalPackets){prove(DeviceId::rocm(0),8);}
+TEST(ImmutableFixedHeadNativeCohort, ROCm8OriginalPackets){prove(DeviceType::ROCm,8);}
 /** @test CUDA2 early-upload and captured-prelaunch peer drops retire exact owners before any unmatched launch. */
 TEST(ImmutableFixedHeadNativeCohort, CUDA2HostDropBeforeLaunch){
-    prove(DeviceId::cuda(0),2,HostFailureInjection::DuringArenaUpload);if(::testing::Test::IsSkipped())return;
-    for(int repetition=0;repetition<3;++repetition){SCOPED_TRACE(repetition);prove(DeviceId::cuda(0),2,HostFailureInjection::BeforeFirstRetainedLaunch);if(::testing::Test::IsSkipped())return;}}
+    prove(DeviceType::CUDA,2,originalHostDropFailure());}
 /** @test ROCm2 early-upload and captured-prelaunch peer drops retire exact owners before any unmatched launch. */
 TEST(ImmutableFixedHeadNativeCohort, ROCm2HostDropBeforeLaunch){
-    prove(DeviceId::rocm(0),2,HostFailureInjection::DuringArenaUpload);if(::testing::Test::IsSkipped())return;
-    for(int repetition=0;repetition<3;++repetition){SCOPED_TRACE(repetition);prove(DeviceId::rocm(0),2,HostFailureInjection::BeforeFirstRetainedLaunch);if(::testing::Test::IsSkipped())return;}}
+    prove(DeviceType::ROCm,2,originalHostDropFailure());}

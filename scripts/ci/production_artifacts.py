@@ -62,6 +62,213 @@ def model_identities(manifest: dict) -> dict:
     return result
 
 
+def validate_optional_native_cohort_requirement(requirement: dict) -> None:
+    """Validate the typed optional geometry shared by registration and receipt readers."""
+    if isinstance(requirement, dict) and "backend_degrees" in requirement:
+        degrees = requirement["backend_degrees"]
+        if (set(requirement) != {"backend_degrees", "locality", "mpi_ranks"}
+                or not isinstance(degrees, dict) or set(degrees) != {"cuda", "rocm"}
+                or any(type(degree) is not int or degree <= 0 for degree in degrees.values())
+                or requirement["locality"] not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+                or type(requirement["mpi_ranks"]) is not int or requirement["mpi_ranks"] <= 0
+                or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)):
+            raise ValueError("invalid optional mixed-family preflight geometry")
+        return
+    required = {"backend", "degree", "locality"}
+    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access"}
+    if (not isinstance(requirement, dict) or not required <= requirement.keys()
+            or not requirement.keys() <= required | optional):
+        raise ValueError("invalid optional preflight requirement")
+    backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
+    if (backend not in ("cuda", "rocm") or type(degree) is not int or degree <= 0
+            or locality not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+            or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
+        raise ValueError("unsupported optional preflight geometry")
+    if "native_isa" in requirement:
+        isa = requirement["native_isa"]
+        syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
+        if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
+            raise ValueError("invalid optional preflight native ISA")
+    if "peer_access" in requirement:
+        if (requirement["peer_access"] not in ("directed-edge", "no-directed-pair") or degree < 2
+                or (requirement["peer_access"] == "no-directed-pair" and degree != 2)
+                or locality != "original-numa-local-rank"
+                or "stage_sizes" in requirement or "rank_sizes" in requirement
+                or type(requirement.get("mpi_ranks")) is not int or requirement["mpi_ranks"] <= 0):
+            raise ValueError("invalid optional directed peer geometry")
+    if "rank_sizes" in requirement:
+        sizes = requirement["rank_sizes"]
+        if (locality != "two-distinct-numa-local-ranks" or "stage_sizes" in requirement
+                or not isinstance(sizes, list) or len(sizes) != 2
+                or any(type(size) is not int or size <= 0 for size in sizes)
+                or sum(sizes) != degree or type(requirement.get("mpi_ranks")) is not int
+                or requirement["mpi_ranks"] != 2):
+            raise ValueError("invalid optional preflight original rank geometry")
+    elif "stage_sizes" in requirement:
+        stages, ranks = requirement["stage_sizes"], requirement.get("mpi_ranks")
+        if (locality != "original-numa-local-rank" or not isinstance(stages, list) or len(stages) < 2
+                or any(type(size) is not int or size <= 0 for size in stages) or sum(stages) != degree
+                or type(ranks) is not int or ranks <= 0):
+            raise ValueError("invalid optional preflight stage/discovery geometry")
+    elif "mpi_ranks" in requirement and "peer_access" not in requirement:
+        raise ValueError("optional preflight discovery count requires stage geometry")
+
+
+def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | None:
+    """Recompute exact optional eligibility from the original observed hardware.
+
+    Local native collectives never pool devices across NUMA ranks. The explicit
+    distinct-rank case uses two separate rank transport endpoints. A staged
+    observed request also proves its original CPU discovery coverage and cannot
+    borrow a different ISA or an ambiguous second matching NUMA owner.
+    """
+    validate_optional_native_cohort_requirement(requirement)
+    from run_qfn_source_admission import (observed_native_isa_cohorts,
+        observed_pipeline_hardware_requirement, source_hardware_devices)
+    observed = source_hardware_devices(hardware)
+    absence = {"qualification": "hardware-ineligible-unqualified", "requirement": requirement}
+    if "backend_degrees" in requirement:
+        cohorts = {backend: {} for backend in requirement["backend_degrees"]}
+        unknown = {backend: [] for backend in cohorts}
+        cpu_nodes = {device["numa_node"] for address, device in observed.items()
+                     if address[0] == "cpu" and device["numa_node"] >= 0}
+        for (backend, ordinal, _), device in observed.items():
+            if backend not in cohorts:
+                continue
+            numa = device["numa_node"]
+            if numa < 0:
+                unknown[backend].append(ordinal)
+            else:
+                cohorts[backend].setdefault(numa, []).append(ordinal)
+        eligible = {backend: {numa for numa, ordinals in groups.items()
+                              if numa in cpu_nodes and len(ordinals) >= requirement["backend_degrees"][backend]}
+                    for backend, groups in cohorts.items()}
+        cuda_nodes, rocm_nodes = eligible["cuda"], eligible["rocm"]
+        legal_owners = (bool(cuda_nodes & rocm_nodes) if requirement["locality"] == "original-numa-local-rank"
+                        else any(cuda != rocm for cuda in cuda_nodes for rocm in rocm_nodes))
+        if legal_owners and len(cpu_nodes) >= requirement["mpi_ranks"]:
+            return None
+        return {**absence, "observed_cpu_discovery_nodes": sorted(cpu_nodes),
+                "observed_family_numa_cohorts": {backend: [
+                    {"numa_node": numa, "ordinals": sorted(groups[numa])} for numa in sorted(groups)]
+                    for backend, groups in cohorts.items()},
+                "unknown_locality_ordinals": {backend: sorted(ordinals) for backend, ordinals in unknown.items()}}
+    backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
+    if "stage_sizes" in requirement and "native_isa" in requirement:
+        # This is the same observed selector used for QFN source qualification.
+        # The request has no invented addresses; runtime still binds the exact
+        # original discovery rank and stage devices before the native body runs.
+        missing = observed_pipeline_hardware_requirement({"participants": [],
+            "mpi_ranks": requirement["mpi_ranks"], "observed_pipeline_request": {
+                key: requirement[key] for key in ("backend", "native_isa", "stage_sizes")}}, observed)
+        return {**absence, "observed_pipeline_cohort": missing[0]} if missing else None
+    cohorts: dict[int, list[int]] = {}
+    unknown = []
+    if "native_isa" in requirement:
+        cohorts = {numa: [device["ordinal"] for device in devices]
+                   for numa, devices in observed_native_isa_cohorts(observed, backend, requirement["native_isa"]).items()}
+    else:
+        for (family, ordinal, _), device in observed.items():
+            if family != backend:
+                continue
+            numa = device["numa_node"]
+            if numa < 0:
+                unknown.append(ordinal)
+            else:
+                cohorts.setdefault(numa, []).append(ordinal)
+    if "peer_access" in requirement:
+        # Consume the complete original publication; missing facts cannot become
+        # a negative capability observation or trigger another discovery probe.
+        matrix = hardware.get("directed_peer_access")
+        if not isinstance(matrix, list):
+            raise ValueError("missing original directed peer matrix")
+        facts = {}
+        for edge in matrix:
+            if (not isinstance(edge, dict) or set(edge) != {"backend", "accessor", "peer", "available"}
+                    or edge["backend"] not in ("cuda", "rocm")
+                    or type(edge["accessor"]) is not int or type(edge["peer"]) is not int
+                    or edge["accessor"] == edge["peer"] or type(edge["available"]) is not bool):
+                raise ValueError("malformed original directed peer matrix")
+            key = (edge["backend"], edge["accessor"], edge["peer"])
+            if key in facts:
+                raise ValueError("duplicate original directed peer edge")
+            facts[key] = edge["available"]
+        expected = {(family, a, b) for family in ("cuda", "rocm")
+                    for f, a, _ in observed for g, b, _ in observed
+                    if f == g == family and a != b}
+        if set(facts) != expected:
+            raise ValueError("incomplete or foreign original directed peer matrix")
+        cpu_nodes = {device["numa_node"] for address, device in observed.items()
+                     if address[0] == "cpu" and device["numa_node"] >= 0}
+        eligible = len(cpu_nodes) >= requirement["mpi_ranks"] and any(
+            numa in cpu_nodes and len(ordinals) >= degree
+            and any((facts[(backend, destination, source)] if requirement["peer_access"] == "directed-edge"
+                     else not facts[(backend, destination, source)] and not facts[(backend, source, destination)])
+                    for source in ordinals for destination in ordinals if source != destination)
+            for numa, ordinals in cohorts.items())
+        absence["observed_cpu_discovery_nodes"] = sorted(cpu_nodes)
+        absence["observed_directed_peer_access"] = matrix
+    elif "rank_sizes" in requirement:
+        cpu_nodes = {device["numa_node"] for address, device in observed.items()
+                     if address[0] == "cpu" and device["numa_node"] >= 0}
+        first, second = requirement["rank_sizes"]
+        eligible = any(left != right and left in cpu_nodes and right in cpu_nodes
+                       and len(left_devices) >= first and len(right_devices) >= second
+                       for left, left_devices in cohorts.items() for right, right_devices in cohorts.items())
+        absence["observed_cpu_discovery_nodes"] = sorted(cpu_nodes)
+    elif "stage_sizes" in requirement:
+        cpu_nodes = {device["numa_node"] for address, device in observed.items() if address[0] == "cpu"}
+        eligible_owners = [numa for numa, ordinals in cohorts.items() if numa in cpu_nodes and len(ordinals) >= degree]
+        if len(eligible_owners) > 1:
+            raise ValueError("observed pipeline request has ambiguous original NUMA ownership")
+        eligible = bool(eligible_owners) and len(cpu_nodes) >= requirement["mpi_ranks"]
+        absence["observed_cpu_discovery_nodes"] = sorted(cpu_nodes)
+    else:
+        eligible = (len(cohorts) >= 2 if locality == "two-distinct-numa-local-ranks"
+                    else any(len(ordinals) >= degree for ordinals in cohorts.values()))
+    if eligible:
+        return None
+    return {**absence, "observed_count": (sum(map(len, cohorts.values())) if "native_isa" in requirement
+                else sum(address[0] == backend for address in observed)),
+        "observed_numa_cohorts": [{"numa_node": numa, "ordinals": sorted(cohorts[numa])}
+            for numa in sorted(cohorts)], "unknown_locality_ordinals": sorted(unknown)}
+
+
+def validate_preflight_qualification(tests: list[str], qualification: dict) -> None:
+    """Authenticate full registration coverage and exact absent physical geometries.
+
+    The original native hardware reader owns address/schema validation. Every
+    optional requirement is recomputed against that saved observation; omissions,
+    invented absence and selected/unqualified overlap fail closed.
+    """
+    if (not isinstance(qualification, dict) or set(qualification) != {
+            "schema", "registered", "selected", "requirements", "hardware", "unqualified"}
+            or qualification["schema"] != 1 or type(qualification["schema"]) is not int
+            or qualification["registered"] != tests):
+        raise ValueError("missing or stale preflight hardware qualification")
+    requirements = qualification["requirements"]
+    if not isinstance(requirements, dict) or not set(requirements).issubset(tests):
+        raise ValueError("foreign optional preflight geometry")
+    if requirements:
+        from run_qfn_source_admission import source_hardware_devices
+        observed = source_hardware_devices(qualification["hardware"])
+    else:
+        if qualification["hardware"] is not None:
+            raise ValueError("unexpected preflight hardware observation")
+        observed = {}
+    unavailable = {}
+    for name, requirement in requirements.items():
+        if not name.startswith("V2_Integration_"):
+            raise ValueError("invalid optional preflight requirement")
+        absence = optional_native_cohort_absence(requirement, qualification["hardware"])
+        if absence is not None:
+            unavailable[name] = absence
+    if qualification["unqualified"] != unavailable:
+        raise ValueError("preflight unqualified evidence differs from actual native hardware")
+    if qualification["selected"] != [name for name in tests if name not in unavailable]:
+        raise ValueError("preflight selected/unqualified partition is incomplete or overlapping")
+
+
 def validate_prerequisites(report: dict) -> None:
     """Require the canonical completed model-free receipt, not a cell pass flag."""
     tests = report.get("preflight_tests")
@@ -73,6 +280,7 @@ def validate_prerequisites(report: dict) -> None:
             or not any(name.startswith("V2_Unit_") for name in tests)
             or not any(name.startswith("V2_Integration_") for name in tests)):
         raise ValueError("canonical Unit/production-preflight receipt is incomplete or failed")
+    validate_preflight_qualification(tests, report.get("preflight_qualification"))
 
 
 def digest(value: object) -> str:

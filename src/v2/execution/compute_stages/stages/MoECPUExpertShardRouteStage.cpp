@@ -100,7 +100,19 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     if(sparse && (sparse->entry_capacity<slots || sparse->d_model!=p.columns || sparse->top_k!=p.top_k ||
        !sparse->original_route_slots_host || !sparse->expert_ids_host || !sparse->route_weights_host))
         throw std::invalid_argument("CPU shard gather requires exact original sparse route roots");
-    if(sparse && (!p.original_return_rows || (root && !p.original_canonical_ticket && (!p.original_preweighted_routes ||
+    const bool host_canonical=p.return_publication==OriginalReturnPublication::CanonicalHostRows;
+    if(host_canonical && (!sparse || !p.original_return_rows || p.original_canonical_ticket || p.original_preweighted_routes ||
+        !p.original_continuation_device.is_cpu() || p.original_return_rows->layout!=MoEOverlayReturnLayout::CanonicalExpertRoutes ||
+        p.original_return_rows->d_model!=p.columns || p.original_return_rows->row_capacity<slots ||
+        p.original_return_rows->row_capacity>maximum/h/sizeof(float) ||
+        p.original_return_rows->row_capacity>maximum/sizeof(int32_t)))
+        throw std::invalid_argument("CPU joint host return requires its exact original unweighted canonical packet");
+    if(host_canonical) {
+        const auto* native=dynamic_cast<GlobalTPContext*>(p.tp);
+        if(!native || !p.original_tp_owner || !native->authenticatesOriginalCPUExpertBorrow(p.original_tp_owner))
+            throw std::invalid_argument("CPU joint host return requires its original admitted native CPU domain");
+    }
+    if(sparse && (!p.original_return_rows || (root && !host_canonical && !p.original_canonical_ticket && (!p.original_preweighted_routes ||
        p.original_return_route_capacity<slots))))
         throw std::invalid_argument("CPU shard sparse return requires the exact original endpoint return bank");
     if(p.original_prepared_layer && (!p.original_prepared_layer->sourceSelection() ||
@@ -117,7 +129,7 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
        p.original_canonical_ticket->continuationDevice()!=p.original_continuation_device ||
        p.original_canonical_ticket->routeCapacity()<slots))
         throw std::invalid_argument("CPU joint canonical ticket requires its exact source/frame/context/layer/GPU binding");
-    const std::array<std::pair<const void*,size_t>,11> regions{{
+    const std::array<std::pair<const void*,size_t>,13> regions{{
         {p.packed_records->data(),p.packed_records->numel()*sizeof(float)},
         {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots*sizeof(float):0},
         {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots*sizeof(float):0},
@@ -128,7 +140,11 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
         {sparse?sparse->original_route_slots_host:nullptr,sparse?slots*sizeof(int32_t):0},
         {sparse?sparse->expert_ids_host:nullptr,sparse?slots*sizeof(int32_t):0},
         {sparse?sparse->route_weights_host:nullptr,sparse?slots*sizeof(float):0},
-        {root?p.original_preweighted_routes:nullptr,root && sparse && p.original_preweighted_routes?slots*h*sizeof(float):0}}};
+        {root?p.original_preweighted_routes:nullptr,root && sparse && p.original_preweighted_routes?slots*h*sizeof(float):0},
+        {root && host_canonical?p.original_return_rows->row_ids_host:nullptr,
+            root && host_canonical?p.original_return_rows->row_capacity*sizeof(int32_t):0},
+        {root && host_canonical?p.original_return_rows->output_rows_fp32:nullptr,
+            root && host_canonical?p.original_return_rows->row_capacity*h*sizeof(float):0}}};
     for(size_t i=0;i<regions.size();++i) {
         const auto [pointer,bytes]=regions[i];
         if(!bytes)continue;
@@ -267,7 +283,7 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     };
     if(p.tp->myIndex()!=p.root_participant) {
         if(publication && !publication->publish(0u))return reject("contributor_empty_ticket_publication");
-        if(p.original_canonical_ticket) {
+        if(p.original_canonical_ticket || p.return_publication==OriginalReturnPublication::CanonicalHostRows) {
             p.original_return_rows->live_row_count=0u;
             p.original_return_rows->layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
         }
@@ -298,6 +314,10 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     } else {
         if(!cpu::moe::combineCanonicalShardRouteRecords(combine_args))return reject("canonical_fixed_order_combine");
         if(timing_observation_)timing_observation_->sample_.combine_ns=rootTimingElapsed(combine_begin);
+        if(p.return_publication==OriginalReturnPublication::CanonicalHostRows &&
+            !copyMoEOverlayCanonicalRouteRowsToHostReturn(*sparse,
+                {p.combined_routes->data(),slots*static_cast<size_t>(p.columns)},*p.original_return_rows))
+            return reject("original_unweighted_host_return");
     }
     publish();
     return finish();

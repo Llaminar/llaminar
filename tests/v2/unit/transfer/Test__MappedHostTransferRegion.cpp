@@ -1537,3 +1537,53 @@ TEST_F(Test__MappedHostTransferRegion, WorkspaceCanonicalTicketDeclarationRetain
     EXPECT_FALSE(cpu.awaitCapturedPublication());
     EXPECT_THROW((void)cpu.ticket(),std::logic_error);
 }
+
+/** @test Exact admitted arena sequence, backing geometry and last-alias lifetime share one issuer. */
+TEST_F(Test__MappedHostTransferRegion, AdmittedArenaOriginalSequenceAndAliasRetirement)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+        auto* backend=device.is_cuda()?cuda_.get():rocm_.get();
+        backend->page_aligned_mapped_storage=true;
+        const auto page=TransferEngine::mappedHostRegionAllocationBytes(1);
+        const std::array requests{MappedHostTransferArena::AllocationRequest{13,64},
+            MappedHostTransferArena::AllocationRequest{page+1,64},
+            MappedHostTransferArena::AllocationRequest{17,64}};
+        const auto bytes=MappedHostTransferArena::backingBytes(requests);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add({0,DeviceId::cpu(),bytes,bytes},PhysicalMemoryOwner::ActivationTransportStaging,bytes);
+        plan.add({0,device,bytes,bytes},PhysicalMemoryOwner::ActivationArena,0u);
+        const auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+        auto arena=engine_.createMappedHostArena(std::array{device},memory,requests);
+        EXPECT_THROW(arena->requireDeclarationConsumed(),std::logic_error);
+        EXPECT_THROW(arena->allocate(14,64),std::logic_error);
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+        for(const auto request:requests)slices.push_back(arena->allocate(request.bytes,request.alignment));
+        EXPECT_NO_THROW(arena->requireDeclarationConsumed());
+        EXPECT_EQ(arena->snapshot().committed_bytes,bytes);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+        EXPECT_THROW(arena->allocate(1,64),std::logic_error);
+        arena.reset();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+        slices.clear();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        backend->force_null_mapped_alias=true;
+        auto failed=engine_.createMappedHostArena(std::array{device},memory,requests);
+        EXPECT_THROW(failed->allocate(requests[0].bytes,requests[0].alignment),std::runtime_error);
+        EXPECT_THROW(failed->requireDeclarationConsumed(),std::logic_error);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        backend->force_null_mapped_alias=false;
+        EXPECT_NO_THROW(failed->allocate(requests[0].bytes,requests[0].alignment));
+        EXPECT_THROW(failed->requireDeclarationConsumed(),std::logic_error); // overdeclared construction
+        failed.reset();
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+    EXPECT_THROW(MappedHostTransferArena::backingBytes({}),std::invalid_argument);
+    const std::array invalid{MappedHostTransferArena::AllocationRequest{1,3}};
+    EXPECT_THROW(MappedHostTransferArena::backingBytes(invalid),std::invalid_argument);
+}

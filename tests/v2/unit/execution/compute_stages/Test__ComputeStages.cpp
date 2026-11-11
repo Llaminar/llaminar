@@ -637,7 +637,8 @@ TEST_F(ComputeStagesTest,
     // Only the RCU placement generation has the ABI-wide expert capacity.
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
-        12348264u + moe_runtime_abi::kPlacementBankBytes);
+        12348264u + moe_runtime_abi::kPlacementBankBytes +
+            sizeof(DeviceMoERebalanceCompletedDecision));
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
         12349440u + placement_only.total_bytes_with_alignment());

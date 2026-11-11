@@ -489,6 +489,7 @@ namespace llaminar2
                 "ExpertOverlay inference transaction channel requires one valid rank pair and fixed send ring");
         }
         send_slots_.resize(config_.send_slot_count);
+        executing_tickets_.reserve(config_.send_slot_count);
     }
 
     MoEOverlayMPIInferenceTransactionChannel::
@@ -673,57 +674,64 @@ namespace llaminar2
     }
 
     bool MoEOverlayMPIInferenceTransactionChannel::awaitCompletion(
-        const MoEOverlayInferenceTransactionTicket &ticket,
-        std::string *error)
+        const MoEOverlayInferenceTransactionTicket &ticket, std::string *error)
     {
-        if (localWorldRank() != sourceWorldRank())
-            return fail("Only the continuation authority may join graph completion", error);
-        const auto found = std::find_if(send_slots_.begin(), send_slots_.end(),
-            [&](const SendSlot &slot) {
-                return slot.lifecycle == SlotLifecycle::AwaitingGraphCompletion &&
-                       slot.ticket == ticket;
-            });
-        if (found == send_slots_.end())
-            return fail("ExpertOverlay completion has no matching live execution ticket", error);
-
-        auto &slot = *found;
         const auto begin = std::chrono::steady_clock::now();
+        const auto deadline = begin + std::chrono::milliseconds(
+            collective_timeout_policy::effectiveCollectTimeoutMs(0));
+        while (true)
+        {
+            const auto progress = tryAwaitCompletion(ticket, error);
+            if (progress == MoEOverlayInferenceCompletionFenceProgress::Failed) return false;
+            if (progress == MoEOverlayInferenceCompletionFenceProgress::Ready)
+            {
+                recordTicketTiming(ticket, "graph_completion_wait", "publisher", begin,
+                    std::chrono::steady_clock::now());
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                return fail("Timed out awaiting exact follower graph completion", error);
+            std::this_thread::yield();
+        }
+    }
+
+    MoEOverlayInferenceCompletionFenceProgress
+    MoEOverlayMPIInferenceTransactionChannel::tryAwaitCompletion(
+        const MoEOverlayInferenceTransactionTicket &ticket, std::string *error)
+    {
+        using Progress = MoEOverlayInferenceCompletionFenceProgress;
+        const auto found = std::find_if(send_slots_.begin(), send_slots_.end(),
+            [&](const SendSlot &slot) { return slot.lifecycle == SlotLifecycle::AwaitingGraphCompletion && slot.ticket == ticket; });
+        if (localWorldRank() != sourceWorldRank() || found == send_slots_.end())
+        {
+            fail("Asynchronous completion has no matching live source ticket", error);
+            return Progress::Failed;
+        }
+        auto &slot = *found;
         try
         {
-            MPI_Status status{};
-            if (!progressRequestToCompletion(
-                    &slot.completion_request, &status,
-                    "ExpertOverlay follower graph completion", error))
+            if (slot.completion_request != MPI_REQUEST_NULL)
             {
-                slot.lifecycle = SlotLifecycle::Failed;
-                return false;
+                MPI_Status status{};
+                if (!config_.mpi_ctx->test(&slot.completion_request, &status)) return Progress::Pending;
+                if (config_.mpi_ctx->getCount(status, MPI_BYTE) != static_cast<int>(sizeof(slot.completion_ticket)) ||
+                    slot.completion_ticket != slot.ticket)
+                {
+                    slot.lifecycle = SlotLifecycle::Failed;
+                    fail("Asynchronous completion failed exact ticket authentication", error);
+                    return Progress::Failed;
+                }
             }
-            if (config_.mpi_ctx->getCount(status, MPI_BYTE) !=
-                    static_cast<int>(sizeof(slot.completion_ticket)) ||
-                slot.completion_ticket != slot.ticket)
-            {
-                slot.lifecycle = SlotLifecycle::Failed;
-                return fail("ExpertOverlay follower completion failed exact ticket authentication", error);
-            }
-            // The completion proves peer execution, not necessarily local MPI
-            // send-buffer release. Join both owners before recycling the slot.
-            if (!progressRequestToCompletion(&slot.request, nullptr,
-                    "ExpertOverlay completed graph ticket send", error))
-            {
-                slot.lifecycle = SlotLifecycle::Failed;
-                return false;
-            }
+            if (slot.request != MPI_REQUEST_NULL && !config_.mpi_ctx->test(&slot.request)) return Progress::Pending;
             slot.lifecycle = SlotLifecycle::Available;
             recordGraphCompletion(ticket, "source");
-            recordTicketTiming(ticket, "graph_completion_wait", "publisher",
-                               begin, std::chrono::steady_clock::now());
-            return true;
+            return Progress::Ready;
         }
         catch (const std::exception &exception)
         {
             slot.lifecycle = SlotLifecycle::Failed;
-            return fail(std::string("ExpertOverlay graph completion failed: ") +
-                        exception.what(), error);
+            fail(exception.what(), error);
+            return Progress::Failed;
         }
     }
 
@@ -732,8 +740,7 @@ namespace llaminar2
         std::string *error)
     {
         if (localWorldRank() != targetWorldRank() ||
-            receive_lifecycle_ != ReceiveLifecycle::Executing ||
-            ticket != receive_ticket_)
+            std::find(executing_tickets_.begin(), executing_tickets_.end(), ticket) == executing_tickets_.end())
         {
             return fail("ExpertOverlay completion must name the follower's exact executing ticket", error);
         }
@@ -748,7 +755,7 @@ namespace llaminar2
             slot->request = config_.mpi_ctx->isend(
                 &slot->ticket, sizeof(slot->ticket), MPI_BYTE,
                 sourceWorldRank(), kInferenceTransactionCompletionTag);
-            receive_lifecycle_ = ReceiveLifecycle::Idle;
+            executing_tickets_.erase(std::find(executing_tickets_.begin(), executing_tickets_.end(), ticket));
             recordGraphCompletion(ticket, "target");
             return true;
         }
@@ -762,82 +769,64 @@ namespace llaminar2
     }
 
     MoEOverlayInferenceTransactionReceiveResult
-    MoEOverlayMPIInferenceTransactionChannel::receive()
+    MoEOverlayMPIInferenceTransactionChannel::tryReceive()
     {
         MoEOverlayInferenceTransactionReceiveResult result;
-        if (config_.mpi_ctx->rank() != config_.target_world_rank)
+        if (localWorldRank() != targetWorldRank() || receive_lifecycle_ == ReceiveLifecycle::Failed)
         {
-            result.error =
-                "Only the remote follower may receive an ExpertOverlay transaction ticket";
+            result.error = "Invalid asynchronous follower receive lifecycle";
             return result;
         }
-        if (receive_lifecycle_ != ReceiveLifecycle::Idle)
-        {
-            result.error = "ExpertOverlay follower cannot receive before completing its current graph";
-            return result;
-        }
-
         try
         {
-            receive_ticket_ = {};
-            receive_lifecycle_ = ReceiveLifecycle::Receiving;
+            if (receive_lifecycle_ == ReceiveLifecycle::Idle)
+            {
+                if (executing_tickets_.size() == config_.send_slot_count) return result;
+                receive_ticket_ = {};
+                receive_request_ = config_.mpi_ctx->irecv(&receive_ticket_, sizeof(receive_ticket_),
+                    MPI_BYTE, sourceWorldRank(), kInferenceTransactionTicketTag);
+                receive_lifecycle_ = ReceiveLifecycle::Receiving;
+            }
             MPI_Status status{};
-            receive_request_ = config_.mpi_ctx->irecv(
-                &receive_ticket_,
-                sizeof(receive_ticket_),
-                MPI_BYTE,
-                config_.source_world_rank,
-                kInferenceTransactionTicketTag);
-            const auto receive_begin = std::chrono::steady_clock::now();
-            if (!progressRequestToCompletion(
-                    &receive_request_,
-                    &status,
-                    "ExpertOverlay transaction ticket receive",
-                    &result.error))
+            if (!config_.mpi_ctx->test(&receive_request_, &status)) return result;
+            if (config_.mpi_ctx->getCount(status, MPI_BYTE) != static_cast<int>(sizeof(receive_ticket_)) ||
+                !receive_ticket_.valid() || receive_ticket_.source_world_rank != sourceWorldRank() ||
+                receive_ticket_.target_world_rank != targetWorldRank())
             {
                 receive_lifecycle_ = ReceiveLifecycle::Failed;
+                result.error = "Asynchronous ticket receive failed fixed-size lane authentication";
                 return result;
             }
-            const int received = config_.mpi_ctx->getCount(status, MPI_BYTE);
-            if (received != static_cast<int>(sizeof(receive_ticket_)))
-            {
-                receive_lifecycle_ = ReceiveLifecycle::Failed;
-                result.error =
-                    "ExpertOverlay transaction control message has the wrong fixed size";
-                return result;
-            }
-            if (!receive_ticket_.valid() ||
-                receive_ticket_.source_world_rank !=
-                    config_.source_world_rank ||
-                receive_ticket_.target_world_rank !=
-                    config_.target_world_rank)
-            {
-                receive_lifecycle_ = ReceiveLifecycle::Failed;
-                result.error =
-                    "ExpertOverlay transaction control message failed lane authentication";
-                return result;
-            }
-            receive_lifecycle_ = receive_ticket_.action ==
-                    MoEOverlayInferenceTransactionAction::Execute
-                ? ReceiveLifecycle::Executing : ReceiveLifecycle::Idle;
+            receive_lifecycle_ = ReceiveLifecycle::Idle;
             result.ok = true;
             result.ticket = receive_ticket_;
-            recordTicketTiming(
-                result.ticket,
-                "control_receive_wait",
-                "follower",
-                receive_begin,
-                std::chrono::steady_clock::now());
+            if (result.ticket.action == MoEOverlayInferenceTransactionAction::Execute)
+                executing_tickets_.push_back(result.ticket);
             recordTicket(result.ticket, "follower", "received");
-            return result;
         }
         catch (const std::exception &exception)
         {
             receive_lifecycle_ = ReceiveLifecycle::Failed;
-            result.error =
-                std::string("ExpertOverlay transaction ticket receive failed: ") +
-                exception.what();
-            return result;
+            result.error = exception.what();
+        }
+        return result;
+    }
+
+    MoEOverlayInferenceTransactionReceiveResult
+    MoEOverlayMPIInferenceTransactionChannel::receive()
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+            collective_timeout_policy::effectiveCollectTimeoutMs(0));
+        while (true)
+        {
+            auto result = tryReceive();
+            if (result.ok || !result.error.empty()) return result;
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                result.error = "Timed out receiving an inference transaction ticket";
+                return result;
+            }
+            std::this_thread::yield();
         }
     }
 
@@ -869,7 +858,7 @@ namespace llaminar2
             return;
         try
         {
-            if (receive_lifecycle_ != ReceiveLifecycle::Idle)
+            if (receive_lifecycle_ != ReceiveLifecycle::Idle || !executing_tickets_.empty())
             {
                 LOG_ERROR("ExpertOverlay control channel destroyed with an unretired follower graph or receive");
                 std::terminate();
@@ -1027,6 +1016,22 @@ namespace llaminar2
             "publisher_authority",
             "data_return_retired");
         return true;
+    }
+
+    MoEOverlayInferenceCompletionFenceProgress MoEOverlayInferenceTransactionPublisher::tryRetire(
+        const MoEOverlayPublishedInferenceTransaction &transaction, std::string *error)
+    {
+        using Progress = MoEOverlayInferenceCompletionFenceProgress;
+        if (!transaction.ok || transaction.slot_index == MoEOverlayInferenceAdmission::kNoSlot)
+        {
+            fail("Cannot poll an unpublished transaction", error);
+            return Progress::Failed;
+        }
+        const auto progress = channel_->tryAwaitCompletion(transaction.ticket, error);
+        if (progress != Progress::Ready) return progress;
+        if (!protocol_.markReturnReady(transaction.slot_index, transaction.ticket, error) ||
+            !protocol_.retire(transaction.slot_index, transaction.ticket, error)) return Progress::Failed;
+        return Progress::Ready;
     }
 
     bool MoEOverlayInferenceTransactionPublisher::publishTerminal(
@@ -2035,6 +2040,10 @@ namespace llaminar2
                 return result;
             }
             break;
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            failLocked("Explicit pipeline conditions require their original pipeline publisher, not the sparse graph coordinator", &result.error);
+            return result;
         case MoEOverlayInferenceGraphRole::None:
             break;
         }
@@ -3222,6 +3231,31 @@ namespace llaminar2
               std::move(config.retired_decode_progress_sink))
     {
         validateConstruction();
+        pending_.reserve(channel_->slotCapacity());
+    }
+
+    MoEOverlayInferenceTransactionFollower::~MoEOverlayInferenceTransactionFollower()
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+            collective_timeout_policy::effectiveCollectTimeoutMs(0));
+        for (auto &entry : pending_)
+        {
+            if (entry.scope) entry.scope->discard();
+            if (entry.submission_progress == MoEOverlayInferenceCompletionFenceProgress::Ready) continue;
+            while (true)
+            {
+                std::string error;
+                const auto progress = entry.fence->poll(&error);
+                if (progress == MoEOverlayInferenceCompletionFenceProgress::Ready) break;
+                if (progress != MoEOverlayInferenceCompletionFenceProgress::Pending ||
+                    std::chrono::steady_clock::now() >= deadline)
+                {
+                    LOG_ERROR("Follower teardown cannot prove retained native producer terminal: " << error);
+                    std::terminate();
+                }
+                std::this_thread::yield();
+            }
+        }
     }
 
     void MoEOverlayInferenceTransactionFollower::validateConstruction() const
@@ -3243,9 +3277,15 @@ namespace llaminar2
     }
 
     MoEOverlayInferenceFollowerCommandResult
-    MoEOverlayInferenceTransactionFollower::runOneCommand()
+    MoEOverlayInferenceTransactionFollower::runOneCommand(
+        std::optional<MoEOverlayInferenceCommandIdentity> admitted_command)
     {
         MoEOverlayInferenceFollowerCommandResult result;
+        // Original global-rank commands have already authenticated provenance
+        // before opening their directed channels. Bind that same identity before
+        // any ticket can submit model work; a ticket cannot choose another mode.
+        if (admitted_command && !protocol_.beginCommand(*admitted_command, &result.error))
+            return result;
         std::optional<MoEOverlayInferenceWorkloadIdentity>
             active_prefill_schedule;
         std::optional<MoEOverlayInferenceInterferenceScope>
@@ -3303,15 +3343,129 @@ namespace llaminar2
                  {"sideband", "existing_transaction_ticket"}});
             return true;
         };
-        while (true)
+        // The fixed ring owns native fences until their exact event and protocol
+        // retirement complete. Receiving later immutable tickets never acknowledges
+        // earlier GPU work and never overwrites its event identity.
+        auto &pending = pending_;
+        if (!pending.empty())
         {
-            const auto received = channel_->receive();
-            if (!received.ok)
+            result.error = "A failed follower command still owns native completion fences";
+            return result;
+        }
+        /** @brief Failed commands never publish timing samples for unfinished device work. */
+        struct PendingScopeGuard
+        {
+            std::vector<PendingExecution> &entries;
+            ~PendingScopeGuard() { for (auto &entry : entries) if (entry.scope) entry.scope->discard(); }
+        } pending_scope_guard{pending};
+        const auto retire_execution = [&](const MoEOverlayInferenceTransactionTicket &ticket,
+            std::size_t slot_index,
+            std::optional<MoEOverlayInferenceInterferenceScope> &transaction_scope,
+            std::chrono::steady_clock::time_point execution_begin) -> bool
+        {
+            const auto prefill_schedule = ticket.prefillScheduleWorkload();
+            const auto execution_end = std::chrono::steady_clock::now();
+            transaction_scope.reset();
+            if (prefill_schedule.valid())
+            {
+                ++active_prefill_transactions;
+                if (active_prefill_transactions ==
+                    prefill_schedule.transaction_count)
+                {
+                    /*
+                     * The immediate CPU return or exact native completion fence
+                     * proves the graph and sparse return handoff are terminal.
+                     * Only that proof closes the logical schedule sample.
+                     */
+                    active_prefill_scope.reset();
+                    active_prefill_schedule.reset();
+                    active_prefill_transactions = 0;
+                }
+            }
+            recordTicketTiming(
+                ticket,
+                "follower_graph_execution",
+                "follower",
+                execution_begin,
+                execution_end);
+            if (!protocol_.markReturnReady(
+                    slot_index, ticket, &result.error) ||
+                !protocol_.retire(
+                    slot_index, ticket, &result.error))
             {
                 discard_active_prefill();
-                result.error = received.error;
-                return result;
+                return false;
             }
+            if (ticket.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainPrefill &&
+                retired_prefill_progress_sink_)
+            {
+                const std::uint64_t completed_tokens =
+                    static_cast<std::uint64_t>(ticket.request_count) *
+                    static_cast<std::uint64_t>(
+                        ticket.logical_rows_per_request);
+                if (!retired_prefill_progress_sink_(
+                        completed_tokens, &result.error))
+                {
+                    discard_active_prefill();
+                    if (result.error.empty())
+                    {
+                        result.error =
+                            "ExpertOverlay follower prefill progress sideband rejected a retired transaction";
+                    }
+                    return false;
+                }
+            }
+            recordTicketTiming(
+                ticket,
+                "follower_protocol_retirement",
+                "follower",
+                execution_end,
+                std::chrono::steady_clock::now());
+            // The exact executor terminal and local protocol retirement precede
+            // the receipt; empty numerical routes cannot erase this lifetime edge.
+            if (!channel_->publishCompletion(ticket, &result.error))
+                return false;
+            ++result.executed_transactions;
+            recordTicket(ticket, "follower", "executed");
+            return true;
+        };
+        auto progress_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+            collective_timeout_policy::effectiveCollectTimeoutMs(0));
+        while (true)
+        {
+            while (!pending.empty())
+            {
+                auto &front = pending.front();
+                const auto progress = front.submission_progress == MoEOverlayInferenceCompletionFenceProgress::Ready ?
+                    MoEOverlayInferenceCompletionFenceProgress::Ready : front.fence->poll(&result.error);
+                if (progress == MoEOverlayInferenceCompletionFenceProgress::Pending) break;
+                if (progress != MoEOverlayInferenceCompletionFenceProgress::Ready ||
+                    !retire_execution(front.ticket, front.slot_index, front.scope, front.execution_begin))
+                {
+                    for (auto &entry : pending) if (entry.scope) entry.scope->discard();
+                    discard_active_prefill();
+                    return result;
+                }
+                pending.erase(pending.begin());
+                progress_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                    collective_timeout_policy::effectiveCollectTimeoutMs(0));
+            }
+            const auto received = channel_->tryReceive();
+            if (!received.ok)
+            {
+                if (!received.error.empty() || std::chrono::steady_clock::now() >= progress_deadline)
+                {
+                    for (auto &entry : pending) if (entry.scope) entry.scope->discard();
+                    discard_active_prefill();
+                    result.error = received.error.empty() ? "Timed out progressing follower transaction events/tickets" : received.error;
+                    return result;
+                }
+                std::this_thread::yield();
+                continue;
+            }
+            progress_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                collective_timeout_policy::effectiveCollectTimeoutMs(0));
 
             const auto &ticket = received.ticket;
             const auto protocol_begin = std::chrono::steady_clock::now();
@@ -3332,6 +3486,11 @@ namespace llaminar2
             if (admission.status ==
                 MoEOverlayInferenceAdmissionStatus::Complete)
             {
+                if (!pending.empty())
+                {
+                    result.error = "Complete arrived before native follower events retired";
+                    return result;
+                }
                 if (active_prefill_schedule)
                 {
                     discard_active_prefill();
@@ -3437,8 +3596,9 @@ namespace llaminar2
                 {
                     source = ExpertHistogramSource::PrefillChunk;
                 }
-                else if (ticket.graph_role ==
-                         MoEOverlayInferenceGraphRole::MainDecode)
+                else if (ticket.graph_role == MoEOverlayInferenceGraphRole::MainDecode ||
+                         ticket.graph_role == MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation ||
+                         ticket.graph_role == MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken)
                 {
                     source = ExpertHistogramSource::DecodeToken;
                 }
@@ -3463,8 +3623,11 @@ namespace llaminar2
                 }
             }
             const auto execution_begin = protocol_end;
-            if (!executor_->executeMoEOverlayInferenceTransaction(
-                    ticket, &result.error))
+            const auto submission = executor_->submitMoEOverlayInferenceTransaction(ticket, &result.error);
+            if ((submission.progress != MoEOverlayInferenceCompletionFenceProgress::Ready &&
+                 submission.progress != MoEOverlayInferenceCompletionFenceProgress::Pending) ||
+                (submission.progress == MoEOverlayInferenceCompletionFenceProgress::Pending && !submission.completion) ||
+                (submission.progress == MoEOverlayInferenceCompletionFenceProgress::Ready && submission.completion))
             {
                 if (transaction_scope)
                     transaction_scope->discard();
@@ -3477,71 +3640,22 @@ namespace llaminar2
                 recordTicket(ticket, "follower", "execution_failed");
                 return result;
             }
-            const auto execution_end = std::chrono::steady_clock::now();
-            transaction_scope.reset();
-            if (prefill_schedule.valid())
+            if (submission.progress == MoEOverlayInferenceCompletionFenceProgress::Pending || !pending.empty())
             {
-                ++active_prefill_transactions;
-                if (active_prefill_transactions ==
-                    prefill_schedule.transaction_count)
+                if (pending.size() == channel_->slotCapacity())
                 {
-                    /*
-                     * executeMoEOverlayInferenceTransaction returns only after
-                     * the retained follower graph and sparse return handoff are
-                     * terminal, so the last graph closes the same complete
-                     * logical schedule carried by the continuation event set.
-                     */
-                    active_prefill_scope.reset();
-                    active_prefill_schedule.reset();
-                    active_prefill_transactions = 0;
-                }
-            }
-            recordTicketTiming(
-                ticket,
-                "follower_graph_execution",
-                "follower",
-                execution_begin,
-                execution_end);
-            if (!protocol_.markReturnReady(
-                    admission.slot_index, ticket, &result.error) ||
-                !protocol_.retire(
-                    admission.slot_index, ticket, &result.error))
-            {
-                discard_active_prefill();
-                return result;
-            }
-            if (ticket.graph_role ==
-                    MoEOverlayInferenceGraphRole::MainPrefill &&
-                retired_prefill_progress_sink_)
-            {
-                const std::uint64_t completed_tokens =
-                    static_cast<std::uint64_t>(ticket.request_count) *
-                    static_cast<std::uint64_t>(
-                        ticket.logical_rows_per_request);
-                if (!retired_prefill_progress_sink_(
-                        completed_tokens, &result.error))
-                {
-                    discard_active_prefill();
-                    if (result.error.empty())
-                    {
-                        result.error =
-                            "ExpertOverlay follower prefill progress sideband rejected a retired transaction";
-                    }
+                    result.error = "Follower native completion ring exceeded admitted capacity";
                     return result;
                 }
+                // MPI matches same-tag completion receives in admission order.
+                // An immediate CPU/metadata completion behind a native pending
+                // producer retains its typed Ready proof in the same queue; it
+                // must not publish ACK(n+1) before ACK(n). No event is invented.
+                pending.push_back({ticket, admission.slot_index, submission,
+                    std::move(transaction_scope), execution_begin});
             }
-            recordTicketTiming(
-                ticket,
-                "follower_protocol_retirement",
-                "follower",
-                execution_end,
-                std::chrono::steady_clock::now());
-            // The exact executor terminal and local protocol retirement precede
-            // the receipt; empty numerical routes cannot erase this lifetime edge.
-            if (!channel_->publishCompletion(ticket, &result.error))
+            else if (!retire_execution(ticket, admission.slot_index, transaction_scope, execution_begin))
                 return result;
-            ++result.executed_transactions;
-            recordTicket(ticket, "follower", "executed");
         }
     }
 

@@ -22,6 +22,7 @@
  * non-default stream.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "tensors/TensorClasses.h"
@@ -1093,7 +1094,7 @@ namespace llaminar2
                     device_chunk_.bytes(), 1u, device).front();
                 auto epoch = MappedTransferProgressEpoch::create({
                     .device = device, .slot_capacity = 1u, .execution_lane_capacity = 1u,
-                    .execution_streams = engine.allocatePersistentTransferExecutionLanes(
+                    .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(engine,
                         1u, device, "packed_service_economy"),
                     .maximum_bytes = device_chunk_.bytes(), .name = "packed_service_economy"});
                 auto command = epoch->reserveSlot(direction == Direction::GpuToCpu

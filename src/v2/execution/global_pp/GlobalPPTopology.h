@@ -292,6 +292,13 @@ namespace llaminar2
         /** @brief Get the stage that contains a given layer */
         const GlobalPPStageSpec *stageForLayer(int layer) const;
 
+        /**
+         * @brief Resolve the original rank that publishes requests for the embedding stage.
+         * @return The singleton owner or the same original global TP leader used for stage transfers.
+         * @throws std::logic_error If the embedding stage or its original rank membership is ambiguous or invalid.
+         */
+        [[nodiscard]] int embeddingPublisherRank() const;
+
         /** @brief Check if a rank participates in a given stage */
         bool rankParticipatesInStage(int rank, int stage_id) const;
 

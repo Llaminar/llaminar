@@ -40,6 +40,7 @@ namespace llaminar2::rocm
             int request_row_capacity,
             int bucket_seq_len,
             int32_t pad_token_id,
+            bool require_exact_rows,
             int32_t *__restrict__ out_token_ids,
             int32_t *__restrict__ out_position_ids,
             int32_t *__restrict__ out_real_rows,
@@ -63,6 +64,12 @@ namespace llaminar2::rocm
             }
 
             const int real_rows = min(bucket_seq_len, total_rows - source_start);
+            if (require_exact_rows && real_rows != bucket_seq_len)
+            {
+                if (global_thread == 0)
+                    __builtin_trap();
+                return;
+            }
             if (global_thread == 0)
             {
                 *out_real_rows = real_rows;
@@ -1103,6 +1110,7 @@ namespace llaminar2::rocm
         int request_row_capacity,
         int bucket_seq_len,
         int32_t pad_token_id,
+        bool require_exact_rows,
         int32_t *out_token_ids,
         int32_t *out_position_ids,
         int32_t *out_real_rows,
@@ -1147,6 +1155,7 @@ namespace llaminar2::rocm
             request_row_capacity,
             bucket_seq_len,
             pad_token_id,
+            require_exact_rows,
             out_token_ids,
             out_position_ids,
             out_real_rows,

@@ -66,7 +66,7 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableCompactLookupGraph(
     qwen4exp::PooledImmutableLocalHotPoolQuery query,PooledImmutableCompactReadRequest delivery,
     DeviceGenerationControlBinding control,const std::string& compactQueryReady,const std::string& identity);
 /**
- * @brief Append the addressed original owner program, independent of source model variants.
+ * @brief Append the addressed mapped-channel owner program with its original flat source seal.
  * @param graph Exclusive participant-local remote graph.
  * @param arena Original remote arena; every operand retains its actual prepared root.
  * @param transport Immutable original addressed channel chain.
@@ -78,6 +78,18 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableCompactLookupGraph(
 PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& graph,BufferArena& arena,
     const qwen4exp::PooledImmutableRemoteTransport& transport,
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const PooledRemoteGraphProgram& program,const std::string& identity);
+/**
+ * @brief Append the original native-library storage-owner recipe without a captured-channel flat seal.
+ * @param graph Actual participant-local owner graph. @param arena Same original root aliases.
+ * @param transport Actual original source-issued native endpoint chain.
+ * @param code Original owner kernel bundle. @param identity Unique participant-local namespace.
+ * @return Actual terminal retirement-send frontier.
+ * @note Every phase, message and dependency is checked before publication. The
+ * native library's General executable/resource admission remains independently owned.
+ */
+PooledPinParticipantNodes appendPooledImmutableNativeOwnerGraph(ComputeGraph& graph,BufferArena& arena,
+    const qwen4exp::PooledImmutableRemoteTransport& transport,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& identity);
 /**
  * @brief Declare the original physical owner's Pin through Read phases in its actual PLE reader graph.
  * @param graph Actual participant-local continuation graph, not a nested storage graph.

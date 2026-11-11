@@ -759,6 +759,33 @@ namespace llaminar2::moe_activation_packet_device
                grant->code == raw(MoEOverlayActivationStatusCode::Success);
     }
 
+    /**
+     * @brief Acquire this grant's publication after its anti-ABA admission loop.
+     * @param control Same original immutable lane acquired by the grant.
+     * @param bank Leased stage bank, already validated by the retained stage.
+     * @param timeline Exact positive stage visit, never allocation capacity.
+     * @return Fresh acquired signal or the original absorbing cancellation word.
+     * Pre-grant stream waits remain scheduling edges, but cannot authorize the
+     * next request's descriptor. This exact second acquire never reads payload
+     * or metadata until the newly granted publication actually exists.
+     */
+    __device__ __forceinline__ std::uint64_t acquireGrantedDispatchPublication(
+        const MoEOverlayActivationEpochControl* control,std::uint32_t bank,std::uint64_t timeline) noexcept
+    {
+        return awaitMoEOverlayGrantedDispatchPublication(timeline,
+            [&]() { return loadSystemAcquire64(&control->buffers[bank].dispatch_signal.value); },
+            [&]() { return moeOverlayActivationAdmissionWaitAborted(
+                loadSystemAcquire64(&control->admission.ready_signal),
+                [&]() { return loadSystemAcquire32(&control->admission.state); }); },
+            [&]() {
+#if defined(__CUDA_ARCH__)
+                __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+                __builtin_amdgcn_s_sleep(1u);
+#endif
+            });
+    }
+
     /** @return Whether a descriptor names the exact retained stage and payload. */
     __device__ __forceinline__ bool validDescriptor(
         const MoEOverlayActivationPayloadDescriptor &descriptor,
@@ -1477,8 +1504,14 @@ namespace llaminar2::moe_activation_packet_device
                 moeOverlayActivationBufferVisit(launch.stage_ordinal));
         const auto &buffer = control->buffers[
             moeOverlayActivationBufferIndex(launch.stage_ordinal)];
-        const std::uint64_t dispatch_timeline =
-            loadSystemAcquire64(&buffer.dispatch_signal.value);
+        const std::uint64_t dispatch_timeline = acquireGrantedDispatchPublication(
+            control,moeOverlayActivationBufferIndex(launch.stage_ordinal),timeline);
+        if(dispatch_timeline==kMoEOverlayActivationAbortTimeline) {
+            publishFailure(control,launch.grant,endpoint,operation,
+                MoEOverlayActivationStatusCode::PeerAborted,launch.stage_ordinal,
+                launch.model_layer_index,dispatch_timeline);
+            return;
+        }
         // Keep this helper's peer snapshot inside its own acquire edge even
         // when its current fused caller already waited on the same signal.
         const auto descriptor = snapshotPeerPublished(
@@ -1687,10 +1720,14 @@ namespace llaminar2::moe_activation_packet_device
                     const auto &buffer = control->buffers[
                         moeOverlayActivationBufferIndex(
                             launch.stage_ordinal)];
-                    block_dispatch_timeline = loadSystemAcquire64(
-                        &buffer.dispatch_signal.value);
-                    // A prior stream/copy-engine wait does not replace the
-                    // compute-kernel acquire that precedes these peer reads.
+                    block_dispatch_timeline = acquireGrantedDispatchPublication(control,
+                        moeOverlayActivationBufferIndex(launch.stage_ordinal),block_timeline);
+                    if(block_dispatch_timeline==kMoEOverlayActivationAbortTimeline) {
+                        publishFailure(control,launch.grant,endpoint,operation,
+                            MoEOverlayActivationStatusCode::PeerAborted,launch.stage_ordinal,
+                            launch.model_layer_index,block_dispatch_timeline);
+                    } else {
+                    // Only this current-grant acquire authorizes the peer bytes.
                     const auto descriptor = snapshotPeerPublished(
                         &buffer.dispatch_descriptor);
                     block_live_rows = descriptor.live_rows;
@@ -1723,6 +1760,7 @@ namespace llaminar2::moe_activation_packet_device
                                             launch.packet.d_model))
                             ? 1u
                             : 0u;
+                    }
                 }
             }
         }

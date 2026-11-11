@@ -186,6 +186,8 @@ namespace llaminar2
             gpu.pcie_max_speed_gts = device.pcie.max_speed_gts;
             gpu.pcie_degraded = device.pcie.degraded;
             gpu.pcie_bottleneck_bdf = device.pcie.bottleneck_bdf;
+            gpu.pcie_upstream_bdfs = device.pcie.upstream_bdfs;
+            gpu.native_isa = device.native_isa;
             rank.gpus.push_back(std::move(gpu));
         }
         projectPeers(rank, DeviceType::CUDA, hardware.cuda_p2p);

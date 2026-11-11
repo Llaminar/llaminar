@@ -9,6 +9,8 @@
  * CPU/GPU identities or allocating an execution communicator in the parser.
  * Compact routed stage plans preserve their global layer origin through the
  * same codec, including terminal MTP rows and nonzero pipeline offsets.
+ * The additive local-hot-cache arm alone may be absent; omission must reproduce
+ * the exact shared-only document, while every other field remains mandatory.
  */
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
@@ -311,11 +313,12 @@ TEST(OrchestrationConfigDocument, WorkloadRoundTripRejectsPartialObjectsAndNumer
     }
 }
 
-TEST(OrchestrationConfigDocument, EveryMissingOrExtraObjectFieldIsRejected)
+TEST(OrchestrationConfigDocument, EveryRequiredOrExtraObjectFieldIsRejected)
 {
     const Json document = Json::parse(serializeOrchestrationConfig(example(DeviceType::CUDA)));
     // Sweep the entire nested document, including every field in MTP, prefix,
-    // domains and movement. No read-side default may conceal an omitted field.
+    // domains and movement. Only the explicitly additive, absent local-cache
+    // arm may normalize to null; it must preserve every other field exactly.
     const auto visit = [&](const auto &self, const Json &node, const Json::json_pointer &path) -> void
     {
         if (node.is_object())
@@ -327,7 +330,17 @@ TEST(OrchestrationConfigDocument, EveryMissingOrExtraObjectFieldIsRejected)
             {
                 auto missing = document;
                 missing[path].erase(key);
-                EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument) << path << "/" << key;
+                if ((path / key).to_string() ==
+                    "/configuration/ngram_table_policy/gpu_adaptive/local_hot_cache")
+                {
+                    ASSERT_TRUE(value.is_null());
+                    const auto decoded = deserializeOrchestrationConfig(missing.dump());
+                    EXPECT_FALSE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
+                    EXPECT_EQ(Json::parse(serializeOrchestrationConfig(decoded)), document);
+                }
+                else
+                    EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()), std::invalid_argument)
+                        << path << "/" << key;
                 self(self, value, path / key);
             }
         }
@@ -567,7 +580,7 @@ namespace
 
 TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurrentSchema)
 {
-    static_assert(kOrchestrationConfigDocumentSchemaVersion == 12);
+    static_assert(kOrchestrationConfigDocumentSchemaVersion == 13);
     for (const auto width : {MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket,
                              MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope,
                              MTPVerifierPhysicalWidthPolicy::ExactLogicalRows})
@@ -582,7 +595,7 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurre
         EXPECT_EQ(decoded.mtp.depth_policy.scope, internal.mtp.depth_policy.scope);
         EXPECT_EQ(serializeOrchestrationConfig(decoded), document);
         const auto json = Json::parse(document);
-        EXPECT_EQ(json.at("schema_version"), 12);
+        EXPECT_EQ(json.at("schema_version"), 13);
         const auto &scope = json.at("configuration").at("mtp").at("depth_policy").at("scope");
         EXPECT_EQ(scope.size(), 10);
         EXPECT_TRUE(scope.at("verifier_width_policy").is_string());
@@ -678,7 +691,7 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeCannotAuthorStartupOrReques
 TEST(OrchestrationConfigDocument, AdaptiveFullRAMBackingRejectsOldSchemaAndMissingField){
     OrchestrationConfig config;config.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
     config.ngram_table_policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
-    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),12);
+    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),13);
     EXPECT_EQ(deserializeOrchestrationConfig(valid.dump()).ngram_table_policy,config.ngram_table_policy);
     auto old=valid;old["schema_version"]=11;EXPECT_THROW(deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
     auto missing=valid;missing["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("source_backing");
@@ -716,4 +729,47 @@ TEST(OrchestrationConfigDocument, NgramLocalHotCacheAbsentNullC0AndOverrides)
     EXPECT_THROW(local.requireConsumers(readers), std::invalid_argument);
     local.policy.protected_denominator = 0;
     EXPECT_THROW(local.validate(), std::invalid_argument);
+}
+
+/** @test Resolved hardware bindings stay lossless values without becoming trusted runtime authority. */
+TEST(OrchestrationConfigDocument, ObservedRouteBindingRoundTripsLosslesslyAtCurrentSchema) {
+    auto config=example(DeviceType::ROCm);
+    const auto unbound=serializeOrchestrationConfig(config);
+    EXPECT_FALSE(deserializeOrchestrationConfig(unbound).moe_routed_expert_plan->observed_route_transport);
+    EXPECT_FALSE(deserializeOrchestrationConfig(unbound).moe_routed_expert_plan->observed_route_diagnostic);
+    auto& plan=*config.moe_routed_expert_plan;
+    plan.observed_route_transport=MoEOverlayNodeLocalRouteTransportPolicy{
+        .ordinary_prefill=MoEOverlayNodeLocalRouteTransport::MappedSparse,
+        .decode=MoEOverlayNodeLocalRouteTransport::NativeCollective};
+    plan.observed_route_diagnostic=MoEOverlayNodeLocalRouteTransport::MappedSparse;
+    const auto text=serializeOrchestrationConfig(config);const auto restored=deserializeOrchestrationConfig(text);
+    ASSERT_TRUE(restored.moe_routed_expert_plan);
+    EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_transport,plan.observed_route_transport);
+    EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_diagnostic,plan.observed_route_diagnostic);
+    EXPECT_EQ(serializeOrchestrationConfig(restored),text);EXPECT_NE(text,unbound);
+    const auto json=Json::parse(text);EXPECT_EQ(json.at("schema_version"),13);
+    EXPECT_EQ(json.at("configuration").at("moe_routed_expert_plan").at("observed_route_transport").at("decode"),"NativeCollective");
+}
+/** @test New required binding fields have strict types/enums and cannot enter through an old schema. */
+TEST(OrchestrationConfigDocument, ObservedRouteBindingRejectsMissingMalformedAndOldSchema) {
+    auto config=example(DeviceType::CUDA);
+    config.moe_routed_expert_plan->observed_route_transport=MoEOverlayNodeLocalRouteTransportPolicy{
+        .ordinary_prefill=MoEOverlayNodeLocalRouteTransport::MappedSparse,
+        .decode=MoEOverlayNodeLocalRouteTransport::NativeCollective};
+    config.moe_routed_expert_plan->observed_route_diagnostic=MoEOverlayNodeLocalRouteTransport::MappedSparse;
+    const auto valid=Json::parse(serializeOrchestrationConfig(config));
+    const Json::json_pointer plan("/configuration/moe_routed_expert_plan");
+    for(const auto* field:{"observed_route_transport","observed_route_diagnostic"}) {
+        auto missing=valid;missing[plan].erase(field);
+        EXPECT_THROW((void)deserializeOrchestrationConfig(missing.dump()),std::invalid_argument)<<field;
+    }
+    for(const auto& [field,value]:std::vector<std::pair<std::string,Json>>{
+        {"observed_route_transport",true},{"observed_route_transport",Json{{"ordinary_prefill","MappedSparse"}}},
+        {"observed_route_transport",Json{{"ordinary_prefill","MappedSparse"},{"decode","Foreign"}}},
+        {"observed_route_diagnostic",3},{"observed_route_diagnostic","mapped_sparse"}}) {
+        auto malformed=valid;malformed[plan][field]=value;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()),std::invalid_argument)<<field;
+    }
+    auto old=valid;old["schema_version"]=12;
+    EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
 }

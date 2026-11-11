@@ -7,6 +7,11 @@
  * - LOCAL TP (multiple devices within a rank)
  * - Pipeline Parallel (PP across ranks)
  * - Combined PP + TP scenarios
+ * - Rank-local model authority across named-domain collective boundaries
+ *
+ * Ownership-policy tests use only declarative topology and factory construction;
+ * actual prepared-weight export and final-owner retirement are exercised by the
+ * native MoE pipeline preparation suite against this same production policy.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -649,8 +654,8 @@ namespace
             RunnerModelAuthorityScope::RankLocal);
     }
 
-    /** @brief Named-domain composition requires an explicit context set. */
-    TEST_F(Test__OrchestrationRunner, NamedDomainRunnerRequiresMultiRankAuthoritySet)
+    /** @brief Cross-rank named TP retains the enclosing rank's one model authority. */
+    TEST_F(Test__OrchestrationRunner, NamedDomainTPUsesOneRankLocalModelAuthority)
     {
         OrchestrationConfig cfg;
         cfg.domain_definitions.push_back(DomainDefinition::parse(
@@ -661,7 +666,47 @@ namespace
         ASSERT_TRUE(requiresNamedDomainGlobalGraph(cfg));
         EXPECT_EQ(
             resolveRunnerModelAuthorityScope(cfg),
-            RunnerModelAuthorityScope::MultiRankSet);
+            RunnerModelAuthorityScope::RankLocal);
+    }
+
+    /**
+     * @brief Replay both mixed-vendor PP orders without creating device state.
+     *
+     * Each domain is a two-device native TP cohort owned by one original world
+     * rank. The cross-rank activation boundary changes the graph topology, not
+     * the cardinality of the enclosing rank's prepared-model/PMA authority.
+     */
+    TEST_F(Test__OrchestrationRunner, NamedDomainPipelineUsesOneRankLocalModelAuthority)
+    {
+        for (const bool cuda_first : {false, true})
+        {
+            SCOPED_TRACE(cuda_first);
+            OrchestrationConfig cfg;
+            const std::string first = cuda_first ? "cuda" : "rocm";
+            const std::string last = cuda_first ? "rocm" : "cuda";
+            cfg.domain_definitions.push_back(DomainDefinition::parse(
+                "head=" + first + ":0," + first + ":1;scope=rank_local;owner=0"));
+            cfg.domain_definitions.push_back(DomainDefinition::parse(
+                "tail=" + last + ":0," + last + ":1;scope=rank_local;owner=1"));
+            cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=head:0-13"));
+            cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("1=tail:14-27"));
+
+            ASSERT_TRUE(requiresNamedDomainGlobalGraph(cfg));
+            EXPECT_EQ(resolveRunnerModelAuthorityScope(cfg), RunnerModelAuthorityScope::RankLocal);
+            auto runner = factory_->createFromOrchestrationConfig(cfg);
+            ASSERT_NE(dynamic_cast<OrchestrationRunner *>(runner.get()), nullptr);
+            EXPECT_FALSE(runner->modelContextReuseContract().has_value())
+                << "Topology alone cannot certify uninitialized weights";
+        }
+    }
+
+    /** @brief Unsupported tree lowering still requires an explicit authority-set contract. */
+    TEST_F(Test__OrchestrationRunner, TopologyTreeRetainsMultiRankAuthoritySet)
+    {
+        OrchestrationConfig cfg;
+        cfg.topology_tree.emplace();
+        EXPECT_EQ(resolveRunnerModelAuthorityScope(cfg), RunnerModelAuthorityScope::MultiRankSet);
+        EXPECT_EQ(factory_->createFromOrchestrationConfig(cfg), nullptr);
     }
 
 } // anonymous namespace

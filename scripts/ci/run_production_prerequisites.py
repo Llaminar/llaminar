@@ -4,8 +4,10 @@
 Run this command in the installed test runner before the outer CI driver starts
 Release HTTP cells in the sibling runtime image. Local callers use the same
 authority with an ordinary build tree. CTest owns both complete inventories;
-the default entrypoint has no selectors, skip switches, receipt synthesis or model
-staging. An explicit focused-panel diagnostic names DeviceFree checks only and
+the default entrypoint has no user selectors, skip switches, receipt synthesis or
+model staging. CMake-authored optional wide geometries are selected against the
+original native hardware inventory and remain explicitly unqualified when absent;
+full registration and qualification evidence travel together. An explicit focused-panel diagnostic names DeviceFree checks only and
 emits a separate non-certifying schema; it never denotes the complete gates. Image/source/ISA binding belongs to the outer pipeline that launches
 the immutable test-runner ID and retains this command's canonical receipt.
 """
@@ -24,6 +26,7 @@ from pathlib import Path
 import subprocess
 
 from run_production_parity_campaigns import (
+    PreflightResult,
     run_production_test_preflight,
     reuse_unchanged_production_test_preflight,
 )
@@ -316,15 +319,16 @@ def main(argv: list[str] | None = None) -> int:
             return code
         try:
             validate_source_freshness(build, args.reuse_report)
-            return reuse_unchanged_production_test_preflight(build, args.reuse_report)[0]
+            return reuse_unchanged_production_test_preflight(build, args.reuse_report).return_code
         except ValueError as error:
             parser.error(str(error))
     if args.diagnostic_focused_panel:
         return run_focused_panel_prerequisites(build, args.focused_test, args.output)
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
-    code, _, _ = run_production_test_preflight(
+    preflight_result = run_production_test_preflight(
         build, None, installed_build_receipt=installed, artifact_directory=output)
+    code = preflight_result.return_code
     return code
 
 

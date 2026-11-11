@@ -38,6 +38,8 @@
 #include <sstream>
 
 #include "collective/LocalTPContext.h"
+#include "execution/moe/MoELocalTPMaintenanceDomain.h"
+#include "../../mocks/MockLocalTPContext.h"
 #include "backends/NativeDeviceBinding.h"
 #include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "collective/CollectiveTimeoutPolicy.h"
@@ -3318,5 +3320,78 @@ TEST_F(Test__LocalTPContext, NativeAbortIgnoresUnreadyOrForeignBackend)
         EXPECT_EQ(recorded->signal_calls.load(std::memory_order_relaxed), 0);
         for (const auto& flag : recorded->original_abort)
             EXPECT_EQ(__atomic_load_n(&flag, __ATOMIC_ACQUIRE), 0u);
+    }
+}
+
+/**
+ * @test Replay qualified-host and sparse-ordinal maintenance declarations through the production predicate.
+ * The original LocalTP scope owns locality; lexical address aliases cannot grant
+ * or withdraw ownership. Capture capability and exact native membership remain mandatory.
+ */
+TEST(LocalTPMaintenanceDomain, QualifiedOriginalStageMembershipReplay)
+{
+    class DomainContext final : public MockLocalTPContext
+    {
+    public:
+        /** @return Recorded resolved scope, with adversarial non-local traces supported. */
+        TPScope scope() const override { return recorded_scope; }
+        /** @return Recorded degree when corrupt, otherwise exact context membership. */
+        int degree() const override { return recorded_degree.value_or(MockLocalTPContext::degree()); }
+        TPScope recorded_scope = TPScope::RANK_LOCAL;
+        std::optional<int> recorded_degree;
+    };
+    for (const auto family : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int width : {2, 4, 8})
+    {
+        const auto backend = family == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        std::vector<GlobalDeviceAddress> original;
+        for (int index = 0; index != width; ++index)
+            original.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(family, 23 - index * 3),
+                "original-worker.example.test", 7));
+        for (const auto &address : original) EXPECT_FALSE(address.isLocal()); // Original failure witness.
+        DomainContext context;
+        for (int replay = 0; replay != 3; ++replay)
+        {
+            context.setDevices(original);
+            context.setBackend(backend);
+            context.setRawAllgatherGraphCaptureSupported(true);
+            context.recorded_scope = TPScope::RANK_LOCAL;
+            context.recorded_degree.reset();
+            for (int index = 0; index != width; ++index)
+                EXPECT_TRUE(isHomogeneousGPULocalTPMaintenanceDomain(context, original[index].toLocalDeviceId(), index, 8));
+            const auto device = original.front().toLocalDeviceId();
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, -1, 8));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, width, 8));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, width - 1));
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, original.back().toLocalDeviceId(), 0, 8));
+            context.setRawAllgatherGraphCaptureSupported(false);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setRawAllgatherGraphCaptureSupported(true);
+            for (const auto scope : {TPScope::AUTO, TPScope::NODE_LOCAL, TPScope::GLOBAL})
+            {
+                context.recorded_scope = scope;
+                EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            }
+            context.recorded_scope = TPScope::RANK_LOCAL;
+            context.setBackend(family == DeviceType::CUDA ? CollectiveBackendType::RCCL : CollectiveBackendType::NCCL);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setBackend(backend);
+            context.recorded_degree = width + 1;
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.recorded_degree.reset();
+            auto changed = original;
+            changed.back() = GlobalDeviceAddress::fromLocalDeviceId(device, "another-display-alias", 7);
+            context.setDevices(changed);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            changed = original;
+            changed.back() = GlobalDeviceAddress::fromLocalDeviceId(
+                DeviceId(family == DeviceType::CUDA ? DeviceType::ROCm : DeviceType::CUDA, 91),
+                "original-worker.example.test", 7);
+            context.setDevices(changed);
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+            context.setDevices({original.front()});
+            EXPECT_FALSE(isHomogeneousGPULocalTPMaintenanceDomain(context, device, 0, 8));
+        }
+        EXPECT_EQ(context.allreduceCallCount(), 0);
     }
 }

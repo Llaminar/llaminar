@@ -348,7 +348,7 @@ namespace llaminar2
             size_t fp16_scratch_elements,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) override;
 
-        /** @brief Freeze one complete no-P2P fabric with exactly this domain's membership. */
+        /** @brief Freeze one original peer/mapped counted fabric with exactly this domain's membership. */
         void installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather> fabric) override;
         /** @return Setup-frozen shared transport; graph bindings retain its physical owners. */
         std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const override { return counted_allgather_; }

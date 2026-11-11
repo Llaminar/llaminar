@@ -1,9 +1,11 @@
 /**
  * @file PooledImmutableDirectedOwnerProgram.h
- * @brief Source-authored flat remote owner program declared before admission and checked against actual stages.
+ * @brief Shared exact owner semantics with separate mapped-flat and native-General contracts.
  *
- * This descriptor describes only the original directed owner graph. It never
- * certifies a complete source/model/MTP graph or grants native ownership.
+ * The mapped descriptor retains its original portable kernel seal. Native
+ * graphs authenticate the same actual semantic recipe without minting a flat
+ * seal or resource allowance. Neither arm certifies a complete source/model/MTP
+ * graph or grants native transport ownership.
  */
 #pragma once
 #include "planning/PhysicalMemoryAuthority.h"
@@ -29,6 +31,19 @@ public:
      * @return The same source descriptor that planning declared before materialization. */
     static PooledRemoteGraphProgram fromOriginalPlans(const PooledImmutableOwnerNativePlan& owner,
         const PooledImmutableCoordinatorNativePlan& coordinator);
+    /** @brief Declare the exact mapped-flat or native-General storage contract before admission.
+     * @param physical Original physical roster. @param coordinator Same source policy. @param coordinate Actual owner coordinate.
+     * @return Native General for homogeneous original endpoints; mapped certificate for cross-vendor endpoints.
+     */
+    static PooledStorageOwnerProgram declareStorage(const PooledImmutablePhysicalOwnerGeometry& physical,
+        const PooledImmutableCoordinatorGeometry& coordinator,std::uint32_t coordinate);
+    /** @brief Reconstruct the same typed contract from actual service-issued original plans.
+     * @param owner Original physical owner plan. @param coordinator Same source/policy plan.
+     * @return Exact mapped-flat or native-General declaration; no resource authority is created.
+     * @throws std::exception For foreign source/generation, geometry or transport ownership.
+     */
+    static PooledStorageOwnerProgram fromOriginalStoragePlans(const PooledImmutableOwnerNativePlan& owner,
+        const PooledImmutableCoordinatorNativePlan& coordinator);
     /**
      * @brief Compare actual typed local stages/edges/dispatch inputs before native recording.
      * @param graph Exclusive actual directed owner graph, without unrelated model stages.
@@ -39,5 +54,16 @@ public:
      */
     static void requireActual(const ComputeGraph& graph,const PooledImmutableOwnerNativePlan& owner,
         const PooledImmutableCoordinatorNativePlan& coordinator,const PooledRemoteGraphProgram& program);
+    /**
+     * @brief Authenticate the actual native-library owner recipe without a flat kernel certificate.
+     * @param graph Actual participant-local owner graph before native recording.
+     * @param owner Original prepared physical owner; its retained endpoints own native authority.
+     * @param coordinator Same original source/policy plan, including table and generation.
+     * @throws std::exception For cross-vendor plans or changed transport, phases, extent, slice or DAG.
+     * @note This proves semantic graph composition only. The original General
+     * executable/source admission separately owns native-library resource bounds.
+     */
+    static void requireNativeActual(const ComputeGraph& graph,const PooledImmutableOwnerNativePlan& owner,
+        const PooledImmutableCoordinatorNativePlan& coordinator);
 };
 }

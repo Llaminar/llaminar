@@ -12,6 +12,7 @@
  */
 
 #pragma once
+#include "backends/NativeAuxiliaryStreamOwnership.h"
 
 #include "backends/PreparedGPUWorkerThread.h"
 #include "../IWorkerGPUContext.h"
@@ -115,6 +116,15 @@ namespace llaminar2
         void *createStream() override;
         void destroyStream(void *stream) override;
         void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::prepareBatchCaptureDependencies */
+        std::shared_ptr<GPUCaptureDependencyRoster> prepareBatchCaptureDependencies(
+            std::size_t,std::size_t,const PreparedGPUContextUsePermit&) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+        void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+            const PreparedGPUContextUsePermit &original,bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream(const std::string &,GPUAuxiliaryStreamSchedulingClass,const PreparedGPUContextUsePermit &,bool *) */
+        void *getOrCreateAdmittedAuxiliaryStream(const std::string &name,GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            const PreparedGPUContextUsePermit &original,bool *created = nullptr) override;
         /** @copydoc IWorkerGPUContext::getOrCreateAuxiliaryStream(const std::string &, GPUAuxiliaryStreamSchedulingClass, bool *) */
         void *getOrCreateAuxiliaryStream(
             const std::string &name,
@@ -251,13 +261,19 @@ namespace llaminar2
         /** @copydoc GPUProjectionResourceOperations::destroyProjectionEvent */
         bool destroyProjectionEvent(void *event) noexcept override;
         cudaStream_t default_stream_ = nullptr;
-        std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
+        /** @brief Actual native handle and its original commitment share one owner record. */
+        struct AuxiliaryStreamRecord {
+            cudaStream_t stream=nullptr;
+            std::unique_ptr<NativeAuxiliaryStreamOwnership> ownership;
+        };
+        std::unordered_map<std::string, AuxiliaryStreamRecord> auxiliary_streams_;
         /** Immutable scheduling class paired with every named stream. */
         std::unordered_map<
             std::string,
             GPUAuxiliaryStreamSchedulingClass>
             auxiliary_stream_scheduling_classes_;
         std::mutex auxiliary_streams_mutex_;
+        std::shared_ptr<GPUCaptureDependencyRoster> batch_capture_dependencies_; ///< Actual internal construction edges only.
 
         /**
          * @brief Number of independently leasable inter-stream handoff events.

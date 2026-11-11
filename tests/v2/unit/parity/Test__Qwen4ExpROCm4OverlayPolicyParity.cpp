@@ -153,6 +153,7 @@ TEST(Qwen4ExpROCm4OverlayPolicy, PairedAttachmentIsExplicitAndLeavesExistingFami
     const auto original = qfnOriginalCaseFamilies();
     auto document = policyDocument(original);
     const auto attached = qfnAttachLocalPairedCases(original, document);
+    std::size_t deferred = 0;
     for (const auto &[family, cells] : original)
     {
         ASSERT_EQ(attached.at(family).size(), cells.size());
@@ -160,6 +161,21 @@ TEST(Qwen4ExpROCm4OverlayPolicy, PairedAttachmentIsExplicitAndLeavesExistingFami
         {
             const auto &after = attached.at(family)[index];
             EXPECT_EQ(after.testName(), cells[index].testName());
+            if (cells[index].topology.needsObservedPipelineBinding())
+            {
+                // An unrelated paired policy cannot resolve original physical
+                // ownership or turn a deferred declaration into executable argv.
+                ++deferred;
+                EXPECT_TRUE(after.topology.needsObservedPipelineBinding());
+                EXPECT_FALSE(after.paired_workload);
+                std::ostringstream before_declaration, after_declaration;
+                PrintTo(cells[index], &before_declaration);
+                PrintTo(after, &after_declaration);
+                EXPECT_EQ(before_declaration.str(), after_declaration.str());
+                EXPECT_THROW((void)modelParityDiagnosticBenchmarkArguments(cells[index]), std::logic_error);
+                EXPECT_THROW((void)modelParityDiagnosticBenchmarkArguments(after), std::logic_error);
+                continue;
+            }
             EXPECT_EQ(modelParityDiagnosticBenchmarkArguments(after), modelParityDiagnosticBenchmarkArguments(cells[index]));
             if (family == "Qwen4ExpROCm4OverlayPolicy")
             {
@@ -171,6 +187,7 @@ TEST(Qwen4ExpROCm4OverlayPolicy, PairedAttachmentIsExplicitAndLeavesExistingFami
             else EXPECT_FALSE(after.paired_workload);
         }
     }
+    EXPECT_GT(deferred, 0u);
     document["bindings"][0]["exact_cell"] = "Qwen4ExpROCm4OverlayPolicy/foreign";
     EXPECT_THROW(qfnAttachLocalPairedCases(original, document), std::invalid_argument);
     document = policyDocument(original);

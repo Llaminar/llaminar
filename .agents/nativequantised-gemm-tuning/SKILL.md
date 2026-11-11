@@ -172,6 +172,17 @@ or aggregate agreement is not a substitute. Exercise production capture,
 fixed/dynamic MTP where affected, reset, partial work, mixed source formats,
 odd/tail rows, repeated execution and actual collective extents.
 
+Prefer layouts and fusion that retain decoded operands, accumulators and
+intermediates in registers through their consumers, reducing unnecessary
+scratch traffic and barriers. Qualify the actual production entry, including
+fused callers and helpers, for each codebook, ISA/architecture and execution
+regime affected by the change. Preserve the numerical contract and independent
+accumulator chains; measure register-pressure, shuffle and occupancy tradeoffs
+alongside latency. Apply the backend skills' resource gates, including the
+[CPU hot-loop spill workflow](../cpu-tuning/SKILL.md#classify-spills-by-execution-regime)
+and its narrowly measured streaming-GEMV exception; GPU zero-spill gates remain
+mandatory.
+
 Profile each selected physical candidate separately from canonical timing:
 
 - CPU: trainer-owned `perf_event_open` groups on the actual persistent worker

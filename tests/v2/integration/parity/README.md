@@ -702,6 +702,15 @@ published-image and canonical runtime inventory consumers reject this diagnostic
 evidence. A diagnostic panel never establishes complete prerequisite, model,
 image or release qualification. The default complete route remains unchanged.
 
+Complete-prerequisite observed-pipeline diagnostics may bind a catalog-pinned
+external manifest while keeping the original corpus root. This adaptation may
+change only the explicit topology inventory: original sources, every prompt and
+Pending teacher, reset control and reference declarations must remain identical
+to the original root manifest. The source-frozen binding, original observed
+owner/configuration, exact arithmetic, all policy groups and full prerequisite
+checks remain required. Ordinary canonical/image routes retain their root
+manifest requirement; no reference rows or acceptance limits are inferred.
+
 Generate a full-stage reference for one existing history with
 `generate_qwen4exp_pipeline_snapshots.py --frozen-history MANIFEST --history-id ID`,
 the original `--model`, any declared inactive `--shared-predictor`, pinned
@@ -1415,7 +1424,7 @@ row byte counts. Full-RAM terminal source observations use the distinct
 window traffic. C0 GPU grants remain valid admission evidence, not positive
 cache-performance evidence.
 
-Lossless config schema12 and ngram setup wire16 carry this explicit choice.
+The lossless configuration and ngram setup formats carry this explicit choice.
 Older/missing-field documents reject; refresh reviewed binding metadata through
 the canonical exporter/parser while preserving histories/source/policy limits.
 Prior numerical observations retain their original source/config identity and

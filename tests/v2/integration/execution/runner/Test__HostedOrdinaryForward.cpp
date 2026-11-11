@@ -22,7 +22,7 @@ namespace llaminar2::test
 {
 namespace
 {
-/** @return Only compiled backend cells; broad execution skips absent hardware. */
+/** @return Compiled backend cells selected by their original native launcher. */
 std::vector<std::string> hostedBackends()
 {
     std::vector<std::string> result;
@@ -101,14 +101,13 @@ TEST_P(HostedOrdinaryForward, MaterializesCompleteHostedBodyAndReusesAcrossReset
     const bool hosted = GetParam().ends_with("Hosted");
     const auto retention = hosted ? OrdinaryForwardRetentionKind::HostedExpertOverlay
                                   : OrdinaryForwardRetentionKind::NativeComposable;
-    auto *backend = cuda ? getCUDABackend() : getROCmBackend();
-    if (!backend || backend->deviceCount() < 1) GTEST_SKIP() << "Requires " << GetParam() << " device zero";
     initCPUBackend(-1);
-    const auto device = cuda ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    const auto placement = observedSingletonPipelinePlacement(cuda ? DeviceType::CUDA : DeviceType::ROCm);
+    const auto device = placement.gpu;
     PlanningGGUFFixture fixture(true, false, GGUFTensorType::Q4_0, 256,
         std::nullopt, 8, PlanningGGUFFixture::Geometry::FullAttentionGraph);
     populateServingGGUFFixture(fixture);
-    const std::string gpu = cuda ? "cuda:0" : "rocm:0";
+    const std::string gpu = std::string(cuda ? "cuda:" : "rocm:") + std::to_string(device.ordinal);
     std::vector<std::string> arguments{"hosted-ordinary-forward", "-m", fixture.path(),
         "--mpi-procs", "1", "--context-length", "512", "--no-mtp",
         "--activation-precision", "fp32", "--kv-cache-precision", "fp16",
@@ -116,7 +115,7 @@ TEST_P(HostedOrdinaryForward, MaterializesCompleteHostedBodyAndReusesAcrossReset
     if (hosted)
         arguments.insert(arguments.end(), {"--backend", "heterogeneous",
             "--expert-tier", "native=" + gpu + ";priority=0;max-experts-per-layer=4",
-            "--expert-tier", "host=cpu:0;priority=10;max-experts-per-layer=4",
+            "--expert-tier", "host=cpu:" + std::to_string(placement.cpu_numa_node) + ";priority=10;max-experts-per-layer=4",
             "--moe-routed-expert-continuation-domain", "native",
             "--moe-routed-expert-shared-domain", "native"});
     else

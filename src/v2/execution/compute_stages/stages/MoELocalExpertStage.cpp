@@ -2784,7 +2784,10 @@ namespace llaminar2
         output.source_participant = input.target_participant;
         output.target_participant = input.source_participant;
         output.live_row_count = 0;
-        output.layout = params_.return_layout;
+        // A joint producer writes only its packed records. The rooted
+        // successor still owns the declared canonical return layout.
+        if (!params_.cpu_joint_route_producer)
+            output.layout = params_.return_layout;
         std::optional<MoEOverlayParticipantResidencyRegistry::CPUJointLayer> execution_joint_layer;
         if(params_.cpu_joint_route_producer) {
             const auto &publication=*params_.cpu_joint_layer;

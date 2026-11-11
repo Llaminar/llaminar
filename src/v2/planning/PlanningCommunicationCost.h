@@ -90,7 +90,7 @@ namespace llaminar2
 
         /**
          * @brief Price one GPU/host byte primitive with an explicit mechanism, direction and page owner.
-         * @param gpu_rank Discovery rank whose visible GPU will issue the operation.
+         * @param gpu_rank Original NUMA-local rank authorized to execute this GPU.
          * @param device GPU ordinal in gpu_rank's namespace.
          * @param host_rank Same-physical-node rank whose setup thread first-touched the pages.
          * @param mechanism DMA or mapped-kernel access; neither substitutes for the other.
@@ -98,8 +98,9 @@ namespace llaminar2
          * @param payload_bytes Positive live traffic, excluding unused staging capacity.
          * @return Qualified primitive estimate, excluding packet routing, waits and remote MPI service.
          *
-         * GPU aliases may differ between ranks. Host scope may not: an absent
-         * first-touch observation is an error, not a guessed GPU-local sample.
+         * GPU ordinals may alias between discovery namespaces. The exact executor
+         * and first-touch pair must still have its own completed observation;
+         * another rank's GPU-local curve cannot supply missing cross-role evidence.
          */
         PlanningCommunicationPrediction hostTransfer(int gpu_rank, DeviceId device, int host_rank,
             PlanningHostTransferMechanism mechanism, MappedTransferDirection direction, size_t payload_bytes) const;

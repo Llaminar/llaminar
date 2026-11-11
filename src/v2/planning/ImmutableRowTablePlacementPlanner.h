@@ -47,6 +47,19 @@ public:
      */
     ImmutableRowTablePlacementInput withGPUCacheResources(const ImmutableRowTablePolicy &requested,
         std::span<const PhysicalMemoryResource> original_resources) const;
+    /**
+     * @brief Bind original storage owners independently of the PLE reader roster.
+     * @param projection Checked local pipeline role and source-head assignment.
+     * @param resources Original allocator observations for every actual storage owner.
+     * @return Source input with immutable pipeline placement roles and allocator observations.
+     * @throws std::invalid_argument For missing, foreign or duplicate owners or changed readers.
+     */
+    ImmutableRowTablePlacementInput withFixedHeadPipeline(
+        std::shared_ptr<const ImmutableFixedHeadPipelineProjection> projection,
+        std::span<const PhysicalMemoryResource> resources) const;
+    /** @return Exact pipeline fixed-head roles, absent for other source inputs. */
+    const std::shared_ptr<const ImmutableFixedHeadPipelineProjection>& fixedHeadPipeline() const noexcept
+    { return fixed_head_pipeline_; }
     /** @brief Attach the original exact-subset peer classification before any source BOM is produced.
      * @param coverage Inventory-owned classification; None selects mapped payload; Complete selects producer-owned peer payload.
      * @return Same immutable source input retaining the explicit observed topology.
@@ -128,6 +141,7 @@ private:
     std::optional<AdaptiveGPUCachePlacementRequest> gpu_placement_; ///< Exact declaration authenticated against original observations.
     std::optional<PeerAccessCoverage> gpu_peer_access_;
     std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access_;
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> fixed_head_pipeline_;
     std::vector<PhysicalMemoryResource> gpu_resources_; ///< Source participants never become graph consumers.
 };
 /**

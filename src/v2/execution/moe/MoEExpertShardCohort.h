@@ -21,6 +21,7 @@
 #include <set>
 #include <span>
 #include <vector>
+#include <limits>
 
 namespace llaminar2 {
 /** @brief Source-authenticated, immutable joint ownership of one layer's expert layout. */
@@ -45,7 +46,7 @@ public:
      */
     static std::vector<Interval> balancedIntervals(const MoEOverlayLayerWeightManifest& layer,int participants) {
         const auto axes=sourceAxes(layer);
-        if(participants<2 || participants>8)throw std::invalid_argument("CPU expert shard cohort requires two through eight original participants");
+        if(participants<2)throw std::invalid_argument("CPU expert shard cohort requires multiple original participants");
         const auto& down=projection(layer,ExpertTierWeightProjection::Down);
         const int unit=sourceBlock(down.format);
         if(axes.second%unit || axes.second/unit<participants)
@@ -66,7 +67,7 @@ public:
      */
     static MoEExpertShardCohort checked(MoEOverlayLayerWeightManifest layer,int experts,
         std::vector<Participant> participants,std::vector<Interval> intervals) {
-        if(participants.size()<2 || participants.size()>8 || intervals.size()!=participants.size())
+        if(participants.size()<2 || participants.size()>static_cast<size_t>(std::numeric_limits<int>::max()) || intervals.size()!=participants.size())
             throw std::invalid_argument("CPU expert shard cohort requires complete ordered membership and intervals");
         const auto geometry=sourceGeometry(layer,experts);
         // NODE_LOCAL inventory binding belongs to the caller's original topology.

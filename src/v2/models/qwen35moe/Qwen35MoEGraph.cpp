@@ -21,8 +21,11 @@
  * nested FFN host work, without timing CPU inference graph construction.
  */
 
+#include "../../execution/moe/DeviceMoECommittedMaintenanceScope.h"
 #include "execution/moe/MoEOverlayHostServiceContract.h"
+#include "execution/moe/MoELocalTPMaintenanceDomain.h"
 #include "Qwen35MoEGraph.h"
+#include "execution/moe/MoEOverlayActivationBatchInventory.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
@@ -50,6 +53,7 @@
 #include "../../execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "../../execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "../../execution/moe/CPUExpertShardSourceSelection.h"
+#include "../../execution/moe/CPUJointHostGraphEndpoint.h"
 #include <omp.h>
 #include "../../execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "../../execution/compute_stages/stages/MoESparseDispatchStage.h"
@@ -1901,55 +1905,21 @@ namespace llaminar2
             return has_restore_state;
         }
 
-        bool supportsDeviceSideGraphRebalanceTransfer(
-            const ILocalTPContext &tp_ctx)
-        {
-            const auto &moe_env = debugEnv().moe_rebalance;
-            if (moe_env.device_rebalance_maintenance_graph)
-                return tp_ctx.supportsRawAllgatherOnStreamGraphCapture();
-            return false;
-        }
-
+        /**
+         * @brief Borrow the existing stage-local captured maintenance authority.
+         * @param tp_ctx Original native context admitted by the stage factory.
+         * @param device Exact graph participant device.
+         * @param tp_device_idx Original participant index in that same context.
+         * @return True only when enabled policy and the real native family both qualify.
+         */
         bool isHomogeneousGpuLocalTPRebalanceDomain(
             const ILocalTPContext &tp_ctx,
             DeviceId device,
             int tp_device_idx)
         {
-            const int degree = tp_ctx.degree();
-            if (!device.is_gpu() ||
-                degree <= 1 ||
-                degree > static_cast<int>(kDeviceMoEMaxParticipants) ||
-                tp_device_idx < 0 ||
-                tp_device_idx >= degree ||
-                !supportsDeviceSideGraphRebalanceTransfer(tp_ctx))
-            {
-                return false;
-            }
-
-            const CollectiveBackendType backend = tp_ctx.backend();
-            if ((device.is_cuda() && backend != CollectiveBackendType::NCCL) ||
-                (device.is_rocm() && backend != CollectiveBackendType::RCCL))
-            {
-                return false;
-            }
-
-            const auto &participants = tp_ctx.devices();
-            if (static_cast<int>(participants.size()) != degree)
-                return false;
-
-            const DeviceType expected_type =
-                device.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
-            for (const auto &participant : participants)
-            {
-                if (!participant.isLocal() ||
-                    !participant.isGPU() ||
-                    participant.device_type != expected_type)
-                {
-                    return false;
-                }
-            }
-
-            return participants[static_cast<size_t>(tp_device_idx)].toLocalDeviceId() == device;
+            return debugEnv().moe_rebalance.device_rebalance_maintenance_graph &&
+                isHomogeneousGPULocalTPMaintenanceDomain(tp_ctx, device, tp_device_idx,
+                    static_cast<int>(kDeviceMoEMaxParticipants));
         }
 
         std::optional<DeviceMoERebalanceTransferMode> selectGraphRebalanceTransferMode(
@@ -3175,6 +3145,10 @@ namespace llaminar2
         params.moe_runtime_table = binding.moe_runtime_table;
         params.tp_device_idx = binding.tp_device_idx;
         params.config = binding.config;
+        // Only this authored Dynamic maintenance family may publish policy
+        // decisions. Current-batch/static assignment stages keep None.
+        if (config_.moe.rebalance_config.mode == MoERebalanceRuntimeMode::Dynamic)
+            params.config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CompletedDynamicDecisions);
         params.local_transfer_slots = binding.local_transfer_slots;
         params.local_transfer_slot_count = binding.local_transfer_slot_count;
         params.collective_payload_slot_bytes =
@@ -3828,9 +3802,11 @@ namespace llaminar2
             for(const auto &family:arena_config.cpu_storage_layout->families())
                 arena_config.row_capacity_buckets.push_back(family.rows);
             arena_config.physical_memory_authority=memory;
-            arena_config.cpu_canonical_route_storage =
-                MoELocalExpertSerialBufferArena::
-                    CPUCanonicalRouteStoragePolicy::RetainSerialMaximum;
+            // The admitted layout gives only the original reduction root
+            // the combined canonical rows. Every member owns its packed rows.
+            arena_config.cpu_canonical_route_storage = arena_config.cpu_storage_layout->canonical()
+                ? MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum
+                : MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::Disabled;
             arena_config.cpu_canonical_route_gpu_consumer =
                 cpu_canonical_route_gpu_consumer;
             arena_config.cpu_grouped_scratch_storage =
@@ -4183,6 +4159,7 @@ namespace llaminar2
         auto transport = createMoEOverlayRankBatchTransport(
             MoEOverlayRankBatchTransportConfig{
                 .mpi_ctx = config_.moe.overlay_mpi_ctx,
+                .physical_memory_authority = prepared_weight_store_->physicalMemoryAuthority(),
                 .source_world_rank = source_world_rank,
                 .target_world_rank = target_world_rank,
                 .workspace = std::move(wire_workspace),
@@ -4559,6 +4536,14 @@ namespace llaminar2
         result.initial_bank = 1u;
         result.request_slot_capacity = 1u;
         return result;
+    }
+
+    std::shared_ptr<PhysicalMemoryAuthority>
+    Qwen35MoEGraph::moeActivationBatchMemoryAuthority(DeviceId device) const
+    {
+        if (!prepared_weight_store_)
+            throw std::logic_error("Original activation Batch graph requires its model-owned prepared weight store");
+        return moeOverlayEpochArenaConfig(device).memory_authority;
     }
 
     DeviceMoEOverlayEpochExecutionBinding
@@ -6140,7 +6125,15 @@ namespace llaminar2
                     static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
             }
 
-            if (first_device_rebalance_decode_layer &&
+            if (decode_maintenance_policy &&
+                env.moe_rebalance.device_rebalance_maintenance_graph)
+            {
+                rebalance_config = deviceMoECommittedMainLayerScope(
+                    rebalance_config,
+                    static_cast<uint32_t>(moe_runtime_table->storageIndexForModelLayer(config_.pp_layer_offset)),
+                    static_cast<uint32_t>(config_.n_layers));
+            }
+            else if (first_device_rebalance_decode_layer &&
                 rebalance_config.num_layers > 0)
             {
                 const uint32_t current_layer =
@@ -10358,6 +10351,9 @@ namespace llaminar2
                             "Qwen35 MoE full-model rank-batch follower is the CPU NodeTP protocol; captured GPU peers require the retained device transaction role");
                     }
 
+                    const bool joint_host=config_.moe.expert_overlay_participant_residency &&
+                        config_.moe.expert_overlay_participant_residency->isCPUJointParticipant(target_participant);
+                    std::unique_ptr<MoECPUExpertShardRouteStage> joint_collective;
                     auto participant_mask =
                         owner_map_lifetime->expertMaskForParticipant(
                             layer_idx,
@@ -10416,7 +10412,19 @@ namespace llaminar2
                             auto &registry =
                                 weight_manager->expertGemmRegistry();
                             local_params.expert_registry = &registry;
-                            (void)registry
+                            if(joint_host) {
+                                if(!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context)
+                                    throw std::logic_error("CPU joint continuation follower lost its original source/context");
+                                const auto formats=originalCPUExpertWorkspaceSourceFormats(model_ctx_->concreteLoader(),
+                                    layer_idx,config_.d_model,expert_intermediate,config_.moe.num_experts);
+                                joint_collective=CPUJointHostGraphEndpoint{
+                                    *config_.moe.expert_overlay_participant_residency,registry,prepared_weight_store_->modelId(),
+                                    config_.moe.expert_overlay_cpu_joint_context,
+                                    {.gate=formats[0],.up=formats[1],.down=formats[2],
+                                     .workers=omp_in_parallel()?omp_get_num_threads():omp_get_max_threads(),.execution=CPUExecutionGeometry::local()},
+                                    total_tokens,prefix+"moe_cpu_joint_host_return_p"+std::to_string(target_participant)}.bind(local_params);
+                            }
+                            else (void)registry
                                 .populateExpertEnginesForParticipant(
                                     tier.domain,
                                     target_device,
@@ -10431,8 +10439,8 @@ namespace llaminar2
                         }
                     }
                     if (!local_params.expert_registry ||
-                        !MoELocalExpertStage::prepareExpertGemmEngines(
-                            local_params))
+                        (!joint_host && !MoELocalExpertStage::prepareExpertGemmEngines(
+                            local_params)))
                     {
                         throw std::runtime_error(
                             "Qwen35 MoE rank-batch follower has incomplete prepared expert engines for layer " +
@@ -10440,7 +10448,7 @@ namespace llaminar2
                             std::to_string(target_participant));
                     }
 
-                    if (config_.moe.expert_overlay_participant_residency)
+                    if (!joint_host && config_.moe.expert_overlay_participant_residency)
                     {
                         auto endpoint = config_.moe
                                             .expert_overlay_participant_residency
@@ -10494,6 +10502,12 @@ namespace llaminar2
                             local_params),
                         target_device);
                     graph.addDependency(local_name, dispatch_node);
+                    if(joint_collective) {
+                        const auto collective_name=local_name+"_rooted_fragment_combine";
+                        graph.addNode(collective_name,std::move(joint_collective),DeviceId::cpu());
+                        graph.addDependency(collective_name,local_name);
+                        return collective_name;
+                    }
                     return local_name;
                 };
 
@@ -11412,6 +11426,7 @@ namespace llaminar2
                         const bool joint_local_target = target_device.is_cpu() &&
                             config_.moe.expert_overlay_participant_residency &&
                             config_.moe.expert_overlay_participant_residency->isCPUJointParticipant(target_participant);
+                        std::unique_ptr<MoECPUExpertShardRouteStage> host_joint_collective;
                         if (owns_target_participant)
                         {
                             MoELocalExpertStage::Params local_params;
@@ -11581,7 +11596,19 @@ namespace llaminar2
                                     }
                                     return populated;
                                 };
-                                if (joint_local_target)
+                                if(joint_local_target && device.is_cpu()) {
+                                    if(cpu_llep_state || !prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context)
+                                        throw std::logic_error("CPU joint continuation root lost its original static source/context");
+                                    const auto formats=originalCPUExpertWorkspaceSourceFormats(model_ctx_->concreteLoader(),
+                                        layer_idx,config_.d_model,expert_intermediate,config_.moe.num_experts);
+                                    host_joint_collective=CPUJointHostGraphEndpoint{
+                                        *config_.moe.expert_overlay_participant_residency,registry,prepared_weight_store_->modelId(),
+                                        config_.moe.expert_overlay_cpu_joint_context,
+                                        {.gate=formats[0],.up=formats[1],.down=formats[2],
+                                         .workers=omp_in_parallel()?omp_get_num_threads():omp_get_max_threads(),.execution=CPUExecutionGeometry::local()},
+                                        total_tokens,prefix+"moe_cpu_joint_host_return_p"+std::to_string(target_participant)}.bind(local_params);
+                                }
+                                else if (joint_local_target)
                                 {
                                     auto residency = config_.moe.expert_overlay_participant_residency;
                                     if (!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context)
@@ -11778,7 +11805,8 @@ namespace llaminar2
                             const auto arena = local_params.serial_compact_buffer_arena;
                             const auto &geometry = *arena->cpuJointLayout();
                             local_collective_name = local_name + "_rooted_fragment_combine";
-                            graph.addNode(local_collective_name, std::make_unique<MoECPUExpertShardRouteStage>(
+                            if(host_joint_collective) graph.addNode(local_collective_name,std::move(host_joint_collective),DeviceId::cpu());
+                            else graph.addNode(local_collective_name, std::make_unique<MoECPUExpertShardRouteStage>(
                                 MoECPUExpertShardRouteStage::Params{
                                     .original_source = local_params.cpu_joint_layer->sourceSelection(),
                                     .tp = config_.moe.expert_overlay_cpu_joint_context.get(),
@@ -12173,6 +12201,10 @@ namespace llaminar2
                         {
                             lanes.push_back(binding.lane);
                         }
+                        if(!config_.moe.activation_batch_inventory)
+                            throw std::logic_error("Original activation Batch graph requires its selected source/row inventory");
+                        config_.moe.activation_batch_inventory->require(modelForwardInput(),identity,total_tokens,
+                            mapped_activation_return_bindings.front().stage_ordinal);
                         mapped_lane_transaction = std::make_shared<
                             MoEOverlayActivationLaneBatchState>(
                             device,
@@ -12180,7 +12212,8 @@ namespace llaminar2
                             total_tokens,
                             mapped_activation_return_bindings.front()
                                 .stage_ordinal,
-                            layer_idx);
+                            layer_idx,
+                            moeActivationBatchMemoryAuthority(device));
                     }
 
                     // Each CPU tensor shard consumes the original routed inputs.

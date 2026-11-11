@@ -14,6 +14,7 @@
  * remains the independent physical4 control with no secondary plane.
  */
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "utils/ExpertTierWeightWireTestOracle.h"
 
@@ -688,8 +689,7 @@ namespace llaminar2
             const std::string pool_name =
                 "cuda_expert_tier_execution_pool_contract";
 
-            const auto first = TransferEngine::instance()
-                                   .allocatePersistentTransferExecutionLanes(
+            const auto first = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                        lane_count,
                                        device,
                                        pool_name);
@@ -708,8 +708,7 @@ namespace llaminar2
                 }
             }
 
-            const auto reused = TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+            const auto reused = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         lane_count,
                                         device,
                                         pool_name);
@@ -746,8 +745,7 @@ namespace llaminar2
                                          staging_bytes,
                                          2u,
                                          device);
-            const auto execution = TransferEngine::instance()
-                                       .allocatePersistentTransferExecutionLanes(
+            const auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                            1u,
                                            device,
                                            "cuda_shared_execution_race_contract")
@@ -1205,8 +1203,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_tier_round_trip")
@@ -1370,8 +1367,7 @@ namespace llaminar2
                                        DeviceId::cuda(device_ordinal),
                                        HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::cuda(device_ordinal),
                                          "cuda_secondary_device_remote_projection")
@@ -1482,8 +1478,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_floating_tier_round_trip")
@@ -1728,8 +1723,7 @@ namespace llaminar2
                                        DeviceId::cuda(0),
                                        HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::cuda(0),
                                          "cuda_remote_q51_roundtrip")
@@ -2073,8 +2067,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_asymmetric_promotion_execution")
@@ -2608,8 +2601,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_production_shadow_slot_q5k")
@@ -2771,8 +2763,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::cuda(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::cuda(0),
                                      "cuda_inference_overlap")
@@ -3223,7 +3214,7 @@ namespace llaminar2
                 .payload=payload.data(),.scales=scales.data(),.mins=coefficients.data(),
                 .payload_bytes=payload.bytes(),.scales_bytes=scales.bytes(),.mins_bytes=coefficients.bytes()};
             ASSERT_TRUE(destination.validFor(layout));
-            const auto execution=TransferEngine::instance().allocatePersistentTransferExecutionLanes(
+            const auto execution=::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                 1u,DeviceId::cuda(0),"cuda_iq3_source_cold_promotion").front();
             ExpertTierWeightTransferLane lane({
                 .device=DeviceId::cuda(0),

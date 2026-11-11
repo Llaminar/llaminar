@@ -22,6 +22,7 @@
 
 #include "MoEOverlayActivationEpochABI.h"
 #include "MoEOverlayInferenceInterferenceProbe.h"
+#include "execution/mtp/MTPConditionForwardPurpose.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +78,22 @@ namespace llaminar2
         Complete = 2, ///< Close the current outer inference command successfully.
         Abort = 3, ///< Close the command fatally with a positive error code.
     };
+
+    /**
+     * @brief Name one exact retained scalar MTP condition, independent of row count.
+     * @param purpose Original public condition ownership passed to the tail runner.
+     * @return The only matching fixed-ticket graph role.
+     * @throws std::invalid_argument For an unknown condition purpose.
+     */
+    [[nodiscard]] MoEOverlayInferenceGraphRole moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose purpose);
+
+    /**
+     * @brief Recover the original retained condition purpose from an authenticated role.
+     * @param role Explicit condition role; MainDecode remains ordinary decode.
+     * @return The matching original public condition policy.
+     * @throws std::invalid_argument For ordinary, verifier, sidecar or unknown roles.
+     */
+    [[nodiscard]] MTPConditionForwardPurpose moeOverlayPipelineConditionForwardPurpose(MoEOverlayInferenceGraphRole role);
 
     /**
      * @brief Fixed command-ring capacity for one retained MTP graph family.
@@ -223,18 +240,43 @@ namespace llaminar2
         std::span<const int> target_participant_ids);
 
     /**
+     * @brief Authority authenticating placement in a retained transaction.
+     *
+     * ResidencyEpoch requires a real positive host-observed residency epoch.
+     * RetainedGraph carries zero: immutable dense/static placement is authenticated by
+     * the topology/workspace, while graph-stable MoE authenticates its actual
+     * live residency ticket inside the original device activation protocol.
+     * ControllerPlacementEpoch names the existing participant-local controller
+     * and its applied mask/replica version; its real initial value can be zero.
+     * Zero alone never selects either authority.
+     */
+    enum class MoEOverlayInferencePlacementIdentityKind : std::uint32_t
+    {
+        ResidencyEpoch = 0, ///< Positive original residency authority observation.
+        RetainedGraph = 1, ///< Frozen graph authority; no host residency observation.
+        ControllerPlacementEpoch = 2, ///< Existing participant controller; initial zero is valid.
+    };
+
+    /**
      * @brief Dynamic identity of one root-published outer inference command.
      *
      * `request_generation` changes on request reset. `command_id` increases for
      * every prefill/decode command inside that request. `initial_placement_epoch`
-     * is the first RCU residency epoch the command may acquire; later execution
-     * tickets may name a newer published epoch, but never an older one.
+     * is the first RCU residency epoch the command may acquire in ResidencyEpoch
+     * mode; later execution tickets may name a newer published epoch, never an
+     * older one. ControllerPlacementEpoch uses the original participant's
+     * canonical placement version, including initial zero. RetainedGraph mode
+     * requires zero and authenticates frozen placement through topology/workspace.
+     * Original pipeline commands name the terminal source's ordering authority;
+     * independent stages retain their own exact capture/workspace identities.
      */
     struct MoEOverlayInferenceCommandIdentity
     {
         std::uint64_t request_generation = 0;
         std::uint64_t command_id = 0;
         std::uint64_t initial_placement_epoch = 0;
+        MoEOverlayInferencePlacementIdentityKind placement_identity_kind =
+            MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch; ///< Explicit zero-epoch authority.
 
         /** @return Whether this identity can open a transaction sequence. */
         [[nodiscard]] bool valid() const noexcept;
@@ -255,7 +297,9 @@ namespace llaminar2
     struct MoEOverlayInferenceTransactionTicket
     {
         static constexpr std::uint32_t kMagic = 0x54494F4Du; // "MOIT"
-        static constexpr std::uint32_t kABIVersion = 4u;
+        // Version 7 authenticates placement authority in the former reserved word.
+        // Earlier tickets cannot distinguish retained placement from a missing epoch.
+        static constexpr std::uint32_t kABIVersion = 7u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -311,7 +355,8 @@ namespace llaminar2
         std::int32_t prefill_schedule_real_rows = 0;
         std::int32_t prefill_schedule_execution_rows = 0;
         std::int32_t prefill_schedule_transaction_count = 0;
-        std::int32_t prefill_schedule_reserved = 0;
+        MoEOverlayInferencePlacementIdentityKind placement_identity_kind =
+            MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch; ///< Authenticated placement authority.
         std::uint64_t prefill_schedule_fingerprint = 0;
 
         /** @return Model-lifetime topology identity carried by this ticket. */

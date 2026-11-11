@@ -7,6 +7,10 @@
  * Setup may wait for initialization. A fixture-owned transfer event represents
  * completion of synthetic physical weights, not a second descriptor upload;
  * captured candidate kernels read the mapped descriptors after that receipt.
+ * Terminal evidence methods record their setup-owned observation event after
+ * every diagnostic copy on the same exact transfer stream, then observe it
+ * before returning host data. The prepared-arrival event retains its original
+ * recording; pageable-copy behavior is never an implicit completion authority.
  */
 
 #pragma once
@@ -118,6 +122,7 @@ namespace llaminar2::test
                     mapped_arrivals_->mutableHostData());
                 transfer_stream_ = backend_->createStream(ordinal);
                 transfer_event_ = backend_->createEvent(ordinal);
+                observation_event_ = backend_->createEvent(ordinal);
                 epoch_arena_ = std::make_shared<DeviceMoEOverlayEpochArena>(
                     llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                         .device_id = participant.device,
@@ -134,7 +139,7 @@ namespace llaminar2::test
                 if (!dummy_payload_ || !dummy_scales_ || !runtime_layers_ ||
                     !prepared_arrivals_ || !apply_status_ ||
                     !arrival_staging_ || !transfer_stream_ ||
-                    !transfer_event_ || !epoch_arena_)
+                    !transfer_event_ || !observation_event_ || !epoch_arena_)
                 {
                     throw std::runtime_error(
                         "publication runtime fixture allocation failed");
@@ -293,12 +298,13 @@ namespace llaminar2::test
         {
             if (!status)
                 return false;
-            return backend_->deviceToHost(
+            const bool submitted = backend_->deviceToHost(
                 status,
                 epoch_arena_->requestStatus(slot),
                 sizeof(*status),
                 participant_.device.ordinal,
                 transfer_stream_);
+            return completeObservation(submitted);
         }
 
         /** Copy terminal RCU control evidence after an exact event is complete. */
@@ -307,12 +313,13 @@ namespace llaminar2::test
         {
             if (!control)
                 return false;
-            return backend_->deviceToHost(
+            const bool submitted = backend_->deviceToHost(
                 control,
                 epoch_arena_->control(),
                 sizeof(*control),
                 participant_.device.ordinal,
                 transfer_stream_);
+            return completeObservation(submitted);
         }
 
         /** Copy terminal maintenance status after its exact event is complete. */
@@ -321,12 +328,13 @@ namespace llaminar2::test
         {
             if (!status)
                 return false;
-            return backend_->deviceToHost(
+            const bool submitted = backend_->deviceToHost(
                 status,
                 epoch_arena_->maintenanceStatus(),
                 sizeof(*status),
                 participant_.device.ordinal,
                 transfer_stream_);
+            return completeObservation(submitted);
         }
 
         /**
@@ -508,7 +516,7 @@ namespace llaminar2::test
                     ordinal,
                     transfer_stream_);
             }
-            return copied;
+            return completeObservation(copied);
         }
 
         /** @return Global immutable identity of this local fixture. */
@@ -518,16 +526,38 @@ namespace llaminar2::test
         }
 
     private:
-        /** Poll the fixture's exact event without blocking its transfer stream. */
-        [[nodiscard]] bool awaitTransfer(
-            std::chrono::steady_clock::duration timeout) const
+        /**
+         * @brief Complete this diagnostic copy batch on its original transfer stream.
+         * @param submitted Whether every requested native copy was accepted.
+         * @return Fresh completion for this batch, including any accepted prefix on failure.
+         */
+        [[nodiscard]] bool completeObservation(bool submitted) const
+        {
+            const bool recorded = backend_->recordEvent(observation_event_, participant_.device.ordinal, transfer_stream_);
+            const bool completed = recorded && awaitEvent(observation_event_, std::chrono::seconds(5));
+            return submitted && completed;
+        }
+
+        /** Poll the original physical-arrival receipt without retagging its generation. */
+        [[nodiscard]] bool awaitTransfer(std::chrono::steady_clock::duration timeout) const
+        {
+            return awaitEvent(transfer_event_, timeout);
+        }
+
+        /**
+         * @brief Observe one explicit fixture event without synchronizing its stream.
+         * @param event Original physical receipt or separate diagnostic terminal.
+         * @param timeout Existing finite component observation budget.
+         * @return True only for this event's current successful recording.
+         */
+        [[nodiscard]] bool awaitEvent(void *event, std::chrono::steady_clock::duration timeout) const
         {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline)
             {
                 bool ready = false;
                 if (!backend_->queryEvent(
-                        transfer_event_, participant_.device.ordinal, &ready))
+                        event, participant_.device.ordinal, &ready))
                 {
                     return false;
                 }
@@ -699,6 +729,8 @@ namespace llaminar2::test
             if (!backend_)
                 return;
             const int ordinal = participant_.device.ordinal;
+            if (observation_event_)
+                backend_->destroyEvent(observation_event_, ordinal);
             if (transfer_event_)
                 backend_->destroyEvent(transfer_event_, ordinal);
             if (transfer_stream_)
@@ -712,6 +744,7 @@ namespace llaminar2::test
                 backend_->free(dummy_scales_, ordinal);
             if (dummy_payload_)
                 backend_->free(dummy_payload_, ordinal);
+            observation_event_ = nullptr;
             transfer_event_ = nullptr;
             transfer_stream_ = nullptr;
             arrival_staging_ = nullptr;
@@ -735,6 +768,7 @@ namespace llaminar2::test
         DeviceMoEExpertDescriptor *arrival_staging_ = nullptr;
         void *transfer_stream_ = nullptr;
         void *transfer_event_ = nullptr;
+        void *observation_event_ = nullptr; ///< Diagnostic-only completion; never a physical arrival receipt.
         bool arrival_in_flight_ = false;
         std::shared_ptr<DeviceMoEOverlayEpochArena> epoch_arena_;
         MoEOverlayDeviceControllerRuntimeBinding runtime_binding_;

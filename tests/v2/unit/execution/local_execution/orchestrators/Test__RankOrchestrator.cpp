@@ -18,6 +18,8 @@
  * retained mock publications to verify original-head subset assembly for1..8.
  * Resident-condition regressions also prove that diagnostic host logits belong
  * to the completed forward, while device-only execution performs no gather.
+ * Global pipeline completion replay proves failed native family construction
+ * or stage ownership cannot publish the shared model gate or release sources.
  */
 
 #include <gmock/gmock.h>
@@ -36,6 +38,8 @@
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
 #include "loaders/PreparedWeightStore.h"
+#include "execution/runner/PreparedPipelineGraphMaterialization.h"
+#include "mocks/MockModelLoader.h"
 #include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
@@ -12703,5 +12707,128 @@ TEST_F(Test__RankOrchestrator, PrefixStateProbeRetainsOriginalMirroredPendingCon
         EXPECT_EQ(after_reset.resident_condition->next_condition_token,760);
         policy.capture_device_logical_state=false;
         EXPECT_FALSE(rank->prefixStateProbe(policy).resident_condition);
+    }
+}
+
+namespace
+{
+    /** @brief Faults at the two real graph-completion boundaries, without device work. */
+    enum class PreparedPipelineCompletionOutcome { Complete, PartialFamily, CaptureThrows, OwnershipThrows };
+
+    /** @brief Replay the production boundary against an observable actual WeightManager. */
+    class PreparedPipelineCompletionWeights final : public WeightManager
+    {
+    public:
+        /** @param loader Empty source fixture; no prepared device state is advertised. */
+        explicit PreparedPipelineCompletionWeights(IModelLoader &loader) : WeightManager(loader) {}
+        /** @return Actual typed release count, observing its required lifecycle ordering. */
+        size_t releaseAllHostWeightData() override
+        {
+            EXPECT_TRUE(lifecycleGates().canReleaseHostData());
+            events.push_back("release");
+            return WeightManager::releaseAllHostWeightData();
+        }
+        std::vector<std::string> events;
+    };
+
+    /** @brief Stateful graph witness injected only at the public inference-runner interface. */
+    class PreparedPipelineCompletionRunner final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Replay completion or an actual materializer failure before ownership validation. */
+        bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+        {
+            events->push_back("materialize");
+            EXPECT_TRUE(plan.valid());
+            EXPECT_FALSE(weights->lifecycleGates().graph_materialization_complete);
+            if (outcome == PreparedPipelineCompletionOutcome::CaptureThrows)
+                throw std::runtime_error("recorded capture failure");
+            return outcome != PreparedPipelineCompletionOutcome::PartialFamily;
+        }
+        /** @brief Fail before model publication when any actual stage owner remains incomplete. */
+        void requireMoEPipelineRuntimeOwnership(MoEPipelineOwnershipValidation frontier) const override
+        {
+            EXPECT_EQ(frontier, MoEPipelineOwnershipValidation::ServingMaterialized);
+            EXPECT_FALSE(weights->lifecycleGates().graph_materialization_complete);
+            events->push_back("ownership");
+            if (outcome == PreparedPipelineCompletionOutcome::OwnershipThrows)
+                throw std::logic_error("recorded incomplete stage ownership");
+        }
+        PreparedPipelineCompletionOutcome outcome = PreparedPipelineCompletionOutcome::Complete;
+        PreparedPipelineCompletionWeights *weights = nullptr;
+        std::vector<std::string> *events = nullptr;
+    };
+
+    /** @brief Partial preparation cannot even enter graph construction or release shared source bytes. */
+    TEST(PreparedPipelineGraphCompletion, RejectsIncompletePreparedSourceBeforeMaterialization)
+    {
+        for (const auto [materialized, prepared] : {std::pair{false, false}, std::pair{true, false}, std::pair{false, true}})
+        {
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            if (materialized) weights.markMaterializationComplete();
+            if (prepared) weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            EXPECT_THROW(materializePreparedPipelineGraphFamily(runner, weights,
+                {.prefill_bucket_rows={32}, .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial}), std::logic_error);
+            EXPECT_TRUE(weights.events.empty());
+            EXPECT_FALSE(weights.lifecycleGates().graph_materialization_complete);
+            EXPECT_FALSE(weights.lifecycleGates().canReleaseHostData());
+        }
+    }
+
+    /** @brief Repeated failed materialization/proof never publishes completion or releases shared sources. */
+    TEST(PreparedPipelineGraphCompletion, ReplaysPartialCaptureAndOwnershipFailureWithoutPublication)
+    {
+        for (const auto outcome : {PreparedPipelineCompletionOutcome::PartialFamily,
+                 PreparedPipelineCompletionOutcome::CaptureThrows, PreparedPipelineCompletionOutcome::OwnershipThrows})
+        {
+            SCOPED_TRACE(static_cast<int>(outcome));
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            weights.markMaterializationComplete();
+            weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.outcome = outcome;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            for (int replay = 0; replay < 3; ++replay)
+            {
+                weights.events.clear();
+                const ServingGraphFamilyMaterializationPlan plan{.prefill_bucket_rows={32},
+                    .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial};
+                if (outcome == PreparedPipelineCompletionOutcome::PartialFamily)
+                    EXPECT_FALSE(materializePreparedPipelineGraphFamily(runner, weights, plan));
+                else
+                    EXPECT_THROW(materializePreparedPipelineGraphFamily(runner, weights, plan), std::exception);
+                const std::vector<std::string> expected = outcome == PreparedPipelineCompletionOutcome::OwnershipThrows
+                    ? std::vector<std::string>{"materialize", "ownership"} : std::vector<std::string>{"materialize"};
+                EXPECT_EQ(weights.events, expected);
+                EXPECT_FALSE(weights.lifecycleGates().graph_materialization_complete);
+                EXPECT_FALSE(weights.lifecycleGates().canReleaseHostData());
+            }
+        }
+    }
+
+    /** @brief Fresh/reset replay publishes only after the actual complete graph and ownership frontier. */
+    TEST(PreparedPipelineGraphCompletion, CompleteFamilyPublishesAfterOwnershipProof)
+    {
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            llaminar2::test::MockModelLoader loader;
+            PreparedPipelineCompletionWeights weights(loader);
+            weights.markMaterializationComplete();
+            weights.markDevicePreparationComplete();
+            PreparedPipelineCompletionRunner runner;
+            runner.weights = &weights;
+            runner.events = &weights.events;
+            ASSERT_TRUE(materializePreparedPipelineGraphFamily(runner, weights,
+                {.prefill_bucket_rows={32}, .main_decode_graph=ServingMainDecodeGraphKind::HistoryBearingSerial}));
+            EXPECT_EQ(weights.events, (std::vector<std::string>{"materialize", "ownership", "release"}));
+            EXPECT_TRUE(weights.lifecycleGates().graph_materialization_complete);
+            EXPECT_TRUE(weights.lifecycleGates().canReleaseHostData());
+        }
     }
 }

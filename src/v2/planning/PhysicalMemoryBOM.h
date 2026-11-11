@@ -70,6 +70,8 @@ namespace llaminar2
         NativeStorageGraphExecutable, ///< Retained storage graph definitions, isolated from model/follower reservations.
         NativeCPUCollectiveDomain, ///< Opaque native CPU domain, released only after original communicator/backend retirement.
         NativeCPUCollectiveProcessPool, ///< Incremental first-domain MPI pool, retained through original MPI_Finalize.
+        NativeAuxiliaryStream,    ///< Certified ordinary stream, retained by its exact native owner.
+        NativeTransferEvent,     ///< Exact peer completion/timestamp event family, original physical lifetime.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -143,6 +145,10 @@ namespace llaminar2
             return "native_cpu_collective_domain";
         case PhysicalMemoryOwner::NativeCPUCollectiveProcessPool:
             return "native_cpu_collective_process_pool";
+        case PhysicalMemoryOwner::NativeTransferEvent:
+            return "native_transfer_event";
+        case PhysicalMemoryOwner::NativeAuxiliaryStream:
+            return "native_auxiliary_stream";
         case PhysicalMemoryOwner::Count:
             break;
         }

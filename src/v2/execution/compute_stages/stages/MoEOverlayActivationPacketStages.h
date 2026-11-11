@@ -35,6 +35,10 @@ namespace llaminar2
     class IBackend;
     class IMoEKernel;
     class TensorBase;
+    class PhysicalMemoryAuthority;
+    class PreparedGPUContextUsePermit;
+    class GPUCaptureDependencyRoster;
+    class MoEOverlayActivationBatchStorage;
 
     /**
      * @brief Pack one planner-targeted sparse dispatch packet on continuation.
@@ -166,15 +170,23 @@ namespace llaminar2
             std::vector<MoEOverlayMappedActivationDeviceLane> lanes,
             std::int32_t physical_rows,
             std::uint32_t stage_ordinal,
-            std::int32_t model_layer_index);
+            std::int32_t model_layer_index,
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority);
 
-        /** @brief Destroy layer-owned events; auxiliary streams remain context-owned. */
+        /** @brief Release graph borrows; actual internal events and streams remain context-owned. */
         ~MoEOverlayActivationLaneBatchState();
 
         MoEOverlayActivationLaneBatchState(
             const MoEOverlayActivationLaneBatchState &) = delete;
         MoEOverlayActivationLaneBatchState &operator=(
             const MoEOverlayActivationLaneBatchState &) = delete;
+
+        /** @return Same original ledger used by the production source and shared resource declaration. */
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory()const noexcept{return physical_memory_authority_;}
+        /** @return Original source/context permit retained through all captured stage users. */
+        const PreparedGPUContextUsePermit& originalContext()const;
+        /** @return Prepared context-owned internal events, never external publication receipts. */
+        const std::shared_ptr<GPUCaptureDependencyRoster>& captureDependencies()const noexcept{return capture_dependencies_;}
 
         /** @return Exact planner-selected continuation device. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
@@ -282,6 +294,9 @@ namespace llaminar2
             void *ready_event = nullptr;
         };
 
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
+        std::unique_ptr<PreparedGPUContextUsePermit> original_context_;
+        std::shared_ptr<GPUCaptureDependencyRoster> capture_dependencies_;
         DeviceId device_ = DeviceId::invalid();
         std::vector<MoEOverlayMappedActivationDeviceLane> lanes_;
         std::int32_t physical_rows_ = 0;
@@ -399,7 +414,7 @@ namespace llaminar2
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Graph-transaction-owned immutable launch descriptors. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+        std::shared_ptr<MoEOverlayActivationBatchStorage>
             descriptor_storage_;
         /** Setup proof covering every main or persistent lane stream. */
         bool grant_initialization_joined_ = false;
@@ -697,9 +712,9 @@ namespace llaminar2
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Persistent planner-ordered launch descriptors for either batch geometry. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+        std::shared_ptr<MoEOverlayActivationBatchStorage>
             descriptor_storage_;
         /** One device word per lane, published only after authentication. */
-        std::shared_ptr<MoEOverlayPersistentGraphStorage> lane_valid_;
+        std::shared_ptr<MoEOverlayActivationBatchStorage> lane_valid_;
     };
 } // namespace llaminar2

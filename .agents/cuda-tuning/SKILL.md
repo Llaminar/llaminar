@@ -30,6 +30,16 @@ The CUDA attachment and observer rules below remain authoritative.
 CUDA kernel tuning must preserve the production execution architecture, not
 trade architecture for an isolated microbenchmark win:
 
+- **Prefer register-resident work.** Keep per-thread reusable operands,
+  accumulators and intermediate results in registers through their consumers.
+  Evaluate layouts, tiling and producer/consumer fusion that remove unnecessary
+  shared/global-memory staging, reloads and barriers. Shared memory remains
+  appropriate for measured cooperative reuse and required synchronization.
+  Shorten live ranges while preserving independent arithmetic chains and the
+  numerical contract. Inspect final SASS for the actual fused entry and its
+  helpers; qualify spills, shuffle traffic and occupancy on each target.
+  Promote measured production wins under the existing zero-spill policy;
+  increased register residency alone is not a performance result.
 - **No dynamic allocation or deallocation.** Hot-path kernels and launch
   bridges consume persistent workspace bindings. `cudaMalloc`,
   `cudaMallocAsync`, `cudaFree`, container growth, or hidden scratch allocation

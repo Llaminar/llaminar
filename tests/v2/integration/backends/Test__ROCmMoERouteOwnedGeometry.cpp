@@ -538,6 +538,12 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                 std::string error;
                 ASSERT_TRUE(automatic->inspectKernelNodes(nodes, &error)) << error;
                 std::uint32_t seen = 0;
+                // The ABI encodes the enum name's length. Derive it from the
+                // current NativeQuantised spelling rather than retaining the
+                // old NativeVNNI name's numeric length after a rename.
+                constexpr std::string_view format_symbol = "NativeQuantisedFormatPrefill";
+                const auto format_prefix = "IL" + std::to_string(format_symbol.size()) +
+                    std::string(format_symbol);
                 for (const auto &node : nodes)
                 {
                     if (node.name.find("moe_grouped_gate_up_decode_equivalent_prefill_kernel") == std::string::npos) continue;
@@ -546,9 +552,9 @@ void verifyCapturedPublicM1Sources(MoERouteOwnedGateUpPartitionExecution request
                     const auto mask = moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask);
                     for (std::uint8_t candidate = 0; candidate < 32; ++candidate)
                         if ((mask & nativeQuantisedCodebookMaskBit(candidate)) &&
-                            node.name.find("IL23NativeQuantisedFormatPrefill" + std::to_string(candidate) + "E") != std::string::npos)
+                            node.name.find(format_prefix + std::to_string(candidate) + "E") != std::string::npos)
                             cb = candidate;
-                    ASSERT_NE(cb, 255);
+                    ASSERT_NE(cb, 255) << node.name;
                     ASSERT_EQ(seen & nativeQuantisedCodebookMaskBit(cb), 0u);
                     seen |= nativeQuantisedCodebookMaskBit(cb);
                     const int columns = cb == 13 && rows * TopK > 16 ? 128 : 64;

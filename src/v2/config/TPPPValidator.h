@@ -151,8 +151,10 @@ namespace llaminar2
 
             validateCPULayers(config, model, result);
 
-            // Skip remaining validation if no parallelism configured
-            if (config.tp_degree == 1 && config.pp_degree == 1)
+            // Overlay normalization retires simple selectors after installing
+            // its named domain. A scalar selector therefore does not mean the
+            // canonical physical assignment is scalar or already validated.
+            if (config.tp_degree == 1 && config.pp_degree == 1 && !config.usesNamedDomains())
             {
                 return result;
             }
@@ -662,6 +664,11 @@ namespace llaminar2
             for (const auto &domain : config.domain_definitions)
             {
                 int domain_tp_degree = static_cast<int>(domain.devices.size());
+                if (domain_tp_degree == 0)
+                {
+                    result.addError("Domain '" + domain.name + "' has no physical participants");
+                    continue;
+                }
                 if (domain.scope == TPScope::RANK_LOCAL)
                 {
                     // Named rank-local TP uses the same uneven-query and

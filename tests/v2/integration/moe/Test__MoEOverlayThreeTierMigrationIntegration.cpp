@@ -12,6 +12,7 @@
  * CUDA-hot/CPU-cold case additionally swaps complete experts in both directions.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -620,8 +621,7 @@ namespace llaminar2
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
                             .execution_streams =
-                                TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+                                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         std::min<std::size_t>(
                                             blob_slots_per_device,
                                             4u),
@@ -638,8 +638,7 @@ namespace llaminar2
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
                             .execution_streams =
-                                TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+                                ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         std::min<std::size_t>(
                                             blob_slots_per_device,
                                             4u),
@@ -787,8 +786,7 @@ namespace llaminar2
                                                            1u,
                                                            DeviceId::rocm(0))
                                                        .front(),
-                                        .execution = TransferEngine::instance()
-                                                         .allocatePersistentTransferExecutionLanes(
+                                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                              1u,
                                                              DeviceId::rocm(0),
                                                              "three_tier:" + identity)
@@ -819,8 +817,7 @@ namespace llaminar2
                                                            1u,
                                                            DeviceId::cuda(0))
                                                        .front(),
-                                        .execution = TransferEngine::instance()
-                                                         .allocatePersistentTransferExecutionLanes(
+                                        .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                              1u,
                                                              DeviceId::cuda(0),
                                                              "three_tier:" + identity)
@@ -1435,8 +1432,7 @@ namespace llaminar2
                                                        1u,
                                                        DeviceId::cuda(0))
                                                    .front(),
-                                    .execution = TransferEngine::instance()
-                                                     .allocatePersistentTransferExecutionLanes(
+                                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                          1u,
                                                          DeviceId::cuda(0),
                                                          "cuda_cpu_rotation:" + identity)

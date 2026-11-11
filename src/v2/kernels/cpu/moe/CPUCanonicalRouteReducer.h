@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "collective/RootedFloatRecordRange.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -157,6 +158,28 @@ namespace llaminar2::cpu::moe
      */
     bool combineCanonicalRouteDownPartialsOrdered(
         const CanonicalRouteDownPartialCombineArgs &args);
+
+    /**
+     * @brief Indexed original compact banks, borrowing the existing admitted gather/map roots.
+     *
+     * Each source range names one original participant's records. Maps are
+     * contiguous [participant, original_route_slot]; no participant descriptor
+     * array, stack cardinality limit or allocation is required.
+     */
+    struct CanonicalRouteDownIndexedPartialRows {
+        std::span<const float> records;
+        std::span<const RootedFloatRecordRange> source_ranges;
+        std::span<const int32_t> participant_route_maps;
+    };
+    /**
+     * @brief Combine indexed compact records using the same validated arithmetic/tile implementation.
+     * @param args Original output/weight geometry; ordered_participants must be empty.
+     * @param indexed Exact original gathered records/ranges and complete caller-owned route maps.
+     * @return False before output mutation for malformed, overlapping or overflowed geometry.
+     */
+    bool combineCanonicalRouteDownPartialsOrderedIndexed(
+        const CanonicalRouteDownPartialCombineArgs &args,
+        const CanonicalRouteDownIndexedPartialRows &indexed);
 
     /**
      * @brief Combine each expert/route in original participant order before weighting it.

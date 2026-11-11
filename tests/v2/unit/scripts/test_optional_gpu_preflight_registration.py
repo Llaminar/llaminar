@@ -38,7 +38,8 @@ def registration_source() -> str:
                          source.index('# Independent PP stages preserve'))
     end = source.index('# Test: device-owned ExpertOverlay epoch publication', start)
     owner = f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")'
-    return '\n'.join((owner, helper, rccl, native, source[start:end]))
+    selection = f'include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")'
+    return '\n'.join((owner, selection, helper, rccl, native, source[start:end]))
 
 
 class OptionalGPUPreflightRegistration(unittest.TestCase):
@@ -82,7 +83,7 @@ set(Python3_EXECUTABLE "{sys.executable}")
             return json.loads(result.stdout)['tests']
 
     def test_integration_preserves_each_native_cell_and_exact_hardware_skip(self):
-        """Only eight-device layouts carry optional-hardware skip expressions."""
+        """Eight-device pipeline absence is qualified before launch, while legacy RCCL metadata stays exact."""
         tests = self.configure('Integration')
         self.assertEqual(len(tests), 49)
         optional = 0
@@ -93,12 +94,147 @@ set(Python3_EXECUTABLE "{sys.executable}")
             labels = set(properties['LABELS'])
             if 'Devices8' in labels:
                 optional += 1
-                pattern = ('Requires 8 ROCm devices' if 'RCCLUnusedRetirement_' in test['name']
-                           else 'Requires 4 CUDA and ROCm devices')
-                self.assertEqual(properties['SKIP_REGULAR_EXPRESSION'], [pattern])
+                if 'RCCLUnusedRetirement_' in test['name']:
+                    self.assertEqual(properties['SKIP_REGULAR_EXPRESSION'], ['Requires 8 ROCm devices'])
+                else:
+                    self.assertTrue({'HardwareOptional', 'DistinctNUMARanks', 'CUDADevices4', 'ROCmDevices4'} <= labels)
+                    self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
             else:
                 self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
         self.assertEqual(optional, 14)
+
+    def test_addressed_optional_geometry_keeps_all_original_strict_cases(self):
+        """Execute the actual addressed registration block; optionality never disables or skips its body."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        start = source.index('function(add_v2_test TEST_NAME)')
+        end = source.index('endfunction()', start) + len('endfunction()')
+        helper = source[start:end]
+        module = (SOURCE / 'tests/v2/cmake/V2NativeCountedBroadcastTests.cmake').read_text()
+        start = module.index('# Addressed original-communicator cases')
+        end = module.index('# Original connector observations', start)
+        with tempfile.TemporaryDirectory(prefix='llaminar-addressed-eligibility-') as directory:
+            root = Path(directory)
+            owner = SOURCE / 'tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake'
+            selection = SOURCE / 'tests/v2/cmake/V2TestTargetSelection.cmake'
+            root.joinpath('CMakeLists.txt').write_text(f"""cmake_minimum_required(VERSION 3.25)
+project(AddressedEligibility NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(V2_TEST_SOCKETS 2)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(DEFAULT_LOG_LEVEL ERROR)
+set(Python3_EXECUTABLE "{sys.executable}")
+set(HAVE_CUDA ON)
+set(HAVE_ROCM ON)
+set(HAVE_NCCL ON)
+set(HAVE_RCCL ON)
+add_executable(v2_integration_captured_transfer_channel IMPORTED GLOBAL)
+set_target_properties(v2_integration_captured_transfer_channel PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")
+include("{owner}")
+include("{selection}")
+""" + helper + module[start:end])
+            ninja = shutil.which('ninja')
+            self.assertIsNotNone(ninja)
+            subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'), '-G', 'Ninja',
+                '-DCMAKE_MAKE_PROGRAM=' + ninja], check=True, capture_output=True, text=True, timeout=10)
+            listing = subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
+                '--show-only=json-v1'], text=True, timeout=10)
+            tests = json.loads(listing)['tests']
+        self.assertEqual(len(tests), 12)
+        optional = set()
+        for test in tests:
+            props = {item['name']: item['value'] for item in test['properties']}
+            labels = set(props['LABELS'])
+            self.assertIn('ProductionTestPreflight', labels)
+            self.assertNotIn('DISABLED', props)
+            self.assertNotIn('SKIP_REGULAR_EXPRESSION', props)
+            self.assertNotIn('SKIP_RETURN_CODE', props)
+            if 'HardwareOptional' in labels:
+                optional.add(test['name'])
+                self.assertTrue(('CUDA' in labels and bool({'Devices4', 'Devices8'} & labels))
+                    or ('ROCm' in labels and 'Devices8' in labels))
+            else:
+                self.assertTrue('Devices2' in labels or ('ROCm' in labels and 'Devices4' in labels))
+        self.assertEqual(len(optional), 6)
+
+    def test_original_mapped_components_partition_exact_native_cohorts(self):
+        """Execute the real per-body registration, retaining honest local mixed eligibility."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        helper_start = source.index('function(add_v2_test TEST_NAME)')
+        helper_end = source.index('endfunction()', helper_start) + len('endfunction()')
+        marker = source.index('# BEGIN original mapped component cohort registration')
+        begin = source.index('    set(_original_component_cases', marker)
+        end = source.index('# END original mapped component cohort registration', begin)
+        # Source ownership is tested by the enclosing real target_sources block;
+        # imported placeholders execute only the executable registration itself.
+        registration = source[begin:end].rsplit('endif()', 1)[0]
+        self.assertNotIn('v2_integration_mapped_activation_packet_cuda_rocm', source)
+        with tempfile.TemporaryDirectory(prefix='llaminar-original-components-') as directory:
+            root = Path(directory)
+            prefix = f"""cmake_minimum_required(VERSION 3.25)
+project(OriginalComponents NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(V2_TEST_SOCKETS 2)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(DEFAULT_LOG_LEVEL ERROR)
+set(Python3_EXECUTABLE "{sys.executable}")
+add_executable(v2_integration_captured_transfer_channel IMPORTED GLOBAL)
+set_target_properties(v2_integration_captured_transfer_channel PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
+include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
+"""
+            (root / 'CMakeLists.txt').write_text(prefix + source[helper_start:helper_end] + '\n' + registration)
+            ninja = shutil.which('ninja')
+            self.assertIsNotNone(ninja)
+            result = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'), '-G', 'Ninja',
+                '-DCMAKE_MAKE_PROGRAM=' + ninja], text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            tests = json.loads(subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
+                '--show-only=json-v1'], text=True, timeout=10))['tests']
+        self.assertEqual(len(tests), 23)
+        filters = set()
+        local_mixed = []
+        return_cases = []
+        for test in tests:
+            props = {item['name']: item['value'] for item in test['properties']}
+            labels = set(props['LABELS'])
+            self.assertTrue({'ProductionTestPreflight', 'HardwareOptional', 'ProcessOwned'} <= labels)
+            self.assertNotIn('DISABLED', props)
+            self.assertNotIn('SKIP_REGULAR_EXPRESSION', props)
+            self.assertNotIn('SKIP_RETURN_CODE', props)
+            command = test['command']
+            self.assertIn('-np', command)
+            self.assertEqual(command[command.index('-np') + 1], '2')
+            exact = [arg for arg in command if arg.startswith('--gtest_filter=')]
+            self.assertEqual(len(exact), 1)
+            self.assertNotIn(exact[0], filters)
+            filters.add(exact[0])
+            if {'CUDA', 'ROCm'} <= labels:
+                local_mixed.append(test)
+                self.assertTrue({'Devices2', 'CUDADevices1', 'ROCmDevices1'} <= labels)
+                self.assertNotIn('DistinctNUMARanks', labels)
+            if 'ReturnValidation_' in test['name']:
+                return_cases.append(test)
+                self.assertIn('Devices1', labels)
+                self.assertIn('/MoEOverlayReturnValidation.', exact[0])
+            elif 'TicketAckRace_' in test['name']:
+                self.assertIn('Devices1', labels)
+            else:
+                self.assertIn('Devices2', labels)
+        self.assertEqual(len(local_mixed), 2)
+        self.assertEqual(len(return_cases), 8)
+        self.assertNotIn('V2_Integration_MappedActivationPacket_CUDA_ROCm', {test['name'] for test in tests})
+        self.assertNotIn('V2_Integration_CanonicalRoutePrefillReplay', {test['name'] for test in tests})
+        # Both original metadata bodies remain covered by the real device-free alias.
+        source_map = source[source.index('add_v2_test(V2_Integration_CPUJointRecordedSourceMapContract'):]
+        source_map = source_map[:source_map.index('list(APPEND')]
+        self.assertIn('JointRecordedSourceMapEpochAndZeroHoleContract', source_map)
+        self.assertIn('JointSourceFixtureHasCompleteOriginalColdPlacement', source_map)
+        self.assertIn('DeviceFree', source_map)
+        self.assertIn('NO_MPI', source_map)
 
     def test_release_omits_native_tests_and_their_properties_together(self):
         """A performance-only build cannot attach metadata to nonexistent tests."""
@@ -184,6 +320,7 @@ set_target_properties(v2_integration_moe_projection_pipeline PROPERTIES IMPORTED
 '''
                 prefix += 'set(LLAMINAR_ROCM_MOE_M1_OWNER_PARTITIONS ' + policy + ')\n'
                 prefix += f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
+                prefix += f'include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")\n'
                 (root / 'CMakeLists.txt').write_text(prefix + source[helper_start:helper_end] + '\n' + registration)
                 ninja = shutil.which('ninja')
                 self.assertIsNotNone(ninja)

@@ -10,6 +10,7 @@
 #include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
 #include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableNativeTransfer.h"
+#include "execution/qwen4exp/PooledImmutableNativeMembership.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderContract.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
@@ -23,6 +24,8 @@
 #include <set>
 namespace llaminar2::test {
 namespace {
+/** @brief Reader bindings must expose only the actual original native endpoints. */
+template<class T> concept HasRetiredCapturedReaderOwner = requires(const T& t){t.result();} || requires(const T& t){t.acknowledgement();};
 namespace q=qwen4exp;
 struct Shape {q::PooledImmutablePhysicalOwnerGeometry physical;q::PooledImmutableCoordinatorGeometry coordinator;std::vector<PhysicalMemoryResource> resources;};
 /** @return Original declared owner order, never compute-rank order or an admission permission. */
@@ -83,42 +86,81 @@ TEST(PooledImmutableDirectedTransport, PlanningAndOriginalRuntimePinEdgeUseIdent
         EXPECT_EQ(bytes(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,s.resources)).at(DeviceId::cpu()),hostBytes);
     }
 }
-/** @test Explicit NoPeer retains compact mapped channel costs and original per-device graph identity. */
-TEST(PooledImmutableDirectedTransport, ExplicitNoPeerKeepsExactFloorGrowthAndNativeOwnerIdentity)
+/** @test Storage-only endpoints use exact native completion metadata without becoming compute readers. */
+TEST(PooledImmutableDirectedTransport, StorageOnlyNativeMembersHaveExactBOMWithoutModelReaderRoles)
 {
     for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
-        for (const auto count : {1u, 3u, 7u})
+        for (const auto count : {1u, 3u, 7u, 9u})
             for (const auto capacity : {0u, 64u}) {
                 const DeviceId source{type,static_cast<int>(count)};
                 const std::vector<std::uint32_t> slots(count, capacity);
                 const auto s = shape(source, slots, true, PeerAccessCoverage::None);
-                auto floor = bytes(q::PooledImmutableDirectedTransport::mandatoryBOM(s.physical,s.coordinator,host,s.resources));
-                const auto growth = bytes(q::PooledImmutableDirectedTransport::slotDependentBOM(s.physical,s.coordinator,host,s.resources));
-                const auto full = bytes(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,s.resources));
-                for (const auto& [device, value] : growth) floor[device] += value;
-                EXPECT_EQ(floor, full);
+                std::vector<std::uint8_t> positive(count+1,capacity!=0),readers(count+1,0);
+                positive[0]=0;readers[0]=1;
+                const q::PooledNativeCompletionLayout declaration(count+1,0,positive,q::PooledNativeReaderMessageProfile::ReplicatedFP32,readers);
+                const auto complete=q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,s.resources);
+                EXPECT_EQ(bytes(complete),bytes(q::PooledImmutableNativeCompletionStorage::memoryBOM(host,s.resources,declaration)));
+                auto floor=bytes(q::PooledImmutableDirectedTransport::mandatoryBOM(s.physical,s.coordinator,host,s.resources));
+                for(const auto& [device,value]:bytes(q::PooledImmutableDirectedTransport::slotDependentBOM(s.physical,s.coordinator,host,s.resources)))floor[device]+=value;
+                EXPECT_EQ(floor,bytes(complete));
+                EXPECT_EQ(declaration.operandBytes(),2u*count*(capacity?11u:0u)*sizeof(ncclLlaminarCompletionOperand));
+                for(std::size_t member=1;member<=count;++member) {
+                    EXPECT_FALSE(declaration.reader(member));
+                    EXPECT_THROW(declaration.operandOffset(q::PooledNativeCountedMessage::ReaderResult,0,int(member)),std::invalid_argument);
+                }
                 const auto coordinator = q::PooledImmutableCoordinatorNativePlan::fromGeometry(s.physical,s.coordinator,701,17);
                 for (std::uint32_t i = 1; i < s.physical.owners().size(); ++i) {
                     const auto owner = q::PooledImmutableOwnerNativePlan::fromGeometry(s.physical,s.coordinator,i,701,17);
                     const auto edge = q::PooledImmutablePinEdge::fromPlans(coordinator,owner);
                     EXPECT_EQ(owner.peerAccess(), PeerAccessCoverage::None);
-                    EXPECT_TRUE(edge.capturedChannelTransport());
-                    EXPECT_NO_THROW(edge.channelMemory());
+                    EXPECT_FALSE(edge.capturedChannelTransport());
+                    EXPECT_THROW(edge.channelMemory(),std::invalid_argument);
                 }
             }
 }
-TEST(PooledImmutableDirectedTransport, ForeignResourcesAndUnsupportedNativeRoutesCannotAcquireMappedBOM){
+TEST(PooledImmutableDirectedTransport, ForeignResourcesCannotAcquireTransportBOM){
     const std::array slots{64u,0u};const auto s=shape(DeviceId::cuda(7),slots);
     auto missing=s.resources;missing.pop_back();EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,missing),std::invalid_argument);
     auto duplicate=s.resources;duplicate.push_back(duplicate.front());EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,host,duplicate),std::invalid_argument);
-    const auto native=shape(DeviceId::cuda(7),slots,true);EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(native.physical,native.coordinator,host,native.resources),std::invalid_argument);
+    const auto native=shape(DeviceId::cuda(7),slots,true);EXPECT_NO_THROW(q::PooledImmutableDirectedTransport::completeBOM(native.physical,native.coordinator,host,native.resources));
     auto foreign=host;foreign.world_rank=1;EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,foreign,s.resources),std::invalid_argument);
     EXPECT_THROW(q::PooledImmutableDirectedTransport::create({}),std::invalid_argument);
 }
 
 /** @test Counted native metadata has one disjoint immutable operand/receipt slot per actual message and participant. */
+TEST(PooledImmutableDirectedTransport, NativeUnionPreservesReaderOrderAndExcludesStorageOnlyResults)
+{
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const std::size_t count:{3u,5u,9u,17u}) {
+        const PhysicalMemoryAllocatorIdentity source{5,DeviceId(type,31)},reader{5,DeviceId(type,29)};
+        const std::array originalReaders{reader,source};
+        std::vector<q::PooledNativeStorageMember> owners;
+        for(std::size_t i=0;i<count;++i)owners.push_back({{5,DeviceId(type,int(i))},i%3!=0});
+        owners.push_back({source,true});owners.push_back({reader,false});
+        owners.push_back({{5,DeviceId(type==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA,37)},true});
+        const q::PooledImmutableNativeMembership membership(source,owners,originalReaders);
+        ASSERT_EQ(membership.members().size(),count+2);EXPECT_EQ(membership.coordinator(),1u);
+        EXPECT_EQ(membership.members()[0],reader);EXPECT_EQ(membership.members()[1],source);
+        for(const auto profile:{q::PooledNativeReaderMessageProfile::ReplicatedFP32,q::PooledNativeReaderMessageProfile::CompactNative}) {
+            const auto layout=membership.layout(profile);
+            EXPECT_TRUE(layout.reader(0));EXPECT_TRUE(layout.reader(1));
+            for(std::size_t i=2;i<layout.degree();++i) {
+                EXPECT_FALSE(layout.reader(i));EXPECT_EQ(layout.positiveOwner(i),(i-2)%3!=0);
+                EXPECT_THROW(layout.operandOffset(q::PooledNativeCountedMessage::ReaderResult,1,int(i)),std::invalid_argument);
+                EXPECT_THROW(layout.operandOffset(q::PooledNativeCountedMessage::LocalHotMissKeys,int(i),1),std::invalid_argument);
+                EXPECT_EQ(layout.receiptBytesPerParticipant(i),((i-2)%3?11u:0u)*sizeof(ncclLlaminarByteCompletion));
+            }
+        }
+        auto foreign=owners;foreign.front().allocator.world_rank=6;
+        EXPECT_THROW((q::PooledImmutableNativeMembership(source,foreign,originalReaders)),std::invalid_argument);
+        const std::array duplicateReaders{source,source};
+        EXPECT_THROW((q::PooledImmutableNativeMembership(source,owners,duplicateReaders)),std::invalid_argument);
+    }
+}
+/** @test Original positive completion edges retain disjoint exact receipt offsets. */
 TEST(PooledImmutableDirectedTransport, NativeCompletionLayoutHasExactPositiveMessagePopulation)
 {
+    static_assert(!HasRetiredCapturedReaderOwner<q::PooledImmutableReplicatedReaderTransport>);
+    EXPECT_FALSE(HasRetiredCapturedReaderOwner<q::PooledImmutableReplicatedReaderTransport>);
     using Message = q::PooledNativeCountedMessage;
     const q::PooledNativeCompletionLayout layout(true);
     std::array<bool, 24> occupied{};
@@ -220,8 +262,12 @@ TEST(PooledImmutableDirectedTransport, NativeInlineOwnersKeepExactProtocolFloorA
             EXPECT_EQ(controls.at(source), sizeof(q::replicated_reader::Control));
             EXPECT_EQ(controls.at(reader), sizeof(q::replicated_reader::Control));
             EXPECT_TRUE(!controls.contains(DeviceId::cpu()) || controls.at(DeviceId::cpu()) == 0);
-            EXPECT_THROW(geometry.resultMemory(consumers[1]), std::logic_error);
-            EXPECT_THROW(geometry.acknowledgementMemory(consumers[1]), std::logic_error);
+            // Native result and ACK evidence share only the typed receipt bank;
+            // no payload-capacity-dependent captured channel is admitted.
+            const q::PooledNativeCompletionLayout completion(capacity != 0);
+            const auto nativeBytes = bytes(actual);
+            EXPECT_EQ(nativeBytes.at(source), completion.receiptBytesPerParticipant(0));
+            EXPECT_EQ(nativeBytes.at(reader), completion.receiptBytesPerParticipant(1));
             auto missing = original.resources; missing.pop_back();
             EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(original.physical, original.coordinator,
                 host, missing, &geometry), std::invalid_argument);
@@ -421,7 +467,7 @@ TEST(PooledImmutableDirectedTransport, AddressedCompletionSlotsAreExactForEveryO
     using Message=q::PooledNativeCountedMessage;
     for(const std::size_t degree:{2u,4u,8u})for(std::size_t source=0;source<degree;++source)
         for(unsigned mask=0;mask<(1u<<degree);++mask) {
-            std::array<std::uint8_t,q::kMaximumPooledNativeParticipants> flags{};
+            std::vector<std::uint8_t> flags(degree);
             std::size_t expectedSlots=0;
             for(std::size_t peer=0;peer<degree;++peer)if(peer!=source){flags[peer]=(mask>>peer)&1u;expectedSlots+=flags[peer]?12:1;}
             const q::PooledNativeCompletionLayout layout(degree,source,std::span(flags.data(),degree));
@@ -479,7 +525,7 @@ TEST(PooledImmutableDirectedTransport, AddressedNativeBOMUsesActualOwnerEdgesEve
         for(const std::size_t source:std::array<std::size_t,2>{0,degree-1})for(const unsigned pattern:{0u,1u,2u,3u})for(const std::uint32_t capacity:{0u,1u,64u,512u}){
             const PhysicalMemoryAllocatorIdentity coordinator{0,DeviceId(type,int(source))};
             std::vector<PhysicalMemoryAllocatorIdentity> consumers,order;std::vector<PhysicalMemoryResource> resources;
-            std::vector<ImmutableRowTableLayoutOwner> owners;std::array<std::uint8_t,q::kMaximumPooledNativeParticipants> flags{};
+            std::vector<ImmutableRowTableLayoutOwner> owners;std::vector<std::uint8_t> flags(degree);
             for(std::size_t participant=0;participant<degree;++participant){
                 const PhysicalMemoryAllocatorIdentity owner{0,DeviceId(type,int(participant))};consumers.push_back(owner);
                 resources.push_back({0,owner.device,1ull<<34,1ull<<34});

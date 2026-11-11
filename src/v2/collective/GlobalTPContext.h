@@ -177,6 +177,14 @@ namespace llaminar2
         bool retireOriginalCPUExpertDomain();
         /** @return Whether a borrower shares this still-live admitted native domain's original control block. */
         bool authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower) const noexcept;
+        /**
+         * @brief Authenticate an original CPU stage borrow in its parent rank namespace.
+         * @param borrower Shared handle to this native owner and its original control block.
+         * @param parent Exact live parent communicator used for this domain's original split.
+         * @return True only while both the original domain and parent identity match.
+         */
+        bool authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower,
+            MPI_Comm parent) const noexcept;
 
         static std::unique_ptr<GlobalTPContext> createWithSplit(
             MPI_Comm base_comm,
@@ -381,6 +389,7 @@ namespace llaminar2
 
         std::optional<NativeCPUCollectiveProgram::DomainUse> cpu_program_use_; ///< Original native duty, released only at explicit shutdown.
         bool cpu_program_retired_=false;
+        MPI_Comm original_cpu_parent_ = MPI_COMM_NULL; ///< Borrowed identity of the admitted CPU split parent.
         std::weak_ptr<GlobalTPContext> original_cpu_owner_; ///< Original shared control block counts retained graph/worker borrowers.
         MPI_Comm domain_comm_;                        ///< Domain-specific MPI communicator
         /**

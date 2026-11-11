@@ -341,6 +341,13 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
   PhysicalMemoryMaterializationKind::NewAllocation),0u);
  const FrozenModelWeightSet aggregate(frozen.strategy(),frozen.bindings(),PhysicalMemoryOwner::PrimaryModelWeights);
+ // Serving first authenticates already committed fragments in its dense pass,
+ // then enters the exact scoped overlay preparation. Neither may reread them.
+ const auto prepared_reads=loader.calls;
+ const auto original_bank=manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7);
+ ASSERT_TRUE(original_bank);
+ ASSERT_TRUE(manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),/*include_expert_jobs=*/false));
+ EXPECT_EQ(loader.calls,prepared_reads);
  const auto original_preparation=std::make_shared<const MoEExpertOverlayPreparationPlan>(prepared);
  ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&aggregate,nullptr,
   PreparedWeightAdmission::AllocateCompleteSet,original_preparation));
@@ -351,6 +358,10 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
   PhysicalMemoryMaterializationKind::NewAllocation),routed_bytes);
  const auto lease=manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7);
  ASSERT_TRUE(lease);EXPECT_EQ(lease->cpu_joint_source,selected);
+ EXPECT_EQ(loader.calls,prepared_reads);
+ EXPECT_EQ(lease->experts[1].gate,original_bank->experts[1].gate);
+ EXPECT_EQ(lease->experts[1].up,original_bank->experts[1].up);
+ EXPECT_EQ(lease->experts[1].down,original_bank->experts[1].down);
  // Copying a source-bound prepared lease retains the actual engines, not raw
  // source windows. Clearing both producer registries cannot invalidate it.
  auto copied=*lease;ASSERT_TRUE(copied.experts[1].complete());
@@ -366,7 +377,18 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
    1.f,0.f,nullptr,mpi.get(),-1,workspace?workspace->get():nullptr);
   for(int row=0;row<engine->get_n();++row)EXPECT_EQ(static_cast<const float*>(output->raw_data())[row],float(engine->get_k()));
  };
- run();manager.expertGemmRegistry().clear();manager.preparedWeightStore()->clear();run();
+ run();
+ // Even with the actual final Store still retained, an absent or partial
+ // original registry cannot be published or repaired by the dense pass.
+ manager.expertGemmRegistry().clear();
+ EXPECT_THROW((void)manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),false),std::logic_error);
+ EXPECT_FALSE(manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7));
+ manager.expertGemmRegistry().registerCommittedCPUProjection(matrices.bindings().front(),*manager.preparedWeightStore());
+ EXPECT_THROW((void)manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),false),std::logic_error);
+ EXPECT_EQ(loader.calls,prepared_reads);
+ EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
+  PhysicalMemoryMaterializationKind::NewAllocation),routed_bytes);
+ manager.expertGemmRegistry().clear();manager.preparedWeightStore()->clear();run();
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
   PhysicalMemoryMaterializationKind::NewAllocation),0u);
 

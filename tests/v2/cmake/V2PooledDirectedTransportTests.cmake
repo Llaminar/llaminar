@@ -61,22 +61,22 @@ if(TARGET v2_test_model_parity_definition)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerInventoryReplay)
 endif()
 if(TARGET v2_test_qwen4exp_primitives)
-    add_v2_test(V2_Integration_PooledNoPeerChannelGeometryReplay
+    add_v2_test(V2_Integration_PooledNoPeerNativeOwnerGeometryReplay
         COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
-            --gtest_filter=PooledImmutableDirectedTransport.ExplicitNoPeerKeepsExactFloorGrowthAndNativeOwnerIdentity
+            --gtest_filter=PooledImmutableDirectedTransport.StorageOnlyNativeMembersHaveExactBOMWithoutModelReaderRoles:PooledImmutableDirectedTransport.NativeUnionPreservesReaderOrderAndExcludesStorageOnlyResults
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;TraceReplay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerChannelGeometryReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerNativeOwnerGeometryReplay)
 endif()
 if(TARGET v2_test_physical_memory_authority)
-    add_v2_test(V2_Integration_PooledNoPeerOwnerProgramReplay
+    add_v2_test(V2_Integration_PooledNativeOwnerAdmissionContractReplay
         COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
-            --gtest_filter=PooledImmutableDirectedOwnerProgram.ExplicitNoPeerBindsOriginalPlansWithoutChangingKernelPopulation
+            --gtest_filter=PooledImmutableDirectedOwnerProgram.NativeGeneralPreservesOriginalGeometryWithoutFlatCertificate
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;TraceReplay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNoPeerOwnerProgramReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNativeOwnerAdmissionContractReplay)
 endif()
 
 # Exact static completion-bank population used by native inline continuation owners.
@@ -345,4 +345,16 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledLocalHotRequestPublicationReplay)
+endif()
+
+# Storage ownership is independent from compute width; the original planner must
+# fit every feasible native owner while retaining exact protocol growth.
+if(TARGET v2_test_memory_planner)
+    add_v2_test(V2_Integration_PooledStorageOnlyOwnerAdmissionReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=GPUAdaptiveImmutableLookupAdmission.SharedDirectoryPressureBalancesEveryFeasibleOwner
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "GTEST_DEATH_TEST_STYLE=threadsafe")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledStorageOnlyOwnerAdmissionReplay)
 endif()

@@ -7,6 +7,10 @@
  * the certified context/process retirement owner. No bytes are claimed twice.
  */
 #include "NativeOrderingEventGroup.h"
+#include "GPUCaptureDependencyRoster.h"
+#include "NativeContextPreparation.h"
+#include "BackendManager.h"
+#include "IBackend.h"
 #include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
 #include "NativeOrderingEventBudgetProjection.h"
 #include "GPUDeviceContextPool.h"
@@ -14,6 +18,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/Sha256.h"
 #include <atomic>
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -30,11 +35,11 @@ NativeOrderingEventProgram NativeOrderingEventProgram::retainedCaptureTerminals(
 
 struct NativeOrderingEventGroup::State final {
     std::shared_ptr<PhysicalMemoryAuthority> memory;
-    GPUContextProvenance original;
+    std::optional<GPUContextProvenance> original;
     NativeOrderingEventProgram program;
     NativeContextRetirementSlot retirement;
     std::unique_ptr<ReadAheadNativeResourceObligation> pending;
-    enum class Phase {Claimed,Attempted,HandlesRetired};Phase phase=Phase::Claimed;
+    enum class Phase {Claimed,Attempted,ContextOwned,HandlesRetired};Phase phase=Phase::Claimed;
     /** @brief Retain one reserved slot and its original cancellable precreator claims. */
     State(std::shared_ptr<PhysicalMemoryAuthority> m,GPUContextProvenance p,NativeOrderingEventProgram v,
         NativeContextRetirementSlot s,std::unique_ptr<ReadAheadNativeResourceObligation> obligation)
@@ -85,8 +90,8 @@ std::unique_ptr<NativeOrderingEventGroup> NativeOrderingEventGroup::claimWithPro
     return group;
 }
 void NativeOrderingEventGroup::requireOriginal(const std::shared_ptr<PhysicalMemoryAuthority>& memory,const GPUContextProvenance& original,NativeOrderingEventProgram program)const{
-    if(!state_ || !memory || memory.get()!=state_->memory.get() || memory.owner_before(state_->memory) || state_->memory.owner_before(memory) || state_->program!=program || original.device()!=state_->original.device() || original.generation()!=state_->original.generation())throw std::logic_error("Ordering group substituted original program/authority/generation");
-    state_->original.requireWorker(original.worker());
+    if(!state_ || !state_->original || !memory || memory.get()!=state_->memory.get() || memory.owner_before(state_->memory) || state_->memory.owner_before(memory) || state_->program!=program || original.device()!=state_->original->device() || original.generation()!=state_->original->generation())throw std::logic_error("Ordering group substituted original program/authority/generation");
+    state_->original->requireWorker(original.worker());
 }
 void NativeOrderingEventGroup::beginNativeAttempt(){
     if(!state_ || state_->phase!=State::Phase::Claimed || isGraphCaptureActive())
@@ -95,6 +100,14 @@ void NativeOrderingEventGroup::beginNativeAttempt(){
     // failing first creator may retain private driver backing until reset/exit.
     state_->retirement.adopt(std::move(state_->pending));
     state_->retirement.armNativeAttempt();state_->phase=State::Phase::Attempted;
+}
+void NativeOrderingEventGroup::delegateNativeHandlesToContext()noexcept{
+    if(!state_ || state_->phase!=State::Phase::Attempted)std::terminate();
+    state_->retirement.delegateHandlesToContext();
+    state_->phase=State::Phase::ContextOwned;
+    // Context owns this group. Dropping the creator borrow avoids a worker ->
+    // roster -> worker cycle; the same original slot still guards reset.
+    state_->original.reset();
 }
 void NativeOrderingEventGroup::completeNativeHandles()noexcept{
     if(!state_ || state_->phase==State::Phase::HandlesRetired)std::terminate();
@@ -106,5 +119,72 @@ void NativeOrderingEventGroup::completeNativeHandles()noexcept{
     }else state_->retirement.completeNativeHandles();
     state_->phase=State::Phase::HandlesRetired;
 }
-NativeOrderingEventGroup::~NativeOrderingEventGroup()noexcept{if(state_ && state_->phase==State::Phase::Attempted)std::terminate();}
+NativeOrderingEventGroup::~NativeOrderingEventGroup()noexcept{if(state_ && (state_->phase==State::Phase::Attempted || state_->phase==State::Phase::ContextOwned))std::terminate();}
+}
+
+namespace llaminar2 {
+GPUCaptureDependencyRoster::GPUCaptureDependencyRoster(const PreparedGPUContextUsePermit& p)
+    :device_(p.device()),generation_(p.generation()),backend_(getBackendFor(p.device())),
+     memory_(p.memory().get()),worker_(p.worker().get()){
+    if(!backend_)throw std::runtime_error("Capture dependency roster lost original backend");
+}
+std::shared_ptr<GPUCaptureDependencyRoster> GPUCaptureDependencyRoster::create(
+    const PreparedGPUContextUsePermit& p,std::size_t lanes,std::size_t groups){
+    auto result=std::shared_ptr<GPUCaptureDependencyRoster>(new GPUCaptureDependencyRoster(p));
+    result->grow(p,lanes,groups);return result;
+}
+void* GPUCaptureDependencyRoster::append(const PreparedGPUContextUsePermit& p){
+    auto group=NativeOrderingEventGroup::claim(p.memory(),p.provenance(),NativeOrderingEventProgram::captureSubmissionRetirement());
+    // Preallocate the owning slot before entering a native creator.
+    ownership_.push_back(std::move(group));
+    auto& owner=*ownership_.back();owner.beginNativeAttempt();
+    void* event=nullptr;
+    try{
+        event=backend_->createEvent(device_.gpu_ordinal());
+        if(!event)throw std::runtime_error("Capture dependency event creator returned null");
+    }catch(...){owner.completeNativeHandles();ownership_.pop_back();throw;}
+    owner.delegateNativeHandlesToContext();return event;
+}
+void GPUCaptureDependencyRoster::grow(const PreparedGPUContextUsePermit& p,std::size_t lanes,std::size_t groups){
+    if(isGraphCaptureActive() || groups>lanes || p.device()!=device_ || p.generation()!=generation_ ||
+       p.memory().get()!=memory_ || p.worker().get()!=worker_)
+        throw std::invalid_argument("Capture dependency roster changed original cold source/geometry");
+    p.requireWorker(p.worker());
+    auto recording=acquire();
+    // Capacity bookkeeping precedes each creator; a failed append never loses
+    // a native handle through vector growth. Old captured addresses stay live.
+    admissions_.reserve(lanes);shared_.reserve(groups);
+    ownership_.reserve(2+std::max(lanes,admissions_.size())+std::max(groups,shared_.size()));
+    if(!cold_publication_)cold_publication_=append(p);
+    if(lanes && !producer_)producer_=append(p);
+    while(admissions_.size()<lanes)admissions_.push_back(append(p));
+    while(shared_.size()<groups)shared_.push_back(append(p));
+}
+GPUCaptureDependencyRoster::CaptureBorrow GPUCaptureDependencyRoster::acquire(){
+    bool expected=false;
+    if(!recording_.compare_exchange_strong(expected,true,std::memory_order_acq_rel))
+        throw std::logic_error("Internal dependency roster has a concurrent or reentrant recording borrower");
+    return CaptureBorrow(recording_);
+}
+GPUCaptureDependencyRoster::CaptureBorrow GPUCaptureDependencyRoster::borrow(std::size_t lanes,std::size_t groups){
+    auto recording=acquire();
+    if(!isGraphCaptureActive() || !lanes || lanes>admissions_.size() || groups>shared_.size() || !producer_)
+        throw std::logic_error("Internal dependency events require their prepared native capture interval");
+    return recording;
+}
+void GPUCaptureDependencyRoster::requireOriginalMemory(const std::shared_ptr<PhysicalMemoryAuthority>& memory)const{
+    if(!memory || memory.get()!=memory_)throw std::logic_error("Batch metadata changed its original memory authority");
+    const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device_,memory);
+    if(original.generation()!=generation_ || original.worker().get()!=worker_)
+        throw std::logic_error("Batch metadata changed its original physical context generation");
+}
+GPUCaptureDependencyRoster::~GPUCaptureDependencyRoster()noexcept{
+    if(recording_.exchange(true,std::memory_order_acq_rel))std::terminate();
+    std::unique_lock publication(cold_publication_mutex_,std::try_to_lock);if(!publication.owns_lock())std::terminate();
+    if(cold_publication_)backend_->destroyEvent(cold_publication_,device_.gpu_ordinal());
+    if(producer_)backend_->destroyEvent(producer_,device_.gpu_ordinal());
+    for(auto* event:admissions_)backend_->destroyEvent(event,device_.gpu_ordinal());
+    for(auto* event:shared_)backend_->destroyEvent(event,device_.gpu_ordinal());
+    for(auto& owner:ownership_)owner->completeNativeHandles();
+}
 }

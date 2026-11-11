@@ -25,6 +25,7 @@
  *    evidence identity; sibling setup variants cannot borrow one another's work.
  */
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include <gtest/gtest.h>
 #include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include "../../../utils/CPUSerialArenaTestAdmission.h"
@@ -2092,8 +2093,7 @@ void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
         .device = device,
         .slot_capacity = 2u,
         .execution_lane_capacity = 2u,
-        .execution_streams = TransferEngine::instance()
-            .allocatePersistentTransferExecutionLanes(
+        .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                 2u, device, "retained_cpu_ticket_progress"),
         .maximum_bytes = 4096u,
         .name = "retained_cpu_ticket_progress",

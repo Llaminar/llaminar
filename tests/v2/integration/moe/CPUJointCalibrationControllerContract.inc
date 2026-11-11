@@ -38,8 +38,8 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
         throw std::logic_error("Joined calibration requires original GPUwhole and complete CPUcohort");
     bool saw_whole=false,saw_cohort=false;
     for(const auto& entry:declaration->entries()) {
-        if(entry.root_world_rank!=0)throw std::logic_error("Joined original target root changed");
         if(entry.coordinate.target.isWhole()) {
+            if(entry.root_world_rank!=original.whole_owner)throw std::logic_error("Joined original GPU target root changed");
             saw_whole=true;
             EXPECT_EQ(entry.coordinate.target.word(),original.whole);
         } else {
@@ -50,6 +50,8 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
             EXPECT_EQ(cohort,owner->shard_cohort);
             if(!cohort || cohort->participants().size()!=2)
                 throw std::logic_error("Joined service lost complete original cohort");
+            if(entry.root_world_rank!=cohort->participants().front().world_rank)
+                throw std::logic_error("Joined original CPU target root changed");
             for(size_t member=0;member<2;++member) {
                 EXPECT_EQ(cohort->participants()[member].world_rank,int(member));
                 EXPECT_EQ(cohort->ownership(member).projection(WeightRole::MoEExpertGate).rows,kF/2);
@@ -59,7 +61,7 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
     }
     if(!saw_whole || !saw_cohort)throw std::logic_error("Joined target vector aliased an original member");
     const int rank=original.mpi->rank();
-    if(rank==0) {
+    if(rank==original.whole_owner) {
         const auto endpoint=original.registry->endpoint(original.whole);
         const auto bank=endpoint?endpoint->acquire(initial->epoch):MoEOverlayParticipantBankLease{};
         if(!bank || bank->device!=original.whole_device || !original.service_native_source ||
@@ -70,11 +72,17 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
     const auto before=evidence->stats();
     const auto local=Service::measurePreparedTargets(*original.registry,*declaration,{kH,kF},
         original.service_domain,original.memory,&original.service_profile,&original.service_inventory);
-    EXPECT_EQ(local.size(),rank==0?2u:0u);
+    const size_t local_targets=std::count_if(declaration->entries().begin(),declaration->entries().end(),
+        [&](const auto& entry){return entry.root_world_rank==rank;});
+    EXPECT_EQ(local.size(),local_targets);
     declaration->requireLocalSamples(local,rank);
     const auto wire=MoEOverlayEconomyEvidenceCodec::encodePreparedService(*declaration,local,rank);
-    const size_t root_bytes=2u*40u*kExpertHistogramProductionSourceCount;
-    EXPECT_EQ(wire.size(),rank==0?root_bytes:0u);
+    const size_t local_bytes=MoEOverlayEconomyEvidenceCodec::preparedServiceBytes(*declaration,rank);
+    size_t root_bytes=0;
+    for(int original_rank=0;original_rank<original.mpi->world_size();++original_rank)
+        root_bytes+=MoEOverlayEconomyEvidenceCodec::preparedServiceBytes(*declaration,original_rank);
+    EXPECT_EQ(root_bytes,2u*40u*kExpertHistogramProductionSourceCount);
+    EXPECT_EQ(wire.size(),local_bytes);
     std::string error;
     if(!evidence->beginPreparedService(declaration,local,&error))throw std::runtime_error(error);
     std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
@@ -95,7 +103,7 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
             EXPECT_EQ(row.activation_count[phase],entry.sample_rows[phase]*Service::kMeasuredSamples);
             EXPECT_EQ(row.expert_ids[phase],declaration->sampleExpert(entry,phase));
         }
-        if(rank==0) {
+        if(entry.root_world_rank==rank) {
             const auto found=std::find_if(local.begin(),local.end(),[&](const auto& measured){return measured.coordinate==row.coordinate;});
             if(found==local.end())throw std::logic_error("Joined root lost actual local measurement");
             EXPECT_EQ(row.total_nanoseconds,found->total_nanoseconds);
@@ -108,7 +116,7 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
     for(const auto& target:service->target_costs)
         for(const auto cost:target.nanoseconds_per_activation)EXPECT_GT(cost,0u);
     const auto after=evidence->stats();
-    EXPECT_EQ(after.evidence_payload_bytes_sent-before.evidence_payload_bytes_sent,rank==0?root_bytes:0u);
+    EXPECT_EQ(after.evidence_payload_bytes_sent-before.evidence_payload_bytes_sent,local_bytes);
     EXPECT_EQ(after.evidence_payload_bytes_received-before.evidence_payload_bytes_received,root_bytes);
     EXPECT_EQ(after.evidence_payload_collectives_started-before.evidence_payload_collectives_started,1u);
     EXPECT_TRUE(evidence->idle());
@@ -309,7 +317,7 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
     }
     EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
-    if(joined_service && original.mpi->rank()==0)
+    if(joined_service && original.mpi->rank()==original.whole_owner)
         EXPECT_EQ(original.memory->claimedBytes(whole_device,PhysicalMemoryOwner::ExecutionWorkspace,
             PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,

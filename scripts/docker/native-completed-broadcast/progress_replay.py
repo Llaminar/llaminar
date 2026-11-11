@@ -4,6 +4,9 @@
 
 This CPU test cannot load a GPU runtime, create a completion authority or select
 inference work. Actual compiled device entry resources remain a separate proof.
+Deliberately fatal children alone are non-dumpable so external crash reporting
+cannot dominate this bounded replay. They still execute the literal native trap
+and must terminate by SIGILL; no signal is intercepted or replaced.
 """
 from pathlib import Path
 import os,json,shlex,subprocess,resource,hashlib
@@ -21,6 +24,8 @@ prefix=r'''
 #include <cstdlib>
 #include <cstdio>
 #include <sys/wait.h>
+#include <sys/prctl.h>
+#include <csignal>
 #include <unistd.h>
 struct ObservationThread {unsigned x=0;};
 ObservationThread observationThread,observationBlock;
@@ -68,13 +73,20 @@ int main(){
   for(int bad=0;bad<7;++bad){
    pid_t child=fork();check(child>=0);
    if(!child){
+    // These deliberately fatal provenance checks need the original trap, not
+    // a userspace crash reporter. RLIMIT_CORE=0 alone does not suppress a
+    // piped core handler. Disable dumping only in this diagnostic child;
+    // failure exits normally so it cannot masquerade as the expected SIGILL.
+    if(prctl(PR_SET_DUMPABLE,0L,0L,0L,0L)!=0 || prctl(PR_GET_DUMPABLE,0L,0L,0L,0L)!=0){
+     std::fprintf(stderr,"Cannot disable native progress replay child dumps\n");_exit(86);
+    }
     NativeComm invalid=comm;const NativeComm* input=&invalid;auto* flag=&abort;int peer=7;
     switch(bad){case 0:input=nullptr;break;case 1:invalid.channels=nullptr;break;
       case 2:flag=&foreign;break;case 3:invalid.nNodes=2;break;
       case 4:peer=-1;break;case 5:peer=8;break;case 6:peer=0;break;}
     ncclDevKernel_P2pProgressObservation(input,flag,peer,reinterpret_cast<ncclLlaminarP2pProgress*>(output.data()));_exit(0);
    }
-   int status=0;check(waitpid(child,&status,0)==child);check(WIFSIGNALED(status));
+   int status=0;check(waitpid(child,&status,0)==child);check(WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
   }
  }
  printf("PASS original native connector observer:20 reset/replays,all actual channels/connections,immutable steps,140 fatal provenance cases\n");

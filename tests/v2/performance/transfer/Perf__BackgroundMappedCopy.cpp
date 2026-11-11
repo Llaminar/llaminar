@@ -9,6 +9,7 @@
  * progress path is the public background-transfer API, not a benchmark kernel.
  * This performance suite deliberately does not belong to parity preflight.
  */
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include <cstdint>
 #include <gtest/gtest.h>
 #ifdef HAVE_CUDA
@@ -80,7 +81,7 @@ namespace
         auto observation = engine.allocateMappedHostRegion(bytes * capacity, devices);
         auto epoch = MappedTransferProgressEpoch::create({
             .device = device, .slot_capacity = capacity, .execution_lane_capacity = capacity,
-            .execution_streams = engine.allocatePersistentTransferExecutionLanes(
+            .execution_streams = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(engine,
                 1u, device, "bounded_service_economy"),
             .maximum_bytes = bytes, .name = "bounded_service_economy"});
         std::vector<MappedTransferProgressSlot> commands;
@@ -376,7 +377,7 @@ namespace
         ASSERT_NE(backend, nullptr);
         if (backend->deviceCount() <= device.gpu_ordinal()) GTEST_SKIP();
         TransferEngine engine;
-        const auto lanes = engine.allocatePersistentTransferExecutionLanes(
+        const auto lanes = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(engine,
             1u, device, "background_copy_economy");
         const auto &lane = lanes.front();
         auto &context = GPUDeviceContextPool::instance().getContext(device);

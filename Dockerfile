@@ -136,9 +136,13 @@ COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
      scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
      scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch \
+     scripts/docker/patches/rocm-hip-timed-sdma-marker.patch \
      /tmp/install-scripts/patches/
 COPY scripts/docker/patches/rocm-rocr-helper-numa.patch /tmp/install-scripts/patches/rocm-rocr-helper-numa.patch
 COPY scripts/docker/rocr-helper-numa/ /tmp/install-scripts/rocr-helper-numa/
+COPY scripts/docker/patches/rocm-rocr-deferred-sdma-profiling.patch \
+     /tmp/install-scripts/patches/rocm-rocr-deferred-sdma-profiling.patch
+COPY scripts/docker/rocr-deferred-sdma/ /tmp/install-scripts/rocr-deferred-sdma/
 COPY scripts/docker/hip-preferred-queue/proof.py \
      scripts/docker/hip-preferred-queue/selector-contract.cpp.in \
      /tmp/install-scripts/hip-preferred-queue/

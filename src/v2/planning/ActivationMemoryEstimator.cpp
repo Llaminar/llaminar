@@ -92,7 +92,10 @@ std::pair<GraphResolverConfig, Qwen4ExpBufferDimensions> qwenLookupGeometry(
         .flattened_rows = static_cast<int>(flattened), .local_query_heads = geometry.local_n_heads,
         .retained_mtp_candidate_rows = geometry.retained_mtp_candidate_rows,
         .device = device, .attention_phase_schedule=geometry.attention_phase_schedule, .ngram_lookup = geometry.ngram_lookup,
-        .ngram_fixed_head_participants = geometry.ngram_fixed_head_participants};
+        .ngram_fixed_head_participants = geometry.ngram_fixed_head_participants,
+        .ngram_fixed_pipeline_local_heads = geometry.ngram_fixed_pipeline_local_heads,
+        .ngram_fixed_pipeline_gathered_heads = geometry.ngram_fixed_pipeline_gathered_heads,
+        .ngram_fixed_pipeline_scratch_words = geometry.ngram_fixed_pipeline_scratch_words};
     return {std::move(resolver), dimensions};
 }
 

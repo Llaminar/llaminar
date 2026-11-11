@@ -64,6 +64,16 @@ class NativePreparationPolicy(unittest.TestCase):
             for body in (f"struct {name} {{ void construct(); }};", f"test::{name}::orderingEvents(permit);", f"using Access=test::{name};"):
                 self.assertTrue(scan_source(path,body))
         self.assertTrue(scan_source("src/v2/backends/Other.cpp",f"friend struct test::{name};"))
+    def test_calibration_slot_friend_remains_declaration_only(self):
+        """The original physical holder admits a test friend, never a production bridge call."""
+        path="src/v2/backends/RetainedParticipantGraphExecutable.h"
+        name="NativeContextPreparationReplayAccess"
+        self.assertEqual(scan_source(path,
+            f"class PreparedServiceCalibrationSlot {{ private: friend struct test::{name}; }};"),[])
+        for source in (f"test::{name}::create();",f"struct {name} {{ void bypass(); }};",
+                       f"using Access=test::{name};", "auto epoch=beginPreparationEpoch(rank);"):
+            self.assertTrue(scan_source(path,source))
+        self.assertTrue(scan_source("src/v2/backends/OtherGraph.h",f"friend struct test::{name};"))
     def test_native_replay_literals_and_comments_are_not_calls(self):
         source='// NativeContextPreparationReplayAccess::create()\nconst char* s=R"x(NativeContextBirthDiagnosticAccess::worker())x";'
         self.assertEqual(scan_source("src/v2/execution/Other.cpp",source),[])

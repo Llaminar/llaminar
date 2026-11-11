@@ -8,6 +8,8 @@
  * nested graph is introduced. Expert placement/rebalancing is independent.
  */
 #include "PooledImmutableDirectedTransport.h"
+#include "PooledImmutableNativeMembership.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <algorithm>
@@ -40,33 +42,20 @@ PhysicalMemoryPlan contribution(const PooledImmutablePhysicalOwnerGeometry& phys
     PooledImmutableCoordinatorNativePlan::requireOriginalCohort(physical,policy);
     if(!host.device.is_cpu() || host.world_rank!=physical.coordinator().world_rank)throw std::invalid_argument("Directed channel changed original host allocator");
     const auto coordinator=resource(resources,physical.coordinator());PhysicalMemoryPlanBuilder builder;
-    const bool native = readers && readers->nativeCollective();
-    if (native) {
-        const auto count=readers->consumers().size();
-        if(readers->coordinator()!=physical.coordinator() || count<2 || count>kMaximumPooledNativeParticipants)
-            throw std::invalid_argument("Native pooled BOM requires exact original addressed reader coordinates");
-        std::array<PhysicalMemoryResource,kMaximumPooledNativeParticipants> endpoints;
-        std::array<std::uint8_t,kMaximumPooledNativeParticipants> positive{};
-        std::size_t source=count;
-        for(std::size_t i=0;i<count;++i){
-            endpoints[i]=resource(resources,readers->consumers()[i]);
-            if(readers->consumers()[i]==physical.coordinator())source=i;
-        }
-        for(const auto& owner:physical.owners()) {
-            if(owner.allocator==physical.coordinator() || owner.allocator.device.type!=physical.coordinator().device.type)continue;
-            const auto found=std::find(readers->consumers().begin(),readers->consumers().end(),owner.allocator);
-            if(found==readers->consumers().end())
-                throw std::invalid_argument("Shared PLE same-vendor storage owner is outside the original native communicator");
-            positive[found-readers->consumers().begin()]=kind!=Contribution::Mandatory && owner.slots!=0;
-        }
-        const auto flags=std::span(positive.data(),count);
-        const auto endpointsView=std::span(endpoints.data(),count);
-        const auto actual=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpointsView,
-            PooledNativeCompletionLayout(count,source,flags,profile));
+    std::vector<PooledNativeStorageMember> owners;
+    for(const auto& owner:physical.owners())owners.push_back({owner.allocator,owner.slots!=0});
+    if(readers && (readers->coordinator()!=physical.coordinator() || !readers->nativeCollective()))
+        throw std::invalid_argument("Native pooled BOM changed its original reader declaration");
+    const PooledImmutableNativeMembership membership(physical.coordinator(),owners,
+        readers?readers->consumers():std::span<const PhysicalMemoryAllocatorIdentity>{});
+    const bool native=membership.remote();
+    if(native) {
+        std::vector<PhysicalMemoryResource> endpoints;
+        for(const auto member:membership.members())endpoints.push_back(resource(resources,member));
+        const auto actual=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpoints,
+            membership.layout(profile,kind==Contribution::Mandatory));
         if(kind==Contribution::Growth) {
-            positive.fill(0);
-            const auto floor=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpointsView,
-                PooledNativeCompletionLayout(count,source,flags,profile));
+            const auto floor=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpoints,membership.layout(profile,true));
             for(const auto& line:actual.resources()) {
                 const auto* baseline=floor.find({line.resource().world_rank,line.resource().device});
                 if(!baseline)throw std::logic_error("Native metadata growth changed original endpoints");
@@ -89,13 +78,11 @@ PhysicalMemoryPlan contribution(const PooledImmutablePhysicalOwnerGeometry& phys
             auto memory=kind==Contribution::Mandatory?baseline[direction]:complete[direction];
             if(kind==Contribution::Growth){
                 if(memory.mapped_host_bytes<baseline[direction].mapped_host_bytes ||
-                    memory.producer_payload_bytes<baseline[direction].producer_payload_bytes ||
                     memory.cursor_bytes_per_device!=baseline[direction].cursor_bytes_per_device)
                     throw std::logic_error("Directed transport growth changed original mandatory cursor roots");
                 memory.mapped_host_bytes-=baseline[direction].mapped_host_bytes;
-                memory.producer_payload_bytes-=baseline[direction].producer_payload_bytes;memory.cursor_bytes_per_device=0;
+                memory.cursor_bytes_per_device=0;
             }
-            if(memory.producer_payload_bytes)builder.add(direction==0?coordinator:observed,PhysicalMemoryOwner::ActivationTransportStaging,memory.producer_payload_bytes);
             if(memory.mapped_host_bytes)builder.add(host,PhysicalMemoryOwner::ActivationTransportStaging,memory.mapped_host_bytes);
             if(memory.cursor_bytes_per_device){builder.add(coordinator,PhysicalMemoryOwner::ActivationTransportStaging,memory.cursor_bytes_per_device);builder.add(observed,PhysicalMemoryOwner::ActivationTransportStaging,memory.cursor_bytes_per_device);}
         }
@@ -125,26 +112,36 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
     for (const auto& owner : storage->originalOwners())
         if (owner->plan().peerAccess() != observation)
             throw std::invalid_argument("Directed owners changed the original transport observation");
-    // A homogeneous edge is an original native CCL operation, independent of
-    // direct-peer availability. Mixed-vendor channels retain their original
-    // inventory/endpoint owner. No failed native selection retries a channel.
-    const auto nativeMember = [&](DeviceId device) {
-        return nativeCohort && std::any_of(nativeCohort->context().devices().begin(),
-            nativeCohort->context().devices().end(), [&](const auto& member) {
-                return member.toLocalDeviceId() == device;
-            });
-    };
-    for (const auto& owner : originalOwners) {
-        if (owner == storage->coordinator()->plan().allocator()) continue;
-        if (owner.device.type == coordinator.device().type) {
-            if (!nativeMember(owner.device) || !nativeMember(coordinator.device()))
-                throw std::invalid_argument("Homogeneous pooled owner requires its actual original inline native communicator");
-        } else {
-            const std::array mixed{owner};
-            ImmutableRowTableDirectedTransportPolicy::requireOriginal(storage->coordinator()->plan().allocator(),
-                mixed, originalInventory, observation);
+    std::vector<PooledNativeStorageMember> nativeOwners;
+    for(const auto& owner:storage->originalOwners())
+        nativeOwners.push_back({owner->plan().allocator(),owner->plan().parameters().owner.capacity()!=0});
+    const PooledImmutableNativeMembership membership(storage->coordinator()->plan().allocator(),nativeOwners,
+        readers?readers->consumers():std::span<const PhysicalMemoryAllocatorIdentity>{});
+    // Validate original ownership before creating any native resources. Visibility
+    // on a remote NUMA rank never grants permission to materialize a storage GPU.
+    std::vector<GlobalDeviceAddress> nativeDevices;
+    if(membership.remote()) {
+        if(!originalInventory)throw std::invalid_argument("Native pool requires its retained original rank inventory");
+        const auto& rank=originalInventory->getRank(memory->worldRank());
+        const ObservedPeerGrouping observation(rank);std::vector<DeviceId> devices;
+        for(const auto member:membership.members()) {
+            if(member.world_rank!=memory->worldRank())throw std::invalid_argument("Native pool changed original MPI ownership");
+            retained->source()->requireSelectedDevice(member.device);
+            const auto& gpu=observation.device(member.device);
+            requireRankLocalGPUOwnership(rank,gpu,"Pooled native transport");
+            devices.push_back(member.device);
+            nativeDevices.push_back(GlobalDeviceAddress::fromLocalDeviceId(member.device,rank.hostname,gpu.numa_node));
         }
+        if(!observation.sameDomain(devices))throw std::invalid_argument("Native pool cannot cross original rank/NUMA/backend ownership");
     }
+    for(const auto& owner:originalOwners)if(owner.device.type!=coordinator.device().type) {
+        const std::array mixed{owner};
+        ImmutableRowTableDirectedTransportPolicy::requireOriginal(storage->coordinator()->plan().allocator(),mixed,originalInventory,{});
+    }
+    const auto nativeMember=[&](DeviceId device) {
+        return std::any_of(membership.members().begin(),membership.members().end(),
+            [&](const auto& member){return member.device==device;});
+    };
     // Reader membership is independent of physical owner order and CPU source
     // channel population. Authenticate every original endpoint before creating
     // any channel, so a later invalid reader cannot partially select transport.
@@ -206,20 +203,28 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
     result->requireOriginalSource();result->remotes_.reserve(retained->owners().size());
     result->local_hot_geometry_=std::move(localHot);
     const auto profile=result->local_hot_geometry_?PooledNativeReaderMessageProfile::CompactNative:PooledNativeReaderMessageProfile::ReplicatedFP32;
-    if(nativeCohort) {
-        if(!readers || std::size_t(nativeCohort->degree())!=readers->consumers().size() ||
-            nativeCohort->degree()<2 || std::size_t(nativeCohort->degree())>kMaximumPooledNativeParticipants)
-            throw std::invalid_argument("Native pooled metadata requires exact original addressed readers");
-        const auto& devices=nativeCohort->context().devices();
-        PooledImmutableNativeCompletionStorage::Participants permits;
-        PooledImmutableNativeCompletionStorage::Frames frames;
-        std::array<std::uint8_t,kMaximumPooledNativeParticipants> positive{};
-        std::size_t source=devices.size();
-        for(std::size_t participant=0;participant<devices.size();++participant) {
-            permits[participant].emplace(retained->source()->acquire(devices[participant].toLocalDeviceId()));
-            const auto device=permits[participant]->device();
+    if(membership.remote()) {
+        std::unique_ptr<LocalTPContext> ownedContext;
+        NativeLocalTPContextBorrow context;
+        const bool borrowReaders=nativeCohort && nativeCohort->context().devices().size()==membership.members().size() &&
+            std::equal(nativeCohort->context().devices().begin(),nativeCohort->context().devices().end(),membership.members().begin(),
+                [](const auto& actual,const auto& member){return actual.toLocalDeviceId()==member.device;});
+        if(borrowReaders)context=nativeCohort->context().borrowOriginalNativeContext();
+        else {
+            // This first-class storage union has a distinct original participant
+            // population; it does not add fake model readers to a TP communicator.
+            ownedContext=std::make_unique<LocalTPContext>(std::move(nativeDevices),std::vector<float>{},
+                coordinator.device().is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+            context=ownedContext->borrowOriginalNativeContext();
+        }
+        const auto count=membership.members().size();
+        PooledImmutableNativeCompletionStorage::Participants permits(count);
+        PooledImmutableNativeCompletionStorage::Frames frames(count);
+        for(std::size_t participant=0;participant<count;++participant) {
+            const auto device=membership.members()[participant].device;
+            permits[participant].emplace(retained->source()->acquire(device));
             if(device==coordinator.device()) {
-                source=participant;const auto& original=storage->coordinator();const auto offset=original->plan().parameters().frame.control;
+                const auto& original=storage->coordinator();const auto offset=original->plan().parameters().frame.control;
                 frames[participant].emplace(PooledNativeTransferSpan(original->roots().frame,
                     offset+offsetof(adaptive_lookup::pooled::LookupFrame,interval),sizeof(adaptive_lookup::pooled::Interval)),
                     PooledNativeTransferSpan(original->roots().frame,offset+offsetof(adaptive_lookup::pooled::LookupFrame,status),sizeof(std::int32_t)),
@@ -231,11 +236,10 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
                     offset+offsetof(adaptive_lookup::pooled::OwnerFrame,interval),sizeof(adaptive_lookup::pooled::Interval)),
                     PooledNativeTransferSpan(original->roots().frame,offset+offsetof(adaptive_lookup::pooled::OwnerFrame,status),sizeof(std::int32_t)),
                     static_cast<std::int32_t>(adaptive_lookup::Status::SourceFailure));
-                positive[participant]=original->plan().parameters().owner.capacity()!=0;
             }
         }
-        result->native_completion_=PooledImmutableNativeCompletionStorage::create(std::move(nativeCohort),
-            std::move(permits),std::move(frames),PooledNativeCompletionLayout(devices.size(),source,std::span(positive.data(),devices.size()),profile));
+        result->native_completion_=PooledImmutableNativeCompletionStorage::create(std::move(context),std::move(ownedContext),
+            std::move(permits),std::move(frames),membership.layout(profile));
     }
 
     void* coordinatorStream=nullptr;coordinator.worker()->submitAndWait([&]{coordinatorStream=coordinator.worker()->defaultStream();});
@@ -248,7 +252,7 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
         const auto& owner=storage->originalOwners()[i];
         if(owner->plan().allocator()==storage->coordinator()->plan().allocator())continue;
         void* ownerStream=ownerStreams[i];
-        const auto pin=PooledImmutableCapturedPinEdge::bind(storage->coordinator(),owner,memory,coordinatorStream,ownerStream,result->original_inventory_,
+        const auto pin=PooledImmutableCapturedPinEdge::bind(storage->coordinator(),owner,memory,coordinatorStream,ownerStream,
             owner->plan().allocator().device.type == coordinator.device().type ? result->native_completion_ : nullptr);
         const auto returned=PooledImmutableCapturedPinReturn::bind(pin,memory,ownerStream,coordinatorStream);
         const auto free=PooledImmutableCapturedFreeWave::bind(returned,memory);
@@ -288,8 +292,8 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
                 });
             }
             result->readers_.push_back(std::shared_ptr<const PooledImmutableReplicatedReaderTransport>(
-                new PooledImmutableReplicatedReaderTransport(coordinate, coordinator, std::move(permit),
-                    {}, {}, std::move(controlClaims), std::move(controls), std::move(output), std::move(ack), profile)));
+                new PooledImmutableReplicatedReaderTransport(coordinate,static_cast<std::uint32_t>(geometry.consumers().size()), coordinator, std::move(permit),
+                    std::move(controlClaims), std::move(controls), std::move(output), std::move(ack), profile)));
         }
     }
     if(result->local_hot_geometry_){
@@ -334,27 +338,20 @@ const std::shared_ptr<DeviceTransferBuffer>& PooledImmutableReplicatedReaderTran
 void PooledImmutableReplicatedReaderTransport::requireCurrent() const
 {
     const auto& memory = source_.memory();
-    const bool native = nativeCollective();
     if (!memory || reader_.memory().get() != memory.get() ||
         reader_.memory().owner_before(memory) || memory.owner_before(reader_.memory()) ||
         source_.device() == reader_.device() ||
-        (native && (result_ || acknowledgement_ || !native_acknowledgement_.nativeCollective() ||
-            native_result_.nativeStorage() != native_acknowledgement_.nativeStorage())) ||
-        (!native && (!result_ || !acknowledgement_ || bool(native_acknowledgement_))))
+        !native_result_.nativeCollective() || !native_acknowledgement_.nativeCollective() ||
+        native_result_.nativeStorage()!=native_acknowledgement_.nativeStorage())
         throw std::logic_error("Shared PLE reader lost its original unique transport/PMA owner");
-    if (native) {
-        native_result_.nativeStorage()->requireCurrent();
-        if (native_result_.endpointDevice(CapturedTransferEndpoint::Producer) != source_.device() ||
-            native_result_.endpointDevice(CapturedTransferEndpoint::Consumer) != reader_.device() ||
-            native_acknowledgement_.endpointDevice(CapturedTransferEndpoint::Producer) != reader_.device() ||
-            native_acknowledgement_.endpointDevice(CapturedTransferEndpoint::Consumer) != source_.device())
-            throw std::logic_error("Native shared PLE reader changed original communicator coordinates");
-    } else if (result_->endpointDevice(CapturedTransferEndpoint::Producer) != source_.device() ||
-        result_->endpointDevice(CapturedTransferEndpoint::Consumer) != reader_.device() ||
-        acknowledgement_->endpointDevice(CapturedTransferEndpoint::Producer) != reader_.device() ||
-        acknowledgement_->endpointDevice(CapturedTransferEndpoint::Consumer) != source_.device()) {
-        throw std::logic_error("Shared PLE reader changed its original captured endpoints");
-    }
+
+    native_result_.nativeStorage()->requireCurrent();
+    if (native_result_.endpointDevice(CapturedTransferEndpoint::Producer) != source_.device() ||
+        native_result_.endpointDevice(CapturedTransferEndpoint::Consumer) != reader_.device() ||
+        native_acknowledgement_.endpointDevice(CapturedTransferEndpoint::Producer) != reader_.device() ||
+        native_acknowledgement_.endpointDevice(CapturedTransferEndpoint::Consumer) != source_.device())
+        throw std::logic_error("Native shared PLE reader changed original communicator coordinates");
+
     const auto controlBytes=profile_==PooledNativeReaderMessageProfile::CompactNative?sizeof(local_hot_transport::Control):sizeof(replicated_reader::Control);
     for (std::size_t i = 0; i < controls_.size(); ++i) {
         const auto device = i ? reader_.device() : source_.device();
@@ -379,10 +376,7 @@ std::vector<std::shared_ptr<CapturedTransferChannel>> PooledImmutableDirectedTra
         if (const auto& original = remote.pin->channel_.captured()) channels.push_back(original);
         if (const auto& original = remote.returned->channel_.captured()) channels.push_back(original);
     }
-    if (!edges || *edges != CancellationEdges::StorageOwners) for (const auto& reader : readers_) {
-        if (reader->result()) channels.push_back(reader->result());
-        if (reader->acknowledgement()) channels.push_back(reader->acknowledgement());
-    }
+
     return channels;
 }
 void PooledImmutableDirectedTransport::beginInvocation(CapturedTransferInvocation original) const
@@ -435,7 +429,7 @@ std::function<void()> PooledImmutableDirectedTransport::nativeFailureSignal() co
     const auto original = native_completion_;
     original->requireCurrent();
     return [original] {
-        if (!original->cohort()->context().signalNativeCompletionAbort())
+        if (!original->context().context().signalNativeCompletionAbort())
             throw std::logic_error("Original pooled native communicator could not publish its absorbing abort");
     };
 }
@@ -503,15 +497,9 @@ void PooledImmutableDirectedTransport::requireCurrent()const{
         reader->requireCurrent();
         if (reader->coordinate() >= reader_geometry_->consumers().size() ||
             reader_geometry_->consumers()[reader->coordinate()].device != reader->originalReader().device() ||
-            (reader->nativeCollective() &&
-                (reader->nativeResult().nativeStorage() != native_completion_ ||
-                 reader->nativeResult().maximumBytes() != resultCapacity ||
-                 reader->nativeAcknowledgement().maximumBytes() != requestCapacity)) ||
-            (!reader->nativeCollective() &&
-                (reader->result()->capacityBytes() != resultCapacity ||
-                 reader->acknowledgement()->capacityBytes() != requestCapacity ||
-                 reader->result()->payloadStorage() != reader_geometry_->payloadStorage(reader_geometry_->consumers()[reader->coordinate()]) ||
-                 reader->acknowledgement()->payloadStorage() != reader_geometry_->payloadStorage(reader_geometry_->consumers()[reader->coordinate()]))))
+            !reader->nativeCollective() || reader->nativeResult().nativeStorage()!=native_completion_ ||
+            reader->nativeResult().maximumBytes()!=resultCapacity ||
+            reader->nativeAcknowledgement().maximumBytes()!=requestCapacity)
             throw std::logic_error("Shared reader channel geometry changed");
     }
     for(const auto& remote:remotes_){remote.pin->requireCurrent();remote.returned->requireCurrent();remote.free->requireCurrent();remote.victim->requireCurrent();remote.source->requireCurrent();remote.publication->requireCurrent();remote.read->requireCurrent();remote.retirement->requireCurrent();}

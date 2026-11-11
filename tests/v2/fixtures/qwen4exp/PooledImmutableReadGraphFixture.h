@@ -86,10 +86,17 @@ public:
     std::size_t liveAllocations()const{return allocations_.size();}
     std::function<void()> beforeRetirementWait;
     bool waitForEvent(void* event,int ordinal)override{if(beforeRetirementWait)beforeRetirementWait();return MockBackend::waitForEvent(event,ordinal);}
-    unsigned capturedTransfers=0;
+    /** @return Transfer calls recorded across this backend's joined capture workers. */
+    unsigned capturedTransferCount() const noexcept
+    {
+        return captured_transfers_.load(std::memory_order_relaxed);
+    }
     /** @brief Record the actual original transfer entry under the executor's capture guard, without executing a wire. */
     bool enqueueCapturedTransferChannel(const CapturedTransferChannelDeviceBinding&,void*,const void*,int,void* stream)override {
-        if(!isGraphCaptureActive() || !stream)return false;++capturedTransfers;return true;
+        if (!isGraphCaptureActive() || !stream) return false;
+        // Several original device workers share this one backend double.
+        captured_transfers_.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
     /** @brief Cold protocol geometry only; no kernel/vendor API is submitted. */
     bool prepareCapturedTransferChannelKernels(int,int timeout,uint64_t* ticks)override{if(timeout!=30000 || !ticks)return false;*ticks=42;return true;}
@@ -98,6 +105,7 @@ public:
     /** @brief Observe only cold setup-event readiness. */
     bool queryEvent(void*,int,bool* ready)override{*ready=true;return true;}
 private:
+    std::atomic<unsigned> captured_transfers_{0};
     struct Record{size_t bytes;int ordinal;std::shared_ptr<const NativeAllocationCaptureIdentity> identity;};
     inline static std::atomic<uint64_t> nextGeneration_{1};
     const uint64_t generation_=nextGeneration_.fetch_add(1);
@@ -133,11 +141,13 @@ protected:
         n::seedCoordinator(a);std::copy(owners.begin(),owners.end(),n::at<n::p::CoordinatorOwnerGeometry>(a.frame,a.plan.frame.owners));
         if(!n::p::CoordinatorOperations(n::coordinatorView(n::CoordinatorArgs{a.plan,a.cache,a.frame,a.native,{}})).initialize())throw std::logic_error("Actual coordinator setup rejected");
     }
-    void launch(n::OwnerAction,const n::OwnerArgs&,void*)const override{if(!isGraphCaptureActive())throw std::logic_error("Unit cannot execute a native kernel");++recorded;}
-    void launch(n::CoordinatorAction,const n::CoordinatorArgs&,const n::CoordinatorQuery*,void*)const override{if(!isGraphCaptureActive())throw std::logic_error("Unit cannot execute a native kernel");++recorded;}
+    void launch(n::OwnerAction,const n::OwnerArgs&,void*)const override{if(!isGraphCaptureActive())throw std::logic_error("Unit cannot execute a native kernel");recorded_.fetch_add(1, std::memory_order_relaxed);}
+    void launch(n::CoordinatorAction,const n::CoordinatorArgs&,const n::CoordinatorQuery*,void*)const override{if(!isGraphCaptureActive())throw std::logic_error("Unit cannot execute a native kernel");recorded_.fetch_add(1, std::memory_order_relaxed);}
 public:
-    mutable unsigned recorded=0;
+    /** @return Native code calls recorded across this shared operation owner's joined workers. */
+    unsigned recordedCount() const noexcept { return recorded_.load(std::memory_order_relaxed); }
 private:
+    mutable std::atomic<unsigned> recorded_{0};
     DeviceType family_;
 };
 /** @brief Exact original one-owner declarations, retaining C0 and original independent allocator roles. */

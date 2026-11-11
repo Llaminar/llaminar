@@ -76,7 +76,9 @@ public:
     [[nodiscard]] RootTimingObservation observeRootTiming(bool enabled) {
         return RootTimingObservation(*this,enabled);
     }
-    /** @brief Immutable bindings; all mutable spans borrow existing graph/PMA arena roots. */
+    /** @brief Original endpoint protocol or raw CPU canonical packet, never two publication authorities. */
+    enum class OriginalReturnPublication {EndpointProtocol,CanonicalHostRows};
+    /** @brief Immutable bindings; mutable spans borrow original graph/PMA arena roots. */
     struct Params {
         std::shared_ptr<const CPUExpertShardSourceSelection> original_source;
         IGlobalTPContext *tp=nullptr;
@@ -96,9 +98,10 @@ public:
         std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> original_prepared_layer; ///< Closed original model source publication, mandatory for channel completion.
         std::shared_ptr<IGlobalTPContext> original_tp_owner; ///< Required retained native owner for channel-bound completion.
         std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> original_canonical_ticket; ///< Sole original local ticket publication authority after the explicit fragment gather.
-        DeviceId original_continuation_device=DeviceId::invalid(); ///< Exact enclosing GPU for the immutable local ticket, never inferred from the CPU member.
+        DeviceId original_continuation_device=DeviceId::invalid(); ///< Exact GPU ticket owner or explicit CPU canonical-row owner; never inferred from the fragment member.
         /** Explicit mathematical phase for standalone dense-route execution; sparse execution uses its original authenticated key. */
         std::optional<ExpertHistogramSource> standalone_execution_phase;
+        OriginalReturnPublication return_publication=OriginalReturnPublication::EndpointProtocol; ///< CPU canonical rows retain unweighted original-slot identity for the final ordered FMA.
     };
     /**
      * @brief Bind one original prepared fragment and its exact NODE_LOCAL TP domain.

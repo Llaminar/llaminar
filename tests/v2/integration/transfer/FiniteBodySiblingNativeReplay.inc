@@ -24,6 +24,11 @@ void replayNativeFiniteBody(DeviceId device,std::size_t liveBytes){
     const auto gpuBytes=3*stride+(device.is_cuda()?sizeof(MappedTransferServiceCursor):0);
     PhysicalMemoryPlanBuilder bom(general);bom.add(session->resource(device),PhysicalMemoryOwner::ActivationArena,gpuBytes);
     if(mappedBytes)bom.add(session->resource(DeviceId::cpu()),PhysicalMemoryOwner::ActivationArena,mappedBytes);
+    if(device.is_cuda()) {
+        const auto streams=TransferEngine::persistentTransferExecutionLanesBOM(
+            1,session->resource(DeviceId::cpu()),session->resource(device));
+        for(const auto &resource:streams.resources())bom.add(resource);
+    }
     session->admit(bom.build());
     {
         auto gpuClaim=session->memory()->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,gpuBytes);
@@ -33,7 +38,7 @@ void replayNativeFiniteBody(DeviceId device,std::size_t liveBytes){
         auto output=transfers.allocateDeviceTransferBuffer(2*stride,device);
         std::shared_ptr<MappedTransferProgressEpoch> epoch;
         if(device.is_cuda())epoch=MappedTransferProgressEpoch::create({.device=device,.slot_capacity=1,.execution_lane_capacity=1,
-            .execution_streams=transfers.allocatePersistentTransferExecutionLanes(1,device,"finite_storage_native"),
+            .execution_streams=transfers.allocatePersistentTransferExecutionLanes(1,device,"finite_storage_native",original),
             .maximum_bytes=capacity,.name="finite_storage_native",.perf_device=device.toString()});
         const auto factory=epoch?epoch->graphBranchFactory():GraphCaptureAuxiliaryBranchFactory{};
         auto progress=factory.valid()?factory.create():nullptr;
@@ -115,6 +120,11 @@ void rejectForeignNativeFiniteBody(DeviceId device,DeviceId foreign){
         const auto graph=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(selected),1);
         for(const auto& row:graph.resources())bom.add(row);
         bom.add(session->resource(selected),PhysicalMemoryOwner::ActivationArena,sizeof(std::uint64_t));
+    }
+    if(device.is_cuda()) {
+        const auto streams=TransferEngine::persistentTransferExecutionLanesBOM(
+            1,session->resource(DeviceId::cpu()),session->resource(device));
+        for(const auto &resource:streams.resources())bom.add(resource);
     }
     session->admit(bom.build());
     {

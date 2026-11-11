@@ -12,6 +12,7 @@
  */
 
 #include "app/modes/BenchmarkMode.h"
+#include "execution/runner/ObservedFixedPipelineEvidence.h"
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -204,7 +205,16 @@ namespace llaminar2
             }
             // The runner exposes the topology-resolved startup configuration;
             // raw CLI intent cannot attest which hardware defaults ran.
-            json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
+            if (isObservedFixedNativePipeline(runner->config()))
+            {
+                auto document=nlohmann::json::parse(benchmarkResultToJsonString(result,&runner->config()));
+                document["observed_pipeline_binding"]=observeFixedNativePipelineBinding(*runner,*ctx.mpi_ctx);
+                if (PerfStatsCollector::isDomainEnabled("immutable_lookup"))
+                    document["fixed_native_pipeline_terminal"]=observeFixedNativePipelineTerminal(*runner);
+                json_out << document.dump() << '\n';
+            }
+            else
+                json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
             if (!json_out)
             {
                 LOG_ERROR("Failed to write benchmark JSON output path: "

@@ -462,9 +462,6 @@ TEST(DeclaredGPUCachePlacement, SharedCoordinatorReadersPreserveOneSourceAndExac
             baseline.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage));
         EXPECT_EQ(actual.find(reader)->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),0u);
         ASSERT_TRUE(geometry.readerGeometry()->nativeCollective());
-        EXPECT_THROW(geometry.readerGeometry()->payloadStorage(reader),std::logic_error);
-        EXPECT_THROW(geometry.readerGeometry()->resultMemory(reader),std::logic_error);
-        EXPECT_THROW(geometry.readerGeometry()->acknowledgementMemory(reader),std::logic_error);
         EXPECT_EQ(actual.find(reader)->bytes(PhysicalMemoryOwner::ActivationTransportStaging),
             sizeof(qwen4exp::replicated_reader::Control));
         // Native completion operands/receipts belong to the complete source

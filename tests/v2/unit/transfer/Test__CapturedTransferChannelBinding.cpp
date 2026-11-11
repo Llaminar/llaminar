@@ -9,7 +9,11 @@
  */
 #include "../../utils/CPUActivationArenaFixture.h"
 #include "transfer/CapturedTransferChannel.h"
+#include "transfer/PipelineActivationFanoutProtocol.h"
+#include "execution/local_execution/orchestrators/PipelineActivationFanout.h"
+#include "planning/PipelineTransferMemory.h"
 #include "collective/LocalTPCollectiveInventory.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
 #include "../../integration/transfer/CapturedTransferChannelReplayProbe.h"
 #include "kernels/qwen4exp/PooledImmutableReplicatedReaderOps.h"
 #include "execution/local_execution/orchestrators/TPWorkerPool.h"
@@ -31,6 +35,8 @@
 #include "../../mocks/MockWorkerGPUContext.h"
 #include "../../mocks/MockComputeStage.h"
 #include "../../mocks/MockLocalTPContext.h"
+#include "fixtures/backends/PreparedNativeLookupFixtureReplayAccess.h"
+#include "fixtures/collective/PooledNativeCollectiveReplayAccess.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <atomic>
@@ -43,6 +49,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <map>
 
 using namespace llaminar2;
 using llaminar2::test::MockBackend;
@@ -71,33 +78,16 @@ namespace
             if(initialization_attempted)EXPECT_TRUE(initialization_complete);
             EXPECT_EQ(registered.erase(ptr),1u);++unregistrations;return true;
         }
-        /** @brief Enable only on the exact original worker after cached coverage admission. */
-        bool enableCapturedTransferPeerAccess(int device, int peer) override
-        {
-            ++peer_preparations;
-            peer_calls.emplace_back(device,peer);
-            const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(
-                DeviceId{backendDeviceType(),device});
-            EXPECT_TRUE(original.worker()->ownsCurrentThread());
-            EXPECT_NE(device,peer);
-            return peer_enabled && peer_preparations!=fail_peer_enable_at;
-        }
         /** @brief Observe producer-slab allocation on the same original worker; other fixture buffers are unchanged. */
         void* allocate(std::size_t bytes,int device) override
         {
-            if(bytes==peer_payload_size){
-                ++peer_payload_attempts;
-                const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(
-                    DeviceId{backendDeviceType(),device});
-                EXPECT_TRUE(original.worker()->ownsCurrentThread());
-                if(fail_peer_payload)return nullptr;
-            }
-            return MockBackend::allocate(bytes,device);
+
+            auto* pointer = MockBackend::allocate(bytes,device);
+            if (record_allocation_owners && pointer)
+                allocation_owners.emplace(pointer, AllocationOwner{bytes, device,
+                    std::make_shared<NativeAllocationCaptureIdentity>()});
+            return pointer;
         }
-        bool peer_enabled=true,fail_peer_payload=false;
-        unsigned peer_preparations=0,fail_peer_enable_at=0,peer_payload_attempts=0;
-        std::size_t peer_payload_size=0;
-        std::vector<std::pair<int,int>> peer_calls;
         /** @brief Freeze timer geometry during setup, with explicit failure injection. */
         bool prepareCapturedTransferChannelKernels(int, int timeout_ms, std::uint64_t *ticks) override
         { ++preparations; EXPECT_EQ(timeout_ms, 30000); *ticks = 42; return !fail_prepare; }
@@ -121,20 +111,28 @@ namespace
                     binding.message, binding.extent_source, 0, 0, 0, 0, cancellation);
                 EXPECT_EQ(decision.status, CapturedTransferStatus::Cancelled);
                 (producer ? control.producer : control.consumer).epoch = kCapturedTransferAbortEpoch;
-                if (!producer && counted) *binding.device_extent = 0;
+                if (!producer && counted && binding.device_extent) *binding.device_extent = 0;
                 calls.push_back({"cancelled", stream, 0});
                 return true;
             }
             if (counted)
             {
                 const auto slice = binding.source_slice ? *binding.source_slice : CapturedTransferSourceSlice{};
+                // This host-only backend models the new typed input; native
+                // kernels remain separately qualified through the captured owner.
+                const auto rows = binding.device_rows
+                    ? capturedTransferRowBytes(*binding.device_rows, binding.row_bytes, binding.message.bytes)
+                    : CapturedTransferRowBytes{true, 0};
+                if (!rows.valid) return false;
                 const auto decision = CapturedTransferChannelProtocol::acquire(binding.role, binding.expected,
                     control.identity, *binding.cursor, producer ? control.consumer : control.producer,
-                    binding.message, binding.extent_source, producer ? *binding.device_extent : 0,
+                    binding.message, binding.extent_source, producer ? (binding.device_rows ? rows.bytes : *binding.device_extent) : 0,
                     slice.byte_offset, binding.source_span_bytes, binding.source_offset_origin);
                 EXPECT_TRUE(decision.ready());
                 if (!decision.ready()) return false;
-                if (!producer) *binding.device_extent = binding.cursor->acquired_message.bytes;
+                if (!producer && binding.device_rows && binding.cursor->acquired_message.bytes != rows.bytes)
+                    return false;
+                if (!producer && binding.device_extent) *binding.device_extent = binding.cursor->acquired_message.bytes;
             }
             const auto bytes = counted ? binding.cursor->acquired_message.bytes : binding.message.bytes;
             calls.push_back({counted ? "counted_copy" : "copy", stream, static_cast<size_t>(bytes)});
@@ -195,6 +193,17 @@ namespace
         {
             ++capture_acquisitions;
             if (capture_sealed) throw std::logic_error("Replay reacquired native allocation authority");
+            if (record_allocation_owners) {
+                const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+                for (const auto& [base, owner] : allocation_owners) {
+                    const auto first = reinterpret_cast<std::uintptr_t>(base);
+                    if (start >= first && start - first < owner.bytes)
+                        return NativeAllocationCaptureLease::acquire(owner.identity, base, owner.bytes,
+                            DeviceId{backendDeviceType(), owner.ordinal}, pointer, bytes,
+                            DeviceId{backendDeviceType(), ordinal});
+                }
+                throw std::invalid_argument("Forward-role capture names no live original mock allocation");
+            }
             if (pointer == second_capture_base)
                 return NativeAllocationCaptureLease::acquire(second_capture_identity, second_capture_base, second_capture_bytes,
                     capture_device, pointer, bytes, DeviceId(backendDeviceType(), ordinal));
@@ -212,6 +221,13 @@ namespace
                 NativeAllocationCaptureLease::requireUnborrowed(capture_identity);
             if (pointer && pointer == second_capture_base)
                 NativeAllocationCaptureLease::requireUnborrowed(second_capture_identity);
+            if (record_allocation_owners && pointer) {
+                const auto owner = allocation_owners.find(pointer);
+                if (owner == allocation_owners.end() || owner->second.ordinal != ordinal)
+                    throw std::invalid_argument("Forward-role free names no exact original mock allocation");
+                NativeAllocationCaptureLease::requireUnborrowed(owner->second.identity);
+                allocation_owners.erase(owner);
+            }
             MockBackend::free(pointer, ordinal);
         }
         std::shared_ptr<const NativeAllocationCaptureIdentity> capture_identity =
@@ -223,6 +239,14 @@ namespace
         void *capture_base = nullptr;
         size_t capture_bytes = 0;
         DeviceId capture_device = DeviceId::invalid();
+        /** @brief Exact physical records retained from allocation until checked free. */
+        struct AllocationOwner {
+            size_t bytes;
+            int ordinal;
+            std::shared_ptr<const NativeAllocationCaptureIdentity> identity;
+        };
+        std::map<void*, AllocationOwner> allocation_owners;
+        bool record_allocation_owners = false;
         int capture_acquisitions = 0;
         bool capture_sealed = false;
 
@@ -281,7 +305,6 @@ namespace
         bool fail = false;
     };
 
-    /** @brief One isolated pair of backend families and canonical test admission. */
     /** @brief Original fake pool worker observes only the exact cold setup stream. */
     class ChannelSetupWorker final:public llaminar2::testing::MockWorkerGPUContext {
     public:
@@ -1070,11 +1093,11 @@ namespace
     {
         using Phase = MoEOverlayServicePhaseHint;
         using Scheduling = CapturedTransferEndpointScheduling;
-        EXPECT_EQ(moeCountedTransferScheduling(Phase::Prefill), Scheduling::Individual);
-        EXPECT_EQ(moeCountedTransferScheduling(Phase::Decode), Scheduling::Batched);
-        EXPECT_EQ(moeCountedTransferScheduling(Phase::GroupedVerifier), Scheduling::Individual);
-        EXPECT_THROW(moeCountedTransferScheduling(Phase::Auto), std::invalid_argument);
-        EXPECT_THROW(moeCountedTransferScheduling(static_cast<Phase>(99)), std::invalid_argument);
+        EXPECT_NO_THROW(requireMoENativeCountedPhase(Phase::Prefill));
+        EXPECT_NO_THROW(requireMoENativeCountedPhase(Phase::Decode));
+        EXPECT_NO_THROW(requireMoENativeCountedPhase(Phase::GroupedVerifier));
+        EXPECT_THROW(requireMoENativeCountedPhase(Phase::Auto), std::invalid_argument);
+        EXPECT_THROW(requireMoENativeCountedPhase(static_cast<Phase>(99)), std::invalid_argument);
         EXPECT_THROW(capturedTransferEndpointSchedulingName(static_cast<Scheduling>(0)), std::invalid_argument);
         EXPECT_THROW(capturedTransferEndpointSchedulingKey(0, Scheduling::Individual), std::invalid_argument);
         EXPECT_NE(capturedTransferEndpointSchedulingKey(31, Scheduling::Individual),
@@ -1428,6 +1451,23 @@ namespace
         EXPECT_EQ(rocm.calls.back().operation, "broadcast");
     }
 
+    /** @brief Recorded constructor body in the original source-owned stack/object extent. */
+    class ForwardRolePreparedWorker final : public llaminar2::testing::MockWorkerGPUContext {
+    public:
+        /** @brief Preserve the real source's worker storage ownership. */
+        ForwardRolePreparedWorker(int ordinal, std::shared_ptr<PreparedGPUWorkerStack>) : MockWorkerGPUContext(ordinal) {}
+    };
+    /** @brief Construction-only recorded communicator identity; no native receipt is synthesized. */
+    class ForwardRoleNativeContext final : public llaminar2::test::MockLocalTPContext {
+    public:
+        /** @return Immutable recorded authority used only to construct the retained graph bank. */
+        NativeCompletionAuthority nativeCompletionAuthority(int) override {
+            return llaminar2::test::PooledNativeCollectiveReplayAccess::recorded({&abort_, this});
+        }
+    private:
+        uint32_t abort_ = 0;
+    };
+
     /** @test Every graph role encloses local compute, independent of TP width or vendor order. */
     TEST_F(CapturedTransferChannelBindingTest, PipelineGraphDomainsEncloseEveryForwardRole)
     {
@@ -1435,20 +1475,53 @@ namespace
         enum class Role { Prefill, Ordinary, AdmittedOrdinary, Condition, Verifier2, Verifier16 };
         MPIContext mpi(0, 1);
         TensorFactory factory(mpi);
+        // Replace the ordinary channel-only doubles with one actual original
+        // Preparing source before any fanout bank is materialized.
+        GPUDeviceContextPool::instance().shutdown();
+        std::vector<DeviceId> devices;
+        std::vector<PhysicalMemoryResource> observed{{0, DeviceId::cpu(), 1ULL << 30, 1ULL << 30}};
+        for (int ordinal = 0; ordinal < 8; ++ordinal)
+            for (const auto device : {DeviceId::cuda(ordinal), DeviceId::rocm(ordinal)}) {
+                devices.push_back(device);
+                observed.push_back({0, device, 1ULL << 30, 1ULL << 30});
+                llaminar2::test::NativeContextPreparationReplayAccess::seed(device, [device](auto stack) {
+                    return llaminar2::test::NativeContextPreparationReplayAccess::construct<ForwardRolePreparedWorker>(std::move(stack), device.ordinal);
+                });
+            }
+        auto source = llaminar2::test::NativeContextPreparationReplayAccess::source<ForwardRolePreparedWorker>(devices, observed);
+        auto prepared = llaminar2::test::PreparedNativeLookupFixtureReplayAccess::prepare(source, devices);
+        // The recorded reset must run even when a fatal assertion returns or a
+        // graph constructor throws; native backend discovery is invalid here.
+        struct RecordedRetirement final {
+            llaminar2::test::PreparedNativeLookupFixture& fixture;
+            /** @brief Retire through the same recorded reset authority on every exit. */
+            ~RecordedRetirement() noexcept {
+                llaminar2::test::PreparedNativeLookupFixtureReplayAccess::retire(fixture);
+            }
+        } retirement{*prepared};
+        cuda.record_allocation_owners = true;
+        rocm.record_allocation_owners = true;
+        const auto geometry = CapturedTransferChannel::memoryFor(16 * 32 * sizeof(float));
+        PhysicalMemoryPlanBuilder payload;
+        for (const auto &resource : observed)
+            payload.add(resource, PhysicalMemoryOwner::ActivationTransportStaging,
+                resource.device.is_cpu() ? 2 * geometry.mapped_host_bytes + 8 * PipelineActivationFanout::hostBytes()
+                    : 2 * geometry.cursor_bytes_per_device + PipelineActivationFanout::deviceBytes());
+        prepared->admit(payload.build());
         for (const bool reverse : {false, true})
         for (const int width : {1, 2, 4, 8})
         {
             const auto head = reverse ? DeviceId::rocm(1) : DeviceId::cuda(1);
             const auto tail = reverse ? DeviceId::cuda(1) : DeviceId::rocm(1);
             constexpr size_t capacity = 16 * 32 * sizeof(float);
-            auto authority = admission(head, tail, capacity, 0, 2);
+            auto authority = prepared->memory();
             auto activation = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), head,
                 producer_stream, tail, consumer_stream, capacity);
             auto metadata = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), tail,
                 consumer_stream, head, producer_stream, capacity);
             for (size_t domain = 0; domain < 2; ++domain)
             {
-                llaminar2::test::MockLocalTPContext context;
+                ForwardRoleNativeContext context;
                 std::vector<GlobalDeviceAddress> members;
                 for (int member = 0; member < width; ++member)
                     members.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId{
@@ -1461,11 +1534,11 @@ namespace
                     const auto device = members[member].toLocalDeviceId();
                     BufferArena arena(::llaminar2::test::cpuArenaFixtureConfig(&factory));
                     ASSERT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 16, 32, "FP32", DeviceId::cpu()));
-                    for (const auto id : {BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE, BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                    for (const auto id : {BufferId::PREFILL_CHUNK_GEOMETRY, BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE, BufferId::MTP_VERIFIER_INPUT_TOKENS,
                              BufferId::MTP_VERIFIER_POSITION_IDS, BufferId::MTP_VERIFIER_REQUEST_LENGTHS})
                         ASSERT_TRUE(arena.registerBuffer(id, 1, 32, "INT32", DeviceId::cpu()));
                     ASSERT_TRUE(arena.allocate());
-                    for (const auto id : {BufferId::HIDDEN_STATE, BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE,
+                    for (const auto id : {BufferId::HIDDEN_STATE, BufferId::PREFILL_CHUNK_GEOMETRY, BufferId::REQUEST_TOKEN_IDS, BufferId::MTP_LOGICAL_SEQUENCE_STATE,
                              BufferId::MTP_VERIFIER_INPUT_TOKENS, BufferId::MTP_VERIFIER_POSITION_IDS,
                              BufferId::MTP_VERIFIER_REQUEST_LENGTHS})
                     {
@@ -1483,6 +1556,9 @@ namespace
                         .activation_out = domain ? nullptr : activation,
                         .metadata_in = domain ? nullptr : metadata,
                         .metadata_out = domain ? metadata : nullptr};
+                    if (domain && width > 1)
+                        port.activation_fanout = PipelineActivationFanout::create(device, context, member,
+                            activation, authority, consumer_stream, transfer);
                     Edges edges(device, port, arena, 32, domain ? std::nullopt : std::optional(follower), transfer);
                     for (const auto role : {Role::Prefill, Role::Ordinary, Role::AdmittedOrdinary, Role::Condition, Role::Verifier2, Role::Verifier16})
                     {
@@ -1505,7 +1581,11 @@ namespace
                             input.token_ids_device = arena.getSharedTensor(BufferId::REQUEST_TOKEN_IDS)->gpu_data_ptr();
                         if (role == Role::Ordinary || role == Role::AdmittedOrdinary)
                             input.device_decode_position = DeviceDecodePositionBinding{resolve(device), logical + 2, logical + 1};
-                        if (role == Role::Prefill) input.device_prefill_chunk.emplace();
+                        if (role == Role::Prefill) {
+                            input.device_prefill_chunk.emplace();
+                            input.device_prefill_chunk->chunk_real_rows_device = static_cast<int32_t *>(
+                                arena.getSharedTensor(BufferId::PREFILL_CHUNK_GEOMETRY)->gpu_data_ptr());
+                        }
                         EXPECT_TRUE(edges.encloses(input));
                         ComputeGraph graph;
                         graph.addNode("model", std::make_unique<llaminar2::testing::MockComputeStage>(), device);
@@ -1550,6 +1630,9 @@ namespace
                 }
             }
         }
+        prepared->requirePayloadRetired();
+        EXPECT_TRUE(cuda.allocation_owners.empty());
+        EXPECT_TRUE(rocm.allocation_owners.empty());
     }
 
     /** @test Native request admission is a NextToken-only owner, independent of mailbox addresses or vendor order. */
@@ -1981,143 +2064,523 @@ RankInventory originalPeerInventory(DeviceType backend,int count)
     matrix.assign(std::size_t(count)*count,true);
     return inventory;
 }
-/** @test Peer payload retains exact original workers, directional coverage, live extents and PMA rollback. */
-TEST_F(CapturedTransferChannelBindingTest,PeerPayloadOriginalOwnerGeometryAndFailureReplay)
+} // namespace
+
+namespace
 {
-    constexpr std::size_t capacity=4099;
-    constexpr std::size_t oracleBytes=512+64;
-    const auto geometry=CapturedTransferChannel::memoryFor(capacity,CapturedTransferPayloadStorage::PeerDevice);
-    EXPECT_EQ(geometry.mapped_host_bytes,
-        TransferEngine::mappedHostRegionAllocationBytes(sizeof(CapturedTransferChannelControl)));
-    EXPECT_EQ(geometry.producer_payload_bytes,capacity);
-    EXPECT_THROW(CapturedTransferChannel::memoryFor(0,CapturedTransferPayloadStorage::PeerDevice),std::invalid_argument);
-    EXPECT_THROW(CapturedTransferChannel::memoryFor(capacity,static_cast<CapturedTransferPayloadStorage>(99)),std::invalid_argument);
-    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
-        for(const auto count:{2,4,8}){
-            SCOPED_TRACE(count);
-            const auto inventory=originalPeerInventory(backend,count);
-            auto& spy=backend==DeviceType::CUDA?cuda:rocm;
-            spy.peer_payload_size=capacity;
-            const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1u<<28,1u<<28};};
-            const DeviceId producer{backend,0};
-            PhysicalMemoryPlanBuilder plan;
-            plan.add(resource(producer),PhysicalMemoryOwner::ExecutionWorkspace,oracleBytes);
-            for(int peer=1;peer<count;++peer){
-                const DeviceId consumer{backend,peer};
-                plan.add(resource(DeviceId::cpu()),PhysicalMemoryOwner::ActivationTransportStaging,geometry.mapped_host_bytes);
-                plan.add(resource(producer),PhysicalMemoryOwner::ActivationTransportStaging,
-                    geometry.cursor_bytes_per_device+geometry.producer_payload_bytes);
-                plan.add(resource(consumer),PhysicalMemoryOwner::ActivationTransportStaging,geometry.cursor_bytes_per_device);
-                plan.add(resource(consumer),PhysicalMemoryOwner::ExecutionWorkspace,oracleBytes);
+/** @brief Four original observers; rank order, NUMA and native ordinals intentionally differ.
+ * @param producer_type Original source GPU family.
+ * @param consumer_type Original destination GPU family.
+ * @return Complete same-node discovery with both devices visible on every rank.
+ */
+ClusterInventory rankChannelInventory(DeviceType producer_type, DeviceType consumer_type)
+{
+    ClusterInventory inventory;
+    inventory.world_size = 4;
+    inventory.node_count = 1;
+    for (int rank = 0; rank < inventory.world_size; ++rank)
+    {
+        RankInventory original;
+        original.rank = rank;
+        original.local_rank = rank;
+        original.node_id = 0;
+        original.hostname = rank == 3 ? "original-node-alias" : "original-node";
+        original.cpu.type = DeviceType::CPU;
+        original.cpu.numa_node = rank == 3 ? 7 : rank == 1 ? 2 : rank;
+        DeviceInfo producer;
+        producer.type = producer_type;
+        producer.local_device_id = 5;
+        producer.numa_node = 7;
+        producer.uuid = "original-source-physical-gpu";
+        DeviceInfo consumer;
+        consumer.type = consumer_type;
+        consumer.local_device_id = 2;
+        consumer.numa_node = 2;
+        consumer.uuid = "original-consumer-physical-gpu";
+        original.gpus = {producer, consumer};
+        inventory.ranks.push_back(std::move(original));
+    }
+    NodeInventory node;
+    node.node_id = 0;
+    node.hostname = "original-node";
+    node.ranks = {0, 1, 2, 3};
+    inventory.nodes.push_back(std::move(node));
+    return inventory;
+}
+
+/** @brief Contribute only an original allocator observation; no runtime discovery occurs.
+ * @param rank Actual original resource owner.
+ * @param device Actual local allocator kind/ordinal.
+ * @return A fixed ample resource for source-only physical quote validation.
+ */
+PhysicalMemoryResource rankChannelResource(int rank, DeviceId device)
+{
+    return {.world_rank = rank, .device = device,
+        .total_bytes = std::size_t{1} << 24, .admission_available_bytes = std::size_t{1} << 24};
+}
+
+/** @test Immutable role/BOM planning never equates MPI rank with NUMA or GPU ordinal. */
+TEST(CapturedTransferRankPlanTest, ExactOriginalRolesQuoteOneSharedBackingAndOnlyLocalCursors)
+{
+    for (const auto producer_type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        for (const auto consumer_type : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            const auto inventory = rankChannelInventory(producer_type, consumer_type);
+            const CapturedTransferRankGPU producer{3, {producer_type, 5}};
+            const CapturedTransferRankGPU consumer{1, {consumer_type, 2}};
+            for (const std::size_t capacity : {std::size_t{1}, std::size_t{65 * 17 * sizeof(float)}})
+            {
+                SCOPED_TRACE(capacity);
+                const auto plan = CapturedTransferRankPlan::fromInventory(
+                    inventory, {19, 23}, producer, consumer, capacity);
+                EXPECT_EQ(plan.endpoint(CapturedTransferEndpoint::Producer), producer);
+                EXPECT_EQ(plan.endpoint(CapturedTransferEndpoint::Consumer), consumer);
+                EXPECT_EQ(plan.localRole(3), CapturedTransferEndpoint::Producer);
+                EXPECT_EQ(plan.localRole(1), CapturedTransferEndpoint::Consumer);
+                EXPECT_FALSE(plan.localRole(0));
+                EXPECT_FALSE(plan.localRole(2));
+                EXPECT_FALSE(plan.localRole(-1));
+                EXPECT_FALSE(plan.localRole(4));
+                EXPECT_EQ(plan.physicalNode(), 0);
+                EXPECT_EQ(plan.capacityBytes(), capacity);
+                EXPECT_EQ(plan.originalId(), (CapturedTransferRankChannelId{19, 23}));
+                EXPECT_THROW(plan.endpoint(static_cast<CapturedTransferEndpoint>(77)), std::invalid_argument);
+
+                const auto geometry = CapturedTransferChannel::memoryFor(capacity);
+                PhysicalMemoryPlanBuilder builder;
+                plan.contributeMemory(CapturedTransferEndpoint::Producer,
+                    rankChannelResource(3, producer.device), rankChannelResource(3, DeviceId::cpu()), builder);
+                plan.contributeMemory(CapturedTransferEndpoint::Consumer,
+                    rankChannelResource(1, consumer.device), std::nullopt, builder);
+                const auto quote = builder.build();
+                ASSERT_EQ(quote.resources().size(), 3u);
+                const auto* host = quote.find({3, DeviceId::cpu()});
+                const auto* source = quote.find({3, producer.device});
+                const auto* destination = quote.find({1, consumer.device});
+                ASSERT_NE(host, nullptr);
+                ASSERT_NE(source, nullptr);
+                ASSERT_NE(destination, nullptr);
+                EXPECT_EQ(host->charge(PhysicalMemoryOwner::ActivationTransportStaging).planned_bytes,
+                    geometry.mapped_host_bytes);
+                EXPECT_EQ(source->charge(PhysicalMemoryOwner::ActivationTransportStaging).planned_bytes,
+                    geometry.cursor_bytes_per_device);
+                EXPECT_EQ(destination->charge(PhysicalMemoryOwner::ActivationTransportStaging).planned_bytes,
+                    geometry.cursor_bytes_per_device);
+                EXPECT_EQ(quote.totalBytes(), geometry.mapped_host_bytes + 2 * geometry.cursor_bytes_per_device);
+                EXPECT_EQ(quote.find({1, DeviceId::cpu()}), nullptr);
+                EXPECT_EQ(quote.find({0, producer.device}), nullptr);
+                EXPECT_EQ(quote.find({2, consumer.device}), nullptr);
             }
-            auto memory=std::make_unique<PhysicalMemoryAuthority>(
-                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
-            const auto create=[&](int peer,const RankInventory& original,std::size_t bytes){
-                return transfer.createPeerCapturedTransferChannel(*memory,DeviceId::cpu(),producer,
-                    producer_stream,DeviceId{backend,peer},consumer_stream,bytes,original);
-            };
-            std::vector<std::shared_ptr<CapturedTransferChannel>> channels;
-            for(int peer=1;peer<count;++peer){
-                const auto calls=spy.peer_calls.size();
-                auto channel=create(peer,inventory,capacity);
-                ASSERT_EQ(spy.peer_calls.size(),calls+2);
-                EXPECT_EQ(spy.peer_calls[calls],(std::pair{0,peer}));
-                EXPECT_EQ(spy.peer_calls[calls+1],(std::pair{peer,0}));
-                EXPECT_EQ(channel->payloadStorage(),CapturedTransferPayloadStorage::PeerDevice);
-                EXPECT_EQ(channel->endpointDevice(CapturedTransferEndpoint::Producer),producer);
-                {
-                    auto sourceClaim=memory->claimNewAllocation(producer,PhysicalMemoryOwner::ExecutionWorkspace,oracleBytes);
-                    auto destinationClaim=memory->claimNewAllocation({backend,peer},PhysicalMemoryOwner::ExecutionWorkspace,oracleBytes);
-                    auto source=transfer.allocateDeviceTransferBuffer(512,producer);
-                    auto destination=transfer.allocateDeviceTransferBuffer(512,{backend,peer});
-                    auto sent=transfer.allocateDeviceTransferBuffer(64,producer);
-                    auto received=transfer.allocateDeviceTransferBuffer(64,{backend,peer});
-                    std::memset(source->mutableDeviceData(),0x3c,512);
-                    auto* live=static_cast<std::uint64_t*>(sent->mutableDeviceData());
-                    auto* observed=static_cast<std::uint64_t*>(received->mutableDeviceData());
-                    const auto send=transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(channel,
-                        CapturedTransferEndpoint::Producer,{71,512},source),sent);
-                    const auto receive=transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(channel,
-                        CapturedTransferEndpoint::Consumer,{71,512},destination),received);
-                    const auto identity=send.captureIdentity();
-                    EXPECT_NE(identity,receive.captureIdentity());
-                    const auto retained=send;
-                    const auto wire=CapturedTransferChannelReplayProbe::terminalPeerPayload(*channel);
-                    EXPECT_THROW(CapturedTransferChannelReplayProbe::payload(*channel),std::invalid_argument);
-                    for(const std::uint64_t bytes:{257,0,17,512,1,0,257}){
-                        *live=bytes;
-                        *observed=99;
-                        std::memset(destination->mutableDeviceData(),0xa5,512);
-                        std::memset(wire->mutableDeviceData(),0xa5,capacity);
-                        transfer.enqueueCapturedTransfer(send,producer_stream);
-                        transfer.enqueueCapturedTransfer(receive,consumer_stream);
-                        EXPECT_EQ(*observed,bytes);
-                        EXPECT_EQ(retained.captureIdentity(),identity);
-                        for(std::size_t byte=0;byte<512;++byte)
-                            EXPECT_EQ(static_cast<const unsigned char*>(destination->deviceData())[byte],byte<bytes?0x3c:0xa5);
-                        for(std::size_t byte=0;byte<capacity;++byte)
-                            EXPECT_EQ(static_cast<const unsigned char*>(wire->deviceData())[byte],byte<bytes?0x3c:0xa5);
-                    }
-                    ++spy.runtime_generation;
-                    EXPECT_THROW(retained.captureIdentity(),std::logic_error);
-                    EXPECT_THROW(transfer.enqueueCapturedTransfer(send,producer_stream),std::logic_error);
-                    --spy.runtime_generation;
-                }
-                channels.push_back(std::move(channel));
-            }
-            EXPECT_EQ(remaining(*memory,DeviceId::cpu()),0u);
-            EXPECT_EQ(remaining(*memory,producer),0u);
-            channels.clear();
-            const auto empty=[&]{
-                for(const auto device:{DeviceId::cpu(),producer,DeviceId{backend,1}})
-                    EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ActivationTransportStaging,
-                        PhysicalMemoryMaterializationKind::NewAllocation),0u);
-            };
-            empty();
-            const auto beforeEnable=spy.peer_preparations;
-            const auto beforePrepare=spy.preparations;
-            const auto beforePayload=spy.peer_payload_attempts;
-            auto partial=inventory;
-            auto& matrix=backend==DeviceType::CUDA?partial.p2p_cuda:partial.p2p_rocm;
-            matrix[1]=false;
-            EXPECT_THROW(create(1,partial,capacity),std::invalid_argument);
-            EXPECT_EQ(spy.peer_preparations,beforeEnable);
-            auto none=partial;
-            auto& noneMatrix=backend==DeviceType::CUDA?none.p2p_cuda:none.p2p_rocm;
-            noneMatrix[count]=false;
-            EXPECT_THROW(create(1,none,capacity),std::invalid_argument);
-            auto missing=inventory;
-            (backend==DeviceType::CUDA?missing.p2p_cuda:missing.p2p_rocm).clear();
-            EXPECT_THROW(create(1,missing,capacity),std::invalid_argument);
-            auto foreign=inventory;
-            foreign.rank=1;
-            EXPECT_THROW(create(1,foreign,capacity),std::invalid_argument);
-            EXPECT_EQ(spy.peer_preparations,beforeEnable);
-            EXPECT_EQ(spy.preparations,beforePrepare);
-            EXPECT_EQ(spy.peer_payload_attempts,beforePayload);
-            empty();
-            EXPECT_THROW(create(1,inventory,capacity*std::size_t(count)),std::logic_error);
-            empty();
-            spy.peer_enabled=false;
-            EXPECT_THROW(create(1,inventory,capacity),std::runtime_error);
-            spy.peer_enabled=true;
-            empty();
-            spy.fail_peer_enable_at=spy.peer_preparations+2;
-            EXPECT_THROW(create(1,inventory,capacity),std::runtime_error);
-            spy.fail_peer_enable_at=0;
-            empty();
-            spy.fail_peer_payload=true;
-            EXPECT_THROW(create(1,inventory,capacity),std::runtime_error);
-            spy.fail_peer_payload=false;
-            empty();
-            PhysicalMemoryPlanBuilder wrongOwner;
-            for(const auto device:{DeviceId::cpu(),producer,DeviceId{backend,1}})
-                wrongOwner.add(resource(device),PhysicalMemoryOwner::NativeGraphExecutable,capacity+geometry.mapped_host_bytes);
-            PhysicalMemoryAuthority wrong(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(wrongOwner.build()),0);
-            EXPECT_THROW(transfer.createPeerCapturedTransferChannel(wrong,DeviceId::cpu(),producer,producer_stream,
-                {backend,1},consumer_stream,capacity,inventory),std::logic_error);
-            spy.peer_payload_size=0;
         }
     }
 }
+
+/** @test Malformed original topology, roles and resource owners reject before native work. */
+TEST(CapturedTransferRankPlanTest, RejectsForeignOwnershipAndAmbiguousPhysicalIdentity)
+{
+    const auto inventory = rankChannelInventory(DeviceType::CUDA, DeviceType::ROCm);
+    const CapturedTransferRankGPU producer{3, DeviceId::cuda(5)};
+    const CapturedTransferRankGPU consumer{1, DeviceId::rocm(2)};
+    const auto make = [&](const ClusterInventory& original, CapturedTransferRankGPU source,
+                          CapturedTransferRankGPU destination, std::size_t capacity = 65) {
+        return CapturedTransferRankPlan::fromInventory(original, {19, 23}, source, destination, capacity);
+    };
+    EXPECT_THROW(make(inventory, {0, producer.device}, consumer), std::invalid_argument);
+    EXPECT_THROW(make(inventory, producer, {0, consumer.device}), std::invalid_argument);
+    EXPECT_THROW(make(inventory, producer, {3, consumer.device}), std::invalid_argument);
+    EXPECT_THROW(make(inventory, {-1, producer.device}, consumer), std::invalid_argument);
+    EXPECT_THROW(make(inventory, producer, {4, consumer.device}), std::invalid_argument);
+    EXPECT_THROW(make(inventory, {3, DeviceId::cpu()}, consumer), std::invalid_argument);
+    EXPECT_THROW(make(inventory, {3, DeviceId::cuda(7)}, consumer), std::invalid_argument);
+    EXPECT_THROW(make(inventory, producer, consumer, 0), std::invalid_argument);
+    EXPECT_THROW(make(inventory, producer, consumer, std::numeric_limits<std::size_t>::max()), std::overflow_error);
+    EXPECT_THROW(CapturedTransferRankPlan::fromInventory(inventory, {0, 23}, producer, consumer, 65), std::invalid_argument);
+    EXPECT_THROW(CapturedTransferRankPlan::fromInventory(inventory, {19, 0}, producer, consumer, 65), std::invalid_argument);
+    auto malformed = inventory;
+    malformed.ranks[1].node_id = 1;
+    EXPECT_THROW(make(malformed, producer, consumer), std::invalid_argument);
+    malformed = inventory;
+    malformed.ranks[3].rank = 0;
+    EXPECT_THROW(make(malformed, producer, consumer), std::invalid_argument);
+    malformed = inventory;
+    malformed.ranks[3].gpus[0].uuid.clear();
+    EXPECT_THROW(make(malformed, producer, consumer), std::invalid_argument);
+    malformed = inventory;
+    malformed.ranks[1].gpus[1].numa_node = -1;
+    EXPECT_THROW(make(malformed, producer, consumer), std::invalid_argument);
+
+    const auto plan = make(inventory, producer, consumer);
+    PhysicalMemoryPlanBuilder builder;
+    EXPECT_THROW(plan.contributeMemory(CapturedTransferEndpoint::Producer,
+        rankChannelResource(1, producer.device), rankChannelResource(3, DeviceId::cpu()), builder), std::invalid_argument);
+    EXPECT_THROW(plan.contributeMemory(CapturedTransferEndpoint::Producer,
+        rankChannelResource(3, producer.device), std::nullopt, builder), std::invalid_argument);
+    EXPECT_THROW(plan.contributeMemory(CapturedTransferEndpoint::Producer,
+        rankChannelResource(3, producer.device), rankChannelResource(1, DeviceId::cpu()), builder), std::invalid_argument);
+    EXPECT_THROW(plan.contributeMemory(CapturedTransferEndpoint::Consumer,
+        rankChannelResource(1, consumer.device), rankChannelResource(1, DeviceId::cpu()), builder), std::invalid_argument);
+    EXPECT_THROW(plan.contributeMemory(static_cast<CapturedTransferEndpoint>(77),
+        rankChannelResource(1, consumer.device), std::nullopt, builder), std::invalid_argument);
+}
+
+/** @test Complete cold role identity is deterministic, directed and independent of hostname aliases. */
+TEST(CapturedTransferRankPlanTest, SerializedIdentityRetainsOriginalRolesUUIDGenerationBoundaryAndCapacity)
+{
+    const auto inventory = rankChannelInventory(DeviceType::CUDA, DeviceType::ROCm);
+    const CapturedTransferRankGPU producer{3, DeviceId::cuda(5)};
+    const CapturedTransferRankGPU consumer{1, DeviceId::rocm(2)};
+    const auto plan = CapturedTransferRankPlan::fromInventory(inventory, {19, 23}, producer, consumer, 65);
+    EXPECT_EQ(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        inventory, {19, 23}, producer, consumer, 65).serialize());
+    EXPECT_NE(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        inventory, {20, 23}, producer, consumer, 65).serialize());
+    EXPECT_NE(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        inventory, {19, 24}, producer, consumer, 65).serialize());
+    EXPECT_NE(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        inventory, {19, 23}, producer, consumer, 66).serialize());
+    EXPECT_NE(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        inventory, {19, 23}, consumer, producer, 65).serialize());
+    auto renamed = inventory;
+    renamed.ranks[3].hostname = "another-alias-for-the-original-node";
+    EXPECT_EQ(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        renamed, {19, 23}, producer, consumer, 65).serialize());
+    auto changed = inventory;
+    for (auto& rank : changed.ranks)
+        rank.gpus[0].uuid = "different-original-source-physical-gpu";
+    EXPECT_NE(plan.serialize(), CapturedTransferRankPlan::fromInventory(
+        changed, {19, 23}, producer, consumer, 65).serialize());
+}
 } // namespace
+
+namespace
+{
+/** @test Signed row conversion uses exact integer bounds, never a byte reinterpretation. */
+TEST(CapturedTransferRankPlanTest, RowByteConversionRejectsNegativeOverflowAndOverCapacity)
+{
+    constexpr std::uint64_t row_bytes = 17 * sizeof(float);
+    constexpr std::uint64_t capacity = 65 * row_bytes;
+    for (const std::int32_t rows : {65, 3, 1, 0, 65})
+    {
+        const auto actual = capturedTransferRowBytes(rows, row_bytes, capacity);
+        ASSERT_TRUE(actual.valid);
+        EXPECT_EQ(actual.bytes, std::uint64_t(rows) * row_bytes);
+    }
+    EXPECT_FALSE(capturedTransferRowBytes(-1, row_bytes, capacity).valid);
+    EXPECT_FALSE(capturedTransferRowBytes(66, row_bytes, capacity).valid);
+    EXPECT_FALSE(capturedTransferRowBytes(1, 0, capacity).valid);
+    EXPECT_FALSE(capturedTransferRowBytes(0, row_bytes, 0).valid);
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    EXPECT_TRUE(capturedTransferRowBytes(1, maximum, maximum).valid);
+    EXPECT_FALSE(capturedTransferRowBytes(2, maximum, maximum).valid);
+    EXPECT_TRUE(capturedTransferRowBytes(std::numeric_limits<std::int32_t>::max(), 4,
+        std::uint64_t(std::numeric_limits<std::int32_t>::max()) * 4).valid);
+}
+
+/** @test Retained INT32 input replays shrinking live bytes and keeps poison tails and read ownership. */
+TEST_F(CapturedTransferChannelBindingTest, RowExtentReplayUsesOriginalCountsAndLeavesPaddingAndInputPublicationUnchanged)
+{
+    constexpr std::size_t row_bytes = 17 * sizeof(float);
+    constexpr std::size_t capacity = 65 * row_bytes;
+    for (const bool reverse : {false, true})
+    for (const bool batched : {false, true})
+    {
+        const auto first = reverse ? DeviceId::rocm(3) : DeviceId::cuda(3);
+        const auto second = reverse ? DeviceId::cuda(6) : DeviceId::rocm(6);
+        auto& source_backend = reverse ? rocm : cuda;
+        auto& destination_backend = reverse ? cuda : rocm;
+        source_backend.capture_sealed = false;
+        destination_backend.capture_sealed = false;
+        auto authority = admission(first, second, capacity);
+        auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first,
+            producer_stream, second, consumer_stream, capacity);
+        auto source = transfer.allocateDeviceTransferBuffer(capacity, first);
+        auto destination = transfer.allocateDeviceTransferBuffer(capacity + 2 * row_bytes, second);
+        auto source_rows = std::make_shared<INT32Tensor>(std::vector<std::size_t>{4});
+        auto destination_rows = std::make_shared<INT32Tensor>(std::vector<std::size_t>{4});
+        source_rows->setBackendForTesting(&source_backend);
+        destination_rows->setBackendForTesting(&destination_backend);
+        TransferEngine::prepareDeviceInput(source_rows.get(), first, producer_stream);
+        TransferEngine::prepareDeviceInput(destination_rows.get(), second, consumer_stream);
+        source_backend.capture_identity = std::make_shared<NativeAllocationCaptureIdentity>();
+        destination_backend.capture_identity = std::make_shared<NativeAllocationCaptureIdentity>();
+        source_backend.capture_base = source_rows->gpu_data_ptr();
+        source_backend.capture_bytes = source_rows->size_bytes();
+        source_backend.capture_device = first;
+        destination_backend.capture_base = destination_rows->gpu_data_ptr();
+        destination_backend.capture_bytes = destination_rows->size_bytes();
+        destination_backend.capture_device = second;
+        // A four-byte offset is legitimate INT32 storage and deliberately not uint64 aligned.
+        const auto send = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(channel,
+            CapturedTransferEndpoint::Producer, {83, capacity}, source), source_rows, 4, row_bytes);
+        const auto receive = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(channel,
+            CapturedTransferEndpoint::Consumer, {83, capacity}, destination, row_bytes), destination_rows, 4, row_bytes);
+        const auto send_identity = send.captureIdentity();
+        const auto receive_identity = receive.captureIdentity();
+        const auto source_borrows = source_backend.capture_acquisitions;
+        const auto destination_borrows = destination_backend.capture_acquisitions;
+        source_backend.capture_sealed = true;
+        destination_backend.capture_sealed = true;
+        auto* source_count = static_cast<std::int32_t*>(source_rows->gpu_data_ptr());
+        auto* destination_count = static_cast<std::int32_t*>(destination_rows->gpu_data_ptr());
+        source_count[0] = -77;
+        source_count[2] = -91;
+        destination_count[0] = -107;
+        destination_count[2] = -119;
+        unsigned replay = 0;
+        for (const std::int32_t rows : {65, 3, 1, 0, 65})
+        {
+            source_count[1] = rows;
+            destination_count[1] = rows;
+            TransferEngine::publishDeviceWrite(source_rows.get(), first, producer_stream);
+            TransferEngine::publishDeviceWrite(destination_rows.get(), second, consumer_stream);
+            auto* input = static_cast<std::uint8_t*>(source->mutableDeviceData());
+            auto* output = static_cast<std::uint8_t*>(destination->mutableDeviceData());
+            for (std::size_t i = 0; i < capacity; ++i)
+                input[i] = static_cast<std::uint8_t>((i * 37 + replay * 53 + 11) & 255);
+            std::memset(output, 0xa5, destination->sizeBytes());
+            const auto records = destination_backend.getEventRecordCount();
+            source_backend.calls.clear();
+            destination_backend.calls.clear();
+            if (batched)
+            {
+                const std::array sends{send};
+                const std::array receives{receive};
+                transfer.enqueueCapturedTransferBatch(sends, producer_stream);
+                transfer.enqueueCapturedTransferBatch(receives, consumer_stream);
+            }
+            else
+            {
+                transfer.enqueueCapturedTransfer(send, producer_stream);
+                transfer.enqueueCapturedTransfer(receive, consumer_stream);
+            }
+            const auto live_bytes = std::size_t(rows) * row_bytes;
+            for (const auto* backend : {&source_backend, &destination_backend})
+            {
+                const auto copied = std::find_if(backend->calls.begin(), backend->calls.end(),
+                    [](const Call& call) { return call.operation == "counted_copy"; });
+                ASSERT_NE(copied, backend->calls.end());
+                EXPECT_EQ(copied->bytes, live_bytes);
+            }
+            EXPECT_EQ(std::memcmp(output + row_bytes, input, live_bytes), 0);
+            for (std::size_t i = 0; i < row_bytes; ++i)
+                ASSERT_EQ(output[i], 0xa5);
+            for (std::size_t i = row_bytes + live_bytes; i < destination->sizeBytes(); ++i)
+                ASSERT_EQ(output[i], 0xa5);
+            EXPECT_EQ(source_backend.native_bindings.back().device_extent, nullptr);
+            EXPECT_EQ(destination_backend.native_bindings.back().device_extent, nullptr);
+            EXPECT_EQ(source_backend.native_bindings.back().device_rows, source_count + 1);
+            EXPECT_EQ(destination_backend.native_bindings.back().device_rows, destination_count + 1);
+            EXPECT_EQ(destination_backend.getEventRecordCount(), records);
+            EXPECT_EQ(destination_count[1], rows);
+            EXPECT_EQ(source_count[0], -77);
+            EXPECT_EQ(source_count[2], -91);
+            EXPECT_EQ(destination_count[0], -107);
+            EXPECT_EQ(destination_count[2], -119);
+            EXPECT_EQ(send.captureIdentity(), send_identity);
+            EXPECT_EQ(receive.captureIdentity(), receive_identity);
+            ++replay;
+        }
+        EXPECT_EQ(source_backend.capture_acquisitions, source_borrows);
+        EXPECT_EQ(destination_backend.capture_acquisitions, destination_borrows);
+        source_backend.capture_sealed = false;
+        destination_backend.capture_sealed = false;
+    }
+}
+
+/** @test Row-count binding rejects bad type, extent, ownership, rebind and alias before submission. */
+TEST_F(CapturedTransferChannelBindingTest, RowExtentRejectsMalformedAndForeignOriginalOwners)
+{
+    const auto first = DeviceId::cuda(0);
+    const auto second = DeviceId::rocm(0);
+    auto authority = admission(first, second, 64);
+    auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first,
+        producer_stream, second, consumer_stream, 64);
+    auto source = transfer.allocateDeviceTransferBuffer(64, first);
+    const auto capacity = transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer, {84, 64}, source);
+    auto rows = std::make_shared<INT32Tensor>(std::vector<std::size_t>{32});
+    rows->setBackendForTesting(&cuda);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, 4, 4), std::invalid_argument);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, {}, 4, 4), std::invalid_argument);
+    TransferEngine::prepareDeviceInput(rows.get(), first, producer_stream);
+    cuda.capture_base = rows->gpu_data_ptr();
+    cuda.capture_bytes = rows->size_bytes();
+    cuda.capture_device = first;
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, 1, 4), std::invalid_argument);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, rows->size_bytes(), 4), std::out_of_range);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, std::numeric_limits<std::size_t>::max(), 4), std::out_of_range);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, 4, 0), std::invalid_argument);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, 4, 3), std::invalid_argument);
+    auto wrong_type = std::make_shared<FP32Tensor>(std::vector<std::size_t>{4});
+    wrong_type->setBackendForTesting(&cuda);
+    TransferEngine::prepareDeviceInput(wrong_type.get(), first, producer_stream);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, wrong_type, 4, 4), std::invalid_argument);
+    auto foreign = std::make_shared<INT32Tensor>(std::vector<std::size_t>{4});
+    foreign->setBackendForTesting(&rocm);
+    TransferEngine::prepareDeviceInput(foreign.get(), second, consumer_stream);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, foreign, 4, 4), std::invalid_argument);
+    const auto overlapping = transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer, {84, 64}, rows);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(overlapping, rows, 4, 4), std::invalid_argument);
+    const auto counted = transfer.bindDeviceRowCountedTransfer(capacity, rows, 4, 4);
+    EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(counted, rows, 4, 4), std::invalid_argument);
+    {
+        GraphCaptureGuard capture;
+        EXPECT_THROW(transfer.bindDeviceRowCountedTransfer(capacity, rows, 4, 4), std::invalid_argument);
+    }
+    rows->setBackendForTesting(&rocm);
+    cuda.calls.clear();
+    rocm.calls.clear();
+    EXPECT_THROW(transfer.enqueueCapturedTransfer(counted, producer_stream), std::logic_error);
+    EXPECT_TRUE(cuda.calls.empty());
+    EXPECT_TRUE(rocm.calls.empty());
+    rows->setBackendForTesting(&cuda);
+}
+
+/** @test Read-only row inputs may share each other, but never another receiver's writable payload. */
+TEST_F(CapturedTransferChannelBindingTest, RowExtentBatchRejectsCrossEndpointInputPayloadAliasBeforeAnySubmission)
+{
+    const auto first = DeviceId::cuda(0);
+    const auto second = DeviceId::rocm(0);
+    auto authority = admission(first, second, 64, 0, 2);
+    auto first_channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first,
+        producer_stream, second, consumer_stream, 64);
+    auto second_channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first,
+        producer_stream, second, consumer_stream, 64);
+    auto payload = transfer.allocateDeviceTransferBuffer(64, second);
+    auto original = std::make_shared<INT32Tensor>(std::vector<std::size_t>{32});
+    original->setBackendForTesting(&rocm);
+    TransferEngine::prepareDeviceInput(original.get(), second, consumer_stream);
+    rocm.capture_base = original->gpu_data_ptr();
+    rocm.capture_bytes = original->size_bytes();
+    rocm.capture_device = second;
+    const auto a = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(first_channel,
+        CapturedTransferEndpoint::Consumer, {85, 64}, payload), original, 0, 4);
+    const auto b = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(second_channel,
+        CapturedTransferEndpoint::Consumer, {85, 64}, original), original, 96, 4);
+    auto other_payload = transfer.allocateDeviceTransferBuffer(64, second);
+    const auto shared_reader = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(second_channel,
+        CapturedTransferEndpoint::Consumer, {85, 64}, other_payload), original, 0, 4);
+    const std::array allowed{a, shared_reader};
+    rocm.calls.clear();
+    // The public submission must admit shared read-only counts and reach the
+    // original native packet boundary. Inject failure there to avoid claiming
+    // that this alias-validation fixture has published an actual payload.
+    rocm.fail_boundary = true;
+    EXPECT_THROW(transfer.enqueueCapturedTransferBatch(allowed, consumer_stream), std::runtime_error);
+    ASSERT_FALSE(rocm.batch_sizes.empty());
+    EXPECT_EQ(rocm.batch_sizes.back(), 2u);
+    rocm.fail_boundary = false;
+    EXPECT_TRUE(std::all_of(rocm.calls.begin(), rocm.calls.end(),
+        [](const auto &call) { return call.operation == "event"; }));
+    const auto row_at_four = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(first_channel,
+        CapturedTransferEndpoint::Consumer, {85, 64}, payload), original, 4, 4);
+    const auto byte_output = transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(second_channel,
+        CapturedTransferEndpoint::Consumer, {85, 64}, other_payload), original, 0);
+    for (const bool reverse : {false, true})
+    {
+        const std::array bindings = reverse ? std::array{b, a} : std::array{a, b};
+        rocm.calls.clear();
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(bindings, consumer_stream), std::invalid_argument);
+        EXPECT_TRUE(rocm.calls.empty());
+        const std::array mixed = reverse ? std::array{byte_output, row_at_four} : std::array{row_at_four, byte_output};
+        EXPECT_THROW(transfer.enqueueCapturedTransferBatch(mixed, consumer_stream), std::invalid_argument);
+        EXPECT_TRUE(rocm.calls.empty());
+    }
+}
+} // namespace
+
+namespace
+{
+/** @test Reverse metadata retains the explicitly declared earlier-domain physical allocator. */
+TEST(CapturedTransferRankPlanTest, ReverseHostRoleQuotesOriginalConsumerWithoutChangingDataDirection)
+{
+    const auto inventory = rankChannelInventory(DeviceType::CUDA, DeviceType::ROCm);
+    const CapturedTransferRankGPU producer{3, DeviceId::cuda(5)};
+    const CapturedTransferRankGPU consumer{1, DeviceId::rocm(2)};
+    const auto forward = CapturedTransferRankPlan::fromInventory(inventory, {19, 23}, producer, consumer, 65);
+    const auto reverse_host = CapturedTransferRankPlan::fromInventory(inventory, {19, 23}, producer, consumer, 65,
+        CapturedTransferEndpoint::Consumer);
+    EXPECT_EQ(reverse_host.hostEndpoint(), CapturedTransferEndpoint::Consumer);
+    EXPECT_EQ(reverse_host.hostRank(), 1);
+    EXPECT_EQ(reverse_host.endpoint(CapturedTransferEndpoint::Producer), producer);
+    EXPECT_EQ(reverse_host.endpoint(CapturedTransferEndpoint::Consumer), consumer);
+    EXPECT_NE(reverse_host.serialize(), forward.serialize());
+    PhysicalMemoryPlanBuilder builder;
+    reverse_host.contributeMemory(CapturedTransferEndpoint::Producer,
+        rankChannelResource(3, producer.device), std::nullopt, builder);
+    reverse_host.contributeMemory(CapturedTransferEndpoint::Consumer,
+        rankChannelResource(1, consumer.device), rankChannelResource(1, DeviceId::cpu()), builder);
+    const auto quote = builder.build();
+    ASSERT_EQ(quote.resources().size(), 3u);
+    EXPECT_EQ(quote.find({3, DeviceId::cpu()}), nullptr);
+    const auto* host = quote.find({1, DeviceId::cpu()});
+    ASSERT_NE(host, nullptr);
+    EXPECT_EQ(host->charge(PhysicalMemoryOwner::ActivationTransportStaging).planned_bytes,
+        CapturedTransferChannel::memoryFor(65).mapped_host_bytes);
+    EXPECT_THROW(CapturedTransferRankPlan::fromInventory(inventory, {19, 23}, producer, consumer, 65,
+        static_cast<CapturedTransferEndpoint>(77)), std::invalid_argument);
+    EXPECT_THROW(reverse_host.contributeMemory(CapturedTransferEndpoint::Producer,
+        rankChannelResource(3, producer.device), rankChannelResource(3, DeviceId::cpu()), builder), std::invalid_argument);
+    EXPECT_THROW(reverse_host.contributeMemory(CapturedTransferEndpoint::Consumer,
+        rankChannelResource(1, consumer.device), std::nullopt, builder), std::invalid_argument);
+}
+} // namespace
+
+/** @test The native header keeps the producer's original epoch/key and only useful live row bytes. */
+TEST(PipelineActivationFanoutContract, RecordedLiveRowsRejectStaleOrMismatchedHeaders)
+{
+    constexpr uint64_t row_bytes = 68, capacity = 65 * row_bytes, key = 0x4143540000000041ULL;
+    uint64_t epoch = 1;
+    for (const int32_t rows : {65, 3, 1, 0, 65})
+    {
+        const PipelineActivationFanoutHeader header{epoch++, {key, uint64_t(rows) * row_bytes}};
+        EXPECT_TRUE(pipelineActivationFanoutHeaderMatches(rows, row_bytes, capacity, key, header));
+        EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(rows + 1, row_bytes, capacity, key, header));
+        EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(rows, row_bytes, capacity, key + 1, header));
+        auto bad = header; bad.epoch = 0;
+        EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(rows, row_bytes, capacity, key, bad));
+        bad.epoch = kCapturedTransferAbortEpoch;
+        EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(rows, row_bytes, capacity, key, bad));
+        bad = header; ++bad.message.bytes;
+        EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(rows, row_bytes, capacity, key, bad));
+    }
+    EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(-1, row_bytes, capacity, key, {1, {key, 0}}));
+    EXPECT_FALSE(pipelineActivationFanoutHeaderMatches(1, UINT64_MAX, capacity, key, {1, {key, row_bytes}}));
+    EXPECT_TRUE(pipelineActivationFanoutHeaderMatches(INT32_MAX, 1, INT32_MAX, key, {1, {key, INT32_MAX}}));
+}
+
+/** @test Actual native receipt law rejects source/scope/sequence drift and every error disposition. */
+TEST(PipelineActivationFanoutContract, OriginalNativeReceiptCannotAuthorizeStaleOrAbortedPayload)
+{
+    uint32_t abort = 0;
+    const ncclLlaminarCompletionAuthority authority{&abort, reinterpret_cast<const void *>(uintptr_t{0x1000})};
+    ncclLlaminarByteCompletion receipt{17, 31, 4, 3 * 68, authority.abortFlag,
+        authority.deviceCommunicator, 0x41435446414e4f55ULL, ncclLlaminarCompletionPhase::Completed, 0};
+    const auto valid = [&](const auto &actual, uint64_t source = 17, uint64_t scope = 31, uint64_t epoch = 4,
+                           uint64_t bytes = 3 * 68, uint32_t native_abort = 0, int32_t error = 0) {
+        return ncclLlaminarCompletionMatches(actual, source, scope, epoch, bytes,
+            0x41435446414e4f55ULL, authority, native_abort, error);
+    };
+    EXPECT_TRUE(valid(receipt));
+    EXPECT_FALSE(valid(receipt, 18)); EXPECT_FALSE(valid(receipt, 17, 32));
+    EXPECT_FALSE(valid(receipt, 17, 31, 3)); EXPECT_FALSE(valid(receipt, 17, 31, 4, 68));
+    EXPECT_FALSE(valid(receipt, 17, 31, 4, 3 * 68, 1));
+    EXPECT_FALSE(valid(receipt, 17, 31, 4, 3 * 68, 0, 1));
+    for (const auto phase : {ncclLlaminarCompletionPhase::Pending, ncclLlaminarCompletionPhase::Aborted})
+    { auto bad = receipt; bad.phase = phase; EXPECT_FALSE(valid(bad)); }
+    auto bad = receipt; bad.reserved = 1; EXPECT_FALSE(valid(bad));
+    bad = receipt; bad.nativeCommunicator = nullptr; EXPECT_FALSE(valid(bad));
+    receipt.bytes = 0; EXPECT_TRUE(valid(receipt, 17, 31, 4, 0));
+}
+
+/** @test Both materialization and canonical PMA quote consume the exact same physical source layouts. */
+TEST(PipelineActivationFanoutContract, OriginalBankBOMIncludesNoPayloadOrCapacitySizedMetadata)
+{
+    EXPECT_EQ(sizeof(PipelineActivationFanoutHeader), 24u);
+    EXPECT_EQ(sizeof(PipelineActivationFanoutDeviceState), 128u);
+    EXPECT_EQ(sizeof(PipelineActivationFanoutOperand), 80u);
+    EXPECT_EQ(PipelineTransferMemory::fanoutDeviceBytes(), PipelineActivationFanout::deviceBytes());
+    EXPECT_EQ(PipelineTransferMemory::fanoutHostBytes(), PipelineActivationFanout::hostBytes());
+    EXPECT_EQ(PipelineActivationFanout::hostBytes(),
+        TransferEngine::mappedHostRegionAllocationBytes(sizeof(PipelineActivationFanoutOperand)));
+}

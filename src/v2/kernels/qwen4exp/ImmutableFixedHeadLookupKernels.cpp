@@ -15,6 +15,40 @@
 
 namespace llaminar2::qwen4exp
 {
+void requireImmutableFixedHeadPipelineRange(ImmutableResidentTableRangeView table,
+    const NgramHashPolicy &policy, FixedHeadPipelineHeads heads)
+{
+    policy.validate();
+    if (heads.first < 0 || heads.count <= 0 || heads.first >= kNgramHeads ||
+        heads.count > kNgramHeads - heads.first)
+        throw std::invalid_argument("Fixed pipeline storage requires an exact original head interval");
+    for (int head = 0; head < kNgramHeads; ++head) {
+        if (policy.offsets[head] > table.sourceRowCount() ||
+            policy.moduli[head] > table.sourceRowCount() - policy.offsets[head])
+            throw std::invalid_argument("Fixed pipeline storage does not cover the authenticated source vocabulary");
+    }
+    const int next = heads.first + heads.count;
+    const auto first = heads.first ? policy.offsets[heads.first] : 0;
+    const auto last = next == kNgramHeads ? table.sourceRowCount() : policy.offsets[next];
+    if (table.globalRowBegin() != first || table.rowCount() != last - first)
+        throw std::invalid_argument("Fixed pipeline storage changed its admitted gap-preserving source range");
+}
+
+std::unique_ptr<IImmutableFixedHeadPipelineKernels> createImmutableFixedHeadPipelineKernels(
+    DeviceId device, ImmutableResidentTableRangeView table, NgramHashPolicy policy,
+    FixedHeadPipelineHeads heads)
+{
+    requireImmutableFixedHeadPipelineRange(table, policy, heads);
+    if (device != table.device())
+        throw std::invalid_argument("Fixed pipeline source range changed its original device");
+#ifdef HAVE_CUDA
+    if (device.is_cuda()) return createCUDAImmutableFixedHeadPipelineKernels(table, policy, heads);
+#endif
+#ifdef HAVE_ROCM
+    if (device.is_rocm()) return createROCmImmutableFixedHeadPipelineKernels(table, policy, heads);
+#endif
+    throw std::invalid_argument("Fixed pipeline source has no compiled original native backend");
+}
 std::unique_ptr<IImmutableFixedHeadLookupKernels> createImmutableFixedHeadLookupKernels(
     DeviceId device,ImmutableFixedHeadLookupPlan plan)
 {

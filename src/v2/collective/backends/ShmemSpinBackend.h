@@ -30,6 +30,7 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/AlignedVector.h"
 #include <atomic>
+#include <limits>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -113,7 +114,7 @@ namespace llaminar2
         struct AllocationGeometry { size_t logical_bytes; size_t mapped_bytes; };
         /** @return The same allocation-owner rounding used by native host mappings. */
         static AllocationGeometry allocationGeometry(int ranks) {
-            if(ranks<=0 || ranks>8)throw std::invalid_argument("Shared CPU expert arena requires1..8 actual participants");
+            if(ranks<=0)throw std::invalid_argument("Shared CPU expert arena requires positive original membership");
             const auto logical=compute_size(ranks);
             using Bytes=AlignedVector<std::byte>;
             return {logical,Bytes::requiredAllocationBytes(logical,64,Bytes::StorageKind::AnonymousPageMapping)};
@@ -121,6 +122,10 @@ namespace llaminar2
         /// Total arena size in bytes for a given rank count
         static size_t compute_size(int num_ranks)
         {
+            const auto maximum=std::numeric_limits<size_t>::max();
+            const auto per_rank=sizeof(EpochSlot)+CHUNK_CAPACITY*sizeof(float);
+            if(num_ranks<=0 || static_cast<size_t>(num_ranks)>(maximum-sizeof(ShmemSpinArena))/per_rank)
+                throw std::overflow_error("Shared CPU expert arena original membership byte extent overflows");
             return sizeof(ShmemSpinArena) // header (one cache line)
                    + static_cast<size_t>(num_ranks) * sizeof(EpochSlot)
                    + static_cast<size_t>(num_ranks) * CHUNK_CAPACITY * sizeof(float);

@@ -2539,7 +2539,7 @@ namespace llaminar2
             .long_name = "--ngram-distribution",
             .category = "Ngram Storage",
             .value_label = "<replicated|fixed-head-sharded>",
-            .description = "Explicit native ngram distribution; fixed-head-sharded requires --ngram-storage vram and full-main homogeneous rank-local GPU TP degree2/4/8; no PP or automatic entry",
+            .description = "Explicit native ngram distribution; fixed-head-sharded requires --ngram-storage vram and an original homogeneous rank-local GPU topology with admitted fixed PLE ranges; no automatic entry",
             .valid_values = {"replicated", "fixed-head-sharded"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c,const std::string &v) { c.ngram_table_policy.distribution=parseNgramDistribution(v); }),

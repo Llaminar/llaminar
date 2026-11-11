@@ -12,6 +12,7 @@
 #include "config/GDNProjectionArithmeticPolicy.h"
 #include "config/MoERouterArithmeticPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/runner/ObservedFixedPipelineEvidence.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "execution/local_execution/graph/IGraphExecutor.h"
@@ -36,7 +37,7 @@
 namespace llaminar2::accuracy
 {
 /** @brief Existing supported public-runner execution surfaces; no serving selector. */
-enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, HomogeneousLocalTP, GPUCPULocalTP, CPUExpertFollower };
+enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, HomogeneousLocalTP, GPUCPULocalTP, CPUExpertFollower, FixedNativePipeline };
 
 /** @brief Reject invalid diagnostic input without device work or partial output. */
 inline void requireQFN(bool condition, const char *message)
@@ -52,7 +53,7 @@ inline void requireQFN(bool condition, const char *message)
  * @note This grants no source, weight, collective or native readiness. Production retains those authorities.
  */
 inline bool qfnDistributedCPUJointIntent(const OrchestrationConfig& config) {
-    if(config.mpi_procs<=1)return false;
+    if(config.mpi_procs<=1 || isObservedFixedNativePipeline(config))return false;
     requireQFN(config.mpi_procs>=2 && config.mpi_procs<=8 && config.hostfile.empty() &&
         !config.execution_rank_selection && config.moe_routed_expert_plan &&
         config.moe_routed_expert_plan->usesExpertOverlayAuthority(),
@@ -341,7 +342,8 @@ inline void requireQFNSourceGeometry(const QFNSourceGeometry& actual,
  * @return Physical host-logit/forced-row shape only; actual prepared expert ownership refines LocalTP before graph certification.
  * @throws std::invalid_argument For cross-rank or unsupported physical execution.
  */
-inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan)
+inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan,
+    const OrchestrationConfig* original_config=nullptr)
 {
     requireQFN(!plan.usesPipelineParallel() && !plan.usesGlobalTP(), "QFN observer requires exactly one rank-local execution authority");
     if (plan.usesLocalPP())
@@ -356,7 +358,12 @@ inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan
             rocm |= address.device_type == DeviceType::ROCm;
             cpu |= address.device_type == DeviceType::CPU;
         }
-        requireQFN(cpu, "QFN observer GPU-only PP unsupported: pipeline ordinary resident-condition control is not implemented");
+        if(original_config && isObservedFixedNativePipeline(*original_config)) {
+            requireQFN(!cpu && cuda!=rocm && plan.local_pp_stage_tp_info.size()==plan.local_pp_devices.size(),
+                "QFN fixed native pipeline requires actual original homogeneous local stage domains");
+            return QFNObservationSurface::FixedNativePipeline;
+        }
+        requireQFN(cpu, "QFN observer GPU-only PP requires its original fixed native pipeline declaration");
         requireQFN(cuda && rocm && plan.local_pp_devices.size() == 3 &&
                    plan.local_pp_devices.back().device_type == DeviceType::CPU,
                    "QFN observer supports only the declared CUDA/ROCm/CPU-tail pipeline");
@@ -564,11 +571,12 @@ inline void qfnRequireGraphPathRecords(const std::vector<PerfStatRecord> &record
         requireQFN(prefill && decode,
                    "QFN observer lacks successful nonempty CPU runtime graph completion for prefill/decode");
     }
+    const bool homogeneous_gpu=surface == QFNObservationSurface::HomogeneousLocalTP ||
+        surface == QFNObservationSurface::FixedNativePipeline;
     const auto topology = surface == QFNObservationSurface::CPU
         ? ProductionParityExecutionTopology::CPUOnly
-        : surface == QFNObservationSurface::HomogeneousLocalTP
-            ? ProductionParityExecutionTopology::HomogeneousGPU
-            : ProductionParityExecutionTopology::HeterogeneousAccelerator;
+        : homogeneous_gpu ? ProductionParityExecutionTopology::HomogeneousGPU
+                          : ProductionParityExecutionTopology::HeterogeneousAccelerator;
     const auto contract = resolveProductionParityGraphContract(topology, true, !gpu_devices.empty());
     const auto evidence = collectProductionParityEvidence(records, true, topology, contract, false, 0.0, 4500.0);
     requireQFN(certifyProductionParityGraphExecution(evidence) == ProductionParityGraphCertification::Certified,
@@ -589,11 +597,11 @@ inline void qfnRequireGraphPathRecords(const std::vector<PerfStatRecord> &record
         requireQFN(prefill && (parityForwardGraphHasDecodePhase(local, "replay") ||
                               productionParityHasRetainedParentDecodeReplay(local)),
                    "QFN observer lacks actual per-device prefill/decode replay");
-        if (surface == QFNObservationSurface::HomogeneousLocalTP)
+        if (homogeneous_gpu)
         {
             const auto homogeneous = collectProductionParityEvidence(local, true, topology, contract, false, 0.0, 4500.0);
             requireQFN(certifyProductionParityGraphExecution(homogeneous) == ProductionParityGraphCertification::Certified,
-                       "QFN homogeneous LocalTP requires each original GPU's unsegmented captured path");
+                       "QFN homogeneous execution requires each original GPU's unsegmented captured path");
         }
     }
 }
@@ -797,7 +805,7 @@ public:
             bool cpu = false;
             for (const auto &domain : config.domain_definitions)
                 for (const auto &device : domain.devices) cpu |= device.device_type == DeviceType::CPU;
-            requireQFN(cpu, "QFN observer GPU-only PP unsupported: pipeline ordinary resident-condition control is not implemented");
+            requireQFN(cpu || isObservedFixedNativePipeline(config), "QFN observer GPU-only PP requires its original fixed native pipeline declaration");
         }
         if (config.moe_routed_expert_plan)
             for (const auto &domain : config.moe_routed_expert_plan->domains)

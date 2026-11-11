@@ -50,6 +50,10 @@ namespace llaminar2
         bool has_pipeline_parallel = false;
         RoutedExpertComputePolicy routed_compute_policy =
             RoutedExpertComputePolicy::Automatic;
+        RoutedExpertPhasePolicy routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+        /** Independent decode/grouped-verifier and ordinary-prefill scheduling. */
+        RoutedExpertWorkloadAssignmentPolicy routed_assignment_policy{
+            RoutedExpertAssignmentPolicy::StaticOwner, RoutedExpertAssignmentPolicy::StaticOwner};
         RoutedExpertOwnerOrder owner_order =
             RoutedExpertOwnerOrder::Ordinal;
         MoERebalanceRuntimeMode residency_maintenance =
@@ -113,5 +117,19 @@ namespace llaminar2
     normalizeMoEExpertOverlayPipelineStagePlan(
         const MoEExpertOverlayAuthorityPlanRequest &request,
         const FactoryPPStageConfig &scope);
+
+    /**
+     * @brief Normalize one original cross-rank CPU pipeline domain without making it LocalTP.
+     * @param request Stage policies and complete original participants; cross-rank TP is explicit.
+     * @param scope Exact model interval and global component roles.
+     * @param domain Canonical topology compiler's complete original CPU domain/rank declaration.
+     * @return Stage-owned host authority preserving every real MPI participant and authored policy.
+     * @throws std::invalid_argument for foreign, duplicated, non-CPU or non-node-local ownership.
+     * Runtime publication still requires its admitted original CPU collective and stage services.
+     */
+    [[nodiscard]] std::shared_ptr<MoERoutedExpertPlacementPlan>
+    normalizeMoEExpertOverlayPipelineStagePlan(
+        const MoEExpertOverlayAuthorityPlanRequest &request,
+        const FactoryPPStageConfig &scope, const ExecutionDomainDefinition &domain);
 
 } // namespace llaminar2

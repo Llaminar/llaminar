@@ -170,8 +170,10 @@ class CanonicalPrerequisiteRetirementTests(unittest.TestCase):
                 result = None
             else:
                 result = parity.run_production_test_preflight(self.build, None, self.root / "installed-receipt")
-                self.assertEqual(result[0], 0)
-                self.assertEqual(result[2], self.names)
+                self.assertEqual(result.return_code, 0)
+                self.assertEqual(result.tests, self.names)
+                self.assertEqual(result.qualification["selected"], list(self.names))
+                self.assertEqual(result.qualification["unqualified"], {})
                 self.assertEqual(execute.call_count, 3)
                 commands = [call.args[0] for call in execute.call_args_list]
                 self.assertTrue(all(command[0] == "ctest" and "--no-tests=error" in command

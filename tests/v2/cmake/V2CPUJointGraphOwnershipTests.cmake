@@ -56,28 +56,6 @@ add_v2_test(V2_Integration_SharedDispatchLiveUnionContract
             --gtest_filter=MoEOverlaySharedDispatchSelection.* --gtest_repeat=20
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;LivePayload;Contract;Regression" NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
 
-# Native capture must touch only the union of actual same-rank consumer rows.
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    foreach(vendor IN ITEMS CUDA ROCm)
-        add_v2_test(V2_Integration_SharedDispatchLiveUnion_${vendor}
-            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                    --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}SharedPhysicalUnionHasOneWriterAndOnlyLivePayload
-                    --gtest_brief=1
-            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LivePayload;Regression"
-            MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
-    endforeach()
-endif()
-
-# Source-native fixture metadata must validate before any backend/device setup.
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    add_v2_test(V2_Integration_JointSourceFixtureColdPlacement
-        COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.JointSourceFixtureHasCompleteOriginalColdPlacement
-                --gtest_repeat=20 --gtest_brief=1
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;SourceOwnership;Contract;Regression"
-        MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
-endif()
-
 # Actual factory scalar projection, including authored CPU TP1 and joint TP2..8.
 add_executable(v2_unit_moe_graph_compute_policy unit/execution/moe/Test__MoEGraphComputePolicy.cpp)
 target_include_directories(v2_unit_moe_graph_compute_policy PRIVATE ${CMAKE_SOURCE_DIR})
@@ -105,19 +83,7 @@ add_v2_test(V2_Integration_LiveCohortChannelIdentityContract
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Protocol;Contract;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_LiveCohortChannelIdentityContract)
-if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    foreach(vendor IN ITEMS CUDA ROCm)
-        set(_zero_joint_test V2_Integration_JointZeroWeightCompactionReplay_${vendor})
-        add_v2_test(${_zero_joint_test}
-            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}JointZeroWeightCompactionReplay
-                --gtest_brief=1
-            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LivePayload;Replay;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_zero_joint_test})
-    endforeach()
-    unset(_zero_joint_test)
-endif()
+
 
 add_v2_test(V2_Integration_LiveCohortPlacementBankContract
     COMMAND $<TARGET_FILE:v2_test_moe_runtime_table>

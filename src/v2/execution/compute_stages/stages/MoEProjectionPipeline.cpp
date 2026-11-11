@@ -97,9 +97,9 @@ namespace
                 params.rows > std::numeric_limits<int>::max() / params.top_k ||
                 !validMoEGroupedPlanDemand(params.demand))
                 throw std::invalid_argument("Projection graph requires complete immutable execution bindings");
-            // Only counted transport needs this explicit scheduling authority.
-            // Other native/P2P declarations retain their existing phase rules.
-            if (params.counted_exchange) (void)moeCountedTransferScheduling(params.service_phase);
+            // Counted native transport requires an explicit immutable semantic phase.
+            // The phase belongs in capture identity; it never selects a second transport.
+            if (params.counted_exchange) requireMoENativeCountedPhase(params.service_phase);
             const auto &ownership = params.fixed_down->ownership();
             const auto geometry = ownership.geometry();
             if (params.top_k > geometry.experts ||
@@ -326,9 +326,8 @@ namespace
                 const std::string identity = params.prefix + "/" + std::to_string(params.rows) + "/" +
                     std::to_string(layout.columns) + "/" + std::to_string(static_cast<int>(layout.encoding)) +
                     "/phase/" + std::to_string(static_cast<std::uint32_t>(params.service_phase));
-                const auto scheduling = moeCountedTransferScheduling(params.service_phase);
                 compact = params.counted_exchange->bind(params.fixed_down->ownership().participant(),
-                    {fnv1a64(identity.data(), identity.size()), layout.compactCapacityBytes()}, scheduling,
+                    {fnv1a64(identity.data(), identity.size()), layout.compactCapacityBytes()},
                     retain(params.local_packet.tensor), retain(params.gathered_packets.tensor));
             }
             std::uint64_t expected_intent = 0;

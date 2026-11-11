@@ -46,7 +46,7 @@ struct PooledImmutableRetainedParticipants::State {
     struct Owner {
         PreparedGPUContextUsePermit original;
         std::uint32_t coordinate;
-        std::optional<PooledRemoteGraphProgram> program; ///< Present only for a separately recorded storage definition.
+        std::optional<PooledStorageOwnerProgram> program; ///< Present only for a separately recorded storage definition.
         std::shared_ptr<IDeviceContext> context;
         std::shared_ptr<BufferArena> arena;
         std::shared_ptr<ComputeGraph> graph;
@@ -80,7 +80,7 @@ struct PooledImmutableRetainedParticipants::State {
     std::vector<std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> localHotParticipants; ///< Sole immutable local-root roster, in declared consumer order.
     std::vector<LocalParticipant> locals; ///< Same-roster original worker and parent lifetimes only.
     std::unique_ptr<RetainedGraphParticipantEnqueueGroup> enqueueGroup;
-    std::vector<PooledRemoteGraphProgram> programs; ///< Original physical order; never recomputed from live counts.
+    std::vector<PooledStorageOwnerProgram> programs; ///< Original physical order; never recomputed from live counts.
     std::uint64_t rootIdentity;
     mutable std::mutex submissionMutex;
     std::optional<RetainedGraphParticipantParentStream> submissionStream;
@@ -184,7 +184,7 @@ public:
         fold(reinterpret_cast<std::uintptr_t>(owner_->state_->transport.get()));
         fold(reinterpret_cast<std::uintptr_t>(owner_->state_->executionPolicy.get()));
         for(const auto& local:owner_->state_->locals)fold(local.rootIdentity);
-        for(const auto& owner:owner_->state_->owners){fold(owner.program ? owner.program->captureIdentity() : owner.coordinate);fold(owner.topology);
+        for(const auto& owner:owner_->state_->owners){fold(owner.program ? pooledStorageOwnerIdentity(*owner.program) : owner.coordinate);fold(owner.topology);
             fold(reinterpret_cast<std::uintptr_t>(owner.executable.get()));}
         std::visit([&](const auto& completion){
             using T=std::decay_t<decltype(completion)>;
@@ -581,7 +581,7 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
     }
     if(witness->coordinator().worker()->ownsCurrentThread())throw std::logic_error("Recurring owner preparation must run off its original source worker");
     std::unique_ptr<RetainedGraphParticipantEnqueueGroup> enqueueGroup;
-    std::vector<PooledRemoteGraphProgram> programs;
+    std::vector<PooledStorageOwnerProgram> programs;
     for(const auto& owner:witness->owners()){
         if(owner.worker()->ownsCurrentThread())throw std::logic_error("Recurring owner preparation must run off every original participant worker");
         if(owner.device()!=boundary->device()){
@@ -591,11 +591,15 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
                 std::any_of(readers->consumers().begin(), readers->consumers().end(),
                     [&](const auto& reader) { return reader.device == owner.device(); });
             if (inlineNative) continue;
-            auto program=PooledImmutableDirectedOwnerProgram::fromOriginalPlans(storage->originalOwners()[coordinate]->plan(),storage->coordinator()->plan());
-            // Revalidate every installed host class before creating even the
-            // first directed channel. This selects no numeric caller budget.
-            (void)RetainedParticipantGraphExecutable::hostBOM(program,witness->source()->originalResource(DeviceId::cpu()),
-                witness->source()->originalResource(owner.device()));
+            auto program=PooledImmutableDirectedOwnerProgram::fromOriginalStoragePlans(storage->originalOwners()[coordinate]->plan(),storage->coordinator()->plan());
+            // Validate each exact mapped or native-General resource declaration
+            // before creating the first directed channel. No caller supplies a bound.
+            std::visit([&](const auto& contract){
+                using Contract=std::decay_t<decltype(contract)>;
+                if constexpr(std::is_same_v<Contract,PooledRemoteGraphProgram>)
+                    (void)RetainedParticipantGraphExecutable::hostBOM(contract,witness->source()->originalResource(DeviceId::cpu()),witness->source()->originalResource(owner.device()));
+                else (void)RetainedParticipantGraphExecutable::nativeStorageBOM(contract,witness->source()->originalResource(DeviceId::cpu()),witness->source()->originalResource(owner.device()));
+            },program);
             programs.push_back(std::move(program));
         }
     }
@@ -806,7 +810,7 @@ void PooledImmutableRetainedParticipants::prepareOriginalOwners(){
                 .code=std::move(code), .disposition=State::ExecutionDisposition::InlineReader});
             continue;
         }
-        const auto declared=std::find_if(state_->programs.begin(),state_->programs.end(),[&](const auto& program){return program.geometry().coordinate==edge.coordinate;});
+        const auto declared=std::find_if(state_->programs.begin(),state_->programs.end(),[&](const auto& program){return pooledStorageOwnerGeometry(program).coordinate==edge.coordinate;});
         if(declared==state_->programs.end())throw std::logic_error("Recurring original owner lost its admitted source program");
         State::Owner owner{.original=permit,.coordinate=edge.coordinate,.program=*declared,
             .arena=std::make_shared<BufferArena>(),.graph=std::make_shared<ComputeGraph>(),.code=std::move(code)};
@@ -832,7 +836,16 @@ void PooledImmutableRetainedParticipants::prepareOriginalOwners(){
                 catch(...){std::terminate();}
             });
             if(!owner.context)throw std::runtime_error("Recurring owner lost its original device context");
-            const auto nodes=appendPooledImmutableDirectedOwnerGraph(*owner.graph,*owner.arena,edge,owner.code,*owner.program,"immutable_owner");
+            const auto nodes=std::visit([&](const auto& contract){
+                using Contract=std::decay_t<decltype(contract)>;
+                if constexpr(std::is_same_v<Contract,PooledRemoteGraphProgram>)
+                    return appendPooledImmutableDirectedOwnerGraph(*owner.graph,*owner.arena,edge,owner.code,contract,"immutable_owner");
+                else {
+                    const auto actual=PooledImmutableDirectedOwnerProgram::fromOriginalStoragePlans(edge.pin->ownerStorage()->plan(),edge.pin->coordinatorStorage()->plan());
+                    if(actual!=*owner.program)throw std::logic_error("Native retained owner substituted its original source semantic declaration");
+                    return appendPooledImmutableNativeOwnerGraph(*owner.graph,*owner.arena,edge,owner.code,"immutable_owner");
+                }
+            },*owner.program);
             owner.terminal=nodes.last;
             DeviceGraphExecutor executor;executor.setArena(owner.arena.get());
             constexpr auto label="original recurring immutable owner";

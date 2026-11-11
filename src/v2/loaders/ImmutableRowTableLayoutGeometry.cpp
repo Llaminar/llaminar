@@ -150,13 +150,7 @@ bool ImmutableRowTableDirectedTransportPolicy::supports(PhysicalMemoryAllocatorI
         (!observation || *observation == PeerAccessCoverage::None || *observation == PeerAccessCoverage::Complete) &&
         (owner == coordinator || owner.device.type != coordinator.device.type || observation == PeerAccessCoverage::None || observation == PeerAccessCoverage::Complete);
 }
-bool ImmutableRowTableDirectedTransportPolicy::usesPeerPayload(PhysicalMemoryAllocatorIdentity coordinator,
-    PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation)
-{
-    require(coordinator, owner, observation);
-    return coordinator != owner && coordinator.device.type == owner.device.type &&
-        observation == PeerAccessCoverage::Complete;
-}
+
 void ImmutableRowTableDirectedTransportPolicy::require(PhysicalMemoryAllocatorIdentity coordinator,
     PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation)
 {

@@ -112,13 +112,15 @@ namespace llaminar2
             ncclNumTypes = 10
         };
 
+        // Native reduction ordinals, independently compiler-checked against the configured vendor header.
+        // Internal backend wrapper op codes are translated separately and are not these ABI values.
         // Reduction operations (same as NCCL)
         enum ncclRedOp_t
         {
             ncclSum = 0,
             ncclProd = 1,
-            ncclMin = 2,
-            ncclMax = 3,
+            ncclMax = 2,
+            ncclMin = 3,
             ncclAvg = 4,
             ncclNumOps = 5
         };
@@ -128,6 +130,9 @@ namespace llaminar2
         // =========================================================================
 
         // Unique ID management
+        /** @return True only from the compiler/header-checked native reduction ABI TU. */
+        bool configuredReductionABIContract() noexcept;
+
         ncclResult_t ncclGetUniqueId(ncclUniqueId *uniqueId);
 
         // Communicator management

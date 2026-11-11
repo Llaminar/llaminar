@@ -1000,6 +1000,42 @@ namespace llaminar2
         return error;
     }
 
+    bool HIPGraphCapture::appendActiveCaptureChild(const IGPUGraphCapture &child)
+    {
+        const auto *recorded = dynamic_cast<const HIPGraphCapture *>(&child);
+        if (!native_capture_active_ || !recorded || recorded == this ||
+            recorded->device_ordinal_ != device_ordinal_ || recorded->projection_owner_ != projection_owner_ ||
+            recorded->native_capture_active_ || !recorded->graph_ || !recorded->node_count_ ||
+            recorded->exec_ || !activateOwner("appendActiveCaptureChild"))
+            return false;
+
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        unsigned long long capture_id = 0;
+        hipGraph_t destination = nullptr;
+        const hipGraphNode_t *dependencies = nullptr;
+        std::size_t count = 0;
+        const auto query = hipStreamGetCaptureInfo_v2(stream_, &status, &capture_id,
+            &destination, &dependencies, &count);
+        if (query != hipSuccess || status != hipStreamCaptureStatusActive || !capture_id ||
+            !destination || destination == recorded->graph_ || (graph_ && destination != graph_) ||
+            (count && !dependencies))
+        {
+            LOG_ERROR("[HIPGraphCapture] Shared child could not resolve its active stream frontier: "
+                      << hipGetErrorString(query));
+            return false;
+        }
+        hipGraphNode_t node = nullptr;
+        auto result = hipGraphAddChildGraphNode(&node, destination, dependencies, count, recorded->graph_);
+        if (result == hipSuccess && node)
+            result = hipStreamUpdateCaptureDependencies(stream_, &node, 1u, hipStreamSetCaptureDependencies);
+        if (result != hipSuccess || !node)
+        {
+            LOG_ERROR("[HIPGraphCapture] Shared child frontier import failed: " << hipGetErrorString(result));
+            return false;
+        }
+        return true;
+    }
+
     bool HIPGraphCapture::endCapture()
     {
         if (!native_capture_active_)

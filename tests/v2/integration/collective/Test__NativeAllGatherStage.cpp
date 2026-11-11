@@ -9,6 +9,7 @@
  * waits belong only to the fixture; the production stage enqueues no waits on
  * the host and performs no allocation, conversion or extra copy.
  */
+#include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -162,12 +163,14 @@ namespace
      */
     void verifyNativeAllGather(DeviceId first, bool arena_counted = false, int row_capacity = 3, bool overlapped = false, GatherPeerDrop drop = GatherPeerDrop::None)
     {
+        test::originalRankLocalReplay(first.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm, 2, [&](const auto &cohort) {
+
         ASSERT_TRUE(drop==GatherPeerDrop::None || (overlapped && arena_counted));
         auto *backend = getBackendFor(first);
         ASSERT_NE(backend, nullptr);
         ASSERT_GE(backend->deviceCount(), 2) << "Native allgather proof requires two GPUs";
         const std::array<DeviceId, 2> devices{
-            first.is_cuda() ? DeviceId::cuda(1) : DeviceId::rocm(1), first};
+            cohort[1], cohort[0]};
         const std::vector members{GlobalDeviceAddress::fromLocalDeviceId(devices[0]),
             GlobalDeviceAddress::fromLocalDeviceId(devices[1])};
         const auto native_backend=first.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
@@ -189,10 +192,10 @@ namespace
             const auto bytes=receipt_requirements.total_bytes_with_alignment();
             PhysicalMemoryPlanBuilder plan;
             for(const auto device:devices)
-                plan.add({.world_rank=0,.device=device,.total_bytes=bytes,.admission_available_bytes=bytes},
+                plan.add({.world_rank=MPIContextFactory::global()->rank(),.device=device,.total_bytes=bytes,.admission_available_bytes=bytes},
                     PhysicalMemoryOwner::ExecutionWorkspace,bytes);
             receipt_memory=std::make_shared<PhysicalMemoryAuthority>(
-                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),MPIContextFactory::global()->rank());
         }
         std::array<std::size_t, 4> extents{1,37,4097,32768};
         if (arena_counted) for (auto &bytes : extents) bytes *= row_capacity;
@@ -613,6 +616,8 @@ namespace
                 try { std::rethrow_exception(error); }
                 catch (const std::exception &failure) { ADD_FAILURE() << failure.what(); }
             }
+
+        });
     }
 } // namespace
 

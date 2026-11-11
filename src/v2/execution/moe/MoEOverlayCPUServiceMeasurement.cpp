@@ -111,6 +111,9 @@ namespace llaminar2
                 source.allocator(), source.placement(), source.initialization()};
         }
 
+        /** @brief One original immutable calibration selection, exchanged outside the timed body. */
+        struct JointServiceJob { uint64_t epoch; int layer,expert,phase,tier,rows,h,f,e; };
+
         /** @brief Exact serial probe roots; the same declaration feeds pricing and construction. */
         struct JointServiceStorageLayout
         {
@@ -121,12 +124,13 @@ namespace llaminar2
             CPUStorageRoot<RootedFloatRecordRange> ranges;
             CPUStorageRoot<int32_t> maps;
             CPUStorageRoot<float> required;
+            CPUStorageRoot<JointServiceJob> jobs; ///< Exact original cohort, never a fixed stack cardinality.
             /** @return Complete physical roots without invocation workspace, checked for overflow. */
             size_t physicalBytes() const
             {
                 size_t total=service.physicalBytes();
                 for(auto bytes:{packed.physicalBytes(),combined.physicalBytes(),release.physicalBytes(),
-                    ranges.physicalBytes(),maps.physicalBytes(),required.physicalBytes()}) {
+                    ranges.physicalBytes(),maps.physicalBytes(),required.physicalBytes(),jobs.physicalBytes()}) {
                     if(bytes>SIZE_MAX-total)throw std::overflow_error("CPU joint prepared-compute roots overflow");
                     total+=bytes;
                 }
@@ -163,7 +167,9 @@ namespace llaminar2
                 0,PhysicalMemoryOwner::ExecutionWorkspace,route.packed().allocator(),placement);
             return {route,config,std::move(service),setupRoot(route.packed()),
                 floatRoot(route.isRoot()?static_cast<size_t>(rows)*geometry.model_columns:0),
-                floatRoot(1),rangeRoot,mapRoot,route.required()?setupRoot(*route.required()):floatRoot(0)};
+                floatRoot(1),rangeRoot,mapRoot,route.required()?setupRoot(*route.required()):floatRoot(0),
+                CPUStorageRoot<JointServiceJob>(cohort->participants().size(),PhysicalMemoryOwner::ExecutionWorkspace,
+                    route.packed().allocator(),placement)};
         }
 
         /** @brief Compare immutable original shared owners, rejecting no-op aliases.
@@ -435,6 +441,7 @@ namespace llaminar2
         auto ranges=layout.ranges.allocate(memory);
         auto maps=layout.maps.allocate(memory);
         auto required=layout.required.allocate(memory);
+        auto jobs=layout.jobs.allocate(memory);
         for(int row=0;row<rows;++row) {
             indices.mutable_typed_data()[row]=static_cast<float>(expert);
             weights.mutable_typed_data()[row]=1.0f;
@@ -479,13 +486,11 @@ namespace llaminar2
         auto context=IDeviceContext::create(device);
         // Metadata-only job agreement is outside the timed boundary. A caller
         // cannot accidentally combine different experts/phases with matching row
-        // shapes. Fixed eight-member storage is the canonical cohort maximum;
-        // the collective carries exactly one live job record per actual member.
-        struct Job { uint64_t epoch; int layer,expert,phase,tier,rows,h,f,e; };
-        const Job job{epoch,layer,expert,static_cast<int>(source_phase),placement->tier_idx,
+        // shapes. The original cohort-sized root is admitted/materialized once
+        // before timing; collect exactly one live record per actual member.
+        const JointServiceJob job{epoch,layer,expert,static_cast<int>(source_phase),placement->tier_idx,
             rows,h,geometry.intermediate_columns,e};
-        std::array<Job,8> jobs{};
-        if(domain->degree()<2 || domain->degree()>static_cast<int>(jobs.size()) ||
+        if(domain->degree()<2 || static_cast<size_t>(domain->degree())!=jobs.size() ||
             !domain->allgatherBytes(&job,jobs.data(),sizeof(job)))
             throw std::runtime_error("CPU joint prepared-compute job agreement failed");
         for(int i=0;i<domain->degree();++i) {

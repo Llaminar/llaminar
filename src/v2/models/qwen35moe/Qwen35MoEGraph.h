@@ -339,6 +339,17 @@ namespace llaminar2
         DeviceMoEOverlayEpochArena::Config moeOverlayEpochArenaConfig(DeviceId device) const;
 
         /**
+         * @brief Require the original model-bound prepared store before Batch construction.
+         * @param device Exact Batch allocator already owned by the model admission.
+         * @return Same shared model/PMA identity carried by the prepared store.
+         * @throws std::logic_error For missing prepared binding, missing model admission,
+         *         an unowned device or a foreign prepared-store authority.
+         * @note Early epoch declaration remains legal before store publication; an
+         *       actual Batch must consume the store installed by the runner factory.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority> moeActivationBatchMemoryAuthority(DeviceId device) const;
+
+        /**
          * @brief Retain every grouped-verifier embedding row on device.
          *
          * This opt-in diagnostic establishes the first data boundary after

@@ -11,6 +11,11 @@
  * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
 
+#include "execution/moe/MoEOverlayActivationBatchInventory.h"
+#include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/mtp/MTPForwardConstruction.h"
+#include "models/qwen/LayerGraphIdentity.h"
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
@@ -305,28 +310,52 @@ TEST(Test__MemoryPlanner, CountedProjectionTransportHasOneCanonicalPhysicalBOM)
     constexpr auto staging_owner = PhysicalMemoryOwner::ActivationTransportStaging;
     for (const auto first : {DeviceId::cuda(0), DeviceId::rocm(0)})
     for (const int degree : {2, 4, 8})
-    for (const auto coverage : {PeerAccessCoverage::None, PeerAccessCoverage::Partial, PeerAccessCoverage::Complete})
+    for (const int clique : {1, 2, degree})
     {
+        RankInventory observed;
+        observed.rank = 0;
+        std::vector<DeviceId> members;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            members.push_back(first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant));
+            observed.gpus.push_back({.type = first.type, .local_device_id = participant});
+        }
+        auto &matrix = first.is_cuda() ? observed.p2p_cuda : observed.p2p_rocm;
+        auto &count = first.is_cuda() ? observed.p2p_cuda_count : observed.p2p_rocm_count;
+        count = degree;matrix.resize(std::size_t(degree) * degree);
+        for (int i = 0; i < degree; ++i) for (int j = 0; j < degree; ++j)
+            matrix[std::size_t(i) * degree + j] = i != j && i / clique == j / clique;
+        const auto topology = std::make_shared<const DeviceCountedAllGatherTopology>(
+            DeviceCountedAllGatherTopology::resolve(observed, members));
         std::vector<DevicePlanConfig> configs;
         for (int participant = 0; participant < degree; ++participant)
         {
-            auto config = overlayDeviceConfig(first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant));
+            auto config = overlayDeviceConfig(members[participant]);
+            config.world_rank = 0;
             config.shard_index = participant; config.total_shards = degree;
             config.local_tp_backend = first.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
             config.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
-            config.projection_peer_access = coverage;
-            config.associated_host_memory = PhysicalMemoryResource{.world_rank = -1, .device = DeviceId::cpu(),
+            config.projection_exchange_topology = topology;
+            config.associated_host_memory = PhysicalMemoryResource{.world_rank = 0, .device = DeviceId::cpu(),
                 .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
             configs.push_back(config);
         }
         const auto plan = MemoryPlanner::plan(profile, configs);
-        const auto geometry = DeviceCountedAllGather::memoryFor(degree,
-            MoEProjectionArenaGeometry::resolve(profile, degree).packetCapacityBytes(32));
+        std::size_t expected_host = 0, expected_device = 0;
+        for (int p = 0; p < degree; ++p)
+        {
+            const auto quote = topology->memoryFor(p,
+                MoEProjectionArenaGeometry::resolve(profile, degree).packetCapacityBytes(32));
+            expected_host += quote.host_bytes;expected_device += quote.device_bytes;
+        }
         std::size_t host_bytes = 0, device_bytes = 0;
         for (const auto &row : plan.devices)
             (row.device().is_cpu() ? host_bytes : device_bytes) += row.bom().bytes(staging_owner);
-        EXPECT_EQ(host_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.host_bytes : 0u);
-        EXPECT_EQ(device_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.device_bytes : 0u);
+        EXPECT_EQ(host_bytes, expected_host);
+        EXPECT_EQ(device_bytes, expected_device);
+        auto mismatched = configs;
+        mismatched.front().shard_index = degree - 1;
+        EXPECT_THROW(MemoryPlanner::plan(profile, mismatched), std::invalid_argument);
     }
 }
 
@@ -2104,6 +2133,63 @@ TEST(Test__MemoryPlanner, CapturedPipelineChannelAccountingIsExactAndBackendSymm
     EXPECT_THROW(PipelineTransferMemory::forRows(1, 0, 1), std::invalid_argument);
     EXPECT_THROW(PipelineTransferMemory::forRows(1, 1, 0), std::invalid_argument);
     EXPECT_THROW(PipelineTransferMemory::forRows(std::numeric_limits<size_t>::max(), 2, 1), std::overflow_error);
+}
+
+/**
+ * @brief Original rank PMAs admit only the CPU allocator that owns physical mapped pages.
+ *
+ * Replay both backend orders and original ranks through the actual planner and
+ * materialization ledger. A receiver with zero host bytes has no CPU authority;
+ * querying or claiming that absent allocator must remain a hard error rather
+ * than manufacturing a second host budget or a zero-valued live ledger.
+ */
+TEST(Test__MemoryPlanner, CapturedPipelineOriginalRankHostAuthorityLifecycle)
+{
+    const auto profile = createTestProfile();
+    constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
+    const auto geometry = PipelineTransferMemory::forRows(profile.d_model, 8, 1);
+    for (const bool reverse : {false, true})
+    for (int rank = 0; rank != 2; ++rank)
+    {
+        SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " original_rank=" << rank);
+        DevicePlanConfig cfg;
+        cfg.world_rank = rank;
+        cfg.device = (bool(rank) == reverse) ? DeviceId::cuda(1) : DeviceId::rocm(3);
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+        cfg.device_compute_units = 128;
+        cfg.max_seq_len = 256;
+        cfg.activation_seq_len = 8;
+        cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = rank, .device = DeviceId::cpu(),
+            .total_bytes = 64ull << 30, .admission_available_bytes = 64ull << 30};
+        cfg.captured_pipeline_boundaries = {rank == 0 ? PipelineBoundarySide::EarlierDomain :
+            PipelineBoundarySide::LaterDomain};
+        auto certificate = std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
+            MemoryPlanner::plan(profile, {cfg}).physicalPlan());
+        PhysicalMemoryAuthority authority(certificate, rank);
+        ASSERT_TRUE(authority.contains(cfg.device));
+        EXPECT_EQ(authority.contains(DeviceId::cpu()), rank == 0);
+        if (rank == 0)
+        {
+            EXPECT_EQ(authority.plannedBytes(DeviceId::cpu(), owner), geometry.host_bytes_per_boundary);
+            for (int replay = 0; replay != 3; ++replay)
+            {
+                {
+                    auto lease = authority.claimNewAllocation(DeviceId::cpu(), owner, geometry.host_bytes_per_boundary);
+                    EXPECT_EQ(authority.claimedBytes(DeviceId::cpu(), owner,
+                        PhysicalMemoryMaterializationKind::NewAllocation), geometry.host_bytes_per_boundary);
+                }
+                EXPECT_EQ(authority.claimedBytes(DeviceId::cpu(), owner,
+                    PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            }
+        }
+        else
+        {
+            EXPECT_THROW(authority.claimedBytes(DeviceId::cpu(), owner,
+                PhysicalMemoryMaterializationKind::NewAllocation), std::out_of_range);
+            EXPECT_THROW(authority.claimNewAllocation(DeviceId::cpu(), owner, 1), std::out_of_range);
+        }
+        EXPECT_EQ(authority.plannedBytes(cfg.device, owner), geometry.device_bytes_per_boundary);
+    }
 }
 
 TEST(Test__MemoryPlanner,
@@ -3984,7 +4070,7 @@ TEST(Test__MemoryPlanner, NgramVRAMEligibilityUsesEachOriginalUploadGeometry)
     EXPECT_THROW(MemoryPlanner::immutableRowTableModeContributions(profile,resident,groups,foreign),std::invalid_argument);
 }
 
-/** @test Native and hosted PP participants price one sampler-free parent per admitted query program. */
+/** @test Native and hosted PP participants price distinct zero-output source and parent per query program. */
 TEST(Test__MemoryPlanner, NativePipelineForwardOnlyParentHasNamedPhysicalBOM)
 {
     constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
@@ -4047,11 +4133,18 @@ TEST(Test__MemoryPlanner, ForwardOnlyBOMFollowsOriginalNativePipelineProjection)
         PipelineStageTransferMemory::forStage(parent, 0).bind(cfg);
         EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
         EXPECT_THROW(PipelineStageTransferMemory::forStage(parent, 0).bind(cfg), std::invalid_argument);
-        EXPECT_EQ(cfg.local_pipeline_backend.has_value(), topology == 0);
-        if (topology == 0)
+        // Nested TP preserves the native outer PP transport. Its source
+        // leader owns one reverse receive and one send per actual tail member;
+        // the legacy singleton boundary has its separate fixed fence inventory.
+        if (topology != 2)
         {
+            ASSERT_TRUE(cfg.local_pipeline_backend);
             EXPECT_EQ(*cfg.local_pipeline_backend, type == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
         }
+        else EXPECT_FALSE(cfg.local_pipeline_backend);
+        EXPECT_EQ(cfg.native_pipeline_byte_endpoints, topology == 1 ? 3u : 0u);
+        EXPECT_EQ(cfg.captured_pipeline_boundaries.size(), topology == 2 ? 1u : 0u);
+        EXPECT_FALSE(cfg.pipeline_native_activation_fanout);
     }
 }
 
@@ -4094,7 +4187,7 @@ TEST(Test__MemoryPlanner, CapturedDomainForwardOnlyOwnersIncludeEveryPhysicalPar
                 EXPECT_EQ(cfg.pipeline_forward_only_graph_owner, PipelineForwardOnlyGraphOwner::Participant);
                 for (const size_t programs : {1u, 2u})
                     EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(
-                        programs, cfg.pipeline_forward_only_graph_owner), programs);
+                        programs, cfg.pipeline_forward_only_graph_owner), 2u * programs);
                 EXPECT_THROW(transfer.bind(cfg), std::invalid_argument);
             }
         }
@@ -4409,8 +4502,8 @@ TEST(Test__MemoryPlanner, SparseQueryProgramInventoryPricesOnlyAdditionalMainOwn
         EXPECT_EQ(two.mtp_graph_owners.speculativePublicationGraphSlots(), retains ? 2u : 0u);
         EXPECT_EQ(two.mtp_graph_owners.generalAuxiliaryExecutableSlotCount(),
             one.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + (retains ? 2u : 0u));
-        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant),1u);
-        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u, PipelineForwardOnlyGraphOwner::Participant),2u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(1u, PipelineForwardOnlyGraphOwner::Participant),2u);
+        EXPECT_EQ(OrdinaryGenerationGraphPlan::pipelineForwardOnlyExecutableCount(2u, PipelineForwardOnlyGraphOwner::Participant),4u);
         for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
             EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(
                 device,
@@ -5083,3 +5176,145 @@ TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureConcurrentModuleReplay){
 }
 
 #include "LocalNativePreparationBOMContract.inc"
+
+/** @test Batch storage follows actual retained sources and original layer ordinals at arbitrary bounds. */
+TEST(Test__MemoryPlanner, MappedBatchOriginalSourceInventoryContract)
+{
+    const std::vector<int> buckets{1, 3, 8, 33};
+    for (const int layers : {1, 3, 48})
+    for (const int depth : {0, 1, 3, 7})
+    for (const auto verifier : {MTPVerifierGraphFamily::BoundedBuckets, MTPVerifierGraphFamily::ExactRows})
+    for (const std::size_t programs : {1u, 2u})
+    {
+        MTPRuntimeConfig mtp;
+        mtp.enabled = depth != 0;
+        mtp.draft_tokens = std::max(1, depth);
+        MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 41, .main_layer_count = layers,
+            .max_graph_rows = 33, .max_decode_rows = std::max(1, depth + 1),
+            .max_request_count = 1, .max_mtp_draft_depth = depth, .first_model_layer = 5};
+        for (int source = 0; source < depth; ++source) family.mtp_source_layers.push_back(5 + layers + source);
+        const auto inventory = MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 1, mtp, verifier, programs);
+        const auto serving = resolveCapturedServingGraphMemoryInventory({}, mtp, verifier,
+            MTPGenerationParentRole::Controller, DeviceGenerationExecutionDomain::HostedBoundary, programs);
+        EXPECT_EQ(inventory->mainGraphIdentityCount(),
+            (buckets.size() + kExpertOverlayPrefillGraphIdentityReserve) * programs + serving.fixed_executable_count);
+        EXPECT_EQ(inventory->sources().size(), inventory->mainGraphIdentityCount() + (family.mtp_source_layers.empty() ? 0u : 4u));
+        ForwardInput input;
+        input.batch_size = 1; input.seq_len = 3;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        for (int ordinal = 0; ordinal < layers; ++ordinal)
+        {
+            const auto layer = LayerGraphSourceIdentity::main(5 + ordinal, 5 + layers, 5, GraphCacheLayerIndex::CacheLocal);
+            EXPECT_NO_THROW(inventory->require(input, layer, 3, ordinal));
+            EXPECT_THROW(inventory->require(input, layer, 3, ordinal + 1), std::invalid_argument);
+        }
+        const auto first = LayerGraphSourceIdentity::main(5, 5 + layers, 5, GraphCacheLayerIndex::CacheLocal);
+        input.seq_len = 34;
+        EXPECT_THROW(inventory->require(input, first, 34, 0), std::invalid_argument);
+        input.seq_len = 1;
+        input.execution_phase = static_cast<ForwardExecutionPhase>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.graph_submission_intent = static_cast<ForwardGraphSubmissionIntent>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        input.execution_role = ForwardExecutionRole::MTPCondition;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        if (depth) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        int token = 0;
+        input.token_ids_device = &token;
+        input.mtp_sidecar_capture_role = MTPSidecarCaptureRole::Full;
+        for (int source = 0; source < depth; ++source)
+        {
+            const auto predictor = LayerGraphSourceIdentity::inlinePredictor(family.mtp_source_layers[source], source);
+            for (const auto role : {MTPSidecarCaptureRole::Full, MTPSidecarCaptureRole::Chained})
+            for (const bool device_token : {false, true})
+            {
+                MTPForwardInput learned;
+                learned.capture_role = role;
+                learned.draft_token_ids = &token;
+                learned.draft_token_ids_device = device_token ? &token : nullptr;
+                const auto projected = mtpForwardConstructionInput(learned);
+                EXPECT_EQ(projected.mtp_sidecar_capture_role, role);
+                if (source == 0) EXPECT_NO_THROW(inventory->require(projected, predictor, 1, 0));
+                else EXPECT_THROW(inventory->require(projected, predictor, 1, 0), std::invalid_argument);
+                learned.capture_role = static_cast<MTPSidecarCaptureRole>(99);
+                EXPECT_THROW(mtpForwardConstructionInput(learned), std::invalid_argument);
+                learned.capture_role = role;
+                learned.kv_cache_only = true;
+                const auto kv_only = mtpForwardConstructionInput(learned);
+                EXPECT_THROW(inventory->require(kv_only, predictor, 1, 0), std::invalid_argument);
+            }
+            EXPECT_THROW(inventory->require(input, predictor, 1, 1), std::invalid_argument);
+        }
+        input.token_ids_device = nullptr;
+        input.mtp_sidecar_capture_role.reset();
+        input.execution_role = ForwardExecutionRole::MainInference;
+        input.state_transaction = static_cast<ForwardStateTransaction>(99);
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.state_transaction = ForwardStateTransaction::ForwardOnlyCondition;
+        EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        const auto pipeline_inventory = MoEOverlayActivationBatchInventory::declare(
+            family, buckets, 33, 1, mtp, verifier, programs, PipelineForwardOnlyGraphOwner::Participant);
+        EXPECT_NO_THROW(pipeline_inventory->require(input, first, 1, 0));
+        EXPECT_EQ(pipeline_inventory->mainGraphIdentityCount(), inventory->mainGraphIdentityCount());
+        EXPECT_EQ(pipeline_inventory->sources().size(), inventory->sources().size() + programs);
+        input.state_transaction = ForwardStateTransaction::Ordinary;
+        input.sparse_query_execution_program = SparseQueryExecutionProgram::ProvenNoRanking;
+        if (programs == 2) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, std::vector<int>{3, 1}, 33, 1, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 32, 1, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 2, mtp, verifier, programs), std::invalid_argument);
+        EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 1, mtp,
+            static_cast<MTPVerifierGraphFamily>(99), programs), std::invalid_argument);
+    }
+}
+
+/** Exact component source declarations neither invent reserves nor relax original invocation checks. */
+TEST(Test__MemoryPlanner, MappedBatchExplicitSourceInventoryContract)
+{
+    using Inventory=MoEOverlayActivationBatchInventory;
+    const std::array sources{
+        Inventory::Source{Inventory::SourceKind::Decode,0,SparseQueryExecutionProgram::RankingPossible,1,1,{5},{},{}},
+        Inventory::Source{Inventory::SourceKind::PrefillBucket,0,SparseQueryExecutionProgram::RankingPossible,3,3,{5},{},{}},
+        Inventory::Source{Inventory::SourceKind::Draft,1,SparseQueryExecutionProgram::RankingPossible,1,1,{9},MTPSidecarCaptureRole::Full,Inventory::DraftTokenSource::Host}};
+    const auto inventory=Inventory::declareSources(sources);
+    EXPECT_EQ(inventory->sources().size(),3u);
+    EXPECT_EQ(inventory->mainGraphIdentityCount(),2u);
+    ForwardInput input;input.seq_len=1;input.execution_phase=ForwardExecutionPhase::Decode;
+    const auto main=LayerGraphSourceIdentity::main(5,6,5,GraphCacheLayerIndex::CacheLocal);
+    EXPECT_NO_THROW(inventory->require(input,main,1,0));
+    input.execution_phase=ForwardExecutionPhase::Prefill;input.seq_len=3;
+    EXPECT_NO_THROW(inventory->require(input,main,3,0));
+    input.seq_len=2;
+    EXPECT_THROW(inventory->require(input,main,2,0),std::invalid_argument);
+    EXPECT_THROW(Inventory::declareSources({}),std::invalid_argument);
+    for(int malformed=0;malformed<9;++malformed){
+        auto changed=sources;
+        if(malformed==0)changed[0].physical_rows=0;
+        if(malformed==1)changed[0].maximum_rows=0;
+        if(malformed==2)changed[0].model_layers={5,5};
+        if(malformed==3)changed[0].sidecar_role=MTPSidecarCaptureRole::Full;
+        if(malformed==4)changed[2].sidecar_role=MTPSidecarCaptureRole::KVOnly;
+        if(malformed==5)changed[2].family_ordinal=0;
+        if(malformed==6)changed[1]=changed[0];
+        if(malformed==7)changed[1].maximum_rows=4;
+        if(malformed==8)changed[2].query_program=SparseQueryExecutionProgram::ProvenNoRanking;
+        EXPECT_THROW(Inventory::declareSources(changed),std::invalid_argument)<<malformed;
+    }
+    auto indistinguishable_draft=sources[2];
+    indistinguishable_draft.query_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const std::array duplicate_draft{sources[2],indistinguishable_draft};
+    EXPECT_THROW(Inventory::declareSources(duplicate_draft),std::invalid_argument);
+    int token=0;MTPForwardInput learned;learned.draft_token_ids=&token;
+    learned.batch_size=learned.seq_len=1;learned.capture_role=MTPSidecarCaptureRole::Full;
+    const auto predictor=LayerGraphSourceIdentity::inlinePredictor(9,0);
+    EXPECT_NO_THROW(inventory->require(mtpForwardConstructionInput(learned),predictor,1,0));
+    learned.capture_role=MTPSidecarCaptureRole::Chained;
+    EXPECT_THROW(inventory->require(mtpForwardConstructionInput(learned),predictor,1,0),std::invalid_argument);
+}

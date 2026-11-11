@@ -21,7 +21,7 @@
 namespace llaminar2 {
 /** @brief One actual lifecycle, not a shadow count of bytes. */
 struct NativeContextRetirementSlotState {
-    enum class Phase {Reserved,NativeAttempted,HandlesRetired};
+    enum class Phase {Reserved,NativeAttempted,ContextOwnedHandles,HandlesRetired};
     std::string certificate;
     std::unique_ptr<IContextNativeRetirementObligation> obligation;
     Phase phase=Phase::Reserved;
@@ -53,7 +53,12 @@ bool NativeContextRetirementOwner::empty()const noexcept{std::lock_guard lock(mu
 bool NativeContextRetirementOwner::discharged()const noexcept{std::lock_guard lock(mutex_);return retired_;}
 void NativeContextRetirementOwner::requireHandlesRetired()const{
     std::lock_guard lock(mutex_);
-    for(const auto& slot:slots_)if((!slot->obligation && !slot->original_process_root) || slot->phase!=NativeContextRetirementSlotState::Phase::HandlesRetired || slot->borrowed_slot)
+    // Only closed backend stream/roster owners may delegate live native handles.
+    // Its record dies inside context cleanup; physical-reset validation below
+    // still requires actual destruction and release of this same slot.
+    for(const auto& slot:slots_)if((!slot->obligation && !slot->original_process_root) ||
+        (slot->phase!=NativeContextRetirementSlotState::Phase::ContextOwnedHandles &&
+         (slot->phase!=NativeContextRetirementSlotState::Phase::HandlesRetired || slot->borrowed_slot)))
         throw std::logic_error("Original native retirement slot still owns live or borrowed handles");
 }
 void NativeContextRetirementOwner::physicallyRetired()noexcept{
@@ -151,12 +156,18 @@ void NativeContextRetirementSlot::completeNativeHandles()noexcept{
     if(owner_->retired_ || (!state_->obligation && !state_->original_process_root) || state_->phase==NativeContextRetirementSlotState::Phase::HandlesRetired)std::terminate();
     state_->phase=NativeContextRetirementSlotState::Phase::HandlesRetired;
 }
+void NativeContextRetirementSlot::delegateHandlesToContext()noexcept{
+    if(!owner_ || !state_)std::terminate();std::lock_guard lock(owner_->mutex_);
+    if(owner_->retired_ || (!state_->obligation && !state_->original_process_root) ||
+       state_->phase!=NativeContextRetirementSlotState::Phase::NativeAttempted || !state_->borrowed_slot)std::terminate();
+    state_->phase=NativeContextRetirementSlotState::Phase::ContextOwnedHandles;
+}
 void NativeContextRetirementSlot::release()noexcept{
     if(!owner_ && !state_)return;if(!owner_ || !state_)std::terminate();
     bool cancelled=false;
     {
         std::lock_guard lock(owner_->mutex_);
-        if(owner_->retired_ || state_->phase==NativeContextRetirementSlotState::Phase::NativeAttempted)std::terminate();
+        if(owner_->retired_ || (state_->phase==NativeContextRetirementSlotState::Phase::NativeAttempted || state_->phase==NativeContextRetirementSlotState::Phase::ContextOwnedHandles))std::terminate();
         state_->borrowed_slot=false;
         if(state_->obligation || state_->original_process_root)state_->phase=NativeContextRetirementSlotState::Phase::HandlesRetired;
         else {std::erase(owner_->slots_,state_);if(owner_->slots_.empty())owner_->authority_.reset();cancelled=true;}

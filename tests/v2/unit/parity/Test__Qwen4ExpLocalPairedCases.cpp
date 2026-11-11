@@ -10,6 +10,7 @@
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "tools/ModelKLDQFNContract.h"
 #include <gtest/gtest.h>
+#include <sstream>
 
 namespace llaminar2::test::parity::qwen4exp
 {
@@ -76,6 +77,7 @@ TEST(Qwen4ExpLocalPairedCases, FiveExactCasesKeepAllOrdinaryAxesAndParserIntent)
     const auto selected = qfnAttachLocalPairedCases(original,input);
     ASSERT_EQ(selected.size(),original.size());
     size_t profiled = 0;
+    size_t deferred = 0;
     for (const auto &[family,cases] : original)
     {
         const auto &result = selected.at(family);
@@ -85,6 +87,22 @@ TEST(Qwen4ExpLocalPairedCases, FiveExactCasesKeepAllOrdinaryAxesAndParserIntent)
             EXPECT_EQ(result[i].testName(),cases[i].testName());
             EXPECT_EQ(result[i].graph_snapshot_policy.required_prefill_snapshot_keys,cases[i].graph_snapshot_policy.required_prefill_snapshot_keys);
             EXPECT_EQ(result[i].graph_snapshot_policy.required_decode_snapshot_keys,cases[i].graph_snapshot_policy.required_decode_snapshot_keys);
+            if (cases[i].topology.needsObservedPipelineBinding())
+            {
+                // Registration retains an observed request, not an invented
+                // physical rank/device config. Attachment must preserve the
+                // entire declaration and its fail-closed runtime boundary.
+                ++deferred;
+                EXPECT_TRUE(result[i].topology.needsObservedPipelineBinding());
+                EXPECT_FALSE(result[i].paired_workload);
+                std::ostringstream before_declaration, after_declaration;
+                PrintTo(cases[i], &before_declaration);
+                PrintTo(result[i], &after_declaration);
+                EXPECT_EQ(before_declaration.str(), after_declaration.str());
+                EXPECT_THROW((void)cases[i].toTestConfig(), std::logic_error);
+                EXPECT_THROW((void)result[i].toTestConfig(), std::logic_error);
+                continue;
+            }
             const auto before = cases[i].makeOrchestrationConfig(cases[i].model.model_path,0);
             const auto after = result[i].makeOrchestrationConfig(result[i].model.model_path,0);
             EXPECT_EQ(accuracy::qfnCanonicalConfigurationIntent(before),accuracy::qfnCanonicalConfigurationIntent(after));
@@ -113,6 +131,7 @@ TEST(Qwen4ExpLocalPairedCases, FiveExactCasesKeepAllOrdinaryAxesAndParserIntent)
             EXPECT_EQ(result[i].retained_mtp_draft_capacity,cases[i].retained_mtp_draft_capacity);
         }
     }
+    EXPECT_GT(deferred,0u);
     EXPECT_EQ(profiled,5u);
     EXPECT_EQ(accuracy::qfnActualArithmeticIntent(),arithmetic_before);
     for (const auto &[family,cases] : original)

@@ -15,6 +15,7 @@
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "loaders/ImmutableRowTable.h"
+#include "collective/NativeCountedAllGatherFrame.h"
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
 #include <limits>
 #include <algorithm>
@@ -434,6 +435,7 @@ TEST(NgramExecutionProvision, FixedHeadOwnersPriceExactRangesAndRetainedNativeCr
             resources.push_back({0,c.device,c.device_total_bytes,c.device_free_bytes});
         }
         const auto placement=Qwen4ExpFixedHeadShards::declare(extent,g.head_offsets,g.head_vocab_sizes,owners);
+        EXPECT_EQ(placement->terminalObservationMode(), ImmutableRowTableObservationMode::FixedHeadStandalone);
         const auto sourceBOM=placement->fixedHeadShardStorageBOM(resources);
         for(auto &c:configs)c.ngram_table_placement=placement;
         const auto complete=MemoryPlanner::plan(profile,configs).physicalPlan();
@@ -908,4 +910,206 @@ TEST(NgramExecutionProvision, CPUReceiverRestoresRemoteGPUInstalledPlanningWitho
         auto truncated=wire;truncated.pop_back();
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(truncated,0,&profile),std::invalid_argument);
     }
+}
+
+/** @test Fixed storage and actual PLE reader widths are independent original pipeline coordinates. */
+TEST(NgramExecutionProvision, PipelineFixedHeadProjectionPreservesOriginalRolesAndUnequalWidths)
+{
+    const auto roster = [](std::initializer_list<int> widths) {
+        std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> result;
+        int ordinal = 19;
+        for (const int width : widths) {
+            auto& stage = result.emplace_back();
+            for (int member = 0; member < width; ++member) {
+                stage.push_back({3, DeviceId::rocm(ordinal)});
+                ordinal -= 2;
+            }
+        }
+        return result;
+    };
+    const auto q7 = roster({4, 4});
+    const auto fixed = ImmutableFixedHeadPipelineProjection::checked(3, 0, 16, 9, q7);
+    ASSERT_EQ(fixed.owners().size(), 8u);
+    ASSERT_EQ(fixed.consumers().size(), 4u);
+    for (std::size_t reader = 0; reader < q7.front().size(); ++reader) {
+        const auto& local = fixed.owners()[2 * reader];
+        const auto& remote = fixed.owners()[2 * reader + 1];
+        EXPECT_EQ(local.allocator, q7[0][reader]);
+        EXPECT_EQ(remote.allocator, q7[1][reader]);
+        EXPECT_EQ(local.first_head, static_cast<int>(4 * reader));
+        EXPECT_EQ(remote.first_head, local.first_head + 2);
+        EXPECT_EQ(remote.head_count, 2);
+        EXPECT_EQ(remote.consumer_index, static_cast<int>(reader));
+        EXPECT_EQ(fixed.assembledHeadCount(reader), 4);
+        EXPECT_EQ(fixed.endpointCount(local.allocator), 2u);
+        EXPECT_EQ(fixed.endpointCount(remote.allocator), 2u);
+        const auto request = fixed.edgeScratch(local.allocator, remote.allocator, 9, 33);
+        const auto service = fixed.edgeScratch(remote.allocator, remote.allocator, 9, 33);
+        EXPECT_EQ(request.ids_offset, 0u);
+        EXPECT_EQ(request.ids_bytes, 9u * 2u * sizeof(std::int64_t));
+        EXPECT_EQ(request.native_offset, request.ids_bytes);
+        EXPECT_EQ(request.native_bytes, 9u * 2u * 33u);
+        EXPECT_FALSE(request.service_rows_offset);
+        ASSERT_TRUE(service.service_rows_offset);
+        EXPECT_EQ(fixed.readerResponseRowsOffset(local.allocator, 9, 33), service.service_rows_offset);
+        EXPECT_EQ(fixed.scratchBytes(local.allocator, 9, 33), *service.service_rows_offset + 8);
+        EXPECT_EQ(fixed.gatheredHeadCount(reader), 16);
+        EXPECT_EQ(fixed.scratchBytes(remote.allocator, 9, 33), *service.service_rows_offset + 8);
+    }
+
+    const auto unequal = roster({1, 3, 5});
+    const auto split = ImmutableFixedHeadPipelineProjection::checked(3, 1, 16, 17, unequal);
+    ASSERT_EQ(split.owners().size(), 9u);
+    ASSERT_EQ(split.consumers().size(), 3u);
+    EXPECT_EQ(split.consumerStage(), 1);
+    EXPECT_EQ(split.maximumRows(), 17);
+    int heads = 0;
+    for (const auto& owner : split.owners()) {
+        EXPECT_EQ(owner.first_head, heads);
+        EXPECT_GT(owner.head_count, 0);
+        EXPECT_EQ(owner.allocator, unequal.at(owner.stage_index).at(owner.participant_index));
+        heads += owner.head_count;
+    }
+    EXPECT_EQ(heads, 16);
+    EXPECT_EQ(split.assembledHeadCount(0) + split.assembledHeadCount(1) + split.assembledHeadCount(2), 16);
+    EXPECT_EQ(split.endpointCount(unequal[1][0]), 4u);
+    EXPECT_TRUE(split.requiresVariableGather());
+    for (int reader = 0; reader < 3; ++reader)
+        EXPECT_EQ(split.gatheredHeadCount(reader), 16 - split.assembledHeadCount(reader));
+    const auto singleton_roster = roster({1, 1, 1});
+    const auto singleton = ImmutableFixedHeadPipelineProjection::checked(3, 1, 16, 17, singleton_roster);
+    EXPECT_FALSE(singleton.requiresVariableGather());
+    EXPECT_EQ(singleton.gatheredHeadCount(0), 0);
+    EXPECT_EQ(singleton.assembledHeadCount(0), 16);
+    EXPECT_TRUE(singleton.readerResponseRowsOffset(singleton_roster[1][0], 17, 33));
+    EXPECT_THROW((void)split.scratchBytes(unequal[1][0], 16, 33), std::invalid_argument);
+    EXPECT_THROW((void)split.edgeScratch(unequal[1][0], unequal[2][1], 17, 33), std::invalid_argument);
+    auto invalid = unequal;
+    invalid[2][0] = invalid[1][0];
+    EXPECT_THROW((void)ImmutableFixedHeadPipelineProjection::checked(3, 1, 16, 17, invalid), std::invalid_argument);
+    invalid = unequal;
+    invalid[2][0].world_rank = 4;
+    EXPECT_THROW((void)ImmutableFixedHeadPipelineProjection::checked(3, 1, 16, 17, invalid), std::invalid_argument);
+    invalid = unequal;
+    invalid[2][0].device = DeviceId::cuda(0);
+    EXPECT_THROW((void)ImmutableFixedHeadPipelineProjection::checked(3, 1, 16, 17, invalid), std::invalid_argument);
+    EXPECT_THROW((void)ImmutableFixedHeadPipelineProjection::checked(3, 1, 8, 17, unequal), std::invalid_argument);
+}
+
+/** @test Complete prepriced fixed pipeline admission charges only final native ranges after the frozen base. */
+TEST(NgramExecutionProvision, PipelineFixedHeadFinalAdmissionPricesAllOriginalStorageAndPreservesFrozenBase)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto& profile = source.metadata().memoryProfile();
+    const auto upload = resolveGPUWeightLoadMemoryGeometry(
+        maximumGGUFTensorPayloadBytes(source.loader().getModel()), {});
+    const std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> roster{
+        {{0, DeviceId::rocm(7)}, {0, DeviceId::rocm(2)}, {0, DeviceId::rocm(9)}, {0, DeviceId::rocm(1)}},
+        {{0, DeviceId::rocm(8)}, {0, DeviceId::rocm(3)}, {0, DeviceId::rocm(5)}, {0, DeviceId::rocm(0)}}};
+    const auto projection = std::make_shared<const ImmutableFixedHeadPipelineProjection>(
+        ImmutableFixedHeadPipelineProjection::checked(0, 0, profile.flash_next->ple_heads, 32, roster));
+    ImmutableRowTablePolicy policy{.storage = ImmutableRowStoragePreference::VRAM};
+    policy.distribution = ImmutableRowTableDistribution::FixedHeadSharded;
+    std::vector<DevicePlanConfig> flattened;
+    for (std::size_t stage = 0; stage < roster.size(); ++stage) {
+        std::vector<DeviceId> devices;
+        for (const auto& member : roster[stage])
+            devices.push_back(member.device);
+        // A rank-local TP domain consumes the same explicit head/KV assignment
+        // as loading. The four participants share two KV heads; a bare shard
+        // fraction cannot describe that valid replicated KV ownership.
+        const auto tp = TensorParallelConfig::equalSplit(
+            static_cast<int>(devices.size()), profile.n_heads, profile.n_kv_heads,
+            profile.d_ff, profile.vocab_size, devices, KVHeadCoveragePolicy::QueryInterval);
+        for (std::size_t index = 0; index < roster[stage].size(); ++index) {
+            auto config = consumer(DeviceType::ROCm, ImmutableRowStoragePreference::VRAM);
+            config.device = roster[stage][index].device;
+            config.first_layer = static_cast<int>(24 * stage);
+            config.last_layer = config.first_layer + 23;
+            config.total_shards = static_cast<int>(roster[stage].size());
+            config.shard_index = static_cast<int>(index);
+            config.bindTensorParallelAssignment(tp.forRank(config.shard_index));
+            config.local_tp_backend = CollectiveBackendType::RCCL;
+            config.local_pipeline_backend = CollectiveBackendType::RCCL;
+            config.ngram_fixed_head_pipeline = projection;
+            config.ordinary_weight_load_geometry = upload;
+            config.weight_load_staging.host_bytes = upload.host_staging_bytes;
+            config.weight_load_staging.device_bytes = upload.staging_bytes;
+            if (stage == 0) {
+                config.ngram_execution_policy = policy;
+                config.ngram_tp_topology = ImmutableRowTableTPTopology::HomogeneousPipelineRankLocal;
+            } else {
+                config.ngram_execution_policy.reset();
+            }
+            flattened.push_back(std::move(config));
+        }
+    }
+    test::shareRecordedNgramHostServices(flattened);
+    std::vector<std::vector<DevicePlanConfig>> groups{
+        {flattened.begin(), flattened.begin() + 4}, {flattened.begin() + 4, flattened.end()}};
+    const auto frozenBase = [&](const auto& plan_groups) {
+        PhysicalMemoryPlanBuilder base;
+        const auto fixed = MemoryPlanner::planGroups(profile, plan_groups);
+        for (const auto& group : fixed)
+            for (const auto& line : group.physicalPlan().resources())
+                base.add(line);
+        return base.build();
+    };
+    const auto request = [&](const auto& plan_groups) {
+        const auto uploads = MemoryPlanner::immutableRowTableUploadBindings(profile, plan_groups);
+        EXPECT_EQ(uploads.size(), 8u);
+        return MemoryPlanner::immutableRowTableAdmissionRequest(profile, policy, plan_groups, uploads,
+            ImmutableRowTableHostPlacement::onNode(3)).value();
+    };
+    const auto base = frozenBase(groups);
+    const auto admission = request(groups);
+    const auto selected = ImmutableRowTablePlacementPlanner::select(admission, base);
+    ASSERT_TRUE(selected.placement->isFixedHeadShards());
+    ASSERT_EQ(selected.placement->fixedHeadPipeline(), projection.get());
+    EXPECT_EQ(selected.placement->terminalObservationMode(), ImmutableRowTableObservationMode::FixedHeadPipeline);
+    const auto standalone = Qwen4ExpFixedHeadShards::declare(selected.placement->extent(), profile.flash_next->ple_head_offsets,
+        profile.flash_next->ple_head_vocab_sizes, roster.front());
+    EXPECT_EQ(standalone->terminalObservationMode(), ImmutableRowTableObservationMode::FixedHeadStandalone);
+    EXPECT_FALSE(standalone->fixedHeadPipeline());
+    ASSERT_EQ(selected.placement->consumers().size(), 4u);
+    ASSERT_EQ(selected.placement->allocators().size(), 8u);
+    EXPECT_THROW((void)selected.placement->lookupForConsumer(roster[1][0]), std::invalid_argument);
+    EXPECT_NO_THROW((void)selected.placement->lookupForConsumer(roster[0][0]));
+    EXPECT_THROW((void)serializeImmutableRowTableAdmissionRequests(std::span(&admission, 1)),
+        std::invalid_argument);
+    std::uint64_t next = 0;
+    for (const auto& member : projection->owners()) {
+        // Every original shard holder is an allocator, including the later
+        // stage that does not execute PLE. Storage ownership must not grant
+        // permission to consume lookup output from that stage.
+        EXPECT_TRUE(selected.placement->containsAllocator(member.allocator));
+        if (member.stage_index == projection->consumerStage())
+            EXPECT_NO_THROW((void)selected.placement->lookupForConsumer(member.allocator));
+        else
+            EXPECT_THROW((void)selected.placement->lookupForConsumer(member.allocator), std::invalid_argument);
+        const auto range = selected.placement->fixedHeadSourceRangeFor(member.allocator);
+        EXPECT_EQ(range.firstRow(), next);
+        next += range.rows();
+        EXPECT_EQ(bytes(base, member.allocator, PhysicalMemoryOwner::ImmutableTableStorage), 0u);
+        EXPECT_EQ(bytes(selected.physical_plan, member.allocator, PhysicalMemoryOwner::ImmutableTableStorage),
+            range.nativeBytes());
+        EXPECT_GE(bytes(base, member.allocator, PhysicalMemoryOwner::ActivationTransportStaging),
+            projection->endpointCount(member.allocator) * NativeCountedAllGatherLayout(1).bytes());
+        for (std::size_t index = 0; index < PhysicalMemoryBOM::ownerCount(); ++index) {
+            const auto owner = PhysicalMemoryBOM::ownerAt(index);
+            if (owner != PhysicalMemoryOwner::ImmutableTableStorage)
+                EXPECT_EQ(bytes(base, member.allocator, owner), bytes(selected.physical_plan, member.allocator, owner));
+        }
+    }
+    EXPECT_EQ(next, admission.input.extent().rows());
+
+    auto short_groups = groups;
+    const auto* tail = selected.physical_plan.find(roster[1].front());
+    ASSERT_NE(tail, nullptr);
+    short_groups[1][0].device_free_bytes = tail->totalBytes() - 1;
+    const auto short_base = frozenBase(short_groups);
+    ASSERT_TRUE(short_base.fits());
+    EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(request(short_groups), short_base),
+        PhysicalMemoryCapacityExhausted);
 }

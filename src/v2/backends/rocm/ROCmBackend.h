@@ -41,6 +41,12 @@ namespace llaminar2
     class ROCmBackend : public IBackend
     {
     public:
+        /** @copydoc IBackend::validateNativeCountedAllGatherFrame */
+        bool validateNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            ncclLlaminarCompletionAuthority original, int device_id, void *stream) override;
+        /** @copydoc IBackend::enqueueNativeCountedAllGatherFrame */
+        bool enqueueNativeCountedAllGatherFrame(void *memory, std::size_t degree,
+            std::uint64_t table, std::uint64_t admission, NativeCountedAllGatherPreparation preparation, int device_id, void *stream, unsigned long long *outgoing) override;
         ROCmBackend();
         ~ROCmBackend() override;
 
@@ -174,6 +180,9 @@ namespace llaminar2
             void *generated_token_counts_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueueNativePipelineByteFrame */
+        bool enqueueNativePipelineByteFrame(const NativePipelineByteInvocation &invocation,
+            NativePipelineByteOperation operation, int device_id, void *stream) override;
         /** @copydoc IBackend::enqueueCommitMTPDirectTokenHistoryDevice */
         bool enqueueCommitMTPDirectTokenHistoryDevice(
             const void *token_device,
@@ -844,6 +853,7 @@ namespace llaminar2
 
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
+
         void free(void *ptr, int device_id) override;
 
         /** @copydoc IBackend::retainNativeAllocation */
@@ -858,6 +868,7 @@ namespace llaminar2
             int request_row_capacity,
             int bucket_seq_len,
             int pad_token_id,
+            bool require_exact_rows,
             int device_id,
             void *stream,
             void *out_token_ids_device,
@@ -985,12 +996,14 @@ namespace llaminar2
                                   int device_id, void *stream) override;
         /** @copydoc IBackend::prepareMappedHostCopyKernels */
         bool prepareMappedHostCopyKernels(int device_id) override;
-        /** @copydoc IBackend::enableCapturedTransferPeerAccess */
-        bool enableCapturedTransferPeerAccess(int device_id, int peer_device_id) override;
         /** @copydoc IBackend::prepareCapturedTransferChannelKernels */
         bool prepareCapturedTransferChannelKernels(int device_id, int timeout_ms, std::uint64_t *timeout_ticks) override;
         /** @copydoc IBackend::enqueueCapturedTransferChannelBatch */
         bool enqueueCapturedTransferChannelBatch(const CapturedTransferChannelBatch &batch,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::enqueuePipelineActivationFanoutValidation */
+        bool enqueuePipelineActivationFanoutValidation(const PipelineActivationFanoutValidation &binding,
             int device_id, void *stream) override;
 
         /** @copydoc IBackend::enqueueCapturedTransferChannel */

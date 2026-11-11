@@ -13,6 +13,8 @@
  * admit their exact epoch arenas through the original model/prepared-store PMA.
  * Shared-FFN ordering checks use the actual canonical topological order while
  * retaining the original CPU-result ingress and producer cutpoint obligations.
+ * Direct FFN construction also admits its exact epoch storage before lowering;
+ * model and prepared-store components share the same physical authority.
  */
 
 #include <gtest/gtest.h>
@@ -58,10 +60,13 @@
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockMPIContext.h"
 #include "fixtures/mpi/OwnedSharedBackingReplay.h"
+#include "fixtures/models/OriginalMappedLoweringAdmission.h"
+#include "fixtures/moe/NodeLocalRouteExchangeReplayAccess.h"
 #include "mocks/MockMPITopology.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
+#include "utils/DeviceEpochArenaTestMemory.h"
 
 #include <algorithm>
 #include <array>
@@ -245,6 +250,19 @@ namespace llaminar2::test
                 }
             }
 
+            /** @brief Borrow the exact original admitted worker stream; own only its declared row scalar.
+             * @param device Original selected GPU.
+             * @param permit Original worker/PMA authority.
+             * @param memory Same authority carrying the scalar BOM.
+             * @throws std::exception For substituted ownership or missing stream. */
+            ScopedDevicePublicationStream(DeviceId device,const PreparedGPUContextUsePermit& permit,
+                std::shared_ptr<PhysicalMemoryAuthority> memory)
+                :device_(device),backend_(getBackendFor(device)),memory_(std::move(memory)),worker_(permit.worker()),borrowed_(true) {
+                if(device!=permit.device() || memory_!=permit.memory())throw std::invalid_argument("Foreign lowering publication authority");
+                worker_->submitAndWait([&]{stream_=worker_->defaultStream();});
+                if(!stream_)throw std::runtime_error("Original lowering stream is unavailable");
+            }
+
             ~ScopedDevicePublicationStream()
             {
                 if (!stream_)
@@ -258,7 +276,7 @@ namespace llaminar2::test
                 }
                 if (row_count_device_)
                     backend_->free(row_count_device_, ordinal);
-                backend_->destroyStream(stream_, ordinal);
+                if(!borrowed_)backend_->destroyStream(stream_, ordinal);
             }
 
             ScopedDevicePublicationStream(
@@ -281,8 +299,10 @@ namespace llaminar2::test
                 if (!device_.is_gpu() || !backend_ || !stream_)
                     throw std::runtime_error("Device row-count publication requires a GPU stream");
                 const int ordinal = device_.toKernelDeviceIndex();
-                if (!row_count_device_)
+                if (!row_count_device_) {
+                    if(memory_)row_claim_.emplace(memory_->claimNewAllocation(device_,PhysicalMemoryOwner::ExecutionWorkspace,sizeof(value)));
                     row_count_device_ = backend_->allocate(sizeof(value), ordinal);
+                }
                 if (!row_count_device_ ||
                     !backend_->hostToDevice(
                         row_count_device_, &value, sizeof(value), ordinal, stream_))
@@ -291,6 +311,8 @@ namespace llaminar2::test
                         "Failed to publish graph-test row count on " +
                         device_.to_string());
                 }
+                // The host scalar is temporary; complete only this cold setup publication before return.
+                if(!backend_->synchronizeStream(stream_,ordinal))throw std::runtime_error("Cold lowering row publication failed");
                 return static_cast<const int32_t *>(row_count_device_);
             }
 
@@ -298,7 +320,37 @@ namespace llaminar2::test
             DeviceId device_;
             IBackend *backend_ = nullptr;
             void *stream_ = nullptr;
+            std::shared_ptr<PhysicalMemoryAuthority> memory_;
+            std::shared_ptr<IWorkerGPUContext> worker_;
+            std::optional<PhysicalMemoryAllocationLease> row_claim_;
+            bool borrowed_=false;
             void *row_count_device_ = nullptr;
+        };
+
+        /** @brief Author complete original invocation metadata for direct component FFN lowering. */
+        class OriginalLoweringGraph final : public Qwen35MoEGraph {
+        public:
+            using Qwen35MoEGraph::Qwen35MoEGraph;
+            /** @brief Lower the real FFN under its actual phase/shape source identity.
+             * @param phase Actual declared main phase.
+             * @param layer Actual prepared layer.
+             * @param buffers Actual stable activation graph operands.
+             * @param layer_idx Original model layer.
+             * @param rows Exact physical source rows.
+             * @param batch Actual admitted batch.
+             * @param device Original participant.
+             * @param stream Exact original publication stream.
+             * @param counts Original live-row scalar, if prefill.
+             * @return Unmodified production FFN graph.
+             * @throws std::exception For invalid original source or production lowering failure. */
+            ComputeGraph buildOriginalFFNGraph(ForwardExecutionPhase phase,const LayerWeights& layer,
+                ActivationBuffers& buffers,int layer_idx,int rows,int batch,DeviceId device,void* stream,
+                const int32_t* counts=nullptr) {
+                ForwardInput input;input.execution_phase=phase;input.batch_size=batch;input.seq_len=rows;
+                input.device=device;input.device_state_publication_stream=stream;
+                ForwardInputConstructionScope scope(*this,input);
+                return buildFFNGraph(layer,buffers,layer_idx,rows,batch,device,stream,counts);
+            }
         };
 
         class ScopedDebugEnv
@@ -1239,6 +1291,10 @@ namespace llaminar2::test
             ASSERT_EQ(config.tp_ctx, nullptr);
             auto model = ModelContext::createForTesting("test.gguf", nullptr, 1, true);
             ASSERT_NE(model->concreteWeightManager(), nullptr);
+            const auto memory = admitEpochArenaForTest({
+                .device_id = device, .request_slot_capacity = 1u}).memory_authority;
+            model->concreteWeightManager()->installPhysicalMemoryAuthority(memory);
+            ASSERT_EQ(model->concreteWeightManager()->physicalMemoryAuthority(), memory);
             auto &registry = model->concreteWeightManager()->expertGemmRegistry();
             // Domain lookup and canonical RCU retention must name the same
             // prepared source, not independently constructed equal-shape mocks.
@@ -1270,6 +1326,9 @@ namespace llaminar2::test
                 const auto *live = publication.publishRowCount(rows);
                 auto graph = builder.buildFFNGraph(layer, buffers, 0, rows, 1,
                     device, publication.get(), live);
+                EXPECT_EQ(memory->claimedBytes(device, PhysicalMemoryOwner::ExecutionWorkspace,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                    DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u));
                 EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_DISPATCH), 0u);
                 EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u);
                 EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_RETURN_REDUCE), 0u);
@@ -1324,6 +1383,10 @@ namespace llaminar2::test
             // Missing prepared native engines cannot revive the host-ticket
             // lowering or the retired raw expert parents.
             auto empty_model = ModelContext::createForTesting("test.gguf", nullptr, 1, true);
+            // Reach the missing-engine guard with a valid independent model
+            // authority; an unrelated admission failure is not this negative.
+            empty_model->concreteWeightManager()->installPhysicalMemoryAuthority(
+                admitEpochArenaForTest({.device_id = device, .request_slot_capacity = 1u}).memory_authority);
             Qwen35MoEGraph missing_builder(empty_model, nullptr, config);
             TensorArena missing_activations;
             auto missing_buffers = makeActivationBuffers(missing_activations);
@@ -1958,7 +2021,7 @@ namespace llaminar2::test
                     ? MoEOverlayNodeLocalRouteTransport::MappedSparse
                     : MoEOverlayNodeLocalRouteTransport::NativeCollective};
             if (config.moe.node_local_route_transport_policy.requiresMappedExchange())
-                config.moe.node_local_route_exchange = std::make_shared<MoEOverlayNodeLocalRouteExchange>(
+                config.moe.node_local_route_exchange = NodeLocalRouteExchangeReplayAccess::create(
                     MoEOverlayNodeLocalRouteExchange::Config{
                         .devices = {device.is_cuda() ? DeviceId::cuda(0) : DeviceId::rocm(0),
                                     device.is_cuda() ? DeviceId::cuda(1) : DeviceId::rocm(1)},
@@ -2395,129 +2458,53 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          DistributedDynamicSingleGPUContinuationUsesMappedAdmissionSelector)
     {
-        auto plan = makeDistributedSingleGPUContinuationPlan();
-        plan->residency_policy =
-            RoutedExpertResidencyPolicy::RoutedTierRebalanced;
-        plan->authority_execution =
-            MoEOverlayAuthorityExecutionKind::DeviceResident;
-        const auto owner_map = MoEExpertOwnerMap::build(*plan);
-        // Deliver actual startup packets between both logical ranks; the plain
-        // mock completes receives without bytes and cannot authenticate a file.
-        auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        auto overlay_mpi =
-            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/0, /*world_size=*/2);
-        overlay_mpi->bind(startup_link);
-        overlay_mpi->set_topology(
-            MockMPITopology::createSimple(
-                /*rank=*/0,
-                /*world_size=*/2,
-                /*ranks_per_node=*/2));
-        auto peer_mpi =
-            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/1, /*world_size=*/2);
-        peer_mpi->bind(startup_link);
-        peer_mpi->set_topology(
-            MockMPITopology::createSimple(
-                /*rank=*/1,
-                /*world_size=*/2,
-                /*ranks_per_node=*/2));
-
-        auto controller_topology_value =
-            resolveMoEOverlayDeviceControllerTopology(
-                *plan,
-                owner_map,
-                {.world_rank_node_ids = std::array<int, 2>{7, 7}});
-        /*
-         * Mock MPI run namespaces are stable. Salt this fixture's mapped ABI
-         * identity so an interrupted prior process cannot be mistaken for the
-         * peer half of the current bilateral first-touch handshake.
-         */
-        controller_topology_value.topology_fingerprint ^=
-            static_cast<std::uint64_t>(::getpid()) << 17u;
-        if (controller_topology_value.topology_fingerprint == 0u)
-            controller_topology_value.topology_fingerprint = 1u;
-        auto controller_topology = std::make_shared<
-            const MoEOverlayDeviceControllerTopology>(
-            std::move(controller_topology_value));
-        const auto initial_layered_ownership = owner_map.layeredOwnership(
-            /*num_layers=*/1,
-            /*num_experts=*/kNumExperts);
-        std::vector<std::uint32_t> initial_owner_participants;
-        initial_owner_participants.reserve(kNumExperts);
-        for (int expert = 0; expert < kNumExperts; ++expert)
-        {
-            initial_owner_participants.push_back(
-                static_cast<std::uint32_t>(
-                    initial_layered_ownership.owner(0, expert)));
-        }
-        const auto controller_config =
-            [&](const std::shared_ptr<MockMPIContext> &mpi)
-        {
-            return MoEOverlayNodeLocalDeviceControllerFabric::Config{
-                .mpi_ctx = mpi,
-                .topology = controller_topology,
-                .num_layers = 1u,
-                .num_experts = static_cast<std::uint32_t>(kNumExperts),
-                .command_capacity = 4u,
-                .initial_durable_epoch = 1u,
-                .payload_bytes_per_layer = {4096u},
-                .initial_owner_participants =
-                    initial_owner_participants,
-                .minimum_window_activations = 1u,
-                .maximum_cycles_per_wave = 1u,
-            };
-        };
-        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
-            root_controller_fabric;
-        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
-            peer_controller_fabric;
-        std::exception_ptr root_controller_error;
-        std::exception_ptr peer_controller_error;
-        std::jthread root_controller_builder(
-            [&]
-            {
-                try
-                {
-                    root_controller_fabric = std::make_shared<
-                        MoEOverlayNodeLocalDeviceControllerFabric>(
-                        controller_config(overlay_mpi));
-                }
-                catch (...)
-                {
-                    root_controller_error = std::current_exception();
-                }
-            });
-        std::jthread peer_controller_builder(
-            [&]
-            {
-                try
-                {
-                    peer_controller_fabric = std::make_shared<
-                        MoEOverlayNodeLocalDeviceControllerFabric>(
-                        controller_config(peer_mpi));
-                }
-                catch (...)
-                {
-                    peer_controller_error = std::current_exception();
-                }
-            });
-        root_controller_builder.join();
-        peer_controller_builder.join();
-        if (root_controller_error)
-            std::rethrow_exception(root_controller_error);
-        if (peer_controller_error)
-            std::rethrow_exception(peer_controller_error);
-        ASSERT_NE(root_controller_fabric, nullptr);
-        ASSERT_NE(peer_controller_fabric, nullptr);
-
-        auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            plan,
-            MoEExpertOverlayRuntimeResolverOptions{
-                .current_world_rank = 0,
-            });
-
+        OriginalMappedLoweringAdmission admission({DeviceType::CUDA,1},{DeviceType::ROCm,1});
+        const auto source_device=admission.cohorts().sourceDevices().front();
+        auto overlay_mpi=admission.mpi();
+        auto plan=makeDistributedSingleGPUContinuationPlan();
+        admission.bind(*plan);
+        plan->residency_policy=RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+        plan->authority_execution=MoEOverlayAuthorityExecutionKind::DeviceResident;
+        const auto owner_map=MoEExpertOwnerMap::build(*plan);
+        std::vector<int> node_ids;std::vector<std::string> nodes;
+        for(const auto& rank:admission.cohorts().inventory()->ranks){
+            auto found=std::find(nodes.begin(),nodes.end(),rank.hostname);
+            if(found==nodes.end()){nodes.push_back(rank.hostname);found=std::prev(nodes.end());}
+            node_ids.push_back(int(found-nodes.begin()));}
+        const auto controller_topology=std::make_shared<const MoEOverlayDeviceControllerTopology>(
+            resolveMoEOverlayDeviceControllerTopology(*plan,owner_map,{.world_rank_node_ids=node_ids}));
+        std::vector<uint32_t> initial_owner_participants;
+        const auto initial_ownership=owner_map.layeredOwnership(1,kNumExperts);
+        for(int expert=0;expert<kNumExperts;++expert)initial_owner_participants.push_back(initial_ownership.owner(0,expert));
+        auto model_ctx=ModelContext::createForTesting("test.gguf",nullptr,1,true);
+        if(!model_ctx || !model_ctx->concreteWeightManager())throw std::runtime_error("Original lowering model directory is absent");
+        const auto graph_family=resolveMoEOverlayInferenceGraphFamilyIdentity(model_ctx->concreteLoader(),
+            model_ctx->architecture(),model_ctx->totalBlockCount(),MoEOverlayMTPGraphFamilyPolicy::MainOnly,
+            1,kSeqLen,1,1,0);
+        using BatchInventory=MoEOverlayActivationBatchInventory;
+        const auto sources=BatchInventory::declareSources(std::array{
+            BatchInventory::Source{BatchInventory::SourceKind::Decode,0,SparseQueryExecutionProgram::RankingPossible,1,1,{0},{},{}},
+            BatchInventory::Source{BatchInventory::SourceKind::PrefillBucket,0,SparseQueryExecutionProgram::RankingPossible,kSeqLen,kSeqLen,{0},{},{}},
+            BatchInventory::Source{BatchInventory::SourceKind::PrefillBucket,0,SparseQueryExecutionProgram::RankingPossible,1,1,{0},{},{}}});
+        const auto layout=MoEOverlayNodeLocalDeviceControllerFabric::planLayout(*controller_topology,1,kNumExperts,4,4096,{4096},1,1);
+        size_t owned_pages=0;
+        if(overlay_mpi->rank()==controller_topology->leader_world_rank)
+            owned_pages+=layout.page_bytes+layout.leader_owned_end-layout.leader_owned_begin;
+        for(const auto& group:layout.groups)if(group.root_world_rank==overlay_mpi->rank())owned_pages+=group.owned_page_end-group.owned_page_begin;
+        admission.prepare(*plan,graph_family,sources,kSeqLen,kDModel,kTopK,owned_pages);
+        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> root_controller_fabric;
+        admission.checkpoint([&]{root_controller_fabric=std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
+            MoEOverlayNodeLocalDeviceControllerFabric::Config{.mpi_ctx=overlay_mpi,.topology=controller_topology,
+                .num_layers=1,.num_experts=kNumExperts,.command_capacity=4,.initial_durable_epoch=1,
+                .payload_bytes_per_layer={4096},.initial_owner_participants=initial_owner_participants,
+                .minimum_window_activations=1,.maximum_cycles_per_wave=1});});
+        admission.checkpoint([&]{if(!admission.source())return;
+        model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(admission.memory());
+        const auto runtime_plan=resolveMoEExpertOverlayRuntimePlan(plan,
+            {.current_world_rank=admission.cohorts().sourceRank()});
         GraphConfig config = makeConfig(plan, /*layer_count=*/1);
         config.max_activation_rows = kSeqLen;
-        config.default_device = DeviceId::cuda(0);
+        config.default_device = source_device;
         config.moe.overlay_mpi_ctx = overlay_mpi;
         config.moe.expert_overlay_runtime_plan = runtime_plan;
         config.moe.rebalance_config.mode =
@@ -2535,7 +2522,7 @@ namespace llaminar2::test
         histogram_config.window_size = 64;
         histogram_config.token_boundary_layer_idx = 0;
         histogram_config.sockets = {
-            DeviceId::cuda(0), DeviceId::rocm(0)};
+            source_device, admission.cohorts().peerDevices().front()};
         histogram_config.ownership =
             owner_map.layeredOwnership(/*num_layers=*/1, kNumExperts);
         auto histogram = std::make_shared<DecodeExpertHistogram>(
@@ -2591,14 +2578,10 @@ namespace llaminar2::test
         config.moe.expert_overlay_participant_residency =
             participant_residency;
 
-        auto model_ctx = ModelContext::createForTesting(
-            "test.gguf", nullptr, 1, /*with_weight_manager=*/true);
-        ASSERT_NE(model_ctx, nullptr);
-        ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
         registerCompleteDomainExpertLayer(
             model_ctx->concreteWeightManager()->expertGemmRegistry(),
             "continuation_domain",
-            DeviceId::cuda(0),
+            source_device,
             /*layer_idx=*/0);
         registerOwnedParticipantExpertLayers(
             model_ctx->concreteWeightManager()->expertGemmRegistry(),
@@ -2611,180 +2594,44 @@ namespace llaminar2::test
         auto decode_buffers = makeActivationBuffers(decode_arena);
         TensorArena prefill_arena;
         auto prefill_buffers = makeActivationBuffers(prefill_arena);
-        ScopedDevicePublicationStream stream(DeviceId::cuda(0));
+        ScopedDevicePublicationStream stream(source_device, admission.permit(source_device), admission.memory());
         const int32_t *const prefill_live_rows =
             stream.publishRowCount(kSeqLen);
 
-        /*
-         * The mapped rank-pair channel has a directional first-touch setup
-         * handshake. Production runs the follower on world rank one; this
-         * direct graph-builder test creates that setup peer concurrently so
-         * it exercises the same retained channel instead of timing out while
-         * waiting for a rank that the fixture never launched.
-         */
-        const auto graph_family =
-            resolveMoEOverlayInferenceGraphFamilyIdentity(
-                model_ctx->concreteLoader(),
-                model_ctx->architecture(),
-                model_ctx->totalBlockCount(),
-                MoEOverlayMTPGraphFamilyPolicy::MainOnly,
-                /*graph_family_generation=*/1,
-                /*max_graph_rows=*/kSeqLen,
-                /*max_decode_rows=*/1,
-                config.max_request_count,
-                /*max_mtp_draft_depth=*/0);
-        const auto transaction_topology =
-            makeMoEOverlayInferenceTopologyIdentity(
-                owner_map,
-                graph_family,
-                /*source_world_rank=*/0,
-                /*target_world_rank=*/1);
-        // Both endpoints retain the same explicit layout for every admitted
-        // graph family; channel identity alone cannot prove payload geometry.
-        const auto activation_graph_families =
-            makeMoEOverlayActivationGraphFamilyManifests(graph_family);
-        const auto activation_layout = planMoEOverlayNodeLocalActivationLayout({
-            .participant_count = 1,
-            .max_rows_per_participant = static_cast<std::size_t>(kSeqLen),
-            .max_entries_per_participant = static_cast<std::size_t>(kSeqLen * kTopK),
-            .d_model = kDModel,
-            .activation_graph_family_count = activation_graph_families.size(),
-        });
-        auto peer_workspace =
-            std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-                MoEOverlayRankBatchWireWorkspace::Config{
-                    .participant_ids = {1},
-                    .max_total_rows =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .max_total_entries =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .d_model = kDModel,
-                    .top_k = kTopK,
-                });
-        std::shared_ptr<IMoEOverlayRankBatchTransport> peer_transport;
-        std::exception_ptr peer_error;
-        std::jthread peer_builder(
-            [&]
-            {
-                try
-                {
-                    peer_transport = createMoEOverlayRankBatchTransport(
-                        MoEOverlayRankBatchTransportConfig{
-                            .mpi_ctx = peer_mpi,
-                            .source_world_rank = 0,
-                            .target_world_rank = 1,
-                            .workspace = peer_workspace,
-                            .max_rows_per_participant = kSeqLen,
-                            .max_entries_per_participant =
-                                static_cast<std::size_t>(kSeqLen * kTopK),
-                            .d_model = kDModel,
-                            .top_k = kTopK,
-                            .tier_index = 1,
-                            .domain_ordinal = 1,
-                            .channel_identity =
-                                "tier1#domain1#rank0to1#p1,",
-                            .transaction_slot_count = 4096,
-                            .transaction_topology = transaction_topology,
-                            .source_endpoint = {
-                                .world_rank = 0,
-                                .participant_id = 0,
-                                .tier_priority = 0,
-                                .domain_ordinal = 0,
-                            },
-                            .target_tier_priority = 1,
-                            .activation_graph_families = activation_graph_families,
-                            .activation_layout = activation_layout,
-                            .local_lanes = {{
-                                .participant_id = 1,
-                                .device = DeviceId::cpu(),
-                            }},
-                        });
-                }
-                catch (...)
-                {
-                    peer_error = std::current_exception();
-                }
-            });
-        auto source_workspace =
-            std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-                MoEOverlayRankBatchWireWorkspace::Config{
-                    .participant_ids = {1},
-                    .max_total_rows =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .max_total_entries =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .d_model = kDModel,
-                    .top_k = kTopK,
-                });
-        auto source_transport = createMoEOverlayRankBatchTransport(
-            MoEOverlayRankBatchTransportConfig{
-                .mpi_ctx = overlay_mpi,
-                .source_world_rank = 0,
-                .target_world_rank = 1,
-                .workspace = std::move(source_workspace),
-                .max_rows_per_participant = kSeqLen,
-                .max_entries_per_participant =
-                    static_cast<std::size_t>(kSeqLen * kTopK),
-                .d_model = kDModel,
-                .top_k = kTopK,
-                .tier_index = 1,
-                .domain_ordinal = 1,
-                .channel_identity = "tier1#domain1#rank0to1#p1,",
-                .transaction_slot_count = 4096,
-                .transaction_topology = transaction_topology,
-                .source_endpoint = {
-                    .world_rank = 0,
-                    .participant_id = 0,
-                    .tier_priority = 0,
-                    .domain_ordinal = 0,
-                },
-                .target_tier_priority = 1,
-                .activation_graph_families = activation_graph_families,
-                .activation_layout = activation_layout,
-                .local_lanes = {{
-                    .participant_id = 1,
-                    .device = DeviceId::cuda(0),
-                }},
-            });
-        peer_builder.join();
-        if (peer_error)
-            std::rethrow_exception(peer_error);
-        ASSERT_NE(peer_transport, nullptr);
-        auto channel_registry =
-            std::make_shared<MoEOverlayRankBatchTransportRegistry>();
-        channel_registry->install(
-            "tier1#domain1#rank0to1#p1,",
-            std::move(source_transport));
-        config.moe.rank_batch_transport_registry =
-            std::move(channel_registry);
-        Qwen35MoEGraph builder(model_ctx, overlay_mpi, config);
+        config.moe.rank_batch_transport_registry=admission.registry();
+        config.moe.activation_batch_inventory=sources;
+        OriginalLoweringGraph builder(model_ctx, overlay_mpi, config);
+        const auto prepared_store=model_ctx->concreteWeightManager()->preparedWeightStore();
+        ASSERT_NE(prepared_store,nullptr);
+        ASSERT_EQ(prepared_store->physicalMemoryAuthority(),admission.memory());
+        builder.setPreparedWeightStore(prepared_store.get());
 
-        ComputeGraph decode_graph = builder.buildFFNGraph(
-            layer,
+        ComputeGraph decode_graph = builder.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Decode, layer,
             decode_buffers,
             /*layer_idx=*/0,
             /*seq_len=*/1,
             kBatchSize,
-            DeviceId::cuda(0),
+            source_device,
             stream.get());
-        ComputeGraph prefill_graph = builder.buildFFNGraph(
-            layer,
+        ComputeGraph prefill_graph = builder.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Prefill, layer,
             prefill_buffers,
             /*layer_idx=*/0,
             kSeqLen,
             kBatchSize,
-            DeviceId::cuda(0),
+            source_device,
             stream.get(),
             prefill_live_rows);
         const int32_t *const one_row_prefill_live_rows =
             stream.publishRowCount(1);
-        ComputeGraph one_row_prefill_graph = builder.buildFFNGraph(
-            layer,
+        ComputeGraph one_row_prefill_graph = builder.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Prefill, layer,
             decode_buffers,
             /*layer_idx=*/0,
             /*seq_len=*/1,
             kBatchSize,
-            DeviceId::cuda(0),
+            source_device,
             stream.get(),
             one_row_prefill_live_rows);
 
@@ -3045,6 +2892,8 @@ namespace llaminar2::test
                    "in one directly captured endpoint graph, never in CUDA "
                    "child graphs";
         }
+        if(::testing::Test::HasFailure())throw std::runtime_error("Original distributed lowering assertion failed");
+        });
     }
 
     /**
@@ -3064,34 +2913,41 @@ namespace llaminar2::test
         MoEOverlayNodeLocalRouteTransportPolicy route_policy)
     {
         ASSERT_TRUE(route_policy.resolved());
-        const MoEOverlayNodeLocalRouteTransport route_transport =
-            route_policy.ordinary_prefill;
-        constexpr int kMTPSourceLayer = 1;
-        auto plan = makeDistributedLocalTPContinuationPlan(
-            /*layer_count=*/kMTPSourceLayer + 1);
-        // Deliver actual startup packets between both logical ranks; the plain
-        // mock completes receives without bytes and cannot authenticate a file.
-        auto startup_link = std::make_shared<OwnedSharedBackingReplayLink>();
-        auto overlay_mpi =
-            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/0, /*world_size=*/2);
-        overlay_mpi->bind(startup_link);
-        overlay_mpi->set_topology(
-            MockMPITopology::createSimple(
-                /*rank=*/0,
-                /*world_size=*/2,
-                /*ranks_per_node=*/2));
-        auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            plan,
-            MoEExpertOverlayRuntimeResolverOptions{
-                .current_world_rank = 0,
-            });
-        const auto owner_map = MoEExpertOwnerMap::build(*plan);
-
-        MockLocalTPContext tp_ctx;
-        tp_ctx.setDevices(
-            {GlobalDeviceAddress::rocm(0),
-             GlobalDeviceAddress::rocm(1)});
-        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        OriginalMappedLoweringAdmission admission({DeviceType::ROCm,2},{DeviceType::ROCm,4});
+        const auto source0=admission.cohorts().sourceDevices().at(0),source1=admission.cohorts().sourceDevices().at(1);
+        auto overlay_mpi=admission.mpi();
+        const auto route_transport=route_policy.ordinary_prefill;
+        constexpr int kMTPSourceLayer=1;
+        auto plan=makeDistributedLocalTPContinuationPlan(kMTPSourceLayer+1);
+        admission.bind(*plan);
+        const auto owner_map=MoEExpertOwnerMap::build(*plan);
+        std::unique_ptr<ILocalTPContext> tp_ctx;
+        LoweringMTPDirectory directory;
+        auto model_ctx=ModelContext::create(directory.path(),nullptr);
+        if(!model_ctx || !model_ctx->concreteWeightManager())throw std::runtime_error("Original lowering NextN directory is absent");
+        MTPRuntimeConfig mtp;mtp.enabled=true;mtp.draft_tokens=1;mtp.graph_capacity_draft_tokens=1;mtp.depth_policy.mode=MTPDepthPolicyMode::Fixed;
+        const auto graph_family=resolveMoEOverlayInferenceGraphFamilyIdentity(model_ctx->concreteLoader(),model_ctx->architecture(),
+            model_ctx->totalBlockCount(),MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars,1,kSeqLen,
+            resolveMTPRetainedTargetQueryRows(mtp),1,resolveMTPRetainedDraftCapacity(mtp));
+        using BatchInventory=MoEOverlayActivationBatchInventory;
+        const auto sources=BatchInventory::declareSources(std::array{
+            BatchInventory::Source{BatchInventory::SourceKind::Decode,0,SparseQueryExecutionProgram::RankingPossible,1,1,{0},{},{}},
+            BatchInventory::Source{BatchInventory::SourceKind::PrefillBucket,0,SparseQueryExecutionProgram::RankingPossible,kSeqLen,kSeqLen,{0},{},{}},
+            BatchInventory::Source{BatchInventory::SourceKind::Draft,1,SparseQueryExecutionProgram::RankingPossible,1,1,{kMTPSourceLayer},MTPSidecarCaptureRole::Full,BatchInventory::DraftTokenSource::Host}});
+        const MoEOverlayNodeLocalRouteExchange::Config route_config{.devices=admission.cohorts().sourceDevices(),
+            .root_device=source0,.identity="continuation:continuation_domain"};
+        std::optional<MoEOverlayNodeLocalRouteExchange::StorageDeclaration> route_declaration;
+        std::optional<PhysicalMemoryPlan> route_bom;
+        if(route_policy.requiresMappedExchange()){
+            route_declaration=MoEOverlayNodeLocalRouteExchange::declareStorage(route_config,kSeqLen,kTopK,kDModel);
+            if(admission.source())route_bom=route_declaration->bom(admission.resource(DeviceId::cpu()),admission.resource(source0));}
+        admission.prepare(*plan,graph_family,sources,kSeqLen,kDModel,kTopK,0,route_bom?&*route_bom:nullptr);
+        admission.checkpoint([&]{if(!admission.source())return;
+        model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(admission.memory());
+        const auto runtime_plan=resolveMoEExpertOverlayRuntimePlan(plan,{.current_world_rank=admission.cohorts().sourceRank()});
+        // The source's local collective owns exactly its observed original GPU roster.
+        tp_ctx=createLocalTPContext(plan->domains.front().participants,{},CollectiveBackendType::RCCL);
+        if(!tp_ctx)throw std::runtime_error("Original source LocalTP context is unavailable");
 
         GraphConfig config0 = makeConfig(plan, /*layer_count=*/1);
         config0.total_n_layers = kMTPSourceLayer + 1;
@@ -3100,8 +2956,8 @@ namespace llaminar2::test
         config0.mtp.graph_capacity_draft_tokens = 1;
         config0.mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
         config0.max_activation_rows = kSeqLen;
-        config0.default_device = DeviceId::rocm(0);
-        config0.tp_ctx = &tp_ctx;
+        config0.default_device = source0;
+        config0.tp_ctx = tp_ctx.get();
         config0.tp_device_idx = 0;
         config0.moe.overlay_mpi_ctx = overlay_mpi;
         config0.moe.expert_overlay_runtime_plan = runtime_plan;
@@ -3109,53 +2965,17 @@ namespace llaminar2::test
         config0.moe.shared_intermediate_size = kIntermediate;
 
         config0.moe.node_local_route_transport_policy = route_policy;
-        if (route_policy.requiresMappedExchange())
-        {
-            /*
-             * RankOrchestrator normally creates this process-local owner
-             * before either participant graph. The direct builder fixture
-             * installs the same shared lifetime explicitly; one fabric per
-             * graph would split mapped epochs and acknowledgement authority.
-             */
-            config0.moe.node_local_route_exchange =
-                std::make_shared<MoEOverlayNodeLocalRouteExchange>(
-                    MoEOverlayNodeLocalRouteExchange::Config{
-                        .devices = {
-                            DeviceId::rocm(0), DeviceId::rocm(1)},
-                        .root_device = DeviceId::rocm(0),
-                        .identity = "continuation:continuation_domain",
-                    });
-        }
+        if(route_declaration)config0.moe.node_local_route_exchange=std::make_shared<MoEOverlayNodeLocalRouteExchange>(
+            route_config,*route_declaration,admission.memory(),admission.cohorts().inventory());
 
         GraphConfig config1 = config0;
-        config1.default_device = DeviceId::rocm(1);
+        config1.default_device = source1;
         config1.tp_device_idx = 1;
 
-        LoweringMTPDirectory directory;
-        // Load the real directory before WeightManager seals its source.
-        // createForTesting(with_weight_manager=true) installs/seals a synthetic
-        // directory, so replacing it afterwards would invalidate weight owners.
-        auto model_ctx = ModelContext::create(directory.path(), nullptr);
-        ASSERT_NE(model_ctx, nullptr);
-        ASSERT_EQ(model_ctx->architecture(), "qwen35moe");
-        ASSERT_EQ(model_ctx->totalBlockCount(), kMTPSourceLayer + 1);
-        ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
-        // Both real GPU builders retain one original request-epoch arena,
-        // shared by their decode/prefill/MTP tables. Admit each exact native
-        // owner through the same model authority before lowering any family.
-        PhysicalMemoryPlanBuilder epoch_admission;
-        const auto epoch_bytes = DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u);
-        for (const auto endpoint : {config0.default_device, config1.default_device})
-        {
-            auto *backend = getBackendFor(endpoint);
-            ASSERT_NE(backend, nullptr);
-            epoch_admission.add({0, endpoint, backend->deviceMemoryTotal(endpoint.ordinal),
-                backend->deviceMemoryFree(endpoint.ordinal)},
-                PhysicalMemoryOwner::ExecutionWorkspace, epoch_bytes);
-        }
-        model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(
-            std::make_shared<PhysicalMemoryAuthority>(
-                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(epoch_admission.build()), 0));
+        config0.moe.rank_batch_transport_registry=admission.registry();
+        config1.moe.rank_batch_transport_registry=admission.registry();
+        config0.moe.activation_batch_inventory=sources;
+        config1.moe.activation_batch_inventory=sources;
         const auto prepared_store = model_ctx->concreteWeightManager()->preparedWeightStore();
         ASSERT_NE(prepared_store, nullptr);
         ASSERT_EQ(prepared_store->physicalMemoryAuthority(),
@@ -3169,12 +2989,12 @@ namespace llaminar2::test
             registerCompleteDomainExpertLayer(
                 registry,
                 "continuation_domain",
-                DeviceId::rocm(0),
+                source0,
                 layer_index);
             registerCompleteDomainExpertLayer(
                 registry,
                 "continuation_domain",
-                DeviceId::rocm(1),
+                source1,
                 layer_index);
         }
 
@@ -3203,187 +3023,14 @@ namespace llaminar2::test
         auto buffers1 = makeActivationBuffers(activation_arena1);
         MTPForwardOutput mtp_output1 =
             makeMTPSidecarOutput(activation_arena1);
-        ScopedDevicePublicationStream stream0(DeviceId::rocm(0));
-        ScopedDevicePublicationStream stream1(DeviceId::rocm(1));
-
-        /*
-         * Channel establishment is a two-rank setup protocol: each consumer
-         * first-touches the payload direction that it will read before either
-         * endpoint pins the complete shared mapping. This graph-lowering test
-         * runs both logical ranks in one process, so model the remote rank's
-         * setup half concurrently. The peer uses a CPU alias because this test
-         * inspects continuation graph topology only; the dedicated CUDA/ROCm
-         * packet integration suite executes both real GPU endpoints and checks
-         * every returned byte.
-         */
-        auto peer_mpi =
-            std::make_shared<OwnedSharedBackingReplayContext>(/*rank=*/1, /*world_size=*/2);
-        peer_mpi->bind(startup_link);
-        peer_mpi->set_topology(
-            MockMPITopology::createSimple(
-                /*rank=*/1,
-                /*world_size=*/2,
-                /*ranks_per_node=*/2));
-        // Both endpoint fixtures and the production graph builder discover the
-        // same source roles and retained capacity from the loaded directory.
-        const auto graph_family = resolveMoEOverlayInferenceGraphFamilyIdentity(
-            model_ctx->concreteLoader(), model_ctx->architecture(), model_ctx->totalBlockCount(),
-            MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars, /*graph_family_generation=*/1,
-            kSeqLen, resolveMTPRetainedTargetQueryRows(config0.mtp), config0.max_request_count,
-            resolveMTPRetainedDraftCapacity(config0.mtp));
-        ASSERT_TRUE(graph_family.valid());
-        ASSERT_EQ(graph_family.main_layer_count, 1);
-        ASSERT_EQ(graph_family.mtp_source_layers, (std::vector<int>{kMTPSourceLayer}));
-        const auto transaction_topology =
-            makeMoEOverlayInferenceTopologyIdentity(
-                owner_map,
-                graph_family,
-                /*source_world_rank=*/0,
-                /*target_world_rank=*/1);
-        const std::vector<int> remote_participants{2, 3, 4, 5};
-        const auto activation_graph_families =
-            makeMoEOverlayActivationGraphFamilyManifests(graph_family);
-        const auto activation_layout =
-            planMoEOverlayNodeLocalActivationLayout({
-                .participant_count = remote_participants.size(),
-                .max_rows_per_participant =
-                    static_cast<std::size_t>(kSeqLen),
-                .max_entries_per_participant =
-                    static_cast<std::size_t>(kSeqLen * kTopK),
-                .d_model = kDModel,
-                .activation_graph_family_count =
-                    activation_graph_families.size(),
-            });
-        auto peer_workspace =
-            std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-                MoEOverlayRankBatchWireWorkspace::Config{
-                    .participant_ids = remote_participants,
-                    .max_total_rows =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .max_total_entries =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .d_model = kDModel,
-                    .top_k = kTopK,
-                });
-        std::shared_ptr<IMoEOverlayRankBatchTransport> peer_transport;
-        std::exception_ptr peer_error;
-        std::jthread peer_builder(
-            [&]
-            {
-                try
-                {
-                    peer_transport = createMoEOverlayRankBatchTransport(
-                        MoEOverlayRankBatchTransportConfig{
-                            .mpi_ctx = peer_mpi,
-                            .source_world_rank = 0,
-                            .target_world_rank = 1,
-                            .workspace = peer_workspace,
-                            .max_rows_per_participant = kSeqLen,
-                            .max_entries_per_participant =
-                                static_cast<std::size_t>(kSeqLen * kTopK),
-                            .d_model = kDModel,
-                            .top_k = kTopK,
-                            .tier_index = 1,
-                            .domain_ordinal = 1,
-                            .channel_identity =
-                                "tier1#domain1#rank0to1#p2,3,4,5,",
-                            .transaction_slot_count = 4096,
-                            .transaction_topology = transaction_topology,
-                            .source_endpoint = {
-                                .world_rank = 0,
-                                .participant_id = 0,
-                                .tier_priority = 0,
-                                .domain_ordinal = 0,
-                            },
-                            .target_tier_priority = 1,
-                            .activation_graph_families =
-                                activation_graph_families,
-                            .activation_layout = activation_layout,
-                            .local_lanes = {
-                                {.participant_id = 2,
-                                 .device = DeviceId::cpu()},
-                                {.participant_id = 3,
-                                 .device = DeviceId::cpu()},
-                                {.participant_id = 4,
-                                 .device = DeviceId::cpu()},
-                                {.participant_id = 5,
-                                 .device = DeviceId::cpu()},
-                            },
-                        });
-                }
-                catch (...)
-                {
-                    peer_error = std::current_exception();
-                }
-            });
-
-        auto source_workspace =
-            std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-                MoEOverlayRankBatchWireWorkspace::Config{
-                    .participant_ids = remote_participants,
-                    .max_total_rows =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .max_total_entries =
-                        static_cast<std::size_t>(kSeqLen * kTopK),
-                    .d_model = kDModel,
-                    .top_k = kTopK,
-                });
-        auto source_transport = createMoEOverlayRankBatchTransport(
-            MoEOverlayRankBatchTransportConfig{
-                .mpi_ctx = overlay_mpi,
-                .source_world_rank = 0,
-                .target_world_rank = 1,
-                .workspace = std::move(source_workspace),
-                .max_rows_per_participant = kSeqLen,
-                .max_entries_per_participant =
-                    static_cast<std::size_t>(kSeqLen * kTopK),
-                .d_model = kDModel,
-                .top_k = kTopK,
-                .tier_index = 1,
-                .domain_ordinal = 1,
-                .channel_identity =
-                    "tier1#domain1#rank0to1#p2,3,4,5,",
-                .transaction_slot_count = 4096,
-                .transaction_topology = transaction_topology,
-                .source_endpoint = {
-                    .world_rank = 0,
-                    .participant_id = 0,
-                    .tier_priority = 0,
-                    .domain_ordinal = 0,
-                },
-                .target_tier_priority = 1,
-                .activation_graph_families =
-                    activation_graph_families,
-                .activation_layout = activation_layout,
-                .local_lanes = {
-                    {.participant_id = 2,
-                     .device = DeviceId::rocm(0)},
-                    {.participant_id = 3,
-                     .device = DeviceId::rocm(0)},
-                    {.participant_id = 4,
-                     .device = DeviceId::rocm(0)},
-                    {.participant_id = 5,
-                     .device = DeviceId::rocm(0)},
-                },
-            });
-        peer_builder.join();
-        if (peer_error)
-            std::rethrow_exception(peer_error);
-        ASSERT_NE(peer_transport, nullptr);
-        auto channel_registry =
-            std::make_shared<MoEOverlayRankBatchTransportRegistry>();
-        channel_registry->install(
-            "tier1#domain1#rank0to1#p2,3,4,5,",
-            std::move(source_transport));
-        config0.moe.rank_batch_transport_registry = channel_registry;
-        config1.moe.rank_batch_transport_registry =
-            std::move(channel_registry);
+        ScopedDevicePublicationStream stream0(source0,admission.permit(source0),admission.memory());
+        ScopedDevicePublicationStream stream1(source1,admission.permit(source1),admission.memory());
 
         const std::string local_name =
             "layer0_moe_expert_ffn_overlay_continuation_local";
 
-        Qwen35MoEGraph builder0(model_ctx, overlay_mpi, config0);
-        Qwen35MoEGraph builder1(model_ctx, overlay_mpi, config1);
+        OriginalLoweringGraph builder0(model_ctx, overlay_mpi, config0);
+        OriginalLoweringGraph builder1(model_ctx, overlay_mpi, config1);
         builder0.setPreparedWeightStore(prepared_store.get());
         builder1.setPreparedWeightStore(prepared_store.get());
         builder0.setWeights(model_weights);
@@ -3396,12 +3043,12 @@ namespace llaminar2::test
          * Each continuation-local branch must receive and initialize its own
          * device table before capture preparation begins.
          */
-        ComputeGraph decode_graph0 = builder0.buildFFNGraph(
-            layer, buffers0, 0, /*seq_len=*/1, kBatchSize,
-            DeviceId::rocm(0), stream0.get());
-        ComputeGraph decode_graph1 = builder1.buildFFNGraph(
-            layer, buffers1, 0, /*seq_len=*/1, kBatchSize,
-            DeviceId::rocm(1), stream1.get());
+        ComputeGraph decode_graph0 = builder0.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Decode, layer, buffers0, 0, /*seq_len=*/1, kBatchSize,
+            source0, stream0.get());
+        ComputeGraph decode_graph1 = builder1.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Decode, layer, buffers1, 0, /*seq_len=*/1, kBatchSize,
+            source1, stream1.get());
         for (const auto *decode_graph : {&decode_graph0, &decode_graph1})
         {
             const auto *node = decode_graph->getNode(local_name);
@@ -3489,11 +3136,11 @@ namespace llaminar2::test
         mtp_input0.batch_size = 1;
         mtp_input0.seq_len = 1;
         mtp_input0.device_state_publication_stream = stream0.get();
-        mtp_input0.device = DeviceId::rocm(0);
+        mtp_input0.device = source0;
         MTPForwardInput mtp_input1 = mtp_input0;
         mtp_input1.terminal_hidden = mtp_output1.projected;
         mtp_input1.device_state_publication_stream = stream1.get();
-        mtp_input1.device = DeviceId::rocm(1);
+        mtp_input1.device = source1;
 
         ComputeGraph mtp_graph0 = builder0.buildMTPGraph(
             /*depth_idx=*/0, mtp_weights, mtp_input0, mtp_output0);
@@ -3658,7 +3305,7 @@ namespace llaminar2::test
         ASSERT_EQ(dispatch_transaction->lanes().size(), 4u);
         EXPECT_EQ(
             dispatch_batch->getParams().device_id,
-            DeviceId::rocm(0));
+            source0);
         EXPECT_EQ(
             dispatch_transaction->stageOrdinal(),
             0u);
@@ -3689,7 +3336,7 @@ namespace llaminar2::test
         ASSERT_EQ(return_transaction->lanes().size(), 4u);
         EXPECT_EQ(
             return_batch->getParams().device_id,
-            DeviceId::rocm(0));
+            source0);
         EXPECT_EQ(
             return_batch->getParams().canonical_route_contributions,
             buffers0.extensions.at(
@@ -3701,7 +3348,7 @@ namespace llaminar2::test
         std::vector<int> batched_participant_order;
         for (const auto &lane : dispatch_transaction->lanes())
         {
-            EXPECT_EQ(lane.device, DeviceId::rocm(0));
+            EXPECT_EQ(lane.device, source0);
             EXPECT_EQ(lane.graph_family_ordinal, 0u);
             batched_participant_order.push_back(
                 lane.target_participant_id);
@@ -3724,12 +3371,12 @@ namespace llaminar2::test
                 << "Complete endpoint captures never weaken an arena frontier";
         }
 
-        ComputeGraph graph0 = builder0.buildFFNGraph(
-            layer, buffers0, 0, kSeqLen, kBatchSize,
-            DeviceId::rocm(0), stream0.get());
-        ComputeGraph graph1 = builder1.buildFFNGraph(
-            layer, buffers1, 0, kSeqLen, kBatchSize,
-            DeviceId::rocm(1), stream1.get());
+        ComputeGraph graph0 = builder0.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Prefill, layer, buffers0, 0, kSeqLen, kBatchSize,
+            source0, stream0.get());
+        ComputeGraph graph1 = builder1.buildOriginalFFNGraph(
+            ForwardExecutionPhase::Prefill, layer, buffers1, 0, kSeqLen, kBatchSize,
+            source1, stream1.get());
 
         ASSERT_NE(graph0.getNode(local_name), nullptr);
         ASSERT_NE(graph1.getNode(local_name), nullptr);
@@ -3839,7 +3486,7 @@ namespace llaminar2::test
             prefill_transaction)
             << "Fork and join must share one immutable layer transaction";
         ASSERT_EQ(prefill_transaction->lanes().size(), 4u);
-        EXPECT_EQ(prefill_transaction->device(), DeviceId::rocm(0));
+        EXPECT_EQ(prefill_transaction->device(), source0);
         EXPECT_EQ(prefill_transaction->physicalRows(), kSeqLen);
         EXPECT_EQ(prefill_transaction->stageOrdinal(), 0u);
         EXPECT_EQ(prefill_transaction->modelLayerIndex(), 0);
@@ -3878,7 +3525,7 @@ namespace llaminar2::test
         std::vector<int> prefill_participant_order;
         for (const auto &lane : prefill_transaction->lanes())
         {
-            EXPECT_EQ(lane.device, DeviceId::rocm(0));
+            EXPECT_EQ(lane.device, source0);
             EXPECT_EQ(lane.graph_family_ordinal, 0u);
             prefill_participant_order.push_back(
                 lane.target_participant_id);
@@ -4379,6 +4026,8 @@ namespace llaminar2::test
             shared_gate_stage1->coherencePolicy(),
             CoherencePolicy::NONE)
             << "A non-root observer must have no tensor ownership";
+        if(::testing::Test::HasFailure())throw std::runtime_error("Original distributed LocalTP lowering assertion failed");
+        });
     }
 
     /**
@@ -5381,13 +5030,19 @@ namespace llaminar2::test
             // through the production authority. Only actual slot allocations
             // materialize; the fixture never reserves a second physical pool.
             constexpr std::size_t migration_capacity = 16u << 20;
+            const auto epoch_bytes = DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u);
+            const auto total = CPUSerialExpertStorageLayout::add(migration_capacity, epoch_bytes);
+            const PhysicalMemoryResource resource{0, device, total, total};
             PhysicalMemoryPlanBuilder memory_plan;
-            memory_plan.add({.world_rank = 0, .device = device,
-                .total_bytes = migration_capacity, .admission_available_bytes = migration_capacity},
-                PhysicalMemoryOwner::ExpertMigrationStaging, migration_capacity);
+            memory_plan.add(resource, PhysicalMemoryOwner::ExpertMigrationStaging, migration_capacity);
+            memory_plan.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, epoch_bytes);
+            const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0);
             PreparedWeightStore prepared;
-            prepared.installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
-                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0));
+            prepared.installPhysicalMemoryAuthority(memory);
+            model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(memory);
+            ASSERT_EQ(model_ctx->concreteWeightManager()->physicalMemoryAuthority(),
+                prepared.physicalMemoryAuthority());
             Qwen35MoEGraph builder(model_ctx, nullptr, config);
             builder.setPreparedWeightStore(&prepared);
             ScopedDevicePublicationStream publication(device);
@@ -5401,6 +5056,8 @@ namespace llaminar2::test
                 auto buffers = makeActivationBuffers(activations);
                 auto graph = builder.buildFFNGraph(layer_weights, buffers, model_layer,
                     kSeqLen, kBatchSize, device, publication.get());
+                EXPECT_EQ(memory->claimedBytes(device, PhysicalMemoryOwner::ExecutionWorkspace,
+                    PhysicalMemoryMaterializationKind::NewAllocation), epoch_bytes);
                 for (const char *suffix : {"_moe_current_batch_llep_plan_pack",
                                          "_moe_current_batch_llep_unpack_apply_assign"})
                 {

@@ -10,6 +10,9 @@
  * can touch that shared slot. Request-reset ingress and terminal observations
  * occur outside the graph transaction; the consumer API performs no host fence.
  * This is native event/epoch ownership proof, not learned-model inference.
+ * These cold-source fixtures have separate fresh-process CTest aliases. They
+ * cannot adopt contexts retained by the process-resident fabric scope. Original
+ * source/PMA identity and the late-adoption guard remain authoritative.
  */
 #include "backends/NativeContextPreparation.h"
 #include "backends/NativeOrderingEventGroup.h"
@@ -36,7 +39,7 @@ PhysicalMemoryResource followerPredecessorResource(DeviceId device)
         return entry.type==backend && (device.is_cpu() || entry.device_id==device.ordinal);
     });
     requireFollowerPredecessor(found!=devices.end(),"Native predecessor endpoint is absent from original startup inventory");
-    return {0,device,found->total_memory_bytes,found->free_memory_bytes};
+    return {originalContext()->rank(),device,found->total_memory_bytes,found->free_memory_bytes};
 }
 
 /**
@@ -46,12 +49,13 @@ PhysicalMemoryResource followerPredecessorResource(DeviceId device)
 void replayFollowerPredecessorCapture(DeviceId device)
 {
     auto *backend=getBackendFor(device);
-    if(!backend || backend->deviceCount()<1)GTEST_SKIP()<<"Requires one actual "<<device.toString()<<" endpoint";
+    requireFollowerPredecessor(backend && device.ordinal>=0 && backend->deviceCount()>device.ordinal,
+        "Cold-source predecessor replay requires its actual original native endpoint");
     using Cache=DeviceGraphExecutor::GraphSegmentCache;
     const auto cpu=followerPredecessorResource(DeviceId::cpu());
     const auto gpu=followerPredecessorResource(device);
     const std::array resources{cpu,gpu};const std::array selected{device};
-    auto source=NativeContextPreparation::create(resources,0,selected);
+    auto source=NativeContextPreparation::create(resources,originalContext()->rank(),selected);
     std::optional<PreparedGPUContextUsePermit> permit(source->acquire(device));
     const auto memory=source->memory();
     source->freezeForPlanning();
@@ -180,10 +184,13 @@ void replayFollowerPredecessorCapture(DeviceId device)
             });
             release_and_drain();
             DeviceMoEOverlayEpochStatus no_edge_status{};
+            Cache::CaptureStreamTerminalTicket no_edge_observation;
             worker.submitAndWait([&] {
                 requireFollowerPredecessor(backend->deviceToHost(&no_edge_status,arena->requestStatus(0u),
                     sizeof(no_edge_status),device.ordinal,caches[0].capture_stream),"No-edge original status output failed");
+                no_edge_observation=caches[0].publishCaptureStreamTerminal();
             });
+            caches[0].waitForPublishedCaptureStreamTerminal(no_edge_observation,Cache::HostFenceWaitPolicy::ActiveProgress);
             EXPECT_EQ(no_edge_status.operation,static_cast<std::uint32_t>(DeviceMoEOverlayEpochOperation::Release));
             EXPECT_EQ(no_edge_status.code,static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::InvalidTicket));
             ++no_edge_controls;
@@ -210,11 +217,14 @@ void replayFollowerPredecessorCapture(DeviceId device)
                 });
                 release_and_drain();
                 DeviceMoEOverlayEpochControl control{};DeviceMoEOverlayEpochStatus first{},second{};
+                Cache::CaptureStreamTerminalTicket observation;
                 worker.submitAndWait([&] {
                     requireFollowerPredecessor(backend->deviceToHost(&control,arena->control(),sizeof(control),device.ordinal,caches[1].capture_stream),"Native shared control output failed");
                     requireFollowerPredecessor(backend->deviceToHost(&first,arena->requestStatus(0u),sizeof(first),device.ordinal,caches[1].capture_stream),"Native producer status output failed");
                     requireFollowerPredecessor(backend->deviceToHost(&second,arena->maintenanceStatus(),sizeof(second),device.ordinal,caches[1].capture_stream),"Native consumer status output failed");
+                    observation=caches[1].publishCaptureStreamTerminal();
                 });
+                caches[1].waitForPublishedCaptureStreamTerminal(observation,Cache::HostFenceWaitPolicy::ActiveProgress);
                 EXPECT_TRUE(first.succeeded());EXPECT_TRUE(second.succeeded());
                 EXPECT_EQ(control.bank_readers[0],0u);EXPECT_EQ(control.bank_readers[1],0u);
                 EXPECT_EQ(control.acquisitions_in_flight,0u);++successful_pairs;
@@ -275,8 +285,13 @@ void replayFollowerPredecessorCapture(DeviceId device)
         <<" pairs=21 shared_slot=0 distinct_streams=2 no_edge_controls=1 partial_rejection=1 reset_without_recapture=1\n";
 }
 } // namespace
-TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm, FollowerPredecessorCUDASharedSlotCapturedReplay)
-{ replayFollowerPredecessorCapture(DeviceId::cuda(0)); }
-TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm, FollowerPredecessorROCmSharedSlotCapturedReplay)
-{ replayFollowerPredecessorCapture(DeviceId::rocm(0)); }
+/** @brief A fresh original source birth, separate from the resident-context fabric suite.
+ * Explicit CTest aliases launch this scope in a fresh process. A source created
+ * after foreign resident contexts must retain its original fatal rejection.
+ */
+class MoEFollowerPredecessorColdSourceCUDAAndROCm : public ::testing::Test {};
+TEST_F(MoEFollowerPredecessorColdSourceCUDAAndROCm, FollowerPredecessorCUDASharedSlotCapturedReplay)
+{ originalRankLocalReplay(DeviceType::CUDA, 1, [](const auto &devices) { replayFollowerPredecessorCapture(devices.front()); }); }
+TEST_F(MoEFollowerPredecessorColdSourceCUDAAndROCm, FollowerPredecessorROCmSharedSlotCapturedReplay)
+{ originalRankLocalReplay(DeviceType::ROCm, 1, [](const auto &devices) { replayFollowerPredecessorCapture(devices.front()); }); }
 } // namespace llaminar2::test

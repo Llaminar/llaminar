@@ -58,17 +58,24 @@ protected:
         ASSERT_TRUE(boundary && boundary->requiresSourceGroupAdmission());
         const auto participants = contract.context->adaptiveImmutableLookupParticipants(coordinator.device());
         ASSERT_TRUE(participants);
+        ASSERT_EQ(participants->boundary(), boundary);
         ASSERT_NO_THROW(participants->requireCurrent());
         const auto transport = participants->transport();
         ASSERT_TRUE(transport && transport->localHotGeometry() && transport->readerGeometry());
         ASSERT_EQ(transport->readerGeometry()->consumers().size(), consumers.size());
         ASSERT_EQ(transport->readers().size(), 1u);
         const auto native_storage = transport->readers().front()->nativeResult().nativeStorage();
-        ASSERT_TRUE(native_storage && native_storage->cohort());
-        const auto original_cohort = native_storage->cohort();
-        ASSERT_EQ(original_cohort->modelOwner(), contract.context.get());
-        for (std::size_t index = 0; index < consumers.size(); ++index)
-            ASSERT_NO_THROW(original_cohort->requireConsumer(consumers[index].device, static_cast<int>(index)));
+        ASSERT_TRUE(native_storage);
+        ASSERT_NO_THROW(native_storage->requireCurrent());
+        ASSERT_EQ(transport->readers().front()->consumerCount(), consumers.size());
+        // The model owns the original boundary/participants. Native transport
+        // additionally admits storage-only devices without making them readers.
+        for (const auto& consumer : consumers)
+        {
+            const auto coordinate = native_storage->coordinate(consumer.device);
+            const auto original = native_storage->context();
+            ASSERT_EQ(original.context().devices().at(coordinate).toLocalDeviceId(), consumer.device);
+        }
         const auto original_service = Access::originalService(*boundary);
         ASSERT_TRUE(original_service);
         std::array<std::shared_ptr<::llaminar2::qwen4exp::PooledImmutableLocalHotPreparedStorage>, 2> locals;

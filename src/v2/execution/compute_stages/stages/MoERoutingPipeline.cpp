@@ -70,9 +70,6 @@ namespace
                 std::to_string(layout.top_k) + "/" + std::to_string(layout.partition.participants());
             exchange = distribution.fabric->bind(layout.partition.participant(),
                 {fnv1a64(identity.data(), identity.size()), layout.packetBytes()},
-                // This distributed row-routing path is ordinary prefill. Its
-                // original individual scheduling is explicit and capture-bound.
-                CapturedTransferEndpointScheduling::Individual,
                 retain(distribution.local_packet.tensor), retain(distribution.received_packets.tensor));
         }
     };

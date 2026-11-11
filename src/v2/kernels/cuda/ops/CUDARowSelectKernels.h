@@ -34,6 +34,7 @@ namespace llaminar2::cuda
         int request_row_capacity,
         int bucket_seq_len,
         int32_t pad_token_id,
+        bool require_exact_rows,
         int32_t *out_token_ids,
         int32_t *out_position_ids,
         int32_t *out_real_rows,

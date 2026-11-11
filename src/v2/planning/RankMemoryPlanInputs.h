@@ -8,6 +8,10 @@
  * those families by maintaining another lightweight device-plan constructor.
  * Compute membership retains CPU NUMA identity; only storage ownership projects
  * those workers onto their shared host physical resource.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #pragma once
 
@@ -19,6 +23,7 @@
 
 namespace llaminar2
 {
+    struct GlobalPPTopology;
     /**
      * @brief Immutable transfer ownership of one authored local pipeline stage.
      *
@@ -38,15 +43,27 @@ namespace llaminar2
          * @throws std::invalid_argument for incomplete or inconsistent topology.
          */
         [[nodiscard]] static PipelineStageTransferMemory forStage(const RankExecutionPlan &parent, size_t stage);
+        /**
+         * @brief Bind one actual local action from the canonical global pipeline.
+         * @param topology Complete compiled topology with observed rank membership.
+         * @param world_rank Actual owning rank; no remote GPU is projected locally.
+         * @param stage_id Original declared stage ID, not a local vector position.
+         * @return Exact local body and original same-node GPU boundary ownership,
+         * including per-member completed live-byte native fanout metadata.
+         * @throws std::invalid_argument For absent, foreign, non-CPU multi-rank TP or duplicate physical members.
+         */
+        [[nodiscard]] static PipelineStageTransferMemory forGlobalStage(
+            const GlobalPPTopology &topology, int world_rank, int stage_id);
         /** @return Whether this physical endpoint owns mapped channel storage. */
         [[nodiscard]] bool requiresHostMemory(DeviceId device) const noexcept;
         /**
          * @brief Attach transport only to its actual physical endpoint.
          * @param config One matching continuation graph's memory input.
+         * @param hosted_row_capacity Exact retained invocation rows; zero uses this graph's authored activation envelope.
          * @throws std::invalid_argument for foreign geometry, duplicate binding,
          *         or missing host authority required by a mapped channel owner.
          */
-        void bind(DevicePlanConfig &config) const;
+        void bind(DevicePlanConfig &config, int hosted_row_capacity = 0) const;
     private:
         /** @brief Only forStage() may construct an authenticated stage projection. */
         PipelineStageTransferMemory() = default;
@@ -55,7 +72,10 @@ namespace llaminar2
         int last_layer_ = -1;
         std::vector<DeviceId> participants_;
         std::optional<CollectiveBackendType> native_backend_;
+        std::vector<std::size_t> native_byte_endpoints_; ///< Exact per-member incidence of original native domain edges.
         std::vector<PipelineBoundarySide> captured_boundaries_;
+        bool hosted_activation_bank_owner_ = false; ///< First actual local stage quotes the one original parent CPU bank.
+        bool native_activation_fanout_ = false; ///< Actual receiving TP domain, quoted once on each member.
     };
 
     /**

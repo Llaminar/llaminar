@@ -270,7 +270,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Return whether a TP pool preserves the model's GDN ownership relation.
+         * @brief Return whether every actual TP participant owns a usable model shard.
          *
          * Automatic search may discard an optional topology which cannot ever
          * compile without changing model arithmetic.  The test deliberately
@@ -280,24 +280,31 @@ namespace llaminar2
          *
          * @param profile Immutable model geometry.
          * @param pool Proposed homogeneous or CPU tensor-parallel participants.
-         * @return @c true when every participant owns an integral GDN key-head
-         *         interval, or when the model has no GDN layers.
+         * @param mtp Retained MTP policy used by the canonical source partition.
+         * @param dense Dense prefill/decode policy to be admitted.
+         * @param single_domain Whether this is a complete local main-model domain.
+         * @return True when every participant has positive Q/KV/FFN/vocabulary
+         *         slices and every present GDN slice has integral key-head boundaries.
          * @throws std::invalid_argument for incomplete or invalid GDN geometry.
          */
-        bool preservesGDNHeadOwnership(const ModelMemoryProfile &profile, const Pool &pool,
+        bool preservesModelShardOwnership(const ModelMemoryProfile &profile, const Pool &pool,
             const MTPRuntimeConfig &mtp,DenseParallelPolicy dense=DenseParallelPolicy::TensorParallel,
             bool single_domain=true)
         {
-            if (pool.size() <= 1 ||
-                (profile.gdn_group_count == 0 && profile.gdn_time_step_rank == 0))
-            {
+            if (pool.size() <= 1)
                 return true;
-            }
-            if (profile.gdn_group_count <= 0 || profile.gdn_time_step_rank <= 0)
+            const bool has_gdn = profile.gdn_group_count != 0 || profile.gdn_time_step_rank != 0;
+            if (has_gdn && (profile.gdn_group_count <= 0 || profile.gdn_time_step_rank <= 0))
             {
                 throw std::invalid_argument(
                     "Automatic planning requires both GDN key and value head counts");
             }
+
+            // The canonical partition constructor rejects this infeasible
+            // positive geometry before it can produce an assignment to validate.
+            // Keep that model constraint local to tensor-shard candidates.
+            if (profile.n_heads > 0 && pool.size() > static_cast<std::size_t>(profile.n_heads))
+                return false;
 
             const auto sharding = [&]
             {
@@ -313,7 +320,10 @@ namespace llaminar2
                     mtp,dense,devices);
                 return source.partition(devices,{},profile.d_ff,profile.vocab_size);
             }();
-            return std::all_of(sharding.assignments().begin(), sharding.assignments().end(),
+            // The original partition authority owns nonempty-slice and coverage
+            // validity. Candidate enumeration adds only model-specific GDN rules.
+            if (!sharding.validate()) return false;
+            return !has_gdn || std::all_of(sharding.assignments().begin(), sharding.assignments().end(),
                 [&](const DeviceShardingAssignment &assignment) {
                     return GDNHeadAssignment::hasIntegralKeyHeadBoundaries(
                         profile.gdn_group_count, profile.gdn_time_step_rank,
@@ -513,7 +523,7 @@ namespace llaminar2
             }
             const auto default_policy = default_config.moe_routed_expert_plan
                 ->continuation_domain_spec.effectiveDensePolicy();
-            if(preservesGDNHeadOwnership(model.memoryProfile(),domains.front(),request.mtp,default_policy,domains.size()==1))
+            if(preservesModelShardOwnership(model.memoryProfile(),domains.front(),request.mtp,default_policy,domains.size()==1))
                 publish({strategy, membership, std::move(default_config)});
             if (default_policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
             {
@@ -523,7 +533,7 @@ namespace llaminar2
                 // expert residency; neither policy is a hidden runtime fallback.
                 auto tp_config = overlayConfig(request, domains, membership,
                     DenseParallelPolicy::TensorParallel);
-                if(preservesGDNHeadOwnership(model.memoryProfile(),domains.front(),request.mtp,DenseParallelPolicy::TensorParallel,domains.size()==1))
+                if(preservesModelShardOwnership(model.memoryProfile(),domains.front(),request.mtp,DenseParallelPolicy::TensorParallel,domains.size()==1))
                     publish({strategy, std::move(membership), std::move(tp_config)});
             }
         };
@@ -533,7 +543,7 @@ namespace llaminar2
             const auto strategy = pool.size() == 1 ? OrchestrationStrategy::SingleDevice : OrchestrationStrategy::TensorParallel;
             if (!permitsPools(*policy, strategy, {pool})) continue;
             if (strategy == OrchestrationStrategy::TensorParallel &&
-                !preservesGDNHeadOwnership(model.memoryProfile(), pool,request.mtp)) continue;
+                !preservesModelShardOwnership(model.memoryProfile(), pool,request.mtp)) continue;
             auto membership = membershipFor({pool}, inventory);
             auto config = explicitRequest(request);
             if (pool.size() == 1)
@@ -634,7 +644,9 @@ namespace llaminar2
             {
                 if (overlaps(first, second)) continue;
                 const std::vector<Pool> domains{first, second};
-                if (pipelines && permitsPools(*policy, OrchestrationStrategy::PipelineParallel, domains))
+                if (pipelines && permitsPools(*policy, OrchestrationStrategy::PipelineParallel, domains) &&
+                    preservesModelShardOwnership(model.memoryProfile(), first, request.mtp) &&
+                    preservesModelShardOwnership(model.memoryProfile(), second, request.mtp))
                 {
                     // Every legal split competes on complete BOM/cost evidence.
                     // Equal layer counts are not a proxy for equal physical bytes.
@@ -654,7 +666,7 @@ namespace llaminar2
                 }
                 if (!overlays ||
                     first.front().address.device_type == DeviceType::CPU) continue;
-                if (!preservesGDNHeadOwnership(model.memoryProfile(), first,request.mtp)) continue;
+                if (!preservesModelShardOwnership(model.memoryProfile(), first,request.mtp)) continue;
                 emitOverlay(domains);
             }
         if (!overlays) return;
@@ -675,7 +687,7 @@ namespace llaminar2
                 if (selected.empty())
                 {
                     if (next.front().address.isCPU() ||
-                        !preservesGDNHeadOwnership(model.memoryProfile(), next,request.mtp))
+                        !preservesModelShardOwnership(model.memoryProfile(), next,request.mtp))
                         continue;
                 }
                 else if (std::any_of(selected.begin(), selected.end(),

@@ -22,6 +22,8 @@
 #include "integration/parity/qwen36/Ornith15ModelParityDefinitions.h"
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
 #include "integration/parity/qwen4exp/Qwen4ExpModelParityDefinitions.h"
+#include "integration/parity/qwen4exp/Qwen4ExpObservedPipelineCases.h"
+#include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
 #include "config/OrchestrationConfigParser.h"
 
 #include "config/OrchestrationConfig.h"
@@ -3249,3 +3251,268 @@ TEST(ModelParityDefinition, FixedHeadNgramDistributionHasDistinctLosslessExportI
     EXPECT_EQ(parseE2ENgramArguments(args).ngram_table_policy,ordinary);
 }
 }
+
+namespace llaminar2::test::parity {
+/** @test Pipeline stage policy axes retain canonical expansion and real discovery/execution namespaces. */
+TEST(ModelParityDefinition, PipelineExpertAxesPreserveSelectedOriginalMembership)
+{
+    ModelParityDefinition definition;
+    definition.model = makeModelDefinition(15);
+    definition.model.attention_heads = 32;
+    definition.model.kv_heads = 8;
+    definition.features.mtp = ModelParityAxisProfile::Standard;
+    definition.dynamic_rebalance = makeDefinition(makeSingleDeviceTopology(),15).dynamic_rebalance;
+    definition.topology = {.test_id="ObservedNative_EP4_EP4",
+        .kind=ModelParityTopologyKind::RankLocalPipelineParallel,
+        .collective=Collective::RCCL,.mpi_ranks=2,
+        .pipeline_stage_sizes={4,4},.pipeline_weights={1.0f,1.0f},
+        .pipeline_tensor_parallel_collectives={Collective::RCCL,Collective::RCCL},
+        .execution_rank_selection=ExecutionRankSelection({1}),
+        .pipeline_routed_compute_policies={RoutedExpertComputePolicy::Apportioned,
+            RoutedExpertComputePolicy::GateUpOwnedDownColumns}};
+    for(const int ordinal:{0,2,3,5,6,8,9,12})
+        definition.topology.participants.push_back({GlobalDeviceAddress::rocm(ordinal),0});
+    const auto cells=expandModelParityDefinition(definition);
+    ASSERT_EQ(cells.size(),24u); // Four normal owner/movement policies x all six capable-model MTP modes.
+    std::set<ModelParityMTP> mtp_modes;
+    for(const auto &cell:cells) {
+        mtp_modes.insert(cell.mtp);
+        ASSERT_TRUE(cell.expert_overlay);
+        const auto config=cell.makeOrchestrationConfig(cell.model.model_path,0);
+        EXPECT_EQ(config.mpi_procs,2);
+        ASSERT_TRUE(config.execution_rank_selection);
+        EXPECT_EQ(config.execution_rank_selection->discoveryRanks(),std::vector<int>{1});
+        EXPECT_EQ(config.planning_mode,OrchestrationPlanningMode::Apply);
+        EXPECT_FALSE(config.moe_routed_expert_plan); // Independent stages own independent real authorities.
+        ASSERT_EQ(config.domain_definitions.size(),2u);
+        for(std::size_t stage=0;stage<2;++stage) {
+            const auto &domain=config.domain_definitions[stage];
+            EXPECT_EQ(domain.owner_rank,0);
+            EXPECT_EQ(domain.devices.size(),4u);
+            EXPECT_EQ(domain.routed_compute_policy,definition.topology.pipeline_routed_compute_policies[stage]);
+            EXPECT_EQ(domain.routed_phase_policy,RoutedExpertPhasePolicy::Uniform);
+        }
+        EXPECT_EQ(config.routed_expert_owner_order,cell.expert_overlay->owner_order);
+        EXPECT_EQ(config.moe_rebalance.mode,cell.expert_overlay->movement==ModelParityExpertMovement::Dynamic
+            ? MoERebalanceRuntimeMode::Dynamic:MoERebalanceRuntimeMode::Off);
+        EXPECT_EQ(cell.toTestConfig().mpi_ranks,1);
+        EXPECT_EQ(cell.requiresCanonicalTPAllreduceMTPDiagnostics(),cell.mtpEnabled());
+        EXPECT_TRUE(config.prefix_cache.enabled);
+    }
+    EXPECT_EQ(mtp_modes.size(),kCanonicalModelParityMTPPolicies.size());
+    auto bad=definition;bad.topology.pipeline_routed_compute_policies.pop_back();
+    EXPECT_THROW((void)expandModelParityDefinition(bad),std::invalid_argument);
+    bad=definition;bad.topology.expert_overlay_plan=makeOverlayPlan();
+    EXPECT_THROW((void)expandModelParityDefinition(bad),std::invalid_argument);
+    bad=definition;bad.topology.execution_rank_selection=ExecutionRankSelection({2});
+    EXPECT_THROW((void)expandModelParityDefinition(bad),std::invalid_argument);
+}
+/** @test Selecting a GPU owner never silently removes an authored multisocket CPU participant. */
+TEST(ModelParityDefinition, ExecutionSelectionCannotHideDeclaredCPUSocketMembers)
+{
+    ModelParityDefinition definition;
+    definition.model=makeModelDefinition();
+    definition.topology={.test_id="CPUOriginalTwoSockets",
+        .kind=ModelParityTopologyKind::NodeTensorParallel,
+        .participants={{GlobalDeviceAddress::cpu(7),0},{GlobalDeviceAddress::cpu(11),1}},
+        .collective=Collective::MPI,.mpi_ranks=2,
+        .execution_rank_selection=ExecutionRankSelection({1})};
+    EXPECT_THROW((void)expandModelParityDefinition(definition),std::invalid_argument);
+    definition.topology.execution_rank_selection=ExecutionRankSelection({0,1});
+    EXPECT_NO_THROW((void)expandModelParityDefinition(definition));
+}
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity {
+/** @test Unbound ISA requests contain no fake GPU addresses; original membership resolves only after observation. */
+TEST(ModelParityDefinition, ObservedPipelineBindsOriginalISAAndRejectsInventedParticipants)
+{
+    ModelParityDefinition definition;
+    definition.model=makeModelDefinition();
+    definition.dynamic_rebalance=makeDefinition(makeSingleDeviceTopology()).dynamic_rebalance;
+    definition.topology={.test_id="ROCm_Observed_EP4_EP4_2xMPI",
+        .kind=ModelParityTopologyKind::RankLocalPipelineParallel,
+        .collective=Collective::RCCL,.mpi_ranks=2,.pipeline_stage_sizes={4,4},
+        .pipeline_tensor_parallel_collectives={Collective::RCCL,Collective::RCCL},
+        .observed_native_pipeline=ModelParityObservedNativePipeline{DeviceType::ROCm,"gfx906"},
+        .pipeline_routed_compute_policies={RoutedExpertComputePolicy::Apportioned,RoutedExpertComputePolicy::Apportioned}};
+    const auto cells=expandModelParityDefinition(definition);
+    ASSERT_EQ(cells.size(),4u);
+    for(const auto& cell:cells) {
+        EXPECT_TRUE(cell.topology.participants.empty());
+        EXPECT_THROW((void)cell.toTestConfig(),std::logic_error);
+        EXPECT_THROW((void)cell.makeOrchestrationConfig(cell.model.model_path,0),std::logic_error);
+    }
+    ClusterInventory observed;observed.world_size=2;
+    for(int rank=0;rank<2;++rank) {
+        RankInventory owner;owner.rank=rank;owner.hostname="original-host";owner.node_id=0;
+        owner.cpu.numa_node=rank?11:7;
+        for(const int ordinal:{0,2,3,4,5,6,8,9,12}) {
+            DeviceInfo gpu;gpu.type=DeviceType::ROCm;gpu.local_device_id=ordinal;gpu.numa_node=11;
+            gpu.uuid="physical-"+std::to_string(ordinal);gpu.native_isa=ordinal==3?"gfx1100":"gfx906:sramecc+";
+            owner.gpus.push_back(gpu);
+        }
+        owner.p2p_rocm_count=9;owner.p2p_rocm.assign(81,true);observed.ranks.push_back(owner);
+    }
+    for(int replay=0;replay<20;++replay) {
+        const auto bound=definition.topology.bindObservedPipeline(observed);
+        ASSERT_TRUE(bound.execution_rank_selection);
+        EXPECT_EQ(bound.execution_rank_selection->discoveryRanks(),std::vector<int>{1});
+        EXPECT_EQ(bound.mpi_ranks,2);EXPECT_EQ(bound.executionRankCount(),1);
+        ASSERT_EQ(bound.participants.size(),8u);
+        for(const auto& participant:bound.participants) {
+            EXPECT_EQ(participant.world_rank,0);EXPECT_EQ(participant.address.numa_node,11);
+            EXPECT_NE(participant.address.device_ordinal,3);
+        }
+        auto concrete=definition;concrete.topology=bound;
+        EXPECT_NO_THROW((void)expandModelParityDefinition(concrete));
+        EXPECT_THROW((void)bound.bindObservedPipeline(observed),std::invalid_argument);
+    }
+    auto fake=definition;fake.topology.participants.push_back({GlobalDeviceAddress::rocm(0),0});
+    EXPECT_THROW((void)expandModelParityDefinition(fake),std::invalid_argument);
+    auto duplicate=observed;duplicate.ranks[1].gpus.front().uuid=duplicate.ranks[1].gpus.back().uuid;
+    EXPECT_THROW((void)definition.topology.bindObservedPipeline(duplicate),std::invalid_argument);
+    auto oversized=definition.topology;oversized.pipeline_stage_sizes={5,4};
+    EXPECT_THROW((void)oversized.bindObservedPipeline(observed),std::invalid_argument);
+}
+/** @test QFN keeps its actual retained3 source dimension without advertising numerical MTP capability. */
+TEST(ModelParityDefinition, ObservedQFNPipelinePreservesNormalSourceAxesAndRetained3)
+{
+    const auto& seeds=qwen4exp::qwen4ExpObservedMI50PipelineSeeds();
+    const auto& cells=qwen4exp::qwen4ExpObservedMI50PipelineSourceCases();
+    EXPECT_EQ(seeds.size(),8u);EXPECT_EQ(cells.size(),32u);
+    std::set<ModelParityMTP> modes;
+    for(const auto& cell:cells) {
+        modes.insert(cell.mtp);EXPECT_TRUE(cell.topology.needsObservedPipelineBinding());
+        EXPECT_TRUE(cell.topology.participants.empty());
+        EXPECT_EQ(cell.topology.pipeline_stage_sizes,std::vector<int>({4,4}));
+        EXPECT_TRUE(cell.expert_overlay.has_value());
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtpEnabled()?3:0);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth,cell.mtpEnabled()?3:0);
+        EXPECT_EQ(bool(cell.model.shared_predictor),cell.mtpEnabled());
+        EXPECT_EQ(cell.requiresCanonicalTPAllreduceMTPDiagnostics(),cell.mtpEnabled());
+    }
+    EXPECT_EQ(modes,std::set<ModelParityMTP>({ModelParityMTP::Off,ModelParityMTP::Depth1,
+        ModelParityMTP::Depth3,ModelParityMTP::DynamicDepth}));
+}
+
+/** @test The Q7 native fixed VRAM request declares all roles without physical addresses or certification. */
+TEST(ModelParityDefinition, ObservedQFNFixedVRAMPreservesSourceAndExactAxes)
+{
+    const auto& ordinary=qwen4exp::qwen4ExpObservedMI50FixedVRAMCases();
+    const auto& source=qwen4exp::qwen4ExpObservedMI50FixedVRAMSourceCases();
+    const auto& exact=qwen4exp::qwen4ExpObservedMI50FixedVRAMExactCases();
+    ASSERT_EQ(ordinary.size(),4u);ASSERT_EQ(source.size(),16u);ASSERT_EQ(exact.size(),12u);
+    std::set<std::string> names;
+    for(const auto& cell:source) {
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+        EXPECT_FALSE(cell.e2e_certification);
+        EXPECT_TRUE(cell.topology.needsObservedPipelineBinding());
+        ASSERT_TRUE(cell.ngram_table_policy);
+        EXPECT_EQ(cell.ngram_table_policy->storage,ImmutableRowStoragePreference::VRAM);
+        EXPECT_TRUE(cell.ngram_table_policy->isFixedHeadSharded());
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtpEnabled()?3:0);
+        EXPECT_EQ(bool(cell.model.shared_predictor),cell.mtpEnabled());
+        EXPECT_THROW((void)cell.makeOrchestrationConfig(cell.model.model_path,0),std::logic_error);
+        std::ostringstream stream;PrintTo(cell,&stream);
+        const auto exported=nlohmann::json::parse(stream.str());
+        const auto& runtime=exported.at("runtime");
+        EXPECT_EQ(runtime.at("configuration_policy"),"observed_pipeline_binding_required_v1");
+        EXPECT_EQ(runtime.at("observed_pipeline_request").at("stage_sizes"),nlohmann::json({4,4}));
+        EXPECT_FALSE(runtime.contains("server_args"));
+        EXPECT_FALSE(runtime.contains("configuration_document"));
+        EXPECT_FALSE(exported.contains("diagnostic_benchmark"));
+    }
+    for(const auto& cell:exact)EXPECT_TRUE(cell.mtpEnabled());
+}
+
+/** @test Useful native Q7 traffic follows original storage and reader roles, including uneven contributions. */
+TEST(ModelParityDefinition, ObservedQFNFixedVRAMTerminalReceiptsUseLiveExtents)
+{
+    namespace native=::llaminar2::qwen4exp;
+    const auto r0=DeviceId::rocm(0),r1=DeviceId::rocm(2),r2=DeviceId::rocm(4),remote=DeviceId::rocm(7);
+    const std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> stages{
+        {{0,r0},{0,r1},{0,r2}},{{0,remote}}};
+    const auto projection=ImmutableFixedHeadPipelineProjection::checked(0,0,8,32,stages);
+    constexpr size_t row_bytes=90;
+    std::vector<PerfStatRecord> records;
+    const auto append=[&](DeviceId device,const native::FixedHeadPipelineTerminalTotals& values) {
+        for(size_t metric=0;metric<values.size();++metric) {
+            PerfStatRecord record;
+            record.kind=PerfStatRecord::Kind::Counter;record.count=1;record.sequence_word_count=1;
+            record.domain="immutable_lookup";record.name=native::kFixedHeadPipelineTerminalMetrics[metric];
+            record.device=device.to_string();record.phase=native::kFixedHeadPipelineTerminalPhase;
+            record.tags={{"authority","pipeline_generation_terminal"},{"request","0"}};
+            record.value=static_cast<double>(values[metric]);
+            records.push_back(std::move(record));
+        }
+    };
+    // Four transactions include one empty prefix. Actual M=7 owns two IDs
+    // per device; one reader also assembles the remote range. Uneven gather
+    // attribution may forward another reader's bytes, but its sum is exact.
+    append(r0,{4,14,1260,0,112,0,4320,8});
+    append(r1,{4,14,1260,0,0,0,3240,0});
+    append(r2,{4,14,1260,0,0,0,2520,0});
+    append(remote,{4,14,1260,0,0,1260,0,8});
+    EXPECT_NO_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,projection,row_bytes));
+    auto invalid=records;
+    invalid.pop_back();
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid[4].value=32*2*sizeof(std::int64_t);
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid.back().value=4;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid[6].value+=row_bytes;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid.front().phase="decode";
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid.front().count=0;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid.front().value=4.5;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+    invalid=records;
+    invalid.back().tags.clear();
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(invalid,projection,row_bytes),std::invalid_argument);
+
+    const std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> uniform_stages{
+        {{0,r0},{0,r1}},{{0,r2},{0,remote}}};
+    const auto uniform=ImmutableFixedHeadPipelineProjection::checked(0,0,8,32,uniform_stages);
+    records.clear();
+    append(r0,{1,6,540,0,48,0,1080,2});
+    append(r1,{1,6,540,0,48,0,1080,2});
+    append(r2,{1,6,540,0,0,540,0,2});
+    append(remote,{1,6,540,0,0,540,0,2});
+    EXPECT_NO_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,uniform,row_bytes,3));
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,uniform,row_bytes,2),std::invalid_argument);
+    auto mixed=records;
+    auto& legacy=mixed.emplace_back(records.front());
+    legacy.name="adaptive_lookup_calls";
+    legacy.phase="generation_terminal";
+    legacy.tags={{"authority","terminal_device_generation_control"},{"request","0"}};
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(mixed,uniform,row_bytes),std::invalid_argument);
+    legacy.name="fixed_head_lookup_calls";
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(mixed,uniform,row_bytes),std::invalid_argument);
+    mixed=records;
+    mixed.push_back(records.front());
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(mixed,uniform,row_bytes),std::invalid_argument);
+    mixed=records;
+    mixed.front().sequence_word_count=0;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(mixed,uniform,row_bytes),std::invalid_argument);
+    records[6].value+=row_bytes;
+    records[14].value-=row_bytes;
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,uniform,row_bytes),std::invalid_argument);
+
+    // An all-empty request has only the two addressed metadata receipts per endpoint.
+    // It cannot certify useful model traffic, even when its progress is otherwise valid.
+    records.clear();
+    for (const auto device : {r0,r1,r2,remote}) append(device,{1,0,0,0,0,0,0,2});
+    EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,uniform,row_bytes),std::invalid_argument);
+}
+} // namespace llaminar2::test::parity

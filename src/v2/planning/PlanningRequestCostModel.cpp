@@ -15,6 +15,7 @@
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEGroupedIntermediateExchangeABI.h"
 #include "transfer/CapturedTransferChannelProtocol.h"
+#include "collective/DeviceCountedAllGather.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <algorithm>
 #include <array>
@@ -338,8 +339,10 @@ namespace llaminar2
          * @brief Price the declared projection exchange, not a complete-FFN output sum.
          *
          * Counted channels send each owner's live records to its down consumers.
-         * P2P domains retain the native packet layout; neither transport is
-         * selected from timings. Column publication is a lossless gather, not
+         * Original topology selects per-edge counted channels, never timings.
+         * Peer/mixed performance still uses the qualified conservative native
+         * packet-capacity proxy, not an assertion of actual live traffic.
+         * Column publication is a lossless gather, not
          * another floating reduction. The bounded native allreduce witness is
          * explicitly a byte-volume proxy for those unmeasured gather protocols.
          */
@@ -349,8 +352,9 @@ namespace llaminar2
             const auto *first = local[group.front()].routed[layer];
             if (!first || !first->projection_ownership)
                 throw std::logic_error("Projection cost has no admitted source ownership");
-            const auto coverage = devices[group.front()].projection_peer_access;
-            if (!coverage) throw std::logic_error("Projection cost is missing observed P2P topology");
+            const auto topology = devices[group.front()].projection_exchange_topology;
+            if (!topology) throw std::logic_error("Projection cost is missing original counted topology");
+            const auto coverage = topology->coverage();
             std::vector<DeviceId> endpoints;
             std::vector<double> records;
             const auto geometry = first->projection_ownership->geometry();
@@ -366,7 +370,8 @@ namespace llaminar2
             {
                 const auto *expert = local[index].routed[layer];
                 if (!expert || !expert->projection_ownership || work[index].discovery_rank != root.discovery_rank ||
-                    work[index].device.type != root.device.type || devices[index].projection_peer_access != coverage ||
+                    work[index].device.type != root.device.type || (!devices[index].projection_exchange_topology ||
+                     !devices[index].projection_exchange_topology->sameRoutes(*topology)) ||
                     expert->projection_ownership->geometry() != geometry ||
                     expert->projection_ownership->participants() != static_cast<int>(group.size()))
                     throw std::logic_error("Projection cost cannot substitute foreign domain/ownership evidence");
@@ -385,7 +390,7 @@ namespace llaminar2
                 return prediction.seconds;
             };
             double intermediate = 0;
-            if (*coverage == PeerAccessCoverage::None)
+            if (coverage == PeerAccessCoverage::None)
             {
                 result.qualifications.insert("projection intermediate uses counted owner records and mapped byte primitives; ordered local sends/receives; protocol polling not separately fitted");
                 std::vector<double> participants;
@@ -415,7 +420,7 @@ namespace llaminar2
             }
             else
             {
-                result.qualifications.insert("projection native intermediate packet gather uses a measured FP32 allreduce byte-volume proxy, not measured gather throughput");
+                result.qualifications.insert("projection counted peer/mixed exchange retains a conservative packet-capacity FP32 allreduce proxy, not actual communicated bytes or measured counted-channel throughput");
                 intermediate = nativeVolume(layout.packetBytes());
             }
             result.qualifications.insert("projection per-role work extrapolates complete-FFN measured rate; gate/up quota and all-expert down slices remain distinct");

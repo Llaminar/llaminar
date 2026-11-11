@@ -42,6 +42,13 @@
  * Physical TP validation borrows the already-resolved LocalTP endpoint order;
  * early structural validation never manufactures physical participant IDs.
  * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
+ * Global pipeline graph completion belongs to the original rank's parent:
+ * nested TP children retain shared sources until its complete serving family
+ * and every stage ownership proof succeed, including terminal MTP operands.
  */
 
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
@@ -49,12 +56,16 @@
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
-#include "planning/ImmutableRowTableAdmissionWire.h"
+#include "planning/OriginalRankCapacityExchange.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "OrchestrationRunner.h"
+#include "PreparedPipelineGraphMaterialization.h"
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/global/GlobalStageTPValidation.h"
+#include "transfer/CapturedTransferChannel.h"
 #include "collective/GlobalTPContext.h"
 #include "collective/NativeCPUCollectiveProgram.h"
 #include <variant>
@@ -101,6 +112,7 @@
 #include "../moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "../moe/MoEOverlayActivationChannelPlan.h"
+#include "../moe/MoEOverlayRankBatchPreparation.h"
 #include "../moe/MoEOverlayEconomyCalibrationController.h"
 #include "../moe/MoEOverlayEconomyCertificationController.h"
 #include "../moe/MoEOverlayDeviceServiceTelemetryPublisher.h"
@@ -1583,6 +1595,12 @@ namespace llaminar2
             };
             if (pipeline)
             {
+                if (const auto &global = pipeline->admission()->globalPipeline(); global)
+                {
+                    if (global->world_size != context->world_size())
+                        throw std::logic_error("Pipeline request publication crossed its original global communicator");
+                    return global->embeddingPublisherRank();
+                }
                 if (pipeline->stages().empty())
                     throw std::logic_error("MoE pipeline request publication has no admitted stages");
                 for (const auto &stage : pipeline->stages())
@@ -1815,395 +1833,6 @@ namespace llaminar2
             }
             return std::nullopt;
         }
-
-
-        /** @brief Append one unsigned scalar in a host-independent wire order. */
-        template <typename UInt>
-        void appendCapacityWireScalar(
-            std::vector<std::uint8_t> &bytes,
-            UInt value)
-        {
-            static_assert(std::is_unsigned_v<UInt>);
-            for (std::size_t offset = 0; offset < sizeof(UInt); ++offset)
-            {
-                bytes.push_back(static_cast<std::uint8_t>(
-                    value >> (offset * 8u)));
-            }
-        }
-
-        /** @brief Read one bounds-checked unsigned little-endian scalar. */
-        template <typename UInt>
-        UInt readCapacityWireScalar(
-            const std::vector<std::uint8_t> &bytes,
-            std::size_t &cursor,
-            std::size_t end)
-        {
-            static_assert(std::is_unsigned_v<UInt>);
-            if (cursor > end || sizeof(UInt) > end - cursor)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity wire record is truncated");
-            }
-            UInt value = 0;
-            for (std::size_t offset = 0; offset < sizeof(UInt); ++offset)
-            {
-                value |= static_cast<UInt>(bytes[cursor++]) <<
-                         (offset * 8u);
-            }
-            return value;
-        }
-
-        /** @brief Serialize rank-local capacity records without ABI padding. */
-        std::vector<std::uint8_t> serializeOverlayCapacityBudgets(
-            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &budgets)
-        {
-            constexpr std::uint32_t kMagic = 0x43415034u; // "CAP4"
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
-            constexpr std::size_t kOwnerBytes = 16;
-            constexpr std::size_t kRecordBytes =
-                kHeaderBytes +
-                PhysicalMemoryBOM::ownerCount() * kOwnerBytes;
-            std::vector<std::uint8_t> bytes;
-            if (budgets.size() >
-                std::numeric_limits<std::size_t>::max() / kRecordBytes)
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay capacity wire record count overflows size_t");
-            }
-            bytes.reserve(budgets.size() * kRecordBytes);
-            for (const auto &budget : budgets)
-            {
-                appendCapacityWireScalar(bytes, kMagic);
-                appendCapacityWireScalar(bytes, kVersion);
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.worldRank()));
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.device().type));
-                appendCapacityWireScalar(
-                    bytes, static_cast<std::uint32_t>(budget.device().ordinal));
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint32_t>(
-                        PhysicalMemoryBOM::ownerCount()));
-                const auto &bom = budget.bom();
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint64_t>(
-                        bom.resource().total_bytes));
-                appendCapacityWireScalar(
-                    bytes,
-                    static_cast<std::uint64_t>(
-                        bom.resource().admission_available_bytes));
-                for (std::size_t owner_index = 0;
-                     owner_index < PhysicalMemoryBOM::ownerCount();
-                     ++owner_index)
-                {
-                    const auto &charge = bom.charge(
-                        PhysicalMemoryBOM::ownerAt(owner_index));
-                    appendCapacityWireScalar(
-                        bytes,
-                        static_cast<std::uint64_t>(
-                            charge.planned_bytes));
-                    appendCapacityWireScalar(
-                        bytes,
-                        static_cast<std::uint64_t>(
-                            charge.already_resident_bytes));
-                }
-            }
-            return bytes;
-        }
-
-        /** @brief Parse and authenticate one rank segment of capacity records. */
-        void parseOverlayCapacityBudgetSegment(
-            const std::vector<std::uint8_t> &bytes,
-            std::size_t begin,
-            std::size_t end,
-            int contributing_rank,
-            std::vector<MoEOverlayBoundPhysicalMemoryBudget> &output)
-        {
-            constexpr std::uint32_t kMagic = 0x43415034u;
-            constexpr std::uint32_t kVersion = 4;
-            constexpr std::size_t kHeaderBytes = 40;
-            constexpr std::size_t kOwnerBytes = 16;
-            constexpr std::size_t kRecordBytes =
-                kHeaderBytes +
-                PhysicalMemoryBOM::ownerCount() * kOwnerBytes;
-            if (begin > end || end > bytes.size() ||
-                (end - begin) % kRecordBytes != 0)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity rank segment has invalid framing");
-            }
-            std::size_t cursor = begin;
-            while (cursor < end)
-            {
-                const auto magic = readCapacityWireScalar<std::uint32_t>(
-                    bytes, cursor, end);
-                const auto version = readCapacityWireScalar<std::uint32_t>(
-                    bytes, cursor, end);
-                const int world_rank = static_cast<int>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const auto device_type = static_cast<DeviceType>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const int ordinal = static_cast<int>(
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end));
-                const auto owner_count =
-                    readCapacityWireScalar<std::uint32_t>(
-                        bytes, cursor, end);
-                const auto total_bytes =
-                    readCapacityWireScalar<std::uint64_t>(
-                        bytes, cursor, end);
-                const auto available_bytes =
-                    readCapacityWireScalar<std::uint64_t>(
-                        bytes, cursor, end);
-                const DeviceId device(device_type, ordinal);
-                if (magic != kMagic || version != kVersion ||
-                    world_rank != contributing_rank ||
-                    owner_count != PhysicalMemoryBOM::ownerCount() ||
-                    !device.is_valid() ||
-                    (!device.is_cpu() && !device.is_gpu()) ||
-                    total_bytes > std::numeric_limits<std::size_t>::max() ||
-                    available_bytes >
-                        std::numeric_limits<std::size_t>::max())
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay capacity wire record failed identity or range validation");
-                }
-                PhysicalMemoryBOMBuilder builder({
-                    .world_rank = world_rank,
-                    .device = device,
-                    .total_bytes = static_cast<std::size_t>(total_bytes),
-                    .admission_available_bytes =
-                        static_cast<std::size_t>(available_bytes),
-                });
-                for (std::size_t owner_index = 0;
-                     owner_index < PhysicalMemoryBOM::ownerCount();
-                     ++owner_index)
-                {
-                    const auto planned =
-                        readCapacityWireScalar<std::uint64_t>(
-                            bytes, cursor, end);
-                    const auto resident =
-                        readCapacityWireScalar<std::uint64_t>(
-                            bytes, cursor, end);
-                    if (planned >
-                            std::numeric_limits<std::size_t>::max() ||
-                        resident >
-                            std::numeric_limits<std::size_t>::max())
-                    {
-                        throw std::invalid_argument(
-                            "ExpertOverlay capacity wire owner charge exceeds size_t");
-                    }
-                    builder.add(
-                        PhysicalMemoryBOM::ownerAt(owner_index),
-                        static_cast<std::size_t>(planned),
-                        static_cast<std::size_t>(resident));
-                }
-                output.emplace_back(
-                    MoEOverlayLocalCapacityPlanner::physicalResourceId(
-                        world_rank, device),
-                    PhysicalMemoryAdmissionCertificate(builder.build()));
-            }
-        }
-
-        /** @brief All-gather variable rank-local physical BOMs in rank order. */
-        std::vector<MoEOverlayBoundPhysicalMemoryBudget>
-        gatherOverlayCapacityBudgets(
-            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &local,
-            const std::shared_ptr<IMPIContext> &mpi_context)
-        {
-            if (!mpi_context || mpi_context->world_size() <= 1)
-                return local;
-
-            const auto send = serializeOverlayCapacityBudgets(local);
-            if (send.size() > static_cast<std::size_t>(INT_MAX))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay rank-local capacity wire payload exceeds MPI int count");
-            }
-            const int world_size = mpi_context->world_size();
-            const int send_count = static_cast<int>(send.size());
-            std::vector<int> counts(static_cast<std::size_t>(world_size), 0);
-            mpi_context->allgather_bytes(
-                &send_count, counts.data(), sizeof(send_count));
-
-            std::vector<int> displacements(
-                static_cast<std::size_t>(world_size), 0);
-            std::size_t total = 0;
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                if (counts[static_cast<std::size_t>(rank)] < 0 ||
-                    total > static_cast<std::size_t>(INT_MAX))
-                {
-                    throw std::overflow_error(
-                        "ExpertOverlay global capacity wire payload exceeds MPI int displacement");
-                }
-                displacements[static_cast<std::size_t>(rank)] =
-                    static_cast<int>(total);
-                total += static_cast<std::size_t>(
-                    counts[static_cast<std::size_t>(rank)]);
-            }
-            if (total > static_cast<std::size_t>(INT_MAX))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay global capacity wire payload exceeds MPI int count");
-            }
-
-            std::vector<std::uint8_t> received(total);
-            mpi_context->allgatherv_bytes(
-                send.empty() ? nullptr : send.data(),
-                send_count,
-                received.empty() ? nullptr : received.data(),
-                counts.data(),
-                displacements.data());
-
-            std::vector<MoEOverlayBoundPhysicalMemoryBudget> result;
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                const std::size_t begin = static_cast<std::size_t>(
-                    displacements[static_cast<std::size_t>(rank)]);
-                const std::size_t end = begin + static_cast<std::size_t>(
-                    counts[static_cast<std::size_t>(rank)]);
-                parseOverlayCapacityBudgetSegment(
-                    received, begin, end, rank, result);
-            }
-            return result;
-        }
-
-        /**
-         * @brief Gather immutable final PLE requests after the higher-priority row/quota search.
-         * @param frame Exact sender bytes validated before readiness consensus.
-         * @param world Existing overlay startup communicator; no inference state is exchanged.
-         * @param profile Canonical source metadata authenticating received requests.
-         * @return Rank-ordered source/consumer/mode BOM requests for one final certificate.
-         * @throws std::exception For malformed framing, foreign identity or an oversized MPI extent.
-         */
-        std::vector<ImmutableRowTableAdmissionRequest> gatherOverlayImmutableTableRequests(
-            const ImmutableRowTableAdmissionSendFrame &frame,
-            const std::shared_ptr<IMPIContext> &world,const ModelMemoryProfile &profile)
-        {
-            if(!world||world->world_size()<=1)
-                return parseImmutableRowTableAdmissionRequests(frame.bytes(),frame.senderRank(),&profile);
-            // Sender validation and serialization already succeeded on every
-            // peer's input-readiness vote. No fallible local wire preparation
-            // remains between that agreement and the first collective.
-            const auto send=frame.bytes();
-            const int n=world->world_size(),send_count=frame.byteCount();
-            std::vector<int> counts(n),offsets(n);
-            world->allgather_bytes(&send_count,counts.data(),sizeof(send_count));
-            std::size_t total=0;
-            for(int rank=0;rank<n;++rank)
-            {
-                if(counts[rank]<0||total>static_cast<std::size_t>(INT_MAX)-static_cast<std::size_t>(counts[rank]))
-                    throw std::overflow_error("Ngram admission aggregate metadata exceeds MPI extent");
-                offsets[rank]=static_cast<int>(total);total+=static_cast<std::size_t>(counts[rank]);
-            }
-            std::vector<std::uint8_t> received(total);
-            world->allgatherv_bytes(send.data(),send_count,received.data(),counts.data(),offsets.data());
-            std::vector<ImmutableRowTableAdmissionRequest> requests;
-            for(int rank=0;rank<n;++rank)
-            {
-                const auto part=std::span<const std::uint8_t>(received).subspan(
-                    static_cast<std::size_t>(offsets[rank]),static_cast<std::size_t>(counts[rank]));
-                auto decoded=parseImmutableRowTableAdmissionRequests(part,rank,&profile);
-                requests.insert(requests.end(),std::make_move_iterator(decoded.begin()),std::make_move_iterator(decoded.end()));
-            }
-            return requests;
-        }
-
-        /**
-         * @brief Prove every overlay rank will execute the same admission loop.
-         *
-         * Capacity admission performs collectives once per candidate. A rank
-         * with a different configured bucket ladder would otherwise leave its
-         * peers inside an unmatched collective. First gathering the count gives
-         * every rank the same safe exit point; only equal counts permit the
-         * second, fixed-width gather of the exact candidate values.
-         */
-        void requireIdenticalOverlayGraphRowCandidates(
-            const std::vector<int> &local_candidates,
-            const std::shared_ptr<IMPIContext> &mpi_context)
-        {
-            if (local_candidates.empty())
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity admission requires at least one graph-row candidate");
-            }
-            const bool uncaptured_contract =
-                local_candidates.size() == 1u &&
-                local_candidates.front() == 0;
-            if (!uncaptured_contract &&
-                (std::any_of(
-                     local_candidates.begin(),
-                     local_candidates.end(),
-                     [](int rows) { return rows <= 0; }) ||
-                 !std::is_sorted(
-                     local_candidates.begin(),
-                     local_candidates.end(),
-                     std::greater<int>{})))
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay graph-row candidates must be positive and descending");
-            }
-            if (!mpi_context || mpi_context->world_size() <= 1)
-                return;
-            if (local_candidates.size() >
-                static_cast<std::size_t>(INT_MAX) / sizeof(int))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay graph-row candidate payload exceeds MPI int count");
-            }
-
-            const int world_size = mpi_context->world_size();
-            const int local_count = static_cast<int>(local_candidates.size());
-            std::vector<int> counts(
-                static_cast<std::size_t>(world_size), 0);
-            mpi_context->allgather_bytes(
-                &local_count, counts.data(), sizeof(local_count));
-            if (!std::all_of(
-                    counts.begin(), counts.end(),
-                    [&](int count) { return count == local_count; }))
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay ranks disagree on the captured-prefill candidate count");
-            }
-
-            const auto candidate_count =
-                static_cast<std::size_t>(local_count);
-            if (candidate_count >
-                std::numeric_limits<std::size_t>::max() /
-                    static_cast<std::size_t>(world_size))
-            {
-                throw std::overflow_error(
-                    "ExpertOverlay gathered graph-row candidates overflow size_t");
-            }
-            std::vector<int> gathered(
-                candidate_count * static_cast<std::size_t>(world_size));
-            mpi_context->allgather_bytes(
-                local_candidates.data(),
-                gathered.data(),
-                candidate_count * sizeof(int));
-            for (int rank = 0; rank < world_size; ++rank)
-            {
-                const auto begin = gathered.begin() +
-                                   static_cast<std::ptrdiff_t>(
-                                       candidate_count *
-                                       static_cast<std::size_t>(rank));
-                if (!std::equal(
-                        local_candidates.begin(),
-                        local_candidates.end(),
-                        begin))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay ranks disagree on the captured-prefill candidate ladder");
-                }
-            }
-        }
-
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> freezeMoEExpertOverlayPlanForModel(
@@ -2831,6 +2460,27 @@ namespace llaminar2
                 return false;
             }
 
+            // Graph construction has completed its original all-rank phase.
+            // Validate every local alias in a separate phase before session
+            // topology discovery can enter any original WORLD collective.
+            if (!run_phase("validateOriginalRankPipelineTransportContext", [&] {
+                    const auto *global = dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+                    if (global && global->requiresOriginalRankGPUTransport())
+                        global->validateOriginalRankGPUTransportContext(mpi_ctx_);
+                    return true;
+                })) return false;
+            if (!run_phase("createOriginalRankPipelineTransportSession", [&] {
+                    auto *global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+                    if (global && global->requiresOriginalRankGPUTransport())
+                    {
+                        if (rank_pipeline_transfer_session_)
+                            return setError("Original rank pipeline session was already constructed");
+                        rank_pipeline_transfer_session_ = CapturedTransferRankSession::create(mpi_ctx_);
+                        global->bindOriginalRankGPUTransportSession(mpi_ctx_, rank_pipeline_transfer_session_);
+                    }
+                    return true;
+                })) return false;
+
             // Bind immutable economics once, before serving capture or warmup.
             // No model directory scan or geometry allocation enters decode.
             if (!run_phase("bindMTPDepthPolicyScopeGeometry", [&]
@@ -3229,6 +2879,7 @@ namespace llaminar2
         const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
             created_native_context_source_ || plan_.runtime.native_context_preparation || runner_ || model_ctx_ || local_tp_ctx_ || local_pp_ctx_ ||
+            rank_pipeline_transfer_session_ ||
             moe_overlay_inference_transaction_coordinator_ ||
             moe_overlay_inference_transaction_follower_ ||
             moe_overlay_rank_batch_transport_registry_ ||
@@ -3345,6 +2996,15 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
+        if (rank_pipeline_transfer_session_)
+        {
+            // Every original local graph/cursor/registration is gone. Existing
+            // session consensus now proves all remote mappings/FDs gone BEFORE
+            // the sole host allocator drops the actual backing charge.
+            try { rank_pipeline_transfer_session_->retireAfterOriginalGraphRelease(); }
+            catch (...) { std::terminate(); }
+            rank_pipeline_transfer_session_.reset();
+        }
         if(cpu_expert_shard_ctx_) {
             // SHUTDOWN has stopped the original workers and runner destruction
             // released every stage/cache borrow. The still-live domain now
@@ -3760,7 +3420,9 @@ namespace llaminar2
             // For example, 448 live rows under a 384-row cap require 384+64,
             // not 384+384. This changes neither row authority nor KV extent.
             const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
-                buckets, runner_->get_position(), token_count);
+                buckets, runner_->get_position(), token_count,
+                plan_.runtime.ngram_table_placement && plan_.runtime.ngram_table_placement->fixedHeadPipeline()
+                    ? PrefillChunkWidthPolicy::ExactRetained : PrefillChunkWidthPolicy::RetainedPadding);
 
             PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
             if (!chunk_schedule)
@@ -4211,23 +3873,30 @@ namespace llaminar2
         const auto &config_prefix = config_.prefix_cache;
         const MTPRuntimeConfig active_mtp = activeMTPRequestConfig();
         /*
-         * The remote expert rank retains MTP-draft and grouped-verifier graph
-         * families, but it does not own a sidecar head, sampler, KV state, or
-         * depth controller.  Its follower consumes those graph families only
-         * after the continuation rank publishes an authenticated transaction
-         * ticket.  Treating it as an ordinary MTP decoder here would reject a
-         * perfectly complete follower merely because supportsChainedMTPDrafts()
-         * correctly reports false.
+         * The installed transaction role determines continuation ownership.
+         * Expert followers and original layer-stage followers retain their
+         * participant-local graph/state families, but only the vocabulary tail
+         * owns the sampler and depth controller. Prefix admission still spans
+         * every original pipeline rank because all stages must submit the same
+         * restored frontier and suffix graph sequence.
          */
+        const auto mtp_participation = mtpRankParticipation();
+        const auto *original_pipeline =
+            dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+        const bool coordinates_original_pipeline_prefix =
+            original_pipeline && original_pipeline->originalRankPipelineReady();
+        if (coordinates_original_pipeline_prefix && !mpi_ctx_)
+            return setError("Original pipeline prefix admission has no original MPI context");
         const bool owns_mtp_continuation_authority =
             active_mtp.enabled &&
-            !moe_overlay_inference_transaction_follower_;
+            mtp_participation != MTPRankParticipation::ExpertTransactionFollower &&
+            mtp_participation != MTPRankParticipation::OriginalPipelineFollower;
         const bool prefix_cache_enabled =
             (plan_prefix.enabled || config_prefix.enabled) &&
             plan_prefix.storage_mode != PrefixCacheStorageMode::Disabled &&
             config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
         const bool mtp_full_hit_requires_terminal_hidden =
-            owns_mtp_continuation_authority &&
+            active_mtp.enabled &&
             active_mtp.require_terminal_hidden_for_full_hit;
         prefix_request_summary_ = {};
         prefix_request_summary_.enabled = prefix_cache_enabled;
@@ -4296,9 +3965,11 @@ namespace llaminar2
 
                 PrefixCoordinationResult coordination;
                 const MPI_Comm prefix_coordination_comm =
-                    continuation_request_group_
-                        ? continuation_request_group_->coordinationCommunicator()
-                        : MPI_COMM_NULL;
+                    coordinates_original_pipeline_prefix
+                        ? mpi_ctx_->communicator()
+                        : (continuation_request_group_
+                               ? continuation_request_group_->coordinationCommunicator()
+                               : MPI_COMM_NULL);
                 if (prefix_coordination_comm != MPI_COMM_NULL)
                 {
                     MPIPrefixCollectiveCoordinator domain_coordinator(
@@ -4382,10 +4053,9 @@ namespace llaminar2
                                               : hit.fingerprint_key;
                     hit.placement_epochs = coordinated_hit.placement_epochs;
                     hit.bypass_reason = coordinated_hit.bypass_reason;
-                    hit.has_terminal_logits =
-                        hit.has_terminal_logits && coordinated_hit.has_terminal_logits;
-                    hit.has_terminal_hidden =
-                        hit.has_terminal_hidden && coordinated_hit.has_terminal_hidden;
+                    // Payload availability remains participant-local. Shared
+                    // terminal requirements select the boundary below; they
+                    // must never manufacture a terminal row on a PP follower.
                     hit.restore_model_runtime_state = matched_tokens > 0;
                     hit.restore_hybrid_state_for_suffix_prefill =
                         matched_tokens > 0 &&
@@ -4398,10 +4068,11 @@ namespace llaminar2
                 prefix_request_summary_.bypass_reason = coordinated_hit.bypass_reason;
                 prefix_request_summary_.admission_placement_epochs =
                     coordinated_hit.placement_epochs;
-                if (owns_mtp_continuation_authority &&
+                if (active_mtp.enabled &&
+                    coordinated_hit.requires_terminal_hidden &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
-                    !common_hit.has_terminal_hidden)
+                    !coordinated_hit.has_terminal_hidden)
                 {
                     const int block_size =
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
@@ -4410,10 +4081,11 @@ namespace llaminar2
                 }
 
                 if (matched_tokens == static_cast<int>(prompt_tokens.size()) &&
-                    !((!common_hit.requires_terminal_logits ||
-                       common_hit.has_terminal_logits) &&
+                    !((!coordinated_hit.requires_terminal_logits ||
+                       coordinated_hit.has_terminal_logits) &&
                       (!mtp_full_hit_requires_terminal_hidden ||
-                       common_hit.has_terminal_hidden)))
+                       !coordinated_hit.requires_terminal_hidden ||
+                       coordinated_hit.has_terminal_hidden)))
                 {
                     /*
                      * A full prefix hit can serve decode directly only when the
@@ -4439,6 +4111,7 @@ namespace llaminar2
                         (common_hit.requires_terminal_logits &&
                          !common_hit.has_terminal_logits) ||
                         (mtp_full_hit_requires_terminal_hidden &&
+                         common_hit.requires_terminal_hidden &&
                          !common_hit.has_terminal_hidden) ||
                         common_hit.blocks.empty())
                     {
@@ -4450,9 +4123,29 @@ namespace llaminar2
                            terminal_block.total_bytes > terminal_block.layout.totalBytes();
                 };
 
+                bool full_terminal_runtime_restorable =
+                    full_terminal_hit_has_restorable_runtime();
+                if (coordinates_original_pipeline_prefix)
+                {
+                    // A full-hit exemption from stable-window alignment needs
+                    // every original stage's own immutable runtime image. A
+                    // tail image cannot authenticate an upstream stage image.
+                    MPIPrefixCollectiveCoordinator domain_coordinator(
+                        prefix_coordination_comm);
+                    bool all_runtime_restorable = false;
+                    if (!domain_coordinator.allAndBool(
+                            full_terminal_runtime_restorable,
+                            &all_runtime_restorable))
+                    {
+                        return setError(
+                            "Original pipeline prefix runtime restore coordination failed");
+                    }
+                    full_terminal_runtime_restorable = all_runtime_restorable;
+                }
+
                 if (stable_prefix_prefill_segment_tokens > 0 &&
                     matched_tokens % stable_prefix_prefill_segment_tokens != 0 &&
-                    !full_terminal_hit_has_restorable_runtime())
+                    !full_terminal_runtime_restorable)
                 {
                     const int original_matched_tokens = matched_tokens;
                     matched_tokens =
@@ -4466,6 +4159,35 @@ namespace llaminar2
                              << " (stable_block="
                              << stable_prefix_prefill_segment_tokens
                              << "); suffix prefill will recompute the remainder");
+                }
+
+                if (coordinates_original_pipeline_prefix)
+                {
+                    // Lookup already clamped every original stage to one
+                    // frontier. Shared terminal/runtime obligations above and
+                    // the admitted routing-window policy must preserve that
+                    // agreement before any restore or suffix graph is submitted.
+                    MPIPrefixCollectiveCoordinator domain_coordinator(
+                        prefix_coordination_comm);
+                    int common_restore_tokens = 0;
+                    if (!domain_coordinator.allMinInt(
+                            matched_tokens, &common_restore_tokens))
+                    {
+                        return setError(
+                            "Original pipeline prefix restore frontier coordination failed");
+                    }
+                    const bool local_frontier_admitted =
+                        common_restore_tokens >= 0 &&
+                        common_restore_tokens == matched_tokens &&
+                        common_hit.cached_tokens == matched_tokens;
+                    bool all_frontiers_admitted = false;
+                    if (!domain_coordinator.allAndBool(
+                            local_frontier_admitted, &all_frontiers_admitted) ||
+                        !all_frontiers_admitted)
+                    {
+                        return setError(
+                            "Original pipeline prefix restore frontier disagrees with a stage admission");
+                    }
                 }
 
                 if (matched_tokens == 0 && stable_prefix_prefill_segment_tokens > 0)
@@ -4587,7 +4309,9 @@ namespace llaminar2
                                 sequence_error);
                         }
                         const bool suffix_ok =
-                            owns_mtp_continuation_authority
+                            (owns_mtp_continuation_authority ||
+                             (dynamic_cast<GlobalOrchestrator *>(runner_.get()) &&
+                              static_cast<GlobalOrchestrator *>(runner_.get())->originalRankPipelineReady()))
                                 ? runner_->forwardRestoredPrefixMTPDecodeBridge(
                                       {.token_id = suffix_token,
                                        .restored_prefix_tokens =
@@ -4654,6 +4378,7 @@ namespace llaminar2
                 else if ((!common_hit.requires_terminal_logits ||
                           common_hit.has_terminal_logits) &&
                          (!mtp_full_hit_requires_terminal_hidden ||
+                          !common_hit.requires_terminal_hidden ||
                           common_hit.has_terminal_hidden) &&
                          runner_->restorePrefixTerminalState(common_hit))
                 {
@@ -7330,6 +7055,26 @@ namespace llaminar2
         return batch_result;
     }
 
+    MTPRankParticipation OrchestrationRunner::mtpRankParticipation() const
+    {
+        // The actual installed outer pipeline service owns stage scheduling.
+        // Its follower can also host local expert machinery; that does not make
+        // the original layer stage a vocabulary or dynamic-depth participant.
+        if (const auto *original = dynamic_cast<const GlobalOrchestrator *>(runner_.get()))
+        {
+            if (original->originalRankGenerationFollower())
+                return MTPRankParticipation::OriginalPipelineFollower;
+            if (original->originalRankGenerationSource())
+                return MTPRankParticipation::OriginalPipelineContinuation;
+        }
+        if (moe_overlay_inference_transaction_coordinator_)
+            return MTPRankParticipation::ExpertTransactionContinuation;
+        if (moe_overlay_inference_transaction_follower_)
+            return MTPRankParticipation::ExpertTransactionFollower;
+        return mpi_ctx_ && mpi_ctx_->world_size() > 1 ?
+            MTPRankParticipation::ModelCollectivePeer : MTPRankParticipation::SingleRank;
+    }
+
     bool OrchestrationRunner::shouldUseMTPDecode() const
     {
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
@@ -7362,17 +7107,10 @@ namespace llaminar2
         if (mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy())
         {
-            // The installed coordinator, not the number of MPI ranks or a
-            // requested topology flag, identifies the sole continuation owner.
-            const auto participation = moe_overlay_inference_transaction_coordinator_
-                ? MTPRankParticipation::ExpertTransactionContinuation
-                : moe_overlay_inference_transaction_follower_
-                    ? MTPRankParticipation::ExpertTransactionFollower
-                    : mpi_ctx_ && mpi_ctx_->world_size() > 1
-                        ? MTPRankParticipation::ModelCollectivePeer
-                        : MTPRankParticipation::SingleRank;
+            // Actual original pipeline/expert transaction owners distinguish
+            // layer/expert followers from full-model vocabulary peers.
             if (const auto failure = mtpStochasticVerificationOwnerFailure(
-                    plan_, *runner_, participation); !failure.empty())
+                    plan_, *runner_, mtpRankParticipation()); !failure.empty())
                 return std::string(failure);
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
@@ -7400,13 +7138,11 @@ namespace llaminar2
         }
         /*
          * Generic MPI worlds still need an explicit token-coordination
-         * contract.  Heterogeneous ExpertOverlay is different: the
-         * continuation rank remains the sole token/MTP authority and the
-         * remote rank follows immutable retained-graph tickets, so it neither
-         * samples nor participates in a token collective.
+         * contract. Original pipeline and ExpertOverlay transaction services
+         * retain one continuation token/MTP authority. Followers execute their
+         * immutable retained-graph tickets without a token collective.
          */
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
+        if (mtpRankRequiresModelCollectives(mtpRankParticipation()) &&
             !runner_->supportsMTPTokenCoordination())
         {
             return "MTP decode is not enabled for MPI world_size > 1";
@@ -7479,10 +7215,7 @@ namespace llaminar2
          * while tensor data still moves through the graph and collective layers.
          */
         if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
-            mpi_ctx_ &&
-            mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
-            !moe_overlay_inference_transaction_follower_)
+            mtpRankRequiresModelCollectives(mtpRankParticipation()))
         {
             int32_t coordinated_depth =
                 mpi_ctx_->rank() == mpi_coordinated_root_rank_
@@ -8926,9 +8659,7 @@ namespace llaminar2
         };
 
         const bool needs_mpi_mtp_boundary_fence =
-            mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
-            !moe_overlay_inference_transaction_coordinator_ &&
-            !moe_overlay_inference_transaction_follower_;
+            mtpRankRequiresModelCollectives(mtpRankParticipation());
         auto fence_mpi_mtp_boundary =
             [&](const char *boundary) -> std::optional<std::string>
         {
@@ -15411,6 +15142,73 @@ namespace llaminar2
             }
         }
 
+        auto *const original_global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+        if (original_global && original_global->originalRankGenerationFollower())
+        {
+            // This original stage process has no sampler/outcome authority.
+            // The actual tail publishes immutable scheduling identities; local
+            // model/KV/publication work stays in its original DGO graphs.
+            GlobalOrchestrator::OriginalRankGenerationTerminal terminal;
+            if (!original_global->serviceOriginalRankGenerationCommand(&terminal, &result.error))
+            {
+                original_global->abortOriginalRankGenerationCommand();
+                if (result.error.empty()) result.error = "Original rank generation follower failed";
+                return result;
+            }
+            if (!decode_transaction_planning_position_ ||
+                *decode_transaction_planning_position_ != terminal.admission_base ||
+                !sampling_math::valid_device_generation_leading_row_disposition(terminal.next_leading_row_disposition) ||
+                !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
+                    terminal.published_state_commit_count, "original_rank_generation_terminal"))
+            {
+                result.error = "Original rank generation terminal differs from its admitted scheduler boundary";
+                return result;
+            }
+            // Keep only completed scheduler/accounting observations. No source
+            // outcome or remote logical-state handle becomes execution input.
+            ready_mtp_condition_.reset();
+            pending_mtp_condition_token_.reset();
+            pending_mtp_condition_params_.reset();
+            pending_mtp_condition_resident_state_.reset();
+            prefill_logits_ready_ = !terminal.model_stopped;
+            result.is_complete = terminal.model_stopped;
+            decode_command_failure_abort.markCompleted();
+            return result;
+        }
+        /** @brief Cancel original directed transport before the outer MPI failure guard can abort the world. */
+        struct OriginalRankCommandGuard
+        {
+            GlobalOrchestrator *owner = nullptr; ///< Real source only; no remote runner alias.
+            bool completed = false; ///< True only after actual terminal publication.
+            /** @brief Keep failed original admissions absorbing while their native owners remain alive. */
+            ~OriginalRankCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
+            /** @brief Complete using actual terminal ledger and its original leading-row disposition. */
+            bool finish(bool stopped, sampling_math::DeviceGenerationLeadingRowDisposition leading)
+            {
+                if (!owner) return true;
+                completed = owner->completeOriginalRankGenerationCommand(stopped, leading);
+                return completed;
+            }
+        } original_command{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
+        if (original_command.owner)
+        {
+            if (!decode_transaction_planning_position_ ||
+                moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
+                !original_command.owner->beginOriginalRankGenerationCommand(
+                    original_command.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
+                    *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                        DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic))
+            {
+                result.error = "Original rank generation source could not admit its exact request/command/placement identity";
+                return result;
+            }
+        }
+        const auto terminal_leading = [&] {
+            return ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+                sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+        };
+
         const bool mpi_worker_rank =
             mpi_coordinated_world &&
             mpi_ctx_->rank() != mpi_coordinated_root_rank_;
@@ -15442,7 +15240,14 @@ namespace llaminar2
         }
 
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
-        if (!mtp.enabled && runner_->primaryDeviceId().is_gpu())
+        // A heterogeneous hosted pipeline has one tail-owned sampler across
+        // the original MPI ranks. Its GPU follower's local primary device is
+        // not generation authority: all ranks must enter the declared hosted
+        // forward/sampling protocol together. Complete GPU pipelines instead
+        // retain their original captured generation service on every rank.
+        const bool hosted_pipeline_generation = original_global &&
+            !original_global->requiresOriginalRankGPUTransport();
+        if (!mtp.enabled && runner_->primaryDeviceId().is_gpu() && !hosted_pipeline_generation)
         {
             result = decodeOrdinaryDeviceResidentGeneration();
             if (result.success())
@@ -15450,6 +15255,8 @@ namespace llaminar2
                 std::string error;
                 if (!overlay_decode_command.complete(&error))
                     result.error = "Ordinary generation command completion failed: " + error;
+                else if (!original_command.finish(result.is_complete, terminal_leading()))
+                    result.error = "Original rank ordinary generation command could not retire its actual terminal";
                 else
                     decode_command_failure_abort.markCompleted();
             }
@@ -15526,7 +15333,10 @@ namespace llaminar2
                             result = std::move(mtp_result);
                             return result;
                         }
-                        decode_command_failure_abort.markCompleted();
+                        if (!original_command.finish(mtp_result.is_complete, terminal_leading()))
+                            mtp_result.error = "Original rank MTP generation command could not retire its actual terminal";
+                        else
+                            decode_command_failure_abort.markCompleted();
                     }
                     result = std::move(mtp_result);
                     return result;
@@ -15977,6 +15787,11 @@ namespace llaminar2
                 overlay_completion_error;
             return result;
         }
+        if (!original_command.finish(result.is_complete, terminal_leading()))
+        {
+            result.error = "Original rank serial generation command could not retire its actual terminal";
+            return result;
+        }
         decode_command_failure_abort.markCompleted();
         return result;
         }
@@ -16146,6 +15961,53 @@ namespace llaminar2
                     command_error;
                 return result;
             }
+        }
+
+        auto *const original_global = dynamic_cast<GlobalOrchestrator *>(runner_.get());
+        if (original_global && original_global->originalRankGenerationFollower())
+        {
+            GlobalOrchestrator::OriginalRankGenerationTerminal terminal;
+            if (!original_global->serviceOriginalRankGenerationCommand(&terminal, &result.error))
+            {
+                original_global->abortOriginalRankGenerationCommand();
+                if (result.error.empty()) result.error = "Original forced-command follower failed";
+                return result;
+            }
+            if (!decode_transaction_planning_position_ ||
+                *decode_transaction_planning_position_ != terminal.admission_base ||
+                !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
+                    terminal.published_state_commit_count, "original_rank_forced_terminal"))
+            {
+                result.error = "Original forced terminal differs from its admitted scheduler boundary";
+                return result;
+            }
+            ready_mtp_condition_.reset();
+            pending_mtp_condition_token_.reset();
+            pending_mtp_condition_params_.reset();
+            pending_mtp_condition_resident_state_.reset();
+            prefill_logits_ready_ = !terminal.model_stopped;
+            result.is_complete = terminal.model_stopped;
+            result.returned_token_commit = terminal.model_stopped ? ReturnedTokenCommitState::NoModelRow : ReturnedTokenCommitState::Pending;
+            force_command_failure_abort.markCompleted();
+            return result;
+        }
+        /** @brief Keep original FORCE transport and transaction ownership absorbing on failure. */
+        struct OriginalRankForceCommandGuard
+        {
+            GlobalOrchestrator *owner = nullptr; ///< Actual original vocabulary-tail source only.
+            bool completed = false; ///< Set only after native terminal and channel retirement.
+            /** @brief Cancel original directions before the outer MPI abort fence destroys owners. */
+            ~OriginalRankForceCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
+        } original_force{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
+        if (original_force.owner && (!decode_transaction_planning_position_ ||
+            moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
+            !original_force.owner->beginOriginalRankGenerationCommand(
+                original_force.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
+                *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                    DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic)))
+        {
+            result.error = "Original forced-command source lost its exact request/command admission";
+            return result;
         }
 
         const auto begin_serial_overlay_graph = [&]() -> bool
@@ -16618,6 +16480,18 @@ namespace llaminar2
                 overlay_completion_error;
             return result;
         }
+        if (original_force.owner)
+        {
+            const auto leading = ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+                sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+            if (!original_force.owner->completeOriginalRankGenerationCommand(token_is_stop, leading))
+            {
+                result.error = "Original forced-command terminal or transport retirement failed";
+                return result;
+            }
+            original_force.completed = true;
+        }
         force_command_failure_abort.markCompleted();
         return result;
     }
@@ -16831,6 +16705,15 @@ namespace llaminar2
                 describeMoEOptimizationMovementTopology(prepared[i].placement.get())});
         }
         return composeMoEOptimizationMovementTopology(MoEOptimizationStages<MoEOptimizationMovementTopology>::seal(std::move(stages)));
+    }
+
+    std::optional<MoEOptimizationStatus>
+    OrchestrationRunner::localPipelineStageOptimizationStatus(int stage_id) const
+    {
+        const auto *pipeline = dynamic_cast<const GlobalOrchestrator *>(runner_.get());
+        const auto *stage = pipeline ? pipeline->stageRunnerForStage(stage_id) : nullptr;
+        if (!stage) return std::nullopt;
+        return stage->moeOptimizationStatus();
     }
 
     MoEOptimizationStatus OrchestrationRunner::moeOptimizationStatus() const
@@ -19094,10 +18977,20 @@ namespace llaminar2
                 if(!plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission lost its original declaration");
                 for(const auto& input:selected_local_capacity->device_inputs)
                     if(input.retained_host_services!=plan_.runtime.retained_host_services)throw std::logic_error("Selected CPU service admission mixed declaration sessions");
-                const auto &capacity = *selected_capacity;
-                moe_expert_overlay_memory_admission_ =
-                    std::make_shared<const MoEOverlayResolvedCapacityPlan>(
-                        capacity);
+                {
+                    auto publication = *selected_capacity;
+                    publication.activation_batch_inventory =
+                        selected_local_capacity->activation_batch_inventory;
+                    publication.physical_gpu_lane_demand =
+                        selected_local_capacity->physical_gpu_lane_demand;
+                    moe_expert_overlay_memory_admission_ =
+                        std::make_shared<const MoEOverlayResolvedCapacityPlan>(
+                            std::move(publication));
+                }
+                // Publication owns the complete admitted geometry and physical
+                // ledger. Quota installation and evidence must borrow that
+                // immutable authority, never its moved-from setup envelope.
+                const auto &capacity = *moe_expert_overlay_memory_admission_;
                 physical_memory_admission_ =
                     moe_expert_overlay_memory_admission_
                         ->physical_memory_admission;
@@ -19260,7 +19153,9 @@ namespace llaminar2
         try
         {
             if (!model_ctx_ || !moe_pipeline_topology_ || config_.moe_routed_expert_plan ||
-                !mpi_ctx_ || mpi_ctx_->rank() != 0 || mpi_ctx_->world_size() != 1)
+                !mpi_ctx_ || mpi_ctx_->rank() != moe_pipeline_topology_->rankPlan().rank ||
+                mpi_ctx_->world_size() != (moe_pipeline_topology_->globalPipeline()
+                    ? moe_pipeline_topology_->globalPipeline()->world_size : 1))
                 throw std::invalid_argument("MoE pipeline admission requires the exact local model and compiled stage topology");
             if (snapshot_capture_setup_.enabled() && !snapshot_capture_setup_.memory_capacity.valid())
                 throw std::invalid_argument("MoE pipeline snapshots require admitted setup capacity");
@@ -19288,14 +19183,16 @@ namespace llaminar2
                     *moe_pipeline_topology_, planningModelMetadata(), model_ctx_->concreteLoader(), cluster_inventory_,
                     {.prefill = {.bucket_rows = execution.prefill_graph_bucket_sizes,
                          .minimum_sequence_rows = execution.prefill_graph_min_seq,
-                         .maximum_cached_buckets = execution.prefill_graph_max_cached_buckets},
+                         .maximum_cached_buckets = execution.prefill_graph_max_cached_buckets,
+                         .maximum_cached_buckets_explicit = execution.prefill_graph_max_cached_buckets_explicit},
                      .gpu_weight_load = {.policy = configuredGPUWeightLoadMemoryPolicy(),
                          .maximum_source_bytes = maximumGGUFTensorPayloadBytes(model_ctx_->concreteLoader().getModel())},
                      .snapshot_capacity = snapshot_capture_setup_.enabled()
                          ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
                      .model_graph_topology_variant_count = snapshot_capture_setup_.retainedModelGraphTopologyVariantCount(),
                      .retained_host_services = RetainedHostServiceBudgetProjection::original(),
-                     .native_context_preparation = plan_.runtime.native_context_preparation}));
+                     .native_context_preparation = plan_.runtime.native_context_preparation,
+                     .original_parent = mpi_ctx_}));
                 moe_pipeline_prepared_plan_ = MoEPipelinePreparedPlan::create(std::move(admission), model_ctx_);
             }
             const auto &admission = *moe_pipeline_prepared_plan_->admission();
@@ -20121,6 +20018,8 @@ namespace llaminar2
                                             .registry =
                                                 moe_expert_overlay_participant_residency_,
                                             .initial_snapshot = initial_snapshot,
+                                            .physical_gpu_lane_demand = moe_expert_overlay_memory_admission_
+                                                ? moe_expert_overlay_memory_admission_->physical_gpu_lane_demand : nullptr,
                                             .inventory_authority =
                                                 MoEOverlayPhysicalInventoryAuthority::
                                                     DeviceSlotLedger,
@@ -20650,6 +20549,8 @@ namespace llaminar2
                                     .registry =
                                         moe_expert_overlay_participant_residency_,
                                     .initial_snapshot = initial_snapshot,
+                                    .physical_gpu_lane_demand = moe_expert_overlay_memory_admission_
+                                        ? moe_expert_overlay_memory_admission_->physical_gpu_lane_demand : nullptr,
                                     .inventory_authority =
                                         MoEOverlayPhysicalInventoryAuthority::
                                             ParticipantRegistry,
@@ -22028,12 +21929,25 @@ namespace llaminar2
             return true;
         }
 
-        // Run validation
-        if(plan_.usesLocalTP() && !plan_.usesLocalPP() && !local_tp_ctx_)
-            return setError("TP validation lacks the already-resolved LocalTP context");
-        const auto membership=local_tp_ctx_
-            ?TPPPAssignmentMembership::resolved(local_tp_ctx_->devices()):TPPPAssignmentMembership::structural();
-        auto result = TPPPValidator::validate(config_, *model_ctx_,membership);
+        TPPPValidationResult result;
+        if (moe_pipeline_topology_ && moe_pipeline_topology_->globalPipeline())
+        {
+            // setupLocalTPContext deliberately creates no enclosing context:
+            // the graph factory later gives every original stage its sole TP
+            // owner. Validate the same sealed stage declarations before PMA or
+            // native graph construction, rather than inventing another owner.
+            if (local_tp_ctx_ || !mpi_ctx_)
+                return setError("Global stage TP validation found a duplicate rank context or missing original MPI owner");
+            result = validateResolvedGlobalStageTP(*moe_pipeline_topology_, *model_ctx_, mpi_ctx_->rank());
+        }
+        else
+        {
+            if(plan_.usesLocalTP() && !plan_.usesLocalPP() && !local_tp_ctx_)
+                return setError("TP validation lacks the already-resolved LocalTP context");
+            const auto membership=local_tp_ctx_
+                ?TPPPAssignmentMembership::resolved(local_tp_ctx_->devices()):TPPPAssignmentMembership::structural();
+            result = TPPPValidator::validate(config_, *model_ctx_,membership);
+        }
 
         // Log warnings (but don't fail)
         for (const auto &warning : result.warnings)
@@ -22790,7 +22704,8 @@ namespace llaminar2
         }
 
         const int continuation_root_rank =
-            overlay_execution ? overlay_execution->continuation_root_rank : plan_.rank;
+            overlay_execution ? overlay_execution->continuation_root_rank :
+            resolveMoEOverlayRequestAuthorityRank(nullptr, moe_pipeline_prepared_plan_, overlay_context).value_or(plan_.rank);
         if (continuation_root_rank < 0 ||
             continuation_root_rank >= overlay_context->world_size())
         {
@@ -22806,14 +22721,20 @@ namespace llaminar2
         {
             const int configured_cache_entries =
                 debugEnv().execution.prefill_graph_max_cached_buckets;
-            if (configured_cache_entries <=
+            const bool exact = plan_.runtime.ngram_table_placement && plan_.runtime.ngram_table_placement->fixedHeadPipeline();
+            if (!exact && configured_cache_entries <=
                 static_cast<int>(
                     kExpertOverlayPrefillGraphIdentityReserve))
             {
                 return setError(
                     "MoE ExpertOverlay prefill graph cache cannot retain its runtime identities and one bucket");
             }
-            bucket_rows = retainedRawPrefillGraphBucketLadder(
+            if (exact) {
+                (void)exactPrefillGraphCacheEntries(common_capacity,
+                    debugEnv().execution.prefill_graph_max_cached_buckets_explicit
+                        ? std::optional{configured_cache_entries} : std::nullopt);
+                bucket_rows = exactPrefillGraphWidths(common_capacity);
+            } else bucket_rows = retainedRawPrefillGraphBucketLadder(
                 debugEnv().execution.prefill_graph_bucket_sizes,
                 common_capacity,
                 debugEnv().execution.prefill_graph_min_seq,
@@ -22912,6 +22833,17 @@ namespace llaminar2
     bool OrchestrationRunner::initializeMoEOverlayRankBatchTransports()
     {
         moe_overlay_rank_batch_transport_registry_.reset();
+        if(moe_pipeline_prepared_plan_) {
+            try {
+                moe_pipeline_stage_bindings_=moe_pipeline_prepared_plan_->prepareOriginalCPUStageTransports(
+                    model_ctx_->concreteLoader(),mpi_ctx_,cluster_inventory_,plan_.runtime,moe_pipeline_stage_bindings_);
+                return true;
+            }
+            catch(const std::exception& error) {
+                return setError(std::string("Original CPU pipeline stage transport setup failed: ")+error.what());
+            }
+        }
+
 
         const auto overlay_context =
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
@@ -22955,39 +22887,6 @@ namespace llaminar2
             }
             const auto &placement = *snapshot->placement_plan;
             const auto &owner_map = snapshot->originalOwnerMap();
-            const int source_participant_id =
-                placement.continuation_domain_spec.logical_root_participant;
-            const auto *const source =
-                owner_map.participantForId(source_participant_id);
-            if (source_participant_id < 0 || !source ||
-                !source->world_rank_known || !source->device.is_valid() ||
-                source->world_rank != overlay_execution->continuation_root_rank ||
-                source->tier_idx < 0 ||
-                static_cast<std::size_t>(source->tier_idx) >=
-                    placement.routed_tiers.size())
-            {
-                return setError(
-                    "Distributed MoE ExpertOverlay activation-channel preflight "
-                    "could not resolve its continuation endpoint");
-            }
-
-            const auto domain_ordinal =
-                [&](const std::string &domain_name)
-            {
-                for (std::size_t index = 0;
-                     index < placement.domains.size();
-                     ++index)
-                {
-                    if (placement.domains[index].name == domain_name)
-                        return static_cast<int>(index);
-                }
-                throw std::logic_error(
-                    "MoE activation-channel domain is absent from the frozen placement: " +
-                    domain_name);
-            };
-            const int source_domain_ordinal =
-                domain_ordinal(source->domain_name);
-
             const MTPRuntimeConfig &active_mtp = retainedMTPConfig();
             const bool retains_mtp_capacity =
                 retainsMTPGraphCapacity(active_mtp);
@@ -23030,229 +22929,12 @@ namespace llaminar2
                     max_mtp_draft_depth).forRoutedLayerInterval(
                         placement.first_model_layer,
                         placement.placementLayerCapacity());
-            const auto activation_graph_families =
-                makeMoEOverlayActivationGraphFamilyManifests(graph_family);
-            const MoEOverlayActivationLaneEndpoint source_endpoint{
-                .world_rank = source->world_rank,
-                .participant_id = source_participant_id,
-                .tier_priority =
-                    placement.routed_tiers[static_cast<std::size_t>(
-                        source->tier_idx)]
-                        .priority,
-                .domain_ordinal = source_domain_ordinal,
-            };
-
-            auto registry =
-                std::make_shared<MoEOverlayRankBatchTransportRegistry>();
-            const std::size_t row_capacity =
-                static_cast<std::size_t>(max_graph_rows);
-            const std::size_t top_k_size = static_cast<std::size_t>(top_k);
-            if (row_capacity >
-                std::numeric_limits<std::size_t>::max() / top_k_size)
-            {
-                throw std::overflow_error(
-                    "MoE activation-channel entry capacity overflows size_t");
-            }
-            const std::size_t max_total_entries = row_capacity * top_k_size;
-            const auto activation_channel_plan =
-                MoEOverlayActivationChannelPlanner::plan({
-                    .placement_plan = &placement,
-                    .cluster_inventory = &cluster_inventory_,
-                    .row_capacity = row_capacity,
-                    .d_model = metadata.d_model,
-                    .top_k = top_k,
-                    .graph_family_count =
-                        activation_graph_families.size(),
-                    .original_native_slots = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
-                        placement, cluster_inventory_, graph_family),
-                });
-
-            for (const auto &channel : activation_channel_plan.channels)
-            {
-                const int tier_index = channel.tier_index;
-                const int target_domain_ordinal = channel.domain_ordinal;
-                const int target_world_rank = channel.target_world_rank;
-                const auto participant_ids = channel.targetParticipantIds();
-                if (channel.source_world_rank != source->world_rank ||
-                    channel.source_device != source->device ||
-                    (channel.source_world_rank != target_world_rank &&
-                     resolveMoEOverlayRankBatchTransportKind(
-                        *overlay_context,
-                        channel.source_world_rank,
-                        target_world_rank) !=
-                        MoEOverlayRankBatchTransportKind::
-                            NodeLocalSharedRows))
-                {
-                    throw std::logic_error(
-                        "MoE activation capacity and MPI topology authorities disagree about a node-local channel");
-                }
-                for (const auto &lane : channel.target_lanes)
-                {
-                    const auto *const participant =
-                        owner_map.participantForId(lane.participant_id);
-                    if (!participant || !participant->world_rank_known ||
-                        participant->world_rank != target_world_rank ||
-                        participant->tier_idx != tier_index ||
-                        participant->device != lane.device ||
-                        domain_ordinal(participant->domain_name) !=
-                            target_domain_ordinal)
-                    {
-                        throw std::logic_error(
-                            "MoE activation capacity topology diverged from the frozen owner map");
-                    }
-                }
-                const bool same_rank = source->world_rank == target_world_rank;
-                const std::string channel_identity = same_rank ?
-                    makeMoEOverlayRankLocalGPUChannelIdentity(tier_index, target_domain_ordinal,
-                        source->world_rank, participant_ids) :
-                    makeMoEOverlayRankBatchChannelIdentity(
-                        tier_index,
-                        target_domain_ordinal,
-                        source->world_rank,
-                        target_world_rank,
-                        participant_ids);
-
-                bool local_ok = true;
-                std::string local_error;
-                const int local_world_rank = overlay_context->rank();
-                if (local_world_rank == source->world_rank ||
-                    local_world_rank == target_world_rank)
-                {
-                    try
-                    {
-                        const std::size_t row_multiplier = std::min(
-                            top_k_size, participant_ids.size());
-                        if (row_capacity >
-                            std::numeric_limits<std::size_t>::max() /
-                                row_multiplier)
-                        {
-                            throw std::overflow_error(
-                                "MoE activation-channel aggregate row capacity overflows size_t");
-                        }
-                        auto workspace = std::make_shared<
-                            MoEOverlayRankBatchWireWorkspace>(
-                            MoEOverlayRankBatchWireWorkspace::Config{
-                                .participant_ids = participant_ids,
-                                .max_total_rows =
-                                    row_capacity * row_multiplier,
-                                .max_total_entries = max_total_entries,
-                                .d_model = metadata.d_model,
-                                .top_k = top_k,
-                                .return_layout = channel.mapping_layout.geometry.return_layout,
-                            });
-
-                        const auto &local_lanes =
-                            channel.localLanes(local_world_rank);
-
-                        auto transport_config = MoEOverlayRankBatchTransportConfig{
-                                .mpi_ctx = overlay_context,
-                                .endpoint_scope = same_rank ? MoEOverlayActivationEndpointScope::RankLocalGPU :
-                                    MoEOverlayActivationEndpointScope::DistinctRanks,
-                                .rank_local_source_device = same_rank ? source->device : DeviceId::invalid(),
-                                .source_world_rank = source->world_rank,
-                                .target_world_rank = target_world_rank,
-                                .workspace = std::move(workspace),
-                                .max_rows_per_participant = row_capacity,
-                                .max_entries_per_participant =
-                                    max_total_entries,
-                                .d_model = metadata.d_model,
-                                .top_k = top_k,
-                                .tier_index = tier_index,
-                                .domain_ordinal = target_domain_ordinal,
-                                .channel_identity = channel_identity,
-                                .transaction_slot_count = 4096,
-                                .transaction_topology =
-                                    same_rank ? makeMoEOverlayRankLocalInferenceTopologyIdentity(
-                                        owner_map, graph_family, source_participant_id, participant_ids) :
-                                    makeMoEOverlayInferenceTopologyIdentity(
-                                        owner_map,
-                                        graph_family,
-                                        source->world_rank,
-                                        target_world_rank),
-                                .source_endpoint = source_endpoint,
-                                .target_tier_priority =
-                                    placement.routed_tiers[
-                                        static_cast<std::size_t>(tier_index)]
-                                        .priority,
-                                .activation_graph_families =
-                                    activation_graph_families,
-                                .activation_layout =
-                                    channel.mapping_layout,
-                                .local_lanes = local_lanes,
-                                .original_cpu_joint_owners=snapshot->jointOwnerMap(),
-                            };
-                        auto transport = same_rank ?
-                            createMoEOverlayRankLocalGPUActivationTransport(std::move(transport_config)) :
-                            createMoEOverlayRankBatchTransport(std::move(transport_config));
-                        if (!transport ||
-                            transport->kind() !=
-                                MoEOverlayRankBatchTransportKind::
-                                    NodeLocalSharedRows)
-                        {
-                            throw std::logic_error(
-                                "MoE activation-channel preflight selected a non-node-local transport");
-                        }
-                        registry->install(
-                            channel_identity, std::move(transport));
-                    }
-                    catch (const std::exception &error)
-                    {
-                        local_ok = false;
-                        local_error = error.what();
-                    }
-                    catch (...)
-                    {
-                        local_ok = false;
-                        local_error =
-                            "non-standard exception during node-local channel setup";
-                    }
-                }
-
-                /*
-                 * Every rank visits every group. Non-endpoint ranks wait in
-                 * this setup-only reduction while the named pair performs
-                 * concurrent first-touch, preventing a later target from
-                 * starting its timeout before the source reaches that group.
-                 */
-                int group_ok = local_ok ? 1 : 0;
-                int global_group_ok = group_ok;
-                if (overlay_context->world_size() > 1 && MPI_Allreduce(
-                        &group_ok,
-                        &global_group_ok,
-                        1,
-                        MPI_INT,
-                        MPI_MIN,
-                        overlay_context->communicator()) != MPI_SUCCESS)
-                {
-                    return setError(
-                        "Distributed MoE ExpertOverlay failed to publish "
-                        "node-local activation-channel setup status");
-                }
-                if (global_group_ok == 0)
-                {
-                    return setError(
-                        "Distributed MoE ExpertOverlay could not pre-create " +
-                        channel_identity +
-                        (local_error.empty()
-                             ? " on another rank"
-                             : ": " + local_error));
-                }
-            }
-
-            moe_overlay_rank_batch_transport_registry_ = std::move(registry);
-            PerfStatsCollector::addCounter(
-                "moe_overlay_transport",
-                "node_local_activation_channels_precreated",
-                static_cast<double>(
-                    moe_overlay_rank_batch_transport_registry_->size()),
-                "model_setup",
-                {},
-                {
-                    {"first_touch", "consumer_rank"},
-                    {"phase", "pre_graph"},
-                    {"scope", "node_local"},
-                    {"source_rank", std::to_string(source->world_rank)},
-                });
+            moe_overlay_rank_batch_transport_registry_=prepareOriginalMoEOverlayRankBatchTransports({
+                .placement=placement,.owner_map=owner_map,.inventory=cluster_inventory_,.graph_family=graph_family,
+                .original_context=overlay_context,.physical_memory_authority=physical_memory_authority_,
+                .activation_batch_inventory=moe_expert_overlay_memory_admission_?moe_expert_overlay_memory_admission_->activation_batch_inventory:nullptr,
+                .original_cpu_joint_owners=snapshot->jointOwnerMap(),
+                .d_model=metadata.d_model,.top_k=top_k});
             return true;
         }
         catch (const std::exception &error)
@@ -23591,7 +23273,8 @@ namespace llaminar2
             if (!plan_builder_)
                 return setError("Named-domain graph has no topology builder");
             runner_ = buildNamedDomainGlobalGraph(
-                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_);
+                config_, plan_, cluster_inventory_, *plan_builder_, model_ctx_, mpi_ctx_,
+                moe_pipeline_stage_bindings_);
             // Resolve before readiness, while every rank still follows the
             // common initialization schedule. The public frontend then runs
             // on the same tail that owns logits, with no vocabulary transfer.
@@ -23844,7 +23527,19 @@ namespace llaminar2
             return setError(
                 "ExpertOverlay diagnostic graph variant disagrees with the frozen prefill schedule");
         }
-        if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
+        bool materialized = false;
+        if (moe_pipeline_topology_ && moe_pipeline_topology_->globalPipeline())
+        {
+            const auto weights = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+            if (!weights)
+                return setError("Global pipeline serving graph has no original WeightManager authority");
+            // Nested TP children deliberately retain shared sources. Only
+            // this original rank's complete global parent may close that gate.
+            materialized = materializePreparedPipelineGraphFamily(*runner_, *weights, family_plan);
+        }
+        else
+            materialized = runner_->materializeServingGraphFamilyWithoutLaunch(family_plan);
+        if (!materialized)
         {
             return setError(
                 "ExpertOverlay runner could not materialize the selected serving graph variant");
@@ -25111,6 +24806,7 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto mdo_config = RankOrchestrator::Config::fromPlan(plan_);
+        mdo_config.original_pipeline_mpi_ctx = mpi_ctx_;
         if (retained_prepared_weight_plan_validated_)
         {
             const auto prepared = model_ctx_->concreteWeightManager()->preparedWeightStoreIfInitialized();

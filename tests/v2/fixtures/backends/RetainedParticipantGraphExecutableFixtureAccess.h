@@ -38,6 +38,19 @@ struct RetainedParticipantGraphExecutableFixtureAccess final {
 #endif
     /** @return Actual original capture; no replacement graph or kernel program is introduced. */
     static IGPUGraphCapture& capture(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){return owner->capture();}
+    /** @brief Seal the actual original General recording without creating an executable. */
+    static void sealSharedChild(const std::shared_ptr<RetainedParticipantGraphExecutable>& child)
+    { child->sealSharedChildDefinition(); }
+    /** @brief Retain the original graph-only child through this parent's native handle destruction. */
+    static void bindSharedChild(const std::shared_ptr<RetainedParticipantGraphExecutable>& parent,
+        const std::shared_ptr<RetainedParticipantGraphExecutable>& child)
+    { parent->bindSharedChildDefinition(child); }
+    /** @brief Import the original prebound definition at the current native stream frontier. */
+    static void recordSharedChild(const std::shared_ptr<RetainedParticipantGraphExecutable>& parent)
+    { parent->recordSharedChildAtFrontier(); }
+    /** @brief Exercise the actual off-worker original retirement and borrower guard. */
+    static void retireSharedDefinition(const std::shared_ptr<RetainedParticipantGraphExecutable>& definition)
+    { definition->retireDefinition(); }
     /** @brief Apply the ACK adversarial topology splice to the sole original recorded definition.
      * @param owner Original retained definition, never a replacement capture.
      * @param mutate Test-only SDK mutation which retains and verifies all original dependencies.

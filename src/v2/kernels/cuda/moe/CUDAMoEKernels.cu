@@ -51,6 +51,7 @@
 #include "execution/moe/DeviceMoERebalancePublication.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/DeviceMoERebalanceMovementJournal.h"
+#include "execution/moe/DeviceMoERebalanceCompletedDecision.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
@@ -150,7 +151,7 @@ namespace
     constexpr uint32_t kDeviceMoEReplicaRoleNone = 0u;
     constexpr uint32_t kDeviceMoEReplicaRolePrimary = 1u;
     constexpr uint32_t kDeviceMoEReplicaRoleReplica = 2u;
-    constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u;
+    constexpr uint32_t kDeviceMoERebalanceMagic = llaminar2::moe_rebalance_abi::kMagic;
     constexpr uint32_t kDeviceMoERebalanceVersion =
         llaminar2::moe_rebalance_abi::kVersion;
     constexpr uint32_t kDeviceMoERebalanceFlagHotReplicaCache = 1u << 0;
@@ -158,8 +159,8 @@ namespace
     constexpr uint32_t kDeviceMoERebalanceFlagPlanMissingArrivals = 1u << 2;
     constexpr uint32_t kDeviceMoERebalanceFlagDeferRuntimeApply = 1u << 3;
     constexpr uint32_t kDeviceMoERebalanceFlagCollectLoadStats = 1u << 4;
-    constexpr uint32_t kDeviceMoERebalanceStatusOk = 0u;
-    constexpr uint32_t kDeviceMoERebalanceStatusWindowNotReady = 1u;
+    constexpr uint32_t kDeviceMoERebalanceStatusOk = llaminar2::moe_rebalance_abi::kStatusOk;
+    constexpr uint32_t kDeviceMoERebalanceStatusWindowNotReady = llaminar2::moe_rebalance_abi::kStatusWindowNotReady;
     constexpr uint32_t kDeviceMoERebalanceStatusInvalidConfig = 2u;
     constexpr uint32_t kDeviceMoERebalanceStatusInvalidRuntime = 3u;
     constexpr uint32_t kDeviceMoERebalanceStatusMissingHistogram = 4u;
@@ -1065,12 +1066,15 @@ namespace
         DeviceMoERebalanceWaveProgressView waves[2];
         llaminar2::DeviceMoERebalanceMovementJournalState movement_journal;
         llaminar2::DeviceMoERebalanceDispatchTicket dispatch_ticket;
+        llaminar2::DeviceMoERebalanceCompletedDecision completed_decision;
     };
 
     static_assert(sizeof(DeviceMoERebalanceWaveProgressView) ==
                   llaminar2::moe_rebalance_abi::kWaveProgressBytes);
     static_assert(sizeof(DeviceMoERebalanceGraphControllerStateView) ==
                   llaminar2::moe_rebalance_abi::kGraphControllerBytes);
+    static_assert(offsetof(DeviceMoERebalanceGraphControllerStateView, completed_decision) ==
+                  llaminar2::moe_rebalance_abi::kCompletedDecisionOffset);
 
     struct DeviceMoEExpertDirectoryEntryView
     {
@@ -12116,11 +12120,17 @@ namespace
             *reinterpret_cast<llaminar2::DeviceMoEMovementJournalAppend *>(journal_append_storage);
         __shared__ uint32_t journal_required;
         __shared__ uint64_t plan_offset;
+        // One root writer owns the completion receipt. Shared scratch avoids
+        // replicating this cold maintenance proof in every cooperative lane.
+        __shared__ uint64_t decision_append_storage[
+            (sizeof(llaminar2::DeviceMoECompletedDecisionAppend) + sizeof(uint64_t) - 1u) / sizeof(uint64_t)];
+        auto &decision_append = *reinterpret_cast<llaminar2::DeviceMoECompletedDecisionAppend *>(decision_append_storage);
 
         if (threadIdx.x == 0u)
         {
             journal_required = 0u;
             plan_offset = 0u;
+            decision_append.disposition = llaminar2::DeviceMoECompletedDecisionDisposition::Inactive;
             /* Capture the reserve result before this same record becomes the
              * final publication result. A failed/busy reserve is deliberately
              * left intact for an ordered diagnostic consumer. */
@@ -12202,6 +12212,26 @@ namespace
                     }
                 }
 
+                if (apply_record_valid && topology_valid && journal_valid && journal.decision_status)
+                {
+                    const auto &policy_status = *reinterpret_cast<const DeviceMoERebalanceStatusView *>(
+                        journal.decision_status);
+                    // Moving provenance is retained with commands, not later
+                    // planner scratch. Busy reservation may defer this exact wave.
+                    if (journal_required != 0u)
+                        decision_append = llaminar2::prepareDeviceMoECompletedOwnershipDecision(
+                            *controller_state,
+                            command_headers[apply_status->transaction_wave_index].movement_decision.load,
+                            candidate_epoch, apply_status->transaction_epoch, apply_status->transaction_command_count);
+                    else
+                        decision_append = llaminar2::prepareDeviceMoECompletedDecision(
+                            *controller_state, policy_status, candidate_epoch,
+                            apply_status->changed_layers ? apply_status->transaction_epoch : 0u,
+                            apply_status->changed_layers ? apply_status->transaction_command_count : 0u);
+                    journal_valid = decision_append.disposition !=
+                        llaminar2::DeviceMoECompletedDecisionDisposition::Invalid;
+                }
+
                 if (!apply_record_valid || !topology_valid || !journal_valid)
                 {
                     /* The published bank remains authoritative. Abandon a
@@ -12250,10 +12280,16 @@ namespace
                     {
                         overlay_atomic_store64(
                             &control->bank_epochs[candidate_bank], 0u);
+                        // A valid no-move policy result completes only when its
+                        // reservation really retires. Replaying this finalizer
+                        // cannot recount: status is no longer ReserveCandidate.
+                        const bool decision_committed = llaminar2::commitDeviceMoECompletedDecision(
+                            controller_state->completed_decision, decision_append);
                         finish_overlay_publication_status(
                             status,
                             llaminar2::DeviceMoEOverlayEpochOperation::AbortCandidate,
-                            llaminar2::DeviceMoEOverlayEpochStatusCode::Success,
+                            decision_committed ? llaminar2::DeviceMoEOverlayEpochStatusCode::Success
+                                               : llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
                             candidate_epoch,
                             old_selector,
                             candidate_bank,
@@ -12447,6 +12483,20 @@ namespace
             // receipt. No telemetry enablement can alter this lifecycle edge.
             if (journal_required != 0u &&
                 !llaminar2::commitDeviceMoEMovementJournalAppend(journal, journal_append))
+            {
+                finish_overlay_publication_status(
+                    status, llaminar2::DeviceMoEOverlayEpochOperation::PublishCandidate,
+                    llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                    candidate_epoch, next_selector, candidate_bank,
+                    llaminar2::DeviceMoEOverlayEpochBankState::Published);
+                poison_rebalance_graph_controller(
+                    controller_state, kDeviceMoERebalanceStatusInvalidRuntime,
+                    apply_status->transaction_wave_index, apply_status->transaction_epoch,
+                    0u, 0u, apply_status->status_code, controller_state->participant_id);
+                return;
+            }
+            if (!llaminar2::commitDeviceMoECompletedDecision(
+                    controller_state->completed_decision, decision_append))
             {
                 finish_overlay_publication_status(
                     status, llaminar2::DeviceMoEOverlayEpochOperation::PublishCandidate,

@@ -10,6 +10,7 @@
  * lane reuse, and teardown without loading a model.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -426,8 +427,7 @@ namespace llaminar2::test
                                                 2u * kProjectionCount,
                                                 gpu_device,
                                                 HostTransferAccess::CrossProcessReadable);
-            const auto remote_execution = TransferEngine::instance()
-                                              .allocatePersistentTransferExecutionLanes(
+            const auto remote_execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                                   2u * kProjectionCount,
                                                   gpu_device,
                                                   "rocm_mpi_remote_projection");

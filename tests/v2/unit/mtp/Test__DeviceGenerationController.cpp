@@ -14,6 +14,7 @@
 
 #include "backends/IGPUGraphCapture.h"
 #include "execution/mtp/HostedDeviceGenerationLifecycle.h"
+#include "execution/mtp/DeviceGenerationContract.h"
 #include "kernels/common/SamplingMath.h"
 
 #include <algorithm>
@@ -65,6 +66,42 @@ namespace
             EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
             EXPECT_EQ(control[kDeviceGenerationControlTransactionCommitBudget], 0);
         }
+    }
+
+    /** @test Continuation authenticates the same exact branch range used to bind its retained family. */
+    TEST(Test__DeviceGenerationController, RetainedSpeculativeContinuationDepthRangeContract)
+    {
+        using llaminar2::DeviceGenerationSpeculativeDepthRange;
+        using llaminar2::deviceGenerationSpeculativeDepthRange;
+        for (const int depth : {1, 2, 3, 15})
+        {
+            const auto fixed = DeviceGenerationPolicy::fixed(depth);
+            const auto original = fixed;
+            const auto range = deviceGenerationSpeculativeDepthRange(fixed);
+            ASSERT_TRUE(range.has_value());
+            EXPECT_EQ(*range, (DeviceGenerationSpeculativeDepthRange{depth, depth}));
+            EXPECT_EQ(fixed, original) << "Continuation must not rewrite the original request policy";
+            auto observe = fixed;
+            observe.mode = DeviceGenerationPolicyMode::Observe;
+            observe.minimum_depth = 1;
+            observe.maximum_depth = 15;
+            EXPECT_EQ(deviceGenerationSpeculativeDepthRange(observe), range);
+            auto dynamic = observe;
+            dynamic.mode = DeviceGenerationPolicyMode::Dynamic;
+            EXPECT_EQ(deviceGenerationSpeculativeDepthRange(dynamic),
+                (std::optional<DeviceGenerationSpeculativeDepthRange>{DeviceGenerationSpeculativeDepthRange{1, 15}}));
+            auto different = DeviceGenerationPolicy::fixed(depth == 15 ? 1 : depth + 1);
+            EXPECT_NE(deviceGenerationSpeculativeDepthRange(different), range)
+                << "A different fixed width cannot authenticate an already retained parent";
+        }
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(DeviceGenerationPolicy::ordinary()));
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(DeviceGenerationPolicy::forwardOnly()));
+        auto invalid = DeviceGenerationPolicy::fixed(3);
+        invalid.maximum_depth = 2;
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(invalid));
+        invalid = DeviceGenerationPolicy::fixed(3);
+        invalid.mode = static_cast<DeviceGenerationPolicyMode>(255);
+        EXPECT_FALSE(deviceGenerationSpeculativeDepthRange(invalid));
     }
 
     TEST(
@@ -129,6 +166,91 @@ namespace
             [](void *, void *) { return true; }));
         ASSERT_TRUE(handoff.retireAfterHostCompletion(2));
         EXPECT_TRUE(handoff.inactive());
+    }
+
+    /**
+     * @test A one-token original follower response closes its real published frontier.
+     *
+     * The source can emit the initial prefill sample with no follower forward.
+     * A later response may already own a retained forward stream, or an initial
+     * MTP verifier may have published committed state. All three frontiers must
+     * close through the original event/borrow lifecycle, without double borrowing
+     * or pretending a no-forward admission had already launched a graph.
+     */
+    TEST(Test__DeviceGenerationController, OriginalPipelineFollowerTerminalReadinessLifecycle)
+    {
+        using llaminar2::DeviceGenerationStateHandoff;
+        using llaminar2::DeviceGenerationStatePublicationKind;
+        using llaminar2::DeviceTimelineRole;
+        enum class InitialFrontier { PrefillSampleOnly, PriorForward, CommittedVerifier };
+        void *const admission = reinterpret_cast<void *>(0x11000);
+        void *const controller = reinterpret_cast<void *>(0x12000);
+        void *const verifier = reinterpret_cast<void *>(0x13000);
+        void *const bridge = reinterpret_cast<void *>(0x14000);
+        for (const auto initial : {InitialFrontier::PrefillSampleOnly, InitialFrontier::PriorForward,
+                                  InitialFrontier::CommittedVerifier})
+        {
+            DeviceGenerationStateHandoff handoff;
+            for (int request = 0; request < 3; ++request)
+            {
+                ASSERT_TRUE(handoff.inactive());
+                ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::Admission,
+                    admission, 1, [] { return true; }));
+                int terminal_acquires = 0;
+                if (initial == InitialFrontier::PriorForward)
+                {
+                    ASSERT_TRUE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [&](void *producer, void *consumer) {
+                            EXPECT_EQ(producer, admission);
+                            EXPECT_EQ(consumer, controller);
+                            return true;
+                        }));
+                }
+                else if (initial == InitialFrontier::CommittedVerifier)
+                {
+                    ASSERT_TRUE(handoff.borrow(verifier, DeviceTimelineRole::AllPositionVerifier,
+                        1, [](void *, void *) { return true; }));
+                    ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::CommittedTransaction,
+                        verifier, 1, [] { return true; }));
+                }
+                if (initial != InitialFrontier::PriorForward)
+                {
+                    // This rejected operation is the original production defect:
+                    // a published admission/commit is not a terminal writer borrow.
+                    bool unpublished_terminal_callback = false;
+                    EXPECT_FALSE(handoff.publish(DeviceGenerationStatePublicationKind::Terminal,
+                        controller, 1, [&] { unpublished_terminal_callback = true; return true; }));
+                    EXPECT_FALSE(unpublished_terminal_callback);
+                    EXPECT_TRUE(handoff.published());
+                    const auto original_producer = handoff.frontierStream();
+                    EXPECT_FALSE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [](void *, void *) { return false; }));
+                    EXPECT_EQ(handoff.frontierStream(), original_producer);
+                    ASSERT_TRUE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                        1, [&](void *producer, void *consumer) {
+                            EXPECT_EQ(producer, initial == InitialFrontier::PrefillSampleOnly ? admission : verifier);
+                            EXPECT_EQ(consumer, controller);
+                            ++terminal_acquires;
+                            return true;
+                        }));
+                }
+                EXPECT_EQ(terminal_acquires, initial == InitialFrontier::PriorForward ? 0 : 1);
+                ASSERT_TRUE(handoff.borrowed());
+                EXPECT_EQ(handoff.frontierStream(), controller);
+                EXPECT_EQ(handoff.borrowerRole(), DeviceTimelineRole::DeviceGenerationController);
+                EXPECT_FALSE(handoff.borrow(controller, DeviceTimelineRole::DeviceGenerationController,
+                    1, [](void *, void *) { ADD_FAILURE() << "A prior retained body must not acquire twice"; return true; }));
+                ASSERT_TRUE(handoff.publish(DeviceGenerationStatePublicationKind::Terminal,
+                    controller, 1, [] { return true; }));
+                ASSERT_TRUE(handoff.borrow(bridge, DeviceTimelineRole::HostResultBridge,
+                    1, [&](void *producer, void *consumer) {
+                        EXPECT_EQ(producer, controller);
+                        EXPECT_EQ(consumer, bridge);
+                        return true;
+                    }));
+                EXPECT_TRUE(handoff.retireAfterHostCompletion(1));
+            }
+        }
     }
 
     /**

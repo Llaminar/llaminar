@@ -38,7 +38,7 @@ class PrerequisiteReuseTests(unittest.TestCase):
             def validate(actual_build, actual_report):
                 order.append("validate")
                 self.assertEqual((actual_build, actual_report), (build, report))
-                return 0, 0.0, ("unit", "preflight")
+                return entrypoint.PreflightResult(0, 0.0, ("unit", "preflight"), None)
             with patch.object(entrypoint.subprocess, "run", side_effect=build_current), \
                  patch.object(entrypoint, "validate_source_freshness", side_effect=lambda *_: order.append("source")), \
                  patch.object(entrypoint, "reuse_unchanged_production_test_preflight", side_effect=validate), \
@@ -70,7 +70,7 @@ class PrerequisiteReuseTests(unittest.TestCase):
     def test_new_evidence_still_runs_the_complete_authority(self):
         """Normal qualification retains the existing complete Unit/preflight transaction."""
         with tempfile.TemporaryDirectory() as temporary, \
-             patch.object(entrypoint, "run_production_test_preflight", return_value=(0, 1.0, ())) as full, \
+             patch.object(entrypoint, "run_production_test_preflight", return_value=entrypoint.PreflightResult(0, 1.0, (), None)) as full, \
              patch.object(entrypoint, "reuse_unchanged_production_test_preflight") as reuse:
             build = Path(temporary).resolve()
             output = build / "new evidence"

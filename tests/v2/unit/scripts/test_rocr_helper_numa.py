@@ -43,7 +43,8 @@ def authority(root: Path) -> tuple[object, str, str]:
     identity = ':'.join(pins[key] for key in ('LLAMINAR_ROCM_VERSION', 'LLAMINAR_ROCM_DEB_VERSION',
                        'LLAMINAR_ROCM_SYSTEMS_REVISION', 'LLAMINAR_ROCR_LIBRARY_VERSION'))
     for relative in ('patches/rocm-rocr-helper-numa.patch', 'rocr-helper-numa/proof.py',
-                     'rocr-helper-numa/contract.cpp.in'):
+                     'rocr-helper-numa/contract.cpp.in', 'patches/rocm-rocr-deferred-sdma-profiling.patch',
+                     'rocr-deferred-sdma/proof.py', 'rocr-deferred-sdma/contract.cpp.in'):
         identity += ':' + owner.digest(docker / relative)
     return owner, identity, pins['LLAMINAR_ROCR_LIBRARY_VERSION']
 
@@ -63,6 +64,14 @@ def require_installed(runtime: Path, root: Path) -> None:
     if marker != identity + ':' + owner.digest(library):
         raise ValueError('ROCr SDK receipt has stale dependency bytes')
     owner.load_verified(prefix / 'share/llaminar/rocr-helper-numa-proof.json', identity, library)
+    sdma_path = root / 'scripts/docker/rocr-deferred-sdma/proof.py'
+    spec = importlib.util.spec_from_file_location('rocr_deferred_sdma_proof', sdma_path)
+    sdma_owner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sdma_owner)
+    sdma_owner.load_verified(prefix / 'share/llaminar/rocr-deferred-sdma-proof.json', identity, library)
+    if (prefix / 'share/licenses/llaminar-rocr/rocm-rocr-deferred-sdma-profiling.patch').read_bytes() != (
+            root / 'scripts/docker/patches/rocm-rocr-deferred-sdma-profiling.patch').read_bytes():
+        raise ValueError('ROCr installed deferred SDMA patch differs from source authority')
     installed_patch = prefix / 'share/licenses/llaminar-rocr/rocm-rocr-helper-numa.patch'
     if installed_patch.read_bytes() != (root / 'scripts/docker/patches/rocm-rocr-helper-numa.patch').read_bytes():
         raise ValueError('ROCr installed patch differs from source authority')

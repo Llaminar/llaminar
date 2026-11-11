@@ -7,6 +7,8 @@
  * Every process-retained population is isolated in a true threadsafe child.
  */
 #include "fixtures/backends/PooledRemoteGraphHostReplayAccess.h"
+#include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <sys/resource.h>
 #include <iostream>
 #include "fixtures/execution/RetainedGraphParticipantsReplayAccess.h"
@@ -23,6 +25,8 @@ namespace {
 using Access=PooledRemoteGraphHostReplayAccess;
 /** @brief Recorded structural SDK result with independent creator/inspection/instantiate observations. */
 struct Trace {GPUFlatGraphStructure structure;int creators=0,destroyed=0,inspections=0,instantiations=0,launches=0,preparations=0,finiteCopies=0;const PhysicalMemoryAuthority* preparedMemory=nullptr;void* preparedStream=nullptr;bool failCreate=false,failInspect=false,failPrepare=false,throwPrepare=false;    unsigned resets=0;
+    unsigned activeImports=0;
+    bool failActiveImport=false;
 };
 /** @brief The fake native object occupies exactly sizeof(Capture); production state remains in the owner. */
 class Capture final:public IGPUGraphCapture {
@@ -37,6 +41,11 @@ public:
         ++trace_.preparations;trace_.preparedMemory=memory.get();trace_.preparedStream=executionStream();
         if(trace_.throwPrepare)throw std::runtime_error("recorded native context preparation failure");
         return !trace_.failPrepare;
+    }
+    /** @brief Double the SDK import after the original owner checks the exact child. */
+    bool appendActiveCaptureChild(const IGPUGraphCapture& child)override{
+        ++trace_.activeImports;
+        return !trace_.failActiveImport && &child!=this && child.nodeCount() && !child.hasExecutable();
     }
     bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> bodies)override{
         if(hasExecutable() || bodies.size()!=1 || !bodies.front() || bodies.front()==this || bodies.front()->hasExecutable())return false;
@@ -553,6 +562,211 @@ TEST(PooledRemoteGraphHost, OriginalSourceSerialDefinitionRecreationKeepsOneSlot
             source.reset();
             std::_Exit(::testing::Test::HasFailure()?2:0);
         }catch(const std::exception& error){std::cerr<<"original_source_recreation_failure: "<<error.what()<<std::endl;std::_Exit(3);}
+    }()),::testing::ExitedWithCode(0),"");
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+namespace {
+/** @return Closed homogeneous original-owner declaration, with no portable flat certificate. */
+PooledNativeOwnerGraphProgram nativeProgram(DeviceId remote,std::uint32_t capacity){
+    const PhysicalMemoryAllocatorIdentity coordinator{0,DeviceId(remote.type,remote.ordinal+1)},owner{0,remote};
+    const std::array order{coordinator,owner};
+    std::vector<ImmutableRowTableLayoutOwner> owners{{{coordinator,ImmutableRowStorage::VRAM},0,0,{}},{{owner,ImmutableRowStorage::VRAM},0,capacity,{}}};
+    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
+    const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,4096,9000),
+        ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,std::move(owners),{coordinator},{},
+        {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},{},
+        capacity?std::optional(coordinator):std::nullopt,16,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,PeerAccessCoverage::None);
+    const auto physical=qwen4exp::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,coordinator);
+    const auto policy=qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},32);
+    return std::get<PooledNativeOwnerGraphProgram>(qwen4exp::PooledImmutableDirectedOwnerProgram::declareStorage(physical,policy,1));
+}
+/**
+ * @brief Actual original resource/owner lifetime with native APIs doubled, never native transport permission.
+ *
+ * Resource observations include exactly the original model and storage General
+ * BOMs above the same context headroom. Omission of the storage purpose is an
+ * intentional negative; abundant model allowance must never repair it.
+ */
+struct NativeGeneralSource final {
+    PooledNativeOwnerGraphProgram descriptor;
+    std::shared_ptr<NativeContextPreparation> source;
+    std::optional<PreparedGPUContextUsePermit> original;
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    NativeGeneralSource(DeviceId device,bool storageBudget):descriptor(nativeProgram(device,0)){
+        NativeContextPreparationReplayAccess::seed(device,[device](auto stack){return NativeContextPreparationReplayAccess::construct<Worker>(std::move(stack),device.ordinal);});
+        constexpr std::size_t contextHeadroom=128u<<20;
+        std::array observed{PhysicalMemoryResource{0,DeviceId::cpu(),contextHeadroom,contextHeadroom},PhysicalMemoryResource{0,device,contextHeadroom,contextHeadroom}};
+        const auto model=RetainedParticipantGraphExecutable::generalBOM(observed[0],observed[1]);
+        const auto storage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,observed[0],observed[1]);
+        const auto holder=RetainedParticipantGraphSourceSlots::physicalBytes(descriptor.geometry().participants);
+        for(const auto* bill:{&model,&storage})for(const auto& row:bill->resources())for(auto& resource:observed)if(resource.device==row.resource().device){
+            if(row.totalBytes()>std::numeric_limits<std::size_t>::max()-resource.total_bytes)
+                throw std::overflow_error("Recorded native storage resource observation overflows");
+            resource.total_bytes+=row.totalBytes();resource.admission_available_bytes+=row.totalBytes();}
+        observed[0].total_bytes+=holder;observed[0].admission_available_bytes+=holder;
+        source=NativeContextPreparationReplayAccess::source<Worker>(device,observed);original.emplace(source->acquire(device));memory=source->memory();source->freezeForPlanning();
+        const auto admittedModel=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),source->originalResource(device));
+        const auto admittedStorage=RetainedParticipantGraphExecutable::nativeStorageBOM(descriptor,source->originalResource(DeviceId::cpu()),source->originalResource(device));
+        PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());for(const auto& row:admittedModel.resources())plan.add(row);
+        if(storageBudget)for(const auto& row:admittedStorage.resources())plan.add(row);
+        plan.add(source->originalResource(DeviceId::cpu()),PhysicalMemoryOwner::NativeStorageGraphExecutable,holder);
+        source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
+    }
+    /** @return Only the original API-double worker; no native loader is called. */
+    Worker& worker(){return static_cast<Worker&>(*original->worker());}
+    /** @brief Record/instantiate through the real retained owner; mock SDK metadata has no flat certificate. */
+    void record(RetainedParticipantGraphExecutable& owner){worker().submitAndWait([&]{auto& capture=Access::recording(owner);
+        ASSERT_TRUE(capture.beginCapture());ASSERT_TRUE(capture.endCapture());ASSERT_TRUE(capture.prepareRuntimeContextStorage(memory));ASSERT_TRUE(capture.instantiate());});}
+    /** @brief Retire the actual recorded generation only after all source definitions are gone. */
+    void reset(){const auto device=original->device();original.reset();auto reset=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);NativeContextPreparationReplayAccess::physicalReset(reset);}
+};
+}
+/** @test Native library graph storage reuses one original General slot without borrowing model purpose or flat scope. */
+TEST(PooledRemoteGraphHost, NativeGeneralSourceSlotsRetainPurposeAndOriginalIdentity){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+        try{
+            NativeGeneralSource source(device,true);
+            const auto identity=static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source.source.get()));
+            auto slots=Access::sourceSlots(identity,source.descriptor.geometry().participants,source.memory);
+            RetainedParticipantGraphExecutable* original=nullptr;
+            for(std::uint64_t epoch=1;epoch<=20;++epoch){
+                auto owner=Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor);
+                if(epoch==1)original=owner.get();else EXPECT_EQ(owner.get(),original);
+                EXPECT_EQ(owner->hostQualification(),GraphHostQualification::GeneralProcessAllowance);
+                EXPECT_EQ(Access::definitionGeneration(*owner),epoch);
+                source.record(*owner);EXPECT_EQ(source.worker().trace.inspections,0);
+                EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable),GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(device));
+                EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeStorageGraphExecutable),GPUGraphMemoryContract::reservationBytesPerExecutable(device));
+                EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable),0u);
+                EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable),0u);
+                EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor),std::invalid_argument);
+                auto alias=owner;EXPECT_THROW(Access::releaseNativeSlots(*slots,identity,source.descriptor,owner),std::invalid_argument);alias.reset();
+                EXPECT_EQ(Access::submissionOrdinal(*owner),epoch-1);
+                ASSERT_TRUE(Access::submit(*owner,epoch));EXPECT_THROW(Access::releaseNativeSlots(*slots,identity,source.descriptor,owner),std::logic_error);
+                ASSERT_TRUE(Access::observe(*owner));Access::releaseNativeSlots(*slots,identity,source.descriptor,owner);owner.reset();
+            }
+            EXPECT_THROW(Access::acquireNativeSlots(*slots,identity+1,*source.original,source.descriptor),std::invalid_argument);
+            EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,nativeProgram(device,3)),std::invalid_argument);
+            EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor,reinterpret_cast<void*>(0x7788)),std::invalid_argument);
+            EXPECT_EQ(source.worker().trace.creators,1);EXPECT_EQ(source.worker().trace.resets,20u);
+            source.worker().rejectQueue=true;EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor),std::runtime_error);source.worker().rejectQueue=false;
+            EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor),std::runtime_error);
+            EXPECT_EQ(source.worker().trace.creators,1);slots.reset();EXPECT_EQ(source.worker().trace.destroyed,1);source.reset();
+            std::_Exit(::testing::Test::HasFailure()?2:0);
+        }catch(const std::exception& error){std::cerr<<"native_general_source_slot_failure: "<<error.what()<<'\n';std::_Exit(3);}
+    }()),::testing::ExitedWithCode(0),"");
+}
+/** @test An admitted model General budget cannot authorize a native storage-only creator. */
+TEST(PooledRemoteGraphHost, NativeGeneralStorageCannotConsumeModelBudget){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+        try{
+            NativeGeneralSource source(device,false);
+            const auto identity=static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source.source.get()));
+            auto slots=Access::sourceSlots(identity,source.descriptor.geometry().participants,source.memory);
+            EXPECT_THROW(Access::acquireNativeSlots(*slots,identity,*source.original,source.descriptor),std::exception);
+            EXPECT_EQ(source.worker().trace.creators,0);EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable),0u);
+            EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeStorageGraphExecutable),0u);
+            slots.reset();source.reset();std::_Exit(::testing::Test::HasFailure()?2:0);
+        }catch(const std::exception& error){std::cerr<<"native_general_purpose_failure: "<<error.what()<<'\n';std::_Exit(3);}
+    }()),::testing::ExitedWithCode(0),"");
+}
+/** @test Actual original owners reject foreign, mutable and prematurely retired shared children. */
+TEST(PooledRemoteGraphHost, SharedNativeChildKeepsExactOriginalOwnerUntilAllParentsRetire)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
+        try {
+            using Graph=RetainedParticipantGraphExecutableFixtureAccess;
+            const std::array devices{DeviceId::cuda(0),DeviceId::cuda(1)};
+            const std::array resources{PhysicalMemoryResource{0,DeviceId::cpu(),8ULL<<30,8ULL<<30},
+                PhysicalMemoryResource{0,devices[0],128ULL<<20,128ULL<<20},
+                PhysicalMemoryResource{0,devices[1],128ULL<<20,128ULL<<20}};
+            for(const auto device:devices)NativeContextPreparationReplayAccess::seed(device,[device](auto stack) {
+                return NativeContextPreparationReplayAccess::construct<Worker>(std::move(stack),device.ordinal);
+            });
+            auto source=NativeContextPreparationReplayAccess::source<Worker>(devices,resources);
+            std::optional first=source->acquire(devices[0]);
+            std::optional second=source->acquire(devices[1]);
+            source->freezeForPlanning();
+            PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
+            for(std::size_t i=0;i<devices.size();++i) {
+                const auto graph_bom=RetainedParticipantGraphExecutable::generalBOM(
+                    source->originalResource(DeviceId::cpu()),source->originalResource(devices[i]),i==0?4:1);
+                for(const auto& resource:graph_bom.resources())plan.add(resource);
+            }
+            source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
+            auto child=Graph::recorded(*first),left=Graph::recorded(*first),right=Graph::recorded(*first);
+            auto failed=Graph::recorded(*first),foreign=Graph::recorded(*second);
+            auto& worker=static_cast<Worker&>(*first->worker());
+            const auto seal=[](auto& original,const auto& graph) {
+                original.worker()->submitAndWait([&] {
+                    auto& capture=Graph::capture(graph);
+                    ScopedBackendGraphCapture recording(*original.worker(),capture,"original graph-only child replay");
+                    ASSERT_TRUE(recording.begin());
+                    recording.finish();
+                    Graph::sealSharedChild(graph);
+                    EXPECT_THROW(capture.instantiate(),std::logic_error);
+                    EXPECT_THROW(capture.reset(),std::logic_error);
+                });
+            };
+            seal(*first,child);
+            seal(*second,foreign);
+            worker.submitAndWait([&] {
+                EXPECT_THROW(Graph::bindSharedChild(left,foreign),std::invalid_argument);
+                EXPECT_THROW(Graph::bindSharedChild(left,right),std::invalid_argument);
+                EXPECT_THROW(Graph::bindSharedChild(left,left),std::invalid_argument);
+                auto alias=std::shared_ptr<RetainedParticipantGraphExecutable>(child.get(),[](auto*) {});
+                EXPECT_THROW(Graph::bindSharedChild(left,alias),std::invalid_argument);
+                EXPECT_THROW(Graph::recordSharedChild(left),std::logic_error);
+                EXPECT_EQ(worker.trace.activeImports,0u);
+                for(const auto& parent:{left,right}) {
+                    Graph::bindSharedChild(parent,child);
+                    EXPECT_THROW(Graph::bindSharedChild(parent,child),std::invalid_argument);
+                    auto& capture=Graph::capture(parent);
+                    ScopedBackendGraphCapture recording(worker,capture,"original shared child parent replay");
+                    ASSERT_TRUE(recording.begin());
+                    Graph::recordSharedChild(parent);
+                    EXPECT_THROW(Graph::recordSharedChild(parent),std::logic_error);
+                    recording.finish();
+                    ASSERT_TRUE(capture.prepareRuntimeContextStorage(source->memory()));
+                    ASSERT_TRUE(capture.instantiate());
+                }
+                Graph::bindSharedChild(failed,child);
+                auto& capture=Graph::capture(failed);
+                ScopedBackendGraphCapture recording(worker,capture,"original partial child import failure");
+                ASSERT_TRUE(recording.begin());
+                worker.trace.failActiveImport=true;
+                EXPECT_THROW(Graph::recordSharedChild(failed),std::runtime_error);
+                recording.finish();
+                EXPECT_THROW(capture.instantiate(),std::logic_error);
+            });
+            EXPECT_EQ(worker.trace.activeImports,3u);
+            EXPECT_EQ(worker.trace.instantiations,2);
+            EXPECT_THROW(Graph::retireSharedDefinition(child),std::logic_error);
+            Graph::retireSharedDefinition(failed);
+            ASSERT_TRUE(Graph::submit(left,1));
+            EXPECT_THROW(Graph::retireSharedDefinition(left),std::logic_error);
+            ASSERT_TRUE(Graph::observeTerminal(left));
+            Graph::retireSharedDefinition(left);
+            EXPECT_THROW(Graph::retireSharedDefinition(child),std::logic_error);
+            Graph::retireSharedDefinition(right);
+            Graph::retireSharedDefinition(child);
+            Graph::retireSharedDefinition(foreign);
+            left.reset();right.reset();failed.reset();child.reset();foreign.reset();
+            first.reset();second.reset();
+            for(const auto device:devices) {
+                auto retirement=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+                NativeContextPreparationReplayAccess::physicalReset(retirement);
+            }
+            std::_Exit(::testing::Test::HasFailure()?2:0);
+        } catch(const std::exception& error) {
+            std::cerr << "shared_native_child_owner_failure: " << error.what() << '\n';
+            std::_Exit(3);
+        }
     }()),::testing::ExitedWithCode(0),"");
 }
 } // namespace llaminar2::test

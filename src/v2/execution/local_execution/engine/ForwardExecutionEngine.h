@@ -211,6 +211,12 @@ namespace llaminar2
             return 0;
         }
 
+        /** @return Exact fixed-pipeline cache capacity when sealed by serving admission. */
+        virtual std::optional<std::size_t> retainedExactPrefillCacheEntries() const
+        {
+            return std::nullopt;
+        }
+
         /**
          * @brief Called once after the first graph build completes and workspace
          *        is allocated, but before execution starts.
@@ -1544,7 +1550,7 @@ namespace llaminar2
 
         /** @brief Enforce the engine-level cap for all reusable prefill topologies. */
         void enforcePrefillForwardCapacity(
-            const ForwardGraphSignature *active_signature = nullptr);
+            const IForwardExecutionHost &host, const ForwardGraphSignature *active_signature);
 
         /** @brief Count valid top-level exact and bucketed prefill cache entries. */
         size_t prefillForwardCacheSize() const;

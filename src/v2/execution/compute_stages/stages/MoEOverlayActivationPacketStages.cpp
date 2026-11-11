@@ -11,6 +11,9 @@
  */
 
 #include "MoEOverlayActivationPacketStages.h"
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
+#include "backends/GPUCaptureDependencyRoster.h"
+#include "backends/NativeContextPreparation.h"
 #include "execution/moe/MoEOverlaySharedDispatchSelection.h"
 
 #include "../../../backends/BackendManager.h"
@@ -574,8 +577,9 @@ namespace llaminar2
             const std::vector<Launch> &launches,
             DeviceId device,
             void *stream,
-            std::shared_ptr<MoEOverlayPersistentGraphStorage> *storage,
-            const char *role)
+            std::shared_ptr<MoEOverlayActivationBatchStorage> *storage,
+            const char *role,
+            const MoEOverlayActivationLaneBatchState& transaction)
         {
             static_assert(std::is_trivially_copyable_v<Launch>);
             static_assert(sizeof(Launch) % alignof(std::int32_t) == 0u);
@@ -590,13 +594,15 @@ namespace llaminar2
                 if (!*storage)
                 {
                     *storage = std::make_shared<
-                        MoEOverlayPersistentGraphStorage>(
-                        MoEOverlayPersistentGraphStorage::Config{
+                        MoEOverlayActivationBatchStorage>(
+                        MoEOverlayActivationBatchStorage::Config{
                             .device = device,
                             .type = MoEOverlayGraphStorageType::Int32,
                             .shape = {words},
                             .immutable_input = true,
                             .identity = role ? role : "activation_launches",
+                            .physical_memory_authority = transaction.memory(),
+                            .context_resources = transaction.captureDependencies(),
                         });
                 }
                 return (*storage)->sizeBytes() == bytes &&
@@ -685,8 +691,10 @@ namespace llaminar2
         std::vector<MoEOverlayMappedActivationDeviceLane> lanes,
         std::int32_t physical_rows,
         std::uint32_t stage_ordinal,
-        std::int32_t model_layer_index)
-        : device_(device),
+        std::int32_t model_layer_index,
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority)
+        : physical_memory_authority_(std::move(physical_memory_authority)),
+          device_(device),
           lanes_(std::move(lanes)),
           physical_rows_(physical_rows),
           stage_ordinal_(stage_ordinal),
@@ -708,6 +716,8 @@ namespace llaminar2
                 "topology or captured geometry");
         }
 
+        if(!physical_memory_authority_)
+            throw std::invalid_argument("Activation Batch requires its original physical memory authority");
         lane_shared_dispatch_payload_groups_.assign(lanes_.size(), -1);
         for (std::size_t lane_index = 0u;
              lane_index < lanes_.size();
@@ -769,6 +779,12 @@ namespace llaminar2
         release();
     }
 
+    const PreparedGPUContextUsePermit& MoEOverlayActivationLaneBatchState::originalContext()const
+    {
+        if(!original_context_)throw std::logic_error("Activation Batch lost its original context permit");
+        return *original_context_;
+    }
+
     std::int32_t MoEOverlayActivationLaneBatchState::dModel() const noexcept
     {
         return lanes_.empty() ? 0 : lanes_.front().dispatch.d_model;
@@ -800,6 +816,15 @@ namespace llaminar2
 
     bool MoEOverlayActivationLaneBatchState::materializePersistentResources()
     {
+        // Construction and workspace declarations remain purely declarative.
+        // Only the existing cold graph-launch preparation may borrow the
+        // admitted original worker or materialize native publication resources.
+        if(!original_context_){
+            auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device_,physical_memory_authority_);
+            auto resources=original.worker()->prepareBatchCaptureDependencies(0,0,original);
+            original_context_=std::make_unique<PreparedGPUContextUsePermit>(std::move(original));
+            capture_dependencies_=std::move(resources);
+        }
         if (!usesAsynchronousLanes())
             return true;
         if (persistentResourcesReady())
@@ -833,8 +858,9 @@ namespace llaminar2
         try
         {
             event_device_ordinal_ = device_.gpu_ordinal();
-            auto &gpu_ctx =
-                GPUDeviceContextPool::instance().getContext(device_);
+            auto &gpu_ctx = *originalContext().worker();
+            capture_dependencies_=gpu_ctx.prepareBatchCaptureDependencies(
+                lanes_.size(),shared_dispatch_payload_groups_.size(),originalContext());
             lane_streams_.reserve(lanes_.size());
             for (std::size_t lane_index = 0u;
                  lane_index < lanes_.size();
@@ -845,9 +871,9 @@ namespace llaminar2
                  * streams; the mapped return timeline remains the one
                  * cross-executable completion authority. */
                 void *const lane_stream =
-                    gpu_ctx.getOrCreateAuxiliaryStream(
+                    gpu_ctx.getOrCreateAdmittedAuxiliaryStream(
                         "moe_overlay_activation_lane:" +
-                        std::to_string(lane_index));
+                        std::to_string(lane_index),originalContext());
                 if (!lane_stream)
                 {
                     throw std::runtime_error(
@@ -856,25 +882,23 @@ namespace llaminar2
                 lane_streams_.push_back(lane_stream);
                 if (stage_ordinal_ == 0u)
                 {
-                    void *const event =
-                        event_backend_->createEvent(event_device_ordinal_);
+                    void *const event = capture_dependencies_->admission(lane_index);
                     if (!event)
                         throw std::runtime_error(
                             "could not create lane epoch-admission event");
                     admission_ready_events_.push_back(event);
                 }
             }
-            producer_ready_event_ =
-                event_backend_->createEvent(event_device_ordinal_);
+            producer_ready_event_ = capture_dependencies_->producer();
             if (!producer_ready_event_)
             {
                 throw std::runtime_error(
                     "could not create main-to-lane fork event");
             }
-            for (auto &group : shared_dispatch_payload_groups_)
+            for (std::size_t index=0;index<shared_dispatch_payload_groups_.size();++index)
             {
-                group.ready_event =
-                    event_backend_->createEvent(event_device_ordinal_);
+                auto& group=shared_dispatch_payload_groups_[index];
+                group.ready_event = capture_dependencies_->shared(index);
                 if (!group.ready_event)
                 {
                     throw std::runtime_error(
@@ -918,32 +942,14 @@ namespace llaminar2
 
     void MoEOverlayActivationLaneBatchState::release()
     {
-        if (event_backend_ && event_device_ordinal_ >= 0)
-        {
-            if (producer_ready_event_)
-            {
-                event_backend_->destroyEvent(
-                    producer_ready_event_, event_device_ordinal_);
-            }
-            for (void *const event : admission_ready_events_)
-                event_backend_->destroyEvent(event, event_device_ordinal_);
-            for (auto &group : shared_dispatch_payload_groups_)
-            {
-                if (group.ready_event)
-                {
-                    event_backend_->destroyEvent(
-                        group.ready_event, event_device_ordinal_);
-                }
-            }
-        }
+        // These are context-owned internal capture edges. Native recording
+        // borrowed them only through the stage/capture interval; retained
+        // parents keep their DAG, not a live event lease or creator population.
         producer_ready_event_ = nullptr;
-        for (auto &group : shared_dispatch_payload_groups_)
-            group.ready_event = nullptr;
-        /* Auxiliary streams remain owned by IWorkerGPUContext. */
-        lane_streams_.clear();
-        admission_ready_events_.clear();
-        event_backend_ = nullptr;
-        event_device_ordinal_ = -1;
+        for (auto &group : shared_dispatch_payload_groups_)group.ready_event = nullptr;
+        lane_streams_.clear();admission_ready_events_.clear();
+        capture_dependencies_.reset();
+        event_backend_ = nullptr;event_device_ordinal_ = -1;
     }
 
     void *MoEOverlayActivationLaneBatchState::laneStream(
@@ -2398,7 +2404,7 @@ namespace llaminar2
             params_.device_id,
             stream,
             &descriptor_storage_,
-            "one-row dispatch batch");
+            "one-row dispatch batch", *params_.transaction);
     }
 
     bool MoEOverlayActivationDispatchPackBatchStage::execute(
@@ -2431,6 +2437,10 @@ namespace llaminar2
                 auto &gpu_ctx =
                     GPUDeviceContextPool::instance().getContext(
                         params_.device_id);
+                auto capture_borrow=gpu_ctx.acquireProjectionSubmission(
+                    stream,GPUProjectionSubmissionKind::Eager,true);
+                auto dependency_borrow=transaction.captureDependencies()->borrow(
+                    lanes.size(),transaction.sharedDispatchPayloadGroupCount());
                 const auto input_fork =
                     TransferEngine::instance().recordDeviceInputFork(
                         params_.hidden,
@@ -2734,6 +2744,7 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+        if(!params_.transaction->materializePersistentResources())return false;
         if (params_.transaction->usesAsynchronousLanes())
         {
             if (!params_.transaction->materializePersistentResources() || !prepareSharedRowGroups(stream))
@@ -2997,19 +3008,21 @@ namespace llaminar2
                     params_.device_id,
                     stream,
                     &descriptor_storage_,
-                    "multi-row return batch"))
+                    "multi-row return batch", *params_.transaction))
             {
                 return false;
             }
 
             lane_valid_ = std::make_shared<
-                MoEOverlayPersistentGraphStorage>(
-                MoEOverlayPersistentGraphStorage::Config{
+                MoEOverlayActivationBatchStorage>(
+                MoEOverlayActivationBatchStorage::Config{
                     .device = params_.device_id,
                     .type = MoEOverlayGraphStorageType::Int32,
                     .shape = {lanes.size()},
                     .immutable_input = false,
                     .identity = "multi_row_return_lane_valid",
+                    .physical_memory_authority = params_.transaction->memory(),
+                    .context_resources = params_.transaction->captureDependencies(),
                 });
             try
             {
@@ -3079,19 +3092,21 @@ namespace llaminar2
                 params_.device_id,
                 stream,
                 &descriptor_storage_,
-                "one-row return batch"))
+                "one-row return batch", *params_.transaction))
         {
             return false;
         }
 
         lane_valid_ = std::make_shared<
-            MoEOverlayPersistentGraphStorage>(
-            MoEOverlayPersistentGraphStorage::Config{
+            MoEOverlayActivationBatchStorage>(
+            MoEOverlayActivationBatchStorage::Config{
                 .device = params_.device_id,
                 .type = MoEOverlayGraphStorageType::Int32,
                 .shape = {lanes.size()},
                 .immutable_input = false,
                 .identity = "single_row_return_lane_valid",
+                .physical_memory_authority = params_.transaction->memory(),
+                .context_resources = params_.transaction->captureDependencies(),
             });
         try
         {
@@ -3345,6 +3360,7 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
+        if(!params_.transaction->materializePersistentResources())return false;
         if (params_.transaction->usesAsynchronousLanes())
         {
             return params_.transaction->materializePersistentResources() &&

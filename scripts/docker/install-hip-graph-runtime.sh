@@ -8,7 +8,9 @@
 # The 10.1 source already includes #9643's TLS-safe native thread stacks and
 # #9652's SDMA sharing; those backports are retired. Ordering-only SDMA events
 # retain their exact DMA completion rather than waiting behind unrelated
-# captured compute frontiers on a shared hardware queue. The graph ROI
+# captured compute frontiers on a shared hardware queue. Eligible timing events
+# use finite profiled SDMA markers, preserving actual device timestamps and
+# cold-owned storage without introducing an unrelated compute dependency. The graph ROI
 # repair preserves independent progress for waits and opaque child/callback
 # work. Packet capture, concurrent builders and the existing queue bound remain
 # enabled; finite compute graphs retain the upstream single-queue optimization.
@@ -39,6 +41,7 @@ hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-kernarg-metadata.patch"
     "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch"
+    "${hip_script_dir}/patches/rocm-hip-timed-sdma-marker.patch"
 )
 # Builder implementation and host fixture are part of the immutable proof
 # identity, so fast reuse cannot silently retain an older contract.

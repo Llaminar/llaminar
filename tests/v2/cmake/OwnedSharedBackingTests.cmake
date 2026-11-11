@@ -19,6 +19,12 @@ add_v2_test(V2_Integration_MPIOwnedSharedFileIdentity
     COMMAND $<TARGET_FILE:v2_test_mpi_owned_shared_backing>
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;SharedMemory;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT "${_owned_shared_cpu_env}")
+add_v2_test(V2_Integration_MPIIndependentLaunchFiles
+    COMMAND $<TARGET_FILE:v2_test_mpi_owned_shared_backing>
+        --gtest_filter=MPIOwnedSharedBacking.UniqueLaunchFilesCoexistAndRetireIndependently
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;SharedMemory;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT "${_owned_shared_cpu_env}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIIndependentLaunchFiles)
 add_executable(v2_test_moe_owned_shared_startup unit/execution/moe/Test__MoEOverlaySharedBackingStartup.cpp)
 target_include_directories(v2_test_moe_owned_shared_startup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_moe_owned_shared_startup PRIVATE llaminar2_core GTest::gtest_main)

@@ -7,6 +7,7 @@
  * Store/PMA lifetimes and every prepared projection independently.
  */
 #pragma once
+#include <limits>
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "MoEExpertOwnerMap.h"
 #include "CPUExpertShardSourceSelection.h"
@@ -69,7 +70,7 @@ inline void requireMoEOverlayMTPSourceCoverage(const MoEExpertOwnerMap &owners,
         if(!preparation || preparation->cpuJointOwnerMap().get()!=&owners)
             throw std::invalid_argument("MTP joint source requires the same original preparation/map authority");
         const auto &cohort=*placement->shard_cohort;
-        if(cohort.source().layer_idx!=layer || cohort.participants().size()<2 || cohort.participants().size()>8)
+        if(cohort.source().layer_idx!=layer || cohort.participants().size()<2 || cohort.participants().size()>static_cast<size_t>(std::numeric_limits<int>::max()))
             throw std::invalid_argument("MTP predictor cohort changed original layer/population");
         for(size_t member=0;member<cohort.participants().size();++member) {
             const auto &original=cohort.participants()[member];

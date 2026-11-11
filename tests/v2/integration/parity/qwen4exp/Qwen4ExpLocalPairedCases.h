@@ -17,6 +17,7 @@
 #include "Qwen4ExpMatchedCacheEconomyCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
+#include "Qwen4ExpObservedPipelineCases.h"
 #include <nlohmann/json.hpp>
 #include <map>
 #include <set>
@@ -60,6 +61,8 @@ inline std::vector<ModelParityCase> qwen4ExpLocalHotNumericalCases()
  */
 inline std::string qfnLocalPairedCellId(const std::string& family, const ModelParityCase& cell)
 {
+    if (family == "Qwen4ExpObservedMI50FixedVRAMFullStage")
+        return family + "/Qwen4ExpObservedPipelineMainParityTest.ProductionParity/" + cell.testName();
     const auto fixture = (family == "Qwen4ExpLocalHotNumerical" || family == "Qwen4ExpLocalHotMeasuredBudgetNumerical" ||
         family == "Qwen4ExpLocalHotRefinedBudgetNumerical")
         ? "Qwen4ExpLocalHotNumericalTest" : "Qwen4ExpMainParityTest";
@@ -98,6 +101,7 @@ inline QFNCaseFamilies qfnOriginalCaseFamilies()
             {"Qwen4ExpMain", qwen4ExpProductionCases()},
             {"Qwen4ExpHostAdaptiveRAMSSD", qwen4ExpHostAdaptiveProductionCases()},
             {"Qwen4ExpFixedHeadTP", qwen4ExpFixedHeadProductionCases()},
+            {"Qwen4ExpObservedMI50FixedVRAMFullStage", qwen4ExpObservedMI50FixedVRAMCases()},
             {"Qwen4ExpGPUAdaptive", qwen4ExpGPUAdaptiveProductionCases()},
             {"Qwen4ExpOppositeVendorOrdinaryRetained15", qwen4ExpOppositeVendorOrdinaryRetained15Cases()},
             {"Qwen4ExpOppositeVendorMTPRetained15", qwen4ExpOppositeVendorMTPRetained15Cases()},

@@ -322,6 +322,16 @@ namespace llaminar2
     class MoEOverlayCanonicalRouteReturnTicketStorage final
     {
     public:
+        /** @brief Exact immutable canonical ticket metadata layout. */
+        struct MetadataLayout { size_t bytes, original_route_slots_offset, compact_route_slots_offset; };
+        /**
+         * @brief Declare the same original offsets used by physical binding.
+         * @param route_capacity Positive original route capacity.
+         * @return Exact payload bytes and original/compact map offsets.
+         * @throws std::invalid_argument For zero capacity.
+         * @throws std::overflow_error For unrepresentable metadata.
+         */
+        static MetadataLayout metadataLayout(size_t route_capacity);
         /**
          * @brief Move-only CPU ownership of one unpublished ticket payload.
          *
@@ -834,6 +844,17 @@ namespace llaminar2
         int32_t *row_ids_host = nullptr;
         float *output_rows_fp32 = nullptr;
     };
+
+    /**
+     * @brief Copy only live original unweighted route rows into a CPU canonical return packet.
+     * @param input Original authenticated sparse dispatch, in increasing original-route order.
+     * @param unweighted Original-slot-indexed result of the fixed participant-order fragment combine.
+     * @param output Original admitted CPU return bank; no capacity tail is published.
+     * @return False before writes for malformed metadata, capacity, alias or nonfinite route weights.
+     * Weighting remains the continuation's one ordered-FMA fold, after its original native root return.
+     */
+    bool copyMoEOverlayCanonicalRouteRowsToHostReturn(const MoEOverlaySparseRows& input,
+        std::span<const float> unweighted,MoEOverlayReturnRows& output) noexcept;
 
     struct MoEOverlaySparseTransferCounters
     {

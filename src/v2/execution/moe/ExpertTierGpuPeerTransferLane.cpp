@@ -1,10 +1,19 @@
 /**
  * @file ExpertTierGpuPeerTransferLane.cpp
- * @brief Direct peer-copy implementation for same-backend ExpertOverlay tiers.
+ * @brief Direct peer-copy with original-PMA completion/timestamp event ownership.
+ *
+ * The immutable native pool supplies the destination's original permit. The
+ * source must already belong to that same original preparation/PMA. One exact
+ * completion event and the optional timing pair retain their actual flags,
+ * streams and conservative process-runtime commitments through checked teardown.
  */
 
 #include "ExpertTierGpuPeerTransferLane.h"
 #include "GPUExpertTransferBackend.h"
+#include "backends/NativePeerTransferEventOwnership.h"
+#include "backends/ReadAheadNativeResourceObligation.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+
 
 #include "../../backends/BackendManager.h"
 #include "../../backends/GPUDeviceContextPool.h"
@@ -21,6 +30,82 @@
 
 namespace llaminar2
 {
+    PhysicalMemoryPlan NativePeerTransferEventOwnership::bom(
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu,bool timing)
+    {
+        if(!host.valid() || !gpu.valid() || !host.device.is_cpu() || !gpu.device.is_gpu() || host.world_rank!=gpu.world_rank)
+            throw std::invalid_argument("Peer event BOM requires exact original CPU/GPU resources");
+        const auto bound=NativeAuxiliaryResourceCatalog::allowance(gpu.device.type,
+            NativeAuxiliaryResourceProgram::peerTransferEvents(timing));
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(host,PhysicalMemoryOwner::NativeTransferEvent,bound.hostBytes);
+        if(bound.deviceBytes)plan.add(gpu,PhysicalMemoryOwner::NativeTransferEvent,bound.deviceBytes);
+        return plan.build();
+    }
+    NativePeerTransferEventOwnership::NativePeerTransferEventOwnership(PreparedGPUContextUsePermit original,
+        NativeContextRetirementSlot retirement,std::unique_ptr<ReadAheadNativeResourceObligation> pending)
+        :original_(std::move(original)),retirement_(std::move(retirement)),pending_(std::move(pending)){}
+    std::unique_ptr<NativePeerTransferEventOwnership> NativePeerTransferEventOwnership::materialize(
+        const PreparedGPUContextUsePermit& original,bool timing,const std::string& instance)
+    {
+        if(instance.empty())throw std::invalid_argument("Peer event set requires its admitted physical lane identity");
+        if(isGraphCaptureActive())throw std::logic_error("Peer event creation is original cold setup only");
+        original.requireWorker(original.worker());
+        const auto program=NativeAuxiliaryResourceProgram::peerTransferEvents(timing);
+        const auto selected=NativeAuxiliaryResourceCatalog::require(original.device(),program);
+        if(selected.contextGeneration!=original.generation() || !selected.hostBytes)
+            throw std::logic_error("Peer event program changed original context generation");
+        const auto memory=original.memory();
+        const auto identity=selected.sourceIdentity+":"+selected.resourceSource+":"+selected.evidence+":"+program.identity();
+        auto slot=original.provenance().reserveNativeRetirementSlot(memory,identity);
+        // Existing physical edge/projection/lane identity is stable across
+        // genuinely retired contexts. The original authority rejects both an
+        // overlapping live generation and a foreign source/PMA before creators.
+        const auto population="peer-transfer-event-instance-v1:"+std::to_string(instance.size())+":"+instance;
+        bool borrowed=false;
+        if(selected.lifetime==NativePhysicalLifetime::ProcessRuntime) {
+            try {borrowed=slot.tryBorrowProcessRuntime(population);}
+            catch(const std::logic_error& error) {
+                throw std::logic_error("Peer event population requires its original retired context: "+std::string(error.what()));
+            }
+        }
+        std::unique_ptr<ReadAheadNativeResourceObligation> leaf;
+        if(!borrowed) {
+            auto host=memory->reserveNewAllocations(DeviceId::cpu(),PhysicalMemoryOwner::NativeTransferEvent,selected.hostBytes);
+            std::optional<PhysicalMemoryOwnerReservation> gpu;
+            if(selected.deviceBytes)gpu.emplace(memory->reserveNewAllocations(original.device(),PhysicalMemoryOwner::NativeTransferEvent,selected.deviceBytes));
+            leaf=std::unique_ptr<ReadAheadNativeResourceObligation>(new ReadAheadNativeResourceObligation(
+                memory,original.device(),original.generation(),identity,std::move(host),std::move(gpu),selected.lifetime));
+        }
+        auto owner=std::unique_ptr<NativePeerTransferEventOwnership>(new NativePeerTransferEventOwnership(original,std::move(slot),std::move(leaf)));
+        original.worker()->submitAndWait([&] {
+            if(owner->pending_)owner->retirement_.adopt(std::move(owner->pending_));
+            owner->retirement_.armNativeAttempt();owner->attempted_=true;
+            for(std::size_t i=0;i<(timing?3u:1u);++i) {
+                owner->events_[i]=original.worker()->createEvent(i==0?GPUEventPurpose::Ordering:GPUEventPurpose::Timing);
+                if(!owner->events_[i])throw std::runtime_error("Original peer event creator returned null at index "+std::to_string(i));
+            }
+        });
+        return owner;
+    }
+    NativePeerTransferEventOwnership::~NativePeerTransferEventOwnership()noexcept
+    {
+        try {
+            if(attempted_) {
+                original_.worker()->submitAndWait([&] {
+                    for(auto& event:events_)if(event){original_.worker()->destroyEvent(event);event=nullptr;}
+                });
+                // Both native backends terminate on a failed destroy before
+                // returning. Successful return is the original handle proof.
+                retirement_.completeNativeHandles();
+            }
+        }catch(...){std::terminate();}
+    }
+    PhysicalMemoryPlan ExpertTierGpuPeerTransferLane::nativeEventsBOM(
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu,bool timing)
+    { return NativePeerTransferEventOwnership::bom(host,gpu,timing); }
+
+
     namespace
     {
         /** Store a peer-lane diagnostic only when the caller requested one. */
@@ -130,6 +215,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "GPU peer tier lane requires one matching destination execution lane");
         }
+        // Component stream pools have no original PMA/context authority and
+        // cannot enter this admitted native event owner, even before materialize.
+        (void)config_.execution.originalContext();
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "GPU peer tier lane requires a stable non-empty name");
@@ -155,7 +243,8 @@ namespace llaminar2
 
     bool ExpertTierGpuPeerTransferLane::materialized() const noexcept
     {
-        return backend_ && source_context_ && destination_context_ &&
+        return materialization_phase_==MaterializationPhase::Ready && native_events_ &&
+               backend_ && source_context_ && destination_context_ &&
                destination_ordinal_ >= 0 && transfer_stream_ &&
                completion_event_ &&
                (!config_.collect_timing_measurements ||
@@ -169,16 +258,31 @@ namespace llaminar2
             config_.destination_device);
         if (materialized())
             return true;
+        if(materialization_phase_!=MaterializationPhase::Fresh) {
+            assignPeerError(error,materialization_failure_.empty()?"GPU peer tier lane setup is not reusable":materialization_failure_);
+            return false;
+        }
+        // Creation may retain process-runtime backing even when the first
+        // native API fails. Every attempt is absorbing until fully completed.
+        materialization_phase_=MaterializationPhase::Failed;
+
         if (backend_ || source_context_ || destination_context_ ||
             destination_ordinal_ >= 0 || transfer_stream_ || completion_event_ ||
             timing_start_event_ || timing_stop_event_)
         {
-            assignPeerError(error, "GPU peer tier lane has a partial resource set");
+            materialization_failure_="GPU peer tier lane has a partial resource set";
+            assignPeerError(error, materialization_failure_);
             return false;
         }
 
         try
         {
+            const auto& destination_original=config_.execution.originalContext();
+            if(destination_original.device()!=config_.destination_device)
+                throw std::logic_error("Peer lane changed original destination device");
+            source_original_=std::make_unique<PreparedGPUContextUsePermit>(
+                GPUDeviceContextPool::instance().retainExistingPreparedContext(
+                    config_.source_device,destination_original.memory()));
             if (config_.source_device != config_.destination_device)
             {
                 bool direct_peer_ready = false;
@@ -216,21 +320,17 @@ namespace llaminar2
                     "GPU peer tier lane endpoints do not share one backend authority");
             }
             backend_ = destination_backend;
-            source_context_ = &GPUDeviceContextPool::instance().getContext(
-                config_.source_device);
-            destination_context_ =
-                &GPUDeviceContextPool::instance().getContext(
-                    config_.destination_device);
+            source_context_ = source_original_->worker().get();
+            destination_context_ = destination_original.worker().get();
             destination_ordinal_ = config_.destination_device.gpu_ordinal();
             transfer_stream_ = config_.execution.stream();
-            completion_event_ = backend_->createEvent(destination_ordinal_);
-            if (config_.collect_timing_measurements)
-            {
-                timing_start_event_ =
-                    backend_->createTimingEvent(destination_ordinal_);
-                timing_stop_event_ =
-                    backend_->createTimingEvent(destination_ordinal_);
-            }
+            const auto& original=config_.execution.originalContext();
+            if(original.device()!=config_.destination_device || original.worker().get()!=destination_context_)
+                throw std::logic_error("Peer transfer events changed original destination authority");
+            native_events_=NativePeerTransferEventOwnership::materialize(original,config_.collect_timing_measurements,config_.lane_name);
+            completion_event_=native_events_->event(0);
+            timing_start_event_=native_events_->event(1);
+            timing_stop_event_=native_events_->event(2);
             if (!transfer_stream_ || !completion_event_ ||
                 (config_.collect_timing_measurements &&
                  (!timing_start_event_ || !timing_stop_event_)))
@@ -239,18 +339,19 @@ namespace llaminar2
         }
         catch (const std::exception &exception)
         {
-            assignPeerError(error, exception.what());
+            materialization_failure_=exception.what();
+            assignPeerError(error, materialization_failure_);
             releaseQuiescentResources();
             return false;
         }
         catch (...)
         {
-            assignPeerError(
-                error,
-                "GPU peer tier lane materialization threw a non-standard exception");
+            materialization_failure_="GPU peer tier lane materialization threw a non-standard exception";
+            assignPeerError(error,materialization_failure_);
             releaseQuiescentResources();
             return false;
         }
+        materialization_phase_=MaterializationPhase::Ready;
         return true;
     }
 
@@ -548,17 +649,13 @@ namespace llaminar2
             config_.destination_device);
         if (work_may_be_in_flight_)
             return;
-        if (backend_ && completion_event_ && destination_ordinal_ >= 0)
-            backend_->destroyEvent(completion_event_, destination_ordinal_);
-        if (backend_ && timing_start_event_ && destination_ordinal_ >= 0)
-            backend_->destroyEvent(timing_start_event_, destination_ordinal_);
-        if (backend_ && timing_stop_event_ && destination_ordinal_ >= 0)
-            backend_->destroyEvent(timing_stop_event_, destination_ordinal_);
+        native_events_.reset(); // Actual checked destruction precedes original obligation completion.
         completion_event_ = nullptr;
         timing_start_event_ = nullptr;
         timing_stop_event_ = nullptr;
         transfer_stream_ = nullptr; // Context owns the named stream.
         source_context_ = nullptr;
+        source_original_.reset();
         destination_context_ = nullptr;
         backend_ = nullptr;
         destination_ordinal_ = -1;

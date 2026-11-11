@@ -13,7 +13,15 @@
  * stay outside those timers. This floor omits pooled lookup/decoding work.
  */
 #include "transfer/CapturedTransferChannel.h"
+#include "execution/local_execution/orchestrators/PipelineActivationFanout.h"
+#include "planning/PipelineTransferMemory.h"
 #include "CapturedChannelGraphProof.h"
+#include "CountedChannelTestKernels.h"
+#include "backends/GPUGraphMemoryContract.h"
+#include "memory/CPUTensorStorageDeclaration.h"
+#include "planning/PlanningPublication.h"
+#include "planning/RankHardwareOwnership.h"
+#include "tensors/TensorClasses.h"
 #include "fixtures/backends/PreparedNativeLookupFixture.h"
 #include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
 #include "collective/LocalTPCollectiveInventory.h"
@@ -34,6 +42,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "planning/PlanningObservedResource.h"
 #include "utils/MPIContext.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <chrono>
@@ -50,6 +59,8 @@ namespace
     /** @brief Propagate native failure before recording/launching any dependent node. */
     void require(bool condition, const char *message)
     { if (!condition) throw std::runtime_error(message); }
+
+    using llaminar2::test::originalRankLocalReplay;
 
     /** @brief Keep native graphs/buffers alive until an interrupted test's original streams drain. */
     struct NativeReplayFailureDrain final
@@ -152,13 +163,19 @@ namespace
      * operation proves first release before the second pending acquisition. The host never reads a live cursor or
      * selects progress from GPU values. All snapshots below follow terminal joins.
      */
-    void cancellationReplay(DeviceId first, DeviceId second, CancellationBoundary boundary,
-        CapturedTransferPayloadStorage payload_storage=CapturedTransferPayloadStorage::MappedHost)
+    void cancellationReplay(DeviceId first, DeviceId second, CancellationBoundary boundary)
     {
         const auto mpi = MPIContextFactory::global();
         const auto inventory = mpi->clusterInventory();
         ASSERT_NE(inventory, nullptr);
         const auto &rank = inventory->ranks.at(mpi->rank());
+        for (const auto device : {first, second}) {
+            bool owned = false;
+            for (const auto &gpu : rank.gpus)
+                if (gpu.type == (device.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm) && gpu.local_device_id == device.ordinal && rankOwnsGPUDevice(rank, gpu))
+                    owned = true;
+            require(owned, "Captured local transfer endpoint is not owned by this original NUMA-local rank");
+        }
         auto *producer_backend = getBackendFor(first);
         auto *consumer_backend = getBackendFor(second);
         ASSERT_NE(producer_backend, nullptr);
@@ -177,13 +194,13 @@ namespace
         // mutually exclusive, so the explicit maximum is the same-PMA envelope.
         constexpr size_t planned_capacity = 8193 + 32;
         const size_t planned_snapshot_bytes = 2 * sizeof(CapturedTransferCursor) + sizeof(uint64_t) + planned_capacity;
-        const auto geometry = CapturedTransferChannel::memoryFor(planned_capacity,payload_storage);
+        const auto geometry = CapturedTransferChannel::memoryFor(planned_capacity);
         PhysicalMemoryPlanBuilder builder;
         builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
             geometry.mapped_host_bytes + TransferEngine::mappedHostRegionAllocationBytes(planned_capacity) +
             TransferEngine::mappedHostRegionAllocationBytes(planned_snapshot_bytes));
         builder.add(planningObservedResource(rank, first), PhysicalMemoryOwner::ActivationTransportStaging,
-            geometry.cursor_bytes_per_device + planned_capacity + geometry.producer_payload_bytes);
+            geometry.cursor_bytes_per_device + planned_capacity);
         builder.add(planningObservedResource(rank, second), PhysicalMemoryOwner::ActivationTransportStaging,
             geometry.cursor_bytes_per_device + planned_capacity + sizeof(uint64_t));
         for (auto device : {first, second})
@@ -199,10 +216,7 @@ namespace
             const size_t count_offset = 2 * cursor_bytes;
             const size_t payload_offset = count_offset + sizeof(uint64_t);
             const size_t snapshot_bytes = payload_offset + capacity;
-            auto channel=payload_storage==CapturedTransferPayloadStorage::PeerDevice
-                ? transfer.createPeerCapturedTransferChannel(*authority,DeviceId::cpu(),
-                    first,producer_stream,second,consumer_stream,capacity,rank)
-                : transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),
+            auto channel=transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),
                     first,producer_stream,second,consumer_stream,capacity);
             auto source_claim = authority->claimNewAllocation(first, PhysicalMemoryOwner::ActivationTransportStaging, capacity);
             auto destination_claim = authority->claimNewAllocation(second, PhysicalMemoryOwner::ActivationTransportStaging, capacity + sizeof(uint64_t));
@@ -218,21 +232,13 @@ namespace
             auto *input_bytes = static_cast<unsigned char *>(input->mutableHostData());
             for (size_t i = 0; i < capacity; ++i) input_bytes[i] = patternByte(i, 0);
             std::span<std::byte> observed_wire;
-            if(payload_storage==CapturedTransferPayloadStorage::MappedHost){
-                observed_wire=CapturedTransferChannelReplayProbe::payload(*channel);
-                std::fill(observed_wire.begin(),observed_wire.end(),std::byte{0xa5});
-            }else{
-                // Reuse the original input mapping for a terminal observation;
-                // it is no longer a producer input after the initial upload.
-                observed_wire={static_cast<std::byte*>(input->mutableHostData()),capacity};
-            }
+
+            observed_wire=CapturedTransferChannelReplayProbe::payload(*channel);
+            std::fill(observed_wire.begin(),observed_wire.end(),std::byte{0xa5});
+
             producer_worker.submitAndWait([&] {
                 transfer.enqueueMappedHostToDevice(*input,0,*source,0,capacity,first,producer_stream);
-                if(payload_storage==CapturedTransferPayloadStorage::PeerDevice){
-                    const auto wire=CapturedTransferChannelReplayProbe::terminalPeerPayload(*channel);
-                    require(producer_backend->memset(wire->mutableDeviceData(),0xa5,capacity,first.ordinal,producer_stream),
-                        "Cancellation peer payload poison failed");
-                }
+
             });
             consumer_worker.submitAndWait([&] {
                 require(consumer_backend->memset(destination->mutableDeviceData(), 0xa5, capacity, second.ordinal, consumer_stream), "Cancellation destination poison failed");
@@ -321,10 +327,7 @@ namespace
             const auto consumer_cursor = CapturedTransferChannelReplayProbe::terminalCursor(*channel, CapturedTransferEndpoint::Consumer);
             producer_worker.submitAndWait([&] {
                 transfer.enqueueDeviceToMappedHost(*producer_cursor,0,*snapshot,0,cursor_bytes,first,producer_stream);
-                if(payload_storage==CapturedTransferPayloadStorage::PeerDevice){
-                    const auto wire=CapturedTransferChannelReplayProbe::terminalPeerPayload(*channel);
-                    transfer.enqueueDeviceToMappedHost(*wire,0,*input,0,capacity,first,producer_stream);
-                }
+
                 require(producer_backend->recordEvent(producer_done.event, first.ordinal, producer_stream), "Producer cursor terminal failed");
             });
             consumer_worker.submitAndWait([&] {
@@ -387,7 +390,6 @@ namespace
         size_t patterns = 2;
         PeerStorage peer_storage = PeerStorage::PrivateScratch;
         bool measure_floor = false; ///< Opt-in performance role; functional timing remains unchanged.
-        CapturedTransferPayloadStorage payload_storage = CapturedTransferPayloadStorage::MappedHost;
         bool fixed_native_collective = false; ///< Fixed byte transport floor only; never a device-counted ngram policy.
         size_t warmups = 0; ///< Unreported replays on the same original cursor/graph family.
     };
@@ -413,6 +415,13 @@ namespace
         const auto inventory = mpi->clusterInventory();
         ASSERT_NE(inventory, nullptr);
         const auto &rank = inventory->ranks.at(mpi->rank());
+        for (const auto device : {first, second}) {
+            bool owned = false;
+            for (const auto &gpu : rank.gpus)
+                if (gpu.type == (device.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm) && gpu.local_device_id == device.ordinal && rankOwnsGPUDevice(rank, gpu))
+                    owned = true;
+            require(owned, "Captured local transfer endpoint is not owned by this original NUMA-local rank");
+        }
         auto *first_backend = getBackendFor(first);
         auto *second_backend = getBackendFor(second);
         ASSERT_NE(first_backend, nullptr);
@@ -423,7 +432,7 @@ namespace
         if (workload.fixed_native_collective)
         {
             const std::array devices{first, second};
-            original = test::PreparedNativeLookupFixture::prepare(devices);
+            original = test::PreparedNativeLookupFixture::prepare(devices, mpi->rank());
         }
         const auto resourceFor = [&](DeviceId device) {
             return original ? original->resource(device) : planningObservedResource(rank, device);
@@ -448,7 +457,7 @@ namespace
         const bool workspace_peer = workload.peer_storage == PeerStorage::RetainedWorkspace;
         const size_t buffer_bytes = capacity + 64;
         const auto geometry = workload.fixed_native_collective ? CapturedTransferChannelMemory{} :
-            CapturedTransferChannel::memoryFor(capacity, workload.payload_storage);
+            CapturedTransferChannel::memoryFor(capacity);
         std::unique_ptr<ILocalTPContext> fixed_collective;
         LocalTPCollectiveMemoryBOM collective_bom{};
         if (workload.fixed_native_collective) {
@@ -467,7 +476,7 @@ namespace
         {
             const auto resource = resourceFor(device);
             builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging,
-                2 * geometry.cursor_bytes_per_device + geometry.producer_payload_bytes + (device == first ? 3 : workspace_peer ? 0 : 1) * buffer_bytes);
+                2 * geometry.cursor_bytes_per_device + (device == first ? 3 : workspace_peer ? 0 : 1) * buffer_bytes);
             if (device == second && workspace_peer)
                 builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace, buffer_bytes);
             if (original)
@@ -520,9 +529,7 @@ namespace
         }
         {
             const auto create=[&](DeviceId producer,void* producerStream,DeviceId consumer,void* consumerStream){
-                if(workload.payload_storage==CapturedTransferPayloadStorage::PeerDevice)
-                    return transfer.createPeerCapturedTransferChannel(*authority,DeviceId::cpu(),
-                        producer,producerStream,consumer,consumerStream,capacity,rank);
+
                 return transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),
                     producer,producerStream,consumer,consumerStream,capacity);
             };
@@ -560,7 +567,8 @@ namespace
                 peer = transfer.allocateDeviceTransferBuffer(buffer_bytes, second);
             }
             const std::array readback_devices{first};
-            auto readback = transfer.allocateMappedHostRegion(buffer_bytes, readback_devices);
+            const std::array diagnostic_devices{first, second};
+            auto readback = transfer.allocateMappedHostRegion(buffer_bytes, diagnostic_devices);
             std::array<std::shared_ptr<MappedHostTransferRegion>, 2> inputs;
             for (size_t pattern = 0; pattern < sources.size(); ++pattern)
             {
@@ -821,8 +829,17 @@ namespace
                         const auto *actual = static_cast<const unsigned char *>(readback->mutableHostData());
                         for (size_t i = 0; i < buffer_bytes; ++i)
                             if (actual[i] != (i >= offset && i < offset + bytes ? patternByte(i, pattern) : 0xa5))
+                            {
+                                const unsigned observed = actual[i];
+                                // All original graphs are terminal. Reuse the admitted
+                                // readback for one failing byte at each physical hop;
+                                // this is failure evidence, never live protocol state.
+
                                 FAIL() << first.toString() << " -> " << second.toString() << " replay=" << replay
-                                    << " bytes=" << bytes << " offset=" << offset << " first_bad_byte=" << i;
+                                    << " bytes=" << bytes << " offset=" << offset << " first_bad_byte=" << i
+                                    << " expected=" << unsigned(i >= offset && i < offset + bytes ? patternByte(i, pattern) : 0xa5)
+                                    << " actual=" << observed;
+                            }
                         if (workload.measure_floor && replay >= workload.warmups)
                             std::cout << "NGRAM_CHANNEL_FLOOR_SAMPLE {\"schema\":1,\"source\":\"" << first.toString()
                                 << "\",\"peer\":\"" << second.toString()
@@ -873,18 +890,54 @@ namespace
 }
 
 #ifdef HAVE_CUDA
-TEST(CapturedTransferChannelDevices, CUDA_CUDA_RetainedRoundTrip) { roundTrip(DeviceId::cuda(0), DeviceId::cuda(1)); }
-TEST(CapturedTransferChannelDevices, CUDA_CUDA_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::cuda(0), DeviceId::cuda(1)); }
+TEST(CapturedTransferChannelDevices, CUDA_CUDA_RetainedRoundTrip) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { roundTrip(cohort[0], cohort[1]);
+    });
+}
+TEST(CapturedTransferChannelDevices, CUDA_CUDA_RetainedWorkspaceRoundTrip) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { workspaceRoundTrip(cohort[0], cohort[1]);
+    });
+}
 #endif
 #ifdef HAVE_ROCM
-TEST(CapturedTransferChannelDevices, ROCm_ROCm_RetainedRoundTrip) { roundTrip(DeviceId::rocm(0), DeviceId::rocm(1)); }
-TEST(CapturedTransferChannelDevices, ROCm_ROCm_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::rocm(0), DeviceId::rocm(1)); }
+TEST(CapturedTransferChannelDevices, ROCm_ROCm_RetainedRoundTrip) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { roundTrip(cohort[0], cohort[1]);
+    });
+}
+TEST(CapturedTransferChannelDevices, ROCm_ROCm_RetainedWorkspaceRoundTrip) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { workspaceRoundTrip(cohort[0], cohort[1]);
+    });
+}
 #endif
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedRoundTrip) { roundTrip(DeviceId::cuda(0), DeviceId::rocm(0)); }
-TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedRoundTrip) { roundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
-TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::cuda(0), DeviceId::rocm(0)); }
-TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedWorkspaceRoundTrip) { workspaceRoundTrip(DeviceId::rocm(0), DeviceId::cuda(0)); }
+TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedRoundTrip)
+{
+    const std::array families{test::NativeReplayFamily{DeviceType::CUDA, 1}, test::NativeReplayFamily{DeviceType::ROCm, 1}};
+    originalRankLocalReplay(std::span<const test::NativeReplayFamily>(families), [&](const auto &cohort) {
+        roundTrip(cohort[0], cohort[1]);
+    });
+}
+TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedRoundTrip)
+{
+    const std::array families{test::NativeReplayFamily{DeviceType::ROCm, 1}, test::NativeReplayFamily{DeviceType::CUDA, 1}};
+    originalRankLocalReplay(std::span<const test::NativeReplayFamily>(families), [&](const auto &cohort) {
+        roundTrip(cohort[0], cohort[1]);
+    });
+}
+TEST(CapturedTransferChannelDevices, CUDA_ROCm_RetainedWorkspaceRoundTrip)
+{
+    const std::array families{test::NativeReplayFamily{DeviceType::CUDA, 1}, test::NativeReplayFamily{DeviceType::ROCm, 1}};
+    originalRankLocalReplay(std::span<const test::NativeReplayFamily>(families), [&](const auto &cohort) {
+        workspaceRoundTrip(cohort[0], cohort[1]);
+    });
+}
+TEST(CapturedTransferChannelDevices, ROCm_CUDA_RetainedWorkspaceRoundTrip)
+{
+    const std::array families{test::NativeReplayFamily{DeviceType::ROCm, 1}, test::NativeReplayFamily{DeviceType::CUDA, 1}};
+    originalRankLocalReplay(std::span<const test::NativeReplayFamily>(families), [&](const auto &cohort) {
+        workspaceRoundTrip(cohort[0], cohort[1]);
+    });
+}
 
 /** @test Exact ngram decode physical-channel floor with both original participant captures. */
 TEST(CapturedTransferChannelFloor, CUDA_ROCm_Decode1440) {
@@ -933,289 +986,878 @@ TEST(CapturedTransferChannelProfiles, DISABLED_ROCm_CUDA_Aligned4099)
 #endif
 
 #ifdef HAVE_CUDA
-TEST(CapturedTransferCancellation, CUDABeforeAcquire) { cancellationReplay(DeviceId::cuda(0), DeviceId::cuda(1), CancellationBoundary::BeforeAcquire); }
-TEST(CapturedTransferCancellation, CUDAPublishedPeerAbsent) { cancellationReplay(DeviceId::cuda(0), DeviceId::cuda(1), CancellationBoundary::PublishedPeerAbsent); }
-TEST(CapturedTransferCancellation, CUDAPublishedPeerLate) { cancellationReplay(DeviceId::cuda(0), DeviceId::cuda(1), CancellationBoundary::PublishedPeerLate); }
-#endif
-#ifdef HAVE_ROCM
-TEST(CapturedTransferCancellation, ROCmBeforeAcquire) { cancellationReplay(DeviceId::rocm(0), DeviceId::rocm(1), CancellationBoundary::BeforeAcquire); }
-TEST(CapturedTransferCancellation, ROCmPublishedPeerAbsent) { cancellationReplay(DeviceId::rocm(0), DeviceId::rocm(1), CancellationBoundary::PublishedPeerAbsent); }
-TEST(CapturedTransferCancellation, ROCmPublishedPeerLate) { cancellationReplay(DeviceId::rocm(0), DeviceId::rocm(1), CancellationBoundary::PublishedPeerLate); }
-#endif
-
-#ifdef HAVE_CUDA
-/** @brief Strict native peer-VRAM route reuses the original captured byte/extent/reset oracle. */
-TEST(CapturedTransferChannelDevices, CUDA_CUDA_PeerPayloadRetainedRoundTrip)
-{ roundTrip(DeviceId::cuda(0), DeviceId::cuda(1), {.measure_floor=true,.payload_storage=CapturedTransferPayloadStorage::PeerDevice,.warmups=5}); }
-#endif
-#ifdef HAVE_ROCM
-/** @brief Symmetric native peer-VRAM route; absent peer access fails rather than selecting host payload. */
-TEST(CapturedTransferChannelDevices, ROCm_ROCm_PeerPayloadRetainedRoundTrip)
-{ roundTrip(DeviceId::rocm(0), DeviceId::rocm(1), {.measure_floor=true,.payload_storage=CapturedTransferPayloadStorage::PeerDevice,.warmups=5}); }
-#endif
-
-#ifdef HAVE_CUDA
-/** @brief Explicit peer route cancellation preserves the original absent/late endpoint and sticky-failure oracle. */
-TEST(CapturedTransferCancellation,CUDAPeerBeforeAcquire)
-{ cancellationReplay(DeviceId::cuda(0),DeviceId::cuda(1),CancellationBoundary::BeforeAcquire,CapturedTransferPayloadStorage::PeerDevice); }
-TEST(CapturedTransferCancellation,CUDAPeerPublishedPeerAbsent)
-{ cancellationReplay(DeviceId::cuda(0),DeviceId::cuda(1),CancellationBoundary::PublishedPeerAbsent,CapturedTransferPayloadStorage::PeerDevice); }
-TEST(CapturedTransferCancellation,CUDAPeerPublishedPeerLate)
-{ cancellationReplay(DeviceId::cuda(0),DeviceId::cuda(1),CancellationBoundary::PublishedPeerLate,CapturedTransferPayloadStorage::PeerDevice); }
-#endif
-#ifdef HAVE_ROCM
-/** @brief The same original cancellation law and terminal proof apply to native HIP peer payload. */
-TEST(CapturedTransferCancellation,ROCmPeerBeforeAcquire)
-{ cancellationReplay(DeviceId::rocm(0),DeviceId::rocm(1),CancellationBoundary::BeforeAcquire,CapturedTransferPayloadStorage::PeerDevice); }
-TEST(CapturedTransferCancellation,ROCmPeerPublishedPeerAbsent)
-{ cancellationReplay(DeviceId::rocm(0),DeviceId::rocm(1),CancellationBoundary::PublishedPeerAbsent,CapturedTransferPayloadStorage::PeerDevice); }
-TEST(CapturedTransferCancellation,ROCmPeerPublishedPeerLate)
-{ cancellationReplay(DeviceId::rocm(0),DeviceId::rocm(1),CancellationBoundary::PublishedPeerLate,CapturedTransferPayloadStorage::PeerDevice); }
-#endif
-
-namespace {
-/**
- * @brief Exercise the actual cached hardware admission law without pretending unsupported peer payload ran.
- * @param first Original producer from the native fixture's MPI inventory.
- * @param second Original consumer from that same discovery owner.
- *
- * Complete executes the same strict native payload/extent/reset oracles. None
- * and Partial prove rejection before channel materialization; they never enter
- * the mapped path. Observations are terminal test properties, not scheduling state.
- */
-void peerInventoryAdmission(DeviceId first,DeviceId second)
-{
-    const auto mpi=MPIContextFactory::global();
-    const auto inventory=mpi->clusterInventory();
-    ASSERT_TRUE(inventory);
-    const auto& rank=inventory->ranks.at(mpi->rank());
-    const auto coverage=localTPPeerAccessCoverage(rank,{first,second});
-    ::testing::Test::RecordProperty("peer_access_coverage",peerAccessCoverageName(coverage));
-    ::testing::Test::RecordProperty("peer_payload_executed",0);
-    std::cout<<"CAPTURED_PEER_ADMISSION coverage="<<peerAccessCoverageName(coverage)
-        <<" peer_payload_executed=0\n";
-    if(coverage==PeerAccessCoverage::Complete){
-        ASSERT_NO_FATAL_FAILURE(roundTrip(first,second,
-            {.measure_floor=true,.payload_storage=CapturedTransferPayloadStorage::PeerDevice,.warmups=5}));
-        ASSERT_NO_FATAL_FAILURE(counted_channel_test::verifyPeerPayloadReplay(first,second));
-        ::testing::Test::RecordProperty("peer_payload_executed",1);
-        std::cout<<"CAPTURED_PEER_ADMISSION coverage=complete peer_payload_executed=1\n";
-        return;
-    }
-    ASSERT_TRUE(coverage==PeerAccessCoverage::None || coverage==PeerAccessCoverage::Partial);
-    auto& producer=GPUDeviceContextPool::instance().getContext(first);
-    auto& consumer=GPUDeviceContextPool::instance().getContext(second);
-    void* producerStream=nullptr;
-    void* consumerStream=nullptr;
-    producer.submitAndWait([&]{producerStream=producer.getOrCreateAuxiliaryStream("captured_peer_admission");});
-    consumer.submitAndWait([&]{consumerStream=consumer.getOrCreateAuxiliaryStream("captured_peer_admission");});
-    ASSERT_NE(producerStream,nullptr);
-    ASSERT_NE(consumerStream,nullptr);
-    constexpr std::size_t capacity=4099;
-    const auto geometry=CapturedTransferChannel::memoryFor(capacity,CapturedTransferPayloadStorage::PeerDevice);
-    PhysicalMemoryPlanBuilder plan;
-    plan.add(planningObservedResource(rank,DeviceId::cpu()),PhysicalMemoryOwner::ActivationTransportStaging,geometry.mapped_host_bytes);
-    plan.add(planningObservedResource(rank,first),PhysicalMemoryOwner::ActivationTransportStaging,
-        geometry.cursor_bytes_per_device+geometry.producer_payload_bytes);
-    plan.add(planningObservedResource(rank,second),PhysicalMemoryOwner::ActivationTransportStaging,geometry.cursor_bytes_per_device);
-    auto memory=std::make_shared<PhysicalMemoryAuthority>(
-        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()),rank.rank);
-    try{
-        (void)TransferEngine::instance().createPeerCapturedTransferChannel(*memory,DeviceId::cpu(),
-            first,producerStream,second,consumerStream,capacity,rank);
-        FAIL()<<"Unavailable peer coverage entered channel materialization";
-    }catch(const std::invalid_argument& error){
-        EXPECT_NE(std::string(error.what()).find("cached complete bidirectional coverage"),std::string::npos)<<error.what();
-    }
-    for(const auto device:{DeviceId::cpu(),first,second})
-        EXPECT_EQ(memory->claimedBytes(device,PhysicalMemoryOwner::ActivationTransportStaging,
-            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+TEST(CapturedTransferCancellation, CUDABeforeAcquire) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::BeforeAcquire);
+    });
 }
-} // namespace
-#ifdef HAVE_CUDA
-TEST(CapturedTransferPeerAdmission,CUDAOriginalInventory)
-{ peerInventoryAdmission(DeviceId::cuda(0),DeviceId::cuda(1)); }
+TEST(CapturedTransferCancellation, CUDAPublishedPeerAbsent) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::PublishedPeerAbsent);
+    });
+}
+TEST(CapturedTransferCancellation, CUDAPublishedPeerLate) {
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::PublishedPeerLate);
+    });
+}
 #endif
 #ifdef HAVE_ROCM
-TEST(CapturedTransferPeerAdmission,ROCmOriginalInventory)
-{ peerInventoryAdmission(DeviceId::rocm(0),DeviceId::rocm(1)); }
+TEST(CapturedTransferCancellation, ROCmBeforeAcquire) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::BeforeAcquire);
+    });
+}
+TEST(CapturedTransferCancellation, ROCmPublishedPeerAbsent) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::PublishedPeerAbsent);
+    });
+}
+TEST(CapturedTransferCancellation, ROCmPublishedPeerLate) {
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) { cancellationReplay(cohort[0], cohort[1], CancellationBoundary::PublishedPeerLate);
+    });
+}
 #endif
 
-#include "PooledReplicatedReaderNativeReplay.inc"
+#ifdef HAVE_ROCM
+/**
+ * @test Public native RCCL copies the failing peer case's exact byte geometry.
+ *
+ * Keep the original full source/return allocation capacity, alternating immutable
+ * patterns, unaligned offset and terminal byte/guard oracle. The archived causal red remains independent evidence after custom transport
+ * retirement; this native control claims only its own exact selected route.
+ */
+TEST(CapturedTransferNativePeerVisibility, ROCmOriginalInventory257Offset1)
+{
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+        roundTrip(cohort[0], cohort[1],
+            {.capacity = 1024 * 1024 + 3, .bytes = {257}, .offsets = {1},
+             .replays = 64, .patterns = 2, .peer_storage = PeerStorage::PrivateScratch,
+             .measure_floor = true, .fixed_native_collective = true, .warmups = 5});
+    });
+}
+#endif
 
 /** @test Original source birth plus two native patterns replay without late stack admission or warmup. */
 TEST(CapturedTransferNativeProgramStack, CUDAOriginalSourceReplay) {
-    roundTrip(DeviceId::cuda(0),DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0],cohort[1],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=3,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=0});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeForward_Header64) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeForward_Decode1440) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeForward_M512737280) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeReverse_Header64) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeReverse_Decode1440) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeReverse_M512737280) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeForward_Header64) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeForward_Decode1440) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeForward_M512737280) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeReverse_Header64) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeReverse_Decode1440) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, ROCm_NativeReverse_M512737280) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedForward_Header64) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedForward_Decode1440) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedForward_M512737280) {
-    roundTrip(DeviceId::cuda(0), DeviceId::cuda(1),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedReverse_Header64) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedReverse_Decode1440) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, CUDA_MappedReverse_M512737280) {
-    roundTrip(DeviceId::cuda(1), DeviceId::cuda(0),
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedForward_Header64) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedForward_Decode1440) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedForward_M512737280) {
-    roundTrip(DeviceId::rocm(0), DeviceId::rocm(1),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[0], cohort[1],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedReverse_Header64) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=64,.bytes={64},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedReverse_Decode1440) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=1440,.bytes={1440},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 /** @test Diagnostic same-pair mapped comparator; never selects production ngram transport. */
 TEST(CapturedTransferChannelFloor, ROCm_MappedReverse_M512737280) {
-    roundTrip(DeviceId::rocm(1), DeviceId::rocm(0),
+    originalRankLocalReplay(DeviceType::ROCm, 2, [&](const auto &cohort) {
+    roundTrip(cohort[1], cohort[0],
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
+
+    });
 }
 
 #include "NativeCompletedReaderReplay.inc"
+
+namespace
+{
+/** @brief Select distinct physical GPUs only from their original rank-local observations.
+ * @param inventory Original context-owned complete discovery publication.
+ * @param first Required first GPU family.
+ * @param second Required second GPU family.
+ * @return Actual original rank/device endpoints; no rank/NUMA/ordinal arithmetic establishes ownership.
+ * @throws std::runtime_error When this exact native placement is unavailable.
+ */
+std::array<CapturedTransferRankGPU, 2> rankReplayEndpoints(
+    const ClusterInventory& inventory, DeviceType first, DeviceType second)
+{
+    for (const auto& source : inventory.ranks)
+        for (const auto& source_gpu : source.gpus)
+            if (source_gpu.type == first && rankOwnsGPUDevice(source, source_gpu))
+                for (const auto& consumer : inventory.ranks)
+                    if (source.rank != consumer.rank &&
+                        inventory.connectionBetweenRanks(source.rank, consumer.rank).locality() == RankConnectionLocality::SameNode)
+                        for (const auto& consumer_gpu : consumer.gpus)
+                            if (consumer_gpu.type == second && rankOwnsGPUDevice(consumer, consumer_gpu) &&
+                                !source_gpu.uuid.empty() && !consumer_gpu.uuid.empty() && source_gpu.uuid != consumer_gpu.uuid)
+                                return {{{source.rank, {first, source_gpu.local_device_id}},
+                                         {consumer.rank, {second, consumer_gpu.local_device_id}}}};
+    std::string detail="Required distinct-rank, NUMA-local physical GPU pair is absent from original inventory";
+    for(const auto& rank:inventory.ranks) {
+        detail+="; original rank="+std::to_string(rank.rank)+" CPU_NUMA="+std::to_string(rank.cpu.numa_node)+" local endpoints=";
+        bool present=false;
+        for(const auto& gpu:rank.gpus)
+            if((gpu.type==first || gpu.type==second) && rankOwnsGPUDevice(rank,gpu)) {
+                detail+=std::string(deviceTypeToString(gpu.type))+":"+std::to_string(gpu.local_device_id)+
+                    "(NUMA="+std::to_string(gpu.numa_node)+",UUID="+gpu.uuid+") ";
+                present=true;
+            }
+        if(!present)detail+="none";
+    }
+    throw std::runtime_error(detail);
+}
+
+/** @brief Replay recorded row inputs through real rank-local captured byte kernels.
+ * @param first Required original source family for the first direction.
+ * @param second Required original source family for the reverse direction.
+ *
+ * Recorded inputs are restored only at explicit test request admission. The
+ * captured GPU kernel derives live bytes from the retained INT32 row input;
+ * no device count is read by the host to schedule execution. This is native
+ * transport/reset proof, not model generation or prefill-materializer proof.
+ */
+void rankCapturedRecordedRowsReplay(DeviceType first, DeviceType second)
+{
+    const auto mpi = MPIContextFactory::global();
+    require(mpi && mpi->world_size() >= 2, "Rank captured replay requires original multi-rank MPI ownership");
+    const auto inventory = mpi->clusterInventory();
+    require(bool(inventory), "Rank captured replay requires original discovery publication");
+    const auto endpoints = rankReplayEndpoints(*inventory, first, second);
+    auto session = CapturedTransferRankSession::create(mpi);
+    constexpr std::size_t row_bytes = 17 * sizeof(float);
+    constexpr std::size_t capacity = 65 * row_bytes;
+    constexpr std::size_t storage_bytes = capacity + 2 * row_bytes;
+    constexpr std::size_t row_words = 4;
+    constexpr std::size_t row_offset = sizeof(std::int32_t);
+    const auto geometry = CapturedTransferChannel::memoryFor(capacity);
+    const auto snapshot_bytes = TransferEngine::mappedHostRegionAllocationBytes(storage_bytes + row_words * sizeof(std::int32_t));
+    const auto graph_bytes = GPUGraphMemoryContract::reservationBytesPerExecutable(
+        endpoints[0].rank == mpi->rank() ? endpoints[0].device : endpoints[1].device,
+        GPUGraphExecutableClass::BoundedFlatHelper);
+    const std::array plans{
+        CapturedTransferRankPlan::fromInventory(*inventory, {session->originalGeneration(), 701}, endpoints[0], endpoints[1], capacity),
+        CapturedTransferRankPlan::fromInventory(*inventory, {session->originalGeneration(), 702}, endpoints[1], endpoints[0], capacity)};
+    const auto role = plans[0].localRole(mpi->rank());
+    const auto local = role ? plans[0].endpoint(*role).device : DeviceId::invalid();
+    std::unique_ptr<llaminar2::test::PreparedNativeLookupFixture> original;
+    std::shared_ptr<PhysicalMemoryAuthority> memory;
+    IWorkerGPUContext* worker = nullptr;
+    IBackend* backend = nullptr;
+    void* stream = nullptr;
+    const CPUTensorStorageDeclaration rows_declaration(1, row_words, BufferTensorType::INT32,
+        PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu());
+    // Original all-rank failure consensus surrounds actual rank-local source
+    // construction. Idle ranks do not create a source, PMA, GPU cursor or worker.
+    exchangePlanningSamples(mpi, [&](int count) {
+        return std::vector<std::vector<std::uint8_t>>(count, plans[0].serialize());
+    }, [&](auto wire) {
+        require(std::vector<std::uint8_t>(wire.begin(), wire.end()) == plans[0].serialize(), "Native replay role declarations disagree");
+        if (role)
+        {
+            const std::array devices{local};
+            original = llaminar2::test::PreparedNativeLookupFixture::prepare(devices, mpi->rank());
+            PhysicalMemoryPlanBuilder builder;
+            for (const auto& plan : plans)
+                plan.contributeMemory(*plan.localRole(mpi->rank()), original->resource(local),
+                    plan.hostRank() == mpi->rank() ? std::optional{original->resource(DeviceId::cpu())} : std::nullopt, builder);
+            builder.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ExecutionWorkspace, rows_declaration.physicalBytes());
+            builder.add(original->resource(local), PhysicalMemoryOwner::ExecutionWorkspace, row_words * sizeof(std::int32_t));
+            builder.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging, snapshot_bytes);
+            builder.add(original->resource(local), PhysicalMemoryOwner::ActivationTransportStaging, storage_bytes + 2 * sizeof(std::uint64_t));
+            builder.add(original->resource(local), PhysicalMemoryOwner::NativeGraphExecutable, graph_bytes);
+            original->admit(builder.build());
+            memory = original->memory();
+            worker = original->permit(local).worker().get();
+            backend = getBackendFor(local);
+            require(worker && backend && memory->worldRank() == mpi->rank(), "Native replay lost its original local source");
+            worker->submitAndWait([&] {
+                stream = worker->getOrCreateAuxiliaryStream("rank_captured_recorded_rows");
+#ifdef HAVE_CUDA
+                if (local.is_cuda()) require(counted_channel_test::prepareKernelsCUDA(), "Prepare original CUDA byte writer");
+#endif
+#ifdef HAVE_ROCM
+                if (local.is_rocm()) require(counted_channel_test::prepareKernelsROCm(), "Prepare original HIP byte writer");
+#endif
+            });
+        }
+        return std::vector<std::uint8_t>{1};
+    }, [](auto receipts) {
+        for (const auto& receipt : receipts)
+            require(receipt.bytes.size() == 1 && receipt.bytes[0] == 1, "Native rank source preparation omitted a participant");
+    });
+    auto& transfer = TransferEngine::instance();
+    std::array<std::shared_ptr<CapturedTransferChannel>, 2> channels;
+    for (std::size_t i = 0; i < plans.size(); ++i)
+    {
+        channels[i] = transfer.createRankCapturedTransferChannel(plans[i], session, memory, stream);
+        require(bool(channels[i]) == bool(role), "Inactive rank acquired a native channel owner");
+        if (!role) continue;
+        const auto own_role = *plans[i].localRole(mpi->rank());
+        const auto peer_role = own_role == CapturedTransferEndpoint::Producer
+            ? CapturedTransferEndpoint::Consumer : CapturedTransferEndpoint::Producer;
+        require(channels[i]->endpointDevice(own_role) == local, "Rank channel changed its local GPU");
+        require(!CapturedTransferChannelReplayProbe::terminalCursor(*channels[i], peer_role), "Rank channel created a foreign GPU cursor");
+        const auto peer = plans[i].endpoint(peer_role).device;
+        if (peer != local)
+        {
+            bool absent = false;
+            try { (void)GPUDeviceContextPool::instance().retainExistingContextProvenance(peer); }
+            catch (const std::logic_error&) { absent = true; }
+            require(absent, "Rank channel created a hidden foreign worker");
+        }
+        const auto& control = CapturedTransferChannelReplayProbe::terminalControl(*channels[i]);
+        require(control.producer.epoch == 0 && control.consumer.epoch == 0 && control.identity.nonce == channels[i]->identity().nonce &&
+            control.identity.capacity == channels[i]->identity().capacity,
+            "Rank channel attachment changed its source-initialized control");
+    }
+    // The original cohort rejects release while even a local channel/graph
+    // borrow remains. Rejection must not drop the actual source host claim.
+    bool live_rejected = false;
+    try { session->retireAfterOriginalGraphRelease(); }
+    catch (const std::exception&) { live_rejected = true; }
+    require(live_rejected && !session->retired(), "Rank source backing retired before original readers");
+    for (std::size_t direction = 0; direction < plans.size(); ++direction)
+    {
+        if (!role)
+        {
+            // Idle original ranks join exactly the same terminal boundaries;
+            // they never acquire a GPU alias, worker or physical-memory claim.
+            for (const auto ignored : {65, 3, 1, 0, 65})
+            {
+                (void)ignored;
+                mpi->barrier();
+            }
+            continue;
+        }
+        const auto own_role = *plans[direction].localRole(mpi->rank());
+        const bool sends = own_role == CapturedTransferEndpoint::Producer;
+        auto payload_claim = memory->claimNewAllocation(local, PhysicalMemoryOwner::ActivationTransportStaging,
+            storage_bytes + 2 * sizeof(std::uint64_t));
+        auto snapshot_claim = memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging, snapshot_bytes);
+        auto payload = transfer.allocateDeviceTransferBuffer(storage_bytes, local);
+        auto sequence = transfer.allocateDeviceTransferBuffer(sizeof(std::uint64_t), local);
+        auto ignored_extent = transfer.allocateDeviceTransferBuffer(sizeof(std::uint64_t), local);
+        std::shared_ptr<TensorBase> rows(rows_declaration.materialize(memory));
+        const std::array devices{local};
+        auto snapshot = transfer.allocateMappedHostRegion(storage_bytes + row_words * sizeof(std::int32_t), devices);
+        worker->submitAndWait([&] {
+            require(backend->memset(sequence->mutableDeviceData(), 0, sizeof(std::uint64_t), local.ordinal, stream), "Initial native sequence reset failed");
+            auto* recorded = static_cast<std::int32_t*>(rows->raw_mutable_data());
+            recorded[0] = 0x1357; recorded[1] = 65; recorded[2] = 0x2468; recorded[3] = 0x369;
+            TransferEngine::publishHostWrite(rows.get());
+            TransferEngine::prepareDeviceInput(rows.get(), local, stream);
+            TransferEngine::requireDeviceInput(rows.get(), local, stream);
+        });
+        const auto binding = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(channels[direction],
+            own_role, {991, capacity}, payload, row_bytes), rows, row_offset, row_bytes);
+        const auto frozen_identity = binding.captureIdentity();
+        auto graph_claim = memory->reserveNewAllocations(local, PhysicalMemoryOwner::NativeGraphExecutable, graph_bytes);
+        // Original graph factory ownership is host setup; only recording and
+        // execution enter the exact local GPU worker.
+        auto graph = worker->createGraphCapture(stream);
+        require(bool(graph), "Missing original rank-local graph factory");
+        Terminal terminal{backend, local, backend->createEvent(local.ordinal)};
+        require(terminal.event != nullptr, "Missing original rank-local terminal event");
+        NativeReplayFailureDrain fatal{[mpi] {
+            MPI_Abort(mpi->communicator(), 2);
+            std::terminate();
+        }};
+        worker->submitAndWait([&] {
+            ScopedBackendGraphCapture capture(*worker, *graph, "rank-local recorded activation rows");
+            require(capture.begin(), "Rank channel capture begin failed");
+            require(backend->memset(payload->mutableDeviceData(), 0xa5, storage_bytes, local.ordinal, stream), "Captured guard reset failed");
+            if (sends)
+            {
+#ifdef HAVE_CUDA
+                if (local.is_cuda()) require(counted_channel_test::prepareCUDA(payload->mutableDeviceData(row_bytes),
+                    static_cast<std::uint64_t*>(ignored_extent->mutableDeviceData()), static_cast<const std::uint64_t*>(sequence->deviceData()), capacity, stream), "Captured CUDA payload writer failed");
+#endif
+#ifdef HAVE_ROCM
+                if (local.is_rocm()) require(counted_channel_test::prepareROCm(payload->mutableDeviceData(row_bytes),
+                    static_cast<std::uint64_t*>(ignored_extent->mutableDeviceData()), static_cast<const std::uint64_t*>(sequence->deviceData()), capacity, stream), "Captured HIP payload writer failed");
+#endif
+            }
+            transfer.enqueueCapturedTransfer(binding, stream);
+            if (sends)
+            {
+#ifdef HAVE_CUDA
+                if (local.is_cuda()) require(counted_channel_test::advanceCUDA(static_cast<std::uint64_t*>(sequence->mutableDeviceData()), stream), "Captured CUDA sequence advance failed");
+#endif
+#ifdef HAVE_ROCM
+                if (local.is_rocm()) require(counted_channel_test::advanceROCm(static_cast<std::uint64_t*>(sequence->mutableDeviceData()), stream), "Captured HIP sequence advance failed");
+#endif
+            }
+            capture.finish();
+            counted_channel_test::verifyCapturedChannelGraph(*graph, capacity, 1);
+            std::string error;
+            require(graph->validateExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper, &error), error.c_str());
+            require(graph->prepareRuntimeContextStorage(memory) && graph->instantiate(), "Rank-local native graph instantiation failed");
+        });
+        std::size_t replay = 0;
+        for (const std::int32_t live_rows : {65, 3, 1, 0, 65})
+        {
+            // Recorded initial inputs at an explicit test request boundary;
+            // no GPU state is downloaded to decide what transaction to launch.
+            require(rows->hostValid(), "Read-only expected row input was falsely published as device-written");
+            auto* recorded = static_cast<std::int32_t*>(rows->raw_mutable_data());
+            recorded[1] = live_rows;
+            TransferEngine::publishHostWrite(rows.get());
+            const CapturedTransferInvocation invocation{session->originalGeneration(), replay + 1};
+            transfer.beginCapturedTransferInvocation(channels[direction], invocation);
+            worker->submitAndWait([&] {
+                TransferEngine::prepareDeviceInput(rows.get(), local, stream);
+                TransferEngine::requireDeviceInput(rows.get(), local, stream);
+                require(graph->launch(), "Rank retained replay launch failed");
+                transfer.enqueueDeviceToMappedHost(*payload, 0, *snapshot, 0, storage_bytes, local, stream);
+                require(backend->deviceToHostOnStream(static_cast<std::byte*>(snapshot->mutableHostData()) + storage_bytes,
+                    rows->gpu_data_ptr(), row_words * sizeof(std::int32_t), local.ordinal, stream), "Observe terminal native row input");
+                require(backend->recordEvent(terminal.event, local.ordinal, stream), "Rank native terminal publication failed");
+            });
+            terminal.await(std::chrono::seconds(30));
+            mpi->barrier(); // Explicit test terminal boundary, never production hot execution.
+            const auto& control = CapturedTransferChannelReplayProbe::terminalControl(*channels[direction]);
+            const auto live_bytes = std::size_t(live_rows) * row_bytes;
+            require(control.producer.message.bytes == live_bytes && control.consumer.message.bytes == live_bytes &&
+                control.producer.epoch == replay + 1 && control.consumer.epoch == replay + 1,
+                "Native shared header communicated a capacity/stale extent");
+            const auto* actual = static_cast<const std::uint8_t*>(snapshot->mutableHostData());
+            for (std::size_t index = 0; index < storage_bytes; ++index)
+            {
+                const bool active = index >= row_bytes && index - row_bytes < (sends ? capacity : live_bytes);
+                const auto expected = active ? counted_channel_test::byte(replay, index - row_bytes) : std::uint8_t{0xa5};
+                require(actual[index] == expected, "Native rank payload byte or poison-tail mismatch");
+            }
+            std::array<std::int32_t, row_words> actual_rows{};
+            std::memcpy(actual_rows.data(), actual + storage_bytes, sizeof(actual_rows));
+            require(actual_rows == std::array<std::int32_t, row_words>{0x1357, live_rows, 0x2468, 0x369},
+                "Native row-count input or adjacent INT32 guard was overwritten");
+            require(binding.captureIdentity() == frozen_identity, "Rank replay changed its capture identity");
+            require(transfer.finishCapturedTransferInvocation(channels[direction], invocation) ==
+                CapturedTransferInvocationRetirement::Completed, "Rank request retirement lost original admission");
+            ++replay;
+        }
+        worker->submitAndWait([&] { graph.reset(); });
+        fatal.completed = true;
+    }
+    mpi->barrier();
+    channels = {};
+    if (role)
+        require(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation) == geometry.mapped_host_bytes,
+            "Original host claim retired before peer graph/alias consensus");
+    session->retireAfterOriginalGraphRelease();
+    require(session->retired(), "Original native cohort did not retire shared mappings");
+    if (original)
+    {
+        original->requirePayloadRetired();
+        original->retire();
+        original->requireExactRetired();
+    }
+}
+} // namespace
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+/** @test Real node-local mixed-rank payload and request-data reset; no real-model qualification. */
+TEST(CapturedTransferRankNative, MixedCUDA_ROCmRecordedRowsAndRetirement)
+{
+    rankCapturedRecordedRowsReplay(DeviceType::CUDA, DeviceType::ROCm);
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test Real distinct-rank ROCm physical pair, including both endpoint directions. */
+TEST(CapturedTransferRankNative, ROCmRecordedRowsAndRetirement)
+{
+    rankCapturedRecordedRowsReplay(DeviceType::ROCm, DeviceType::ROCm);
+}
+#endif
+
+namespace
+{
+/** @brief Real local TP2 fanout after original captured channel receipt, inside the original native owner.
+ * @param family Exact backend family. Original NUMA ownership chooses a real TP2 cohort; ranks never impersonate devices.
+ * Recorded request inputs and independent per-member poison prove compactness
+ * even when the source and one native reader share the same physical GPU.
+ */
+void pipelineActivationCompletedFanoutReplay(DeviceType family)
+{
+    const auto mpi = MPIContextFactory::global();
+    originalRankLocalReplay(family, 2, [&](const auto &devices) {
+        const int owner_rank = mpi->rank();
+        constexpr size_t row_bytes = 17 * sizeof(float), capacity = 65 * row_bytes;
+        constexpr size_t storage_bytes = 67 * row_bytes, count_bytes = 4 * sizeof(int32_t);
+        constexpr size_t host_snapshot_bytes = 2 * (storage_bytes + count_bytes);
+        constexpr uint64_t message_key = 0x4143540000000041ULL;
+        const CPUTensorStorageDeclaration hidden_declaration(67, 17, BufferTensorType::FP32,
+            PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu());
+        const CPUTensorStorageDeclaration rows_declaration(1, 4, BufferTensorType::INT32,
+            PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu());
+        auto original = test::PreparedNativeLookupFixture::prepare(devices, owner_rank);
+        std::vector<GlobalDeviceAddress> addresses;
+        for (const auto device : devices)
+            addresses.push_back(device.is_cuda() ? GlobalDeviceAddress::cuda(device.ordinal) : GlobalDeviceAddress::rocm(device.ordinal));
+        auto collective = createLocalTPContext(addresses, {}, family == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        require(bool(collective), "Original fanout native context is absent");
+        const auto native_bom = CollectiveMemoryEstimator::localTP(1, capacity,
+            family == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+        const auto channel_bom = CapturedTransferChannel::memoryFor(capacity);
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
+            channel_bom.mapped_host_bytes + 2 * PipelineTransferMemory::fanoutHostBytes() +
+                TransferEngine::mappedHostRegionAllocationBytes(host_snapshot_bytes));
+        plan.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ExecutionWorkspace,
+            2 * (hidden_declaration.physicalBytes() + rows_declaration.physicalBytes()));
+        for (const auto device : devices)
+        {
+            plan.add(original->resource(device), PhysicalMemoryOwner::ActivationTransportStaging,
+                channel_bom.cursor_bytes_per_device + PipelineTransferMemory::fanoutDeviceBytes() +
+                    (device == devices[1] ? capacity + 2 * sizeof(uint64_t) : 0));
+            plan.add(original->resource(device), PhysicalMemoryOwner::ExecutionWorkspace, storage_bytes + count_bytes);
+            plan.add(original->resource(device), PhysicalMemoryOwner::LocalCollective, native_bom.perDeviceBytes());
+            const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
+                original->resource(DeviceId::cpu()), original->resource(device), 1);
+            for (const auto &row : graph_bom.resources()) plan.add(row);
+        }
+        original->admit(plan.build());
+        auto memory = original->memory();
+        require(collective->reserveCollectiveResources(native_bom.backend_payload_capacity_bytes,
+            native_bom.fp16_scratch_elements, memory), "Fanout original collective resources were not admitted");
+        {
+            auto &transfer = TransferEngine::instance();
+            std::array<std::shared_ptr<IWorkerGPUContext>, 2> workers{original->permit(devices[0]).worker(), original->permit(devices[1]).worker()};
+            std::array<IBackend *, 2> backends{getBackendFor(devices[0]), getBackendFor(devices[1])};
+            std::array<void *, 2> streams{workers[0]->defaultStream(), workers[1]->defaultStream()};
+            std::array<std::shared_ptr<TensorBase>, 2> hidden, rows;
+            for (size_t i = 0; i < 2; ++i)
+            {
+                hidden[i] = hidden_declaration.materialize(memory);
+                rows[i] = rows_declaration.materialize(memory);
+                workers[i]->submitAndWait([&] {
+                    auto *input = static_cast<int32_t *>(rows[i]->raw_mutable_data());
+                    input[0] = 0x1357; input[1] = 65; input[2] = 0x2468; input[3] = 0x369;
+                    TransferEngine::publishHostWrite(rows[i].get());
+                    TransferEngine::prepareDeviceInput(rows[i].get(), devices[i], streams[i]);
+                    TransferEngine::prepareDeviceOutput(hidden[i].get(), devices[i], streams[i]);
+                });
+            }
+            auto channel = transfer.createCapturedTransferChannel(*memory, DeviceId::cpu(),
+                devices[1], streams[1], devices[0], streams[0], capacity);
+            std::array<std::shared_ptr<PipelineActivationFanout>, 2> fanout;
+            for (size_t i = 0; i < 2; ++i)
+                fanout[i] = PipelineActivationFanout::create(devices[i], *collective, int(i), channel, memory, streams[i]);
+            auto producer_claim = memory->claimNewAllocation(devices[1], PhysicalMemoryOwner::ActivationTransportStaging,
+                capacity + 2 * sizeof(uint64_t));
+            auto producer = transfer.allocateDeviceTransferBuffer(capacity, devices[1]);
+            auto sequence = transfer.allocateDeviceTransferBuffer(sizeof(uint64_t), devices[1]);
+            auto ignored_extent = transfer.allocateDeviceTransferBuffer(sizeof(uint64_t), devices[1]);
+            workers[1]->submitAndWait([&] {
+                require(backends[1]->memset(sequence->mutableDeviceData(), 0, sizeof(uint64_t), devices[1].ordinal, streams[1]), "Fanout original sequence initialization failed");
+#ifdef HAVE_CUDA
+                if (devices[1].is_cuda()) require(counted_channel_test::prepareKernelsCUDA(), "Fanout CUDA writer preparation failed");
+#endif
+#ifdef HAVE_ROCM
+                if (devices[1].is_rocm()) require(counted_channel_test::prepareKernelsROCm(), "Fanout HIP writer preparation failed");
+#endif
+            });
+            const auto outgoing = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(channel,
+                CapturedTransferEndpoint::Producer, {message_key, capacity}, producer), rows[1], sizeof(int32_t), row_bytes);
+            const auto incoming = transfer.bindDeviceRowCountedTransfer(transfer.bindCapturedTransfer(channel,
+                CapturedTransferEndpoint::Consumer, {message_key, capacity}, hidden[0]), rows[0], sizeof(int32_t), row_bytes);
+            const std::array identities{outgoing.captureIdentity(), incoming.captureIdentity()};
+            auto snapshot_claim = memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
+                TransferEngine::mappedHostRegionAllocationBytes(host_snapshot_bytes));
+            auto snapshot = transfer.allocateMappedHostRegion(host_snapshot_bytes, devices);
+            std::array<std::shared_ptr<RetainedParticipantGraphExecutable>, 2> owners;
+            for (size_t i = 0; i < 2; ++i)
+                owners[i] = test::RetainedParticipantGraphExecutableFixtureAccess::original(original->permit(devices[i]), streams[i]);
+            const auto await = [&] {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                for (size_t i = 0; i < 2; ++i)
+                    for (;;)
+                    {
+                        GPUStreamExecutionState state = GPUStreamExecutionState::Pending;
+                        workers[i]->submitAndWait([&] { state = workers[i]->queryStreamExecutionState(streams[i], "pipeline fanout original terminal"); });
+                        if (state == GPUStreamExecutionState::Complete) break;
+                        require(std::chrono::steady_clock::now() < deadline, "Fanout exact original terminal exceeded canonical deadline");
+                        std::this_thread::yield();
+                    }
+            };
+            CapturedTransferInvocation active_invocation{};
+            NativeReplayFailureDrain drain{[&] {
+                if (active_invocation.valid()) transfer.cancelCapturedTransferInvocation(channel, active_invocation);
+                require(collective->signalNativeCompletionAbort(), "Fanout original native abort failed");
+                await();
+            }};
+            std::barrier begun(2), recorded(2), ended(2);
+            std::array<bool, 2> began{};
+            std::array<std::exception_ptr, 2> errors{};
+            std::array<bool, 2> failed{};
+            const auto capture = [&](size_t i) {
+                auto &definition = test::RetainedParticipantGraphExecutableFixtureAccess::capture(owners[i]);
+                std::unique_ptr<GraphCaptureDependencyLedger> ledger;
+                std::unique_ptr<ScopedBackendGraphCapture> scope;
+                try {
+                    // The recorded row bank is an external input. Join its
+                    // upload event on this exact worker/stream before capture,
+                    // matching the production executor's arena-frontier pass.
+                    TransferEngine::requireDeviceInput(rows[i].get(), devices[i], streams[i]);
+                    using StagePlan = GraphCaptureDependencyLedger::StagePlan;
+                    std::vector<StagePlan> stages;
+                    stages.push_back({.stage_identity = fanout[i].get(), .stage_name = "original completed activation fanout",
+                        .external_inputs = {rows[i].get()}, .outputs = {hidden[i].get()}});
+                    ledger = std::make_unique<GraphCaptureDependencyLedger>(devices[i], streams[i], std::move(stages),
+                        "pipeline fanout recorded row component");
+                    scope = std::make_unique<ScopedBackendGraphCapture>(*workers[i], definition,
+                        "original pipeline completed activation fanout", ledger.get());
+                    require(scope->begin(), "Fanout original capture begin failed"); began[i] = true;
+                } catch (...) { errors[i] = std::current_exception(); }
+                begun.arrive_and_wait();
+                if (began[0] && began[1]) try {
+                    ScopedGraphCaptureStage stage(fanout[i].get());
+                    require(backends[i]->memset(hidden[i]->gpu_data_ptr(), i ? 0x5a : 0xa5, storage_bytes, devices[i].ordinal, streams[i]), "Fanout captured poison failed");
+                    if (i == 1)
+                    {
+#ifdef HAVE_CUDA
+                        if (devices[i].is_cuda()) require(counted_channel_test::prepareCUDA(producer->mutableDeviceData(),
+                            static_cast<uint64_t *>(ignored_extent->mutableDeviceData()), static_cast<const uint64_t *>(sequence->deviceData()), capacity, streams[i]), "Fanout captured CUDA source failed");
+#endif
+#ifdef HAVE_ROCM
+                        if (devices[i].is_rocm()) require(counted_channel_test::prepareROCm(producer->mutableDeviceData(),
+                            static_cast<uint64_t *>(ignored_extent->mutableDeviceData()), static_cast<const uint64_t *>(sequence->deviceData()), capacity, streams[i]), "Fanout captured HIP source failed");
+#endif
+                        transfer.enqueueCapturedTransfer(outgoing, streams[i]);
+                    }
+                    else transfer.enqueueCapturedTransfer(incoming, streams[i]);
+                    const auto receipt = i == 0 ? transfer.capturedReceiveCompletion(incoming, streams[i]) : CapturedTransferReceiveCompletion::notRequired();
+                    require(fanout[i]->enqueue(*hidden[i], *rows[i], sizeof(int32_t), row_bytes,
+                        {message_key, capacity}, receipt, streams[i]), "Fanout original live native operations failed");
+                    if (i == 1)
+                    {
+#ifdef HAVE_CUDA
+                        if (devices[i].is_cuda()) require(counted_channel_test::advanceCUDA(static_cast<uint64_t *>(sequence->mutableDeviceData()), streams[i]), "Fanout CUDA original sequence advance failed");
+#endif
+#ifdef HAVE_ROCM
+                        if (devices[i].is_rocm()) require(counted_channel_test::advanceROCm(static_cast<uint64_t *>(sequence->mutableDeviceData()), streams[i]), "Fanout HIP original sequence advance failed");
+#endif
+                    }
+                    stage.complete();
+                } catch (...) { errors[i] = std::current_exception(); collective->signalNativeCompletionAbort(); }
+                recorded.arrive_and_wait();
+                if (scope) try { scope->finish(); } catch (...) { if (!errors[i]) errors[i] = std::current_exception(); collective->signalNativeCompletionAbort(); }
+                failed[i] = bool(errors[i]);
+                ended.arrive_and_wait();
+                if (!failed[0] && !failed[1]) try {
+                    require(definition.prepareRuntimeContextStorage(memory) && definition.instantiate(), "Fanout original graph instantiation failed");
+                } catch (...) { errors[i] = std::current_exception(); collective->signalNativeCompletionAbort(); }
+            };
+            auto first = workers[0]->submitAsync([&] { capture(0); });
+            auto second = workers[1]->submitAsync([&] { capture(1); });
+            first.get(); second.get();
+            for (const auto &error : errors) if (error) std::rethrow_exception(error);
+            size_t replay = 0;
+            for (const int32_t live : {65, 3, 1, 0, 65})
+            {
+                for (size_t i = 0; i < 2; ++i)
+                {
+                    require(rows[i]->hostValid(), "Fanout read-only INT32 input was falsely published as output");
+                    static_cast<int32_t *>(rows[i]->raw_mutable_data())[1] = live;
+                    TransferEngine::publishHostWrite(rows[i].get());
+                    workers[i]->submitAndWait([&] { TransferEngine::prepareDeviceInput(rows[i].get(), devices[i], streams[i]); });
+                }
+                const CapturedTransferInvocation invocation{channel->identity().nonce, replay + 1};
+                active_invocation = invocation;
+                transfer.beginCapturedTransferInvocation(channel, invocation);
+                for (const auto i : replay % 2 ? std::array<size_t, 2>{1, 0} : std::array<size_t, 2>{0, 1})
+                    workers[i]->submitAndWait([&] { require(test::RetainedParticipantGraphExecutableFixtureAccess::submit(owners[i], replay + 1), "Fanout retained original replay submission failed"); });
+                await();
+                for (size_t i = 0; i < 2; ++i)
+                {
+                    require(test::RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owners[i]), "Fanout original graph lacks terminal proof");
+                    workers[i]->submitAndWait([&] {
+                        require(backends[i]->deviceToHostOnStream(static_cast<std::byte *>(snapshot->mutableHostData()) + i * (storage_bytes + count_bytes),
+                            hidden[i]->gpu_data_ptr(), storage_bytes, devices[i].ordinal, streams[i]), "Fanout terminal hidden readback failed");
+                        require(backends[i]->deviceToHostOnStream(static_cast<std::byte *>(snapshot->mutableHostData()) + i * (storage_bytes + count_bytes) + storage_bytes,
+                            rows[i]->gpu_data_ptr(), count_bytes, devices[i].ordinal, streams[i]), "Fanout terminal original row readback failed");
+                    });
+                }
+                await();
+                for (size_t i = 0; i < 2; ++i)
+                {
+                    const auto *actual = static_cast<const uint8_t *>(snapshot->mutableHostData()) + i * (storage_bytes + count_bytes);
+                    for (size_t byte = 0; byte < storage_bytes; ++byte)
+                        require(actual[byte] == (byte < size_t(live) * row_bytes ? counted_channel_test::byte(replay, byte) : uint8_t(i ? 0x5a : 0xa5)),
+                            "Fanout copied capacity/padding or changed an original live byte");
+                    std::array<int32_t, 4> observed{};
+                    std::memcpy(observed.data(), actual + storage_bytes, count_bytes);
+                    require(observed == std::array<int32_t, 4>{0x1357, live, 0x2468, 0x369}, "Fanout changed original INT32 input guards");
+                }
+                const auto &control = CapturedTransferChannelReplayProbe::terminalControl(*channel);
+                require(control.consumer.message.bytes == size_t(live) * row_bytes && control.consumer.epoch == replay + 1,
+                    "Fanout source header retained stale/capacity extent");
+                require(outgoing.captureIdentity() == identities[0] && incoming.captureIdentity() == identities[1], "Fanout reset changed original captured identity");
+                require(transfer.finishCapturedTransferInvocation(channel, invocation) == CapturedTransferInvocationRetirement::Completed,
+                    "Fanout failed original invocation retirement");
+                ++replay;
+            }
+            ::testing::Test::RecordProperty("fanout_wire_contract", "actual_publication_header24_then_completed_native_live_prefix;independent_member_poison");
+            drain.completed = true;
+        }
+        collective.reset();
+        original->requirePayloadRetired(); original->retire(); original->requireExactRetired();
+    });
+}
+}
+#ifdef HAVE_CUDA
+/** @test Real completed native CUDA prefix with recorded live rows and distinct TP padding poisons. */
+TEST(PipelineActivationFanoutNative, CUDARecordedRowsAndPoisonReplay)
+{ pipelineActivationCompletedFanoutReplay(DeviceType::CUDA); }
+#endif
+#ifdef HAVE_ROCM
+/** @test Symmetric actual ROCm native TP owner, selected only from original NUMA observations. */
+TEST(PipelineActivationFanoutNative, ROCmRecordedRowsAndPoisonReplay)
+{ pipelineActivationCompletedFanoutReplay(DeviceType::ROCm); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test The same original native visibility law on the CUDA/NCCL backend. */
+TEST(CapturedTransferNativePeerVisibility, CUDAOriginalInventory257Offset1)
+{
+    originalRankLocalReplay(DeviceType::CUDA, 2, [&](const auto &cohort) {
+        roundTrip(cohort[0], cohort[1],
+            {.capacity = 1024 * 1024 + 3, .bytes = {257}, .offsets = {1},
+             .replays = 64, .patterns = 2, .peer_storage = PeerStorage::PrivateScratch,
+             .measure_floor = true, .fixed_native_collective = true, .warmups = 5});
+    });
+}
+#endif
+
+#include "NativePipelineByteReplay.inc"
+#include "NativeReductionOpcodeReplay.inc"
+#include "NativeFixedHeadPipelineReplay.inc"
+
+#include "CapturedTransferRankRoundTripReplay.inc"
+
+#include "CapturedTransferRankCountedReplay.inc"
+
+#include "NativeMoECompletedDecisionReplay.inc"
+
+#include "NativeExactRowsMappedPacketReplay.inc"
+
+#include "MoERecurrentOriginalSlotPacketReplay.inc"
+
+#include "NativeSharedUnionPacketReplay.inc"

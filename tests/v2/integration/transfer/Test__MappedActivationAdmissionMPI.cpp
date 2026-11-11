@@ -1,737 +1,210 @@
 /**
  * @file Test__MappedActivationAdmissionMPI.cpp
- * @brief Two-process CUDA/ROCm proof for mapped graph admission publication.
+ * @brief Original-rank admitted GPU metadata parents across the real shared channel.
  *
- * The production heterogeneous ExpertOverlay path maps the same POSIX shared
- * object independently in two MPI processes, then registers each process-local
- * virtual address with the GPU family owned by that rank.  Same-process tests
- * cannot prove that a scheduler publication made through one mapping is visible
- * to a retained graph launched from another process.  This fixture exercises
- * exactly that boundary in both topology directions: the follower rank arms the
- * production activation protocol, and both endpoint GPUs wait on the mapped
- * admission word before publishing a distinct mapped timeline word. A second
- * proof retains the production-shaped alternating-bank ping-pong across 48
- * ordered MoE stages, which admission-only and same-process tests cannot prove.
+ * One original native source per process owns all four direction/recipe
+ * definitions before either test launches. Discovery retains actual UUID/NUMA
+ * ownership; each process creates only its local GPU grant and native graphs.
+ * Follower-host admission releases both complete captured metadata parents.
+ * The48-stage recipe reuses the two original physical timeline banks without
+ * host stepping. This control-only proof neither fabricates payload work nor
+ * claims model inference. Every native definition and mapping retires before
+ * the original source and MPI session.
  */
-
 #include <gtest/gtest.h>
-#include <mpi.h>
-
-#include "backends/BackendManager.h"
-#include "backends/GPUDeviceContextPool.h"
-#include "backends/IGPUGraphCapture.h"
+#include "fixtures/backends/OriginalMappedNativeCohorts.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
+#include "planning/PlanningPublication.h"
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
-
-#include <atomic>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
-#include <cstddef>
-#include <cstdint>
+#include <exception>
 #include <memory>
-#include <optional>
-#include <string>
+#include <numeric>
 #include <thread>
-#include <utility>
-#include <vector>
+#include <unistd.h>
 
-namespace llaminar2::test
-{
-    namespace
-    {
-        constexpr std::int32_t kSourceParticipant = 2;
-        constexpr std::int32_t kTargetParticipant = 7;
-        constexpr std::int32_t kModelLayer = 5;
-        constexpr std::int32_t kDModel = 8;
-        constexpr std::int32_t kTopK = 2;
-        constexpr std::uint64_t kPlacementEpoch = 41u;
-        constexpr std::uint64_t kPublishedTimeline = 9u;
-        constexpr std::uint32_t kRetainedMoEStageCount = 48u;
+namespace llaminar2::test { namespace {
+constexpr int source_participant=2,target_participant=7,width=8,topk=2;
+constexpr std::uint32_t retained_stages=48;
+constexpr std::uint64_t publication=9;
+/** Reject incomplete native evidence; unavailable original hardware is qualified before launch. */
+void requireAdmission(bool valid,const char* reason){if(!valid)throw std::runtime_error(reason);}
+/** Actual complete parent recipe, with no test-side per-stage submissions. */
+enum class AdmissionRecipe {Publication,AlternatingBanks};
+/** Four source/recipe definitions retain the same original lexical process source. */
+class OriginalAdmissionSuite final {
+    using Graph=RetainedParticipantGraphExecutableFixtureAccess;
+    struct Frame {
+        explicit Frame(OriginalMappedNativeCohorts cohort,AdmissionRecipe kind):cohorts(std::move(cohort)),recipe(kind){}
+        OriginalMappedNativeCohorts cohorts;
+        AdmissionRecipe recipe;
+        MoEOverlayRankBatchTransportConfig config;
+        std::shared_ptr<MoEOverlayNodeLocalRankBatchTransport> transport;
+        MoEOverlayMappedActivationDeviceLane lane;
+        std::shared_ptr<RetainedParticipantGraphExecutable> graph;
+        std::unique_ptr<MoEOverlayActivationEpochProtocol> protocol;
+        std::optional<MoEOverlayActivationEpochIdentity> identity;
+        bool submitted=false,pending=false;
+    };
+public:
+    /** Bind both actual endpoint roles before native birth; unused original ranks stay idle. */
+    OriginalAdmissionSuite():mpi_(MPIContextFactory::global()),cohorts_(OriginalMappedNativeCohorts::observe(
+        mpi_->clusterInventory(),{DeviceType::CUDA,1},{DeviceType::ROCm,1})),
+        frames_{Frame(cohorts_,AdmissionRecipe::Publication),Frame(cohorts_.reversed(),AdmissionRecipe::Publication),
+                Frame(cohorts_,AdmissionRecipe::AlternatingBanks),Frame(cohorts_.reversed(),AdmissionRecipe::AlternatingBanks)} {}
+    /** Physical drain and off-worker graph retirement precede source retirement. */
+    ~OriginalAdmissionSuite() noexcept {try{dispose();}catch(...){std::terminate();}}
+    /** Admit the exact four original channel/grant/definition declarations, then capture. */
+    void prepare();
+    /** Run both original source directions for one retained recipe. */
+    void run(AdmissionRecipe recipe);
+private:
+    /** One original communicator owns all test checkpoints; no WORLD substitute exists. */
+    void checkpoint(const std::function<void()>& body){acceptPlanningCostPreparation(mpi_,body);}
+    /** Poll only the exact original participant's terminal stream. */
+    void await(){if(!worker_)return;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        for(;;){GPUStreamExecutionState state=GPUStreamExecutionState::Pending;
+            worker_->submitAndWait([&]{state=worker_->queryStreamExecutionState(stream_,"mapped admission original terminal");});
+            if(state==GPUStreamExecutionState::Complete)return;
+            requireAdmission(std::chrono::steady_clock::now()<deadline,"Original mapped admission terminal timed out");std::this_thread::yield();}}
+    /** Absorbing failure signal releases native metadata waits before owners unwind. */
+    void abortPending()noexcept;
+    /** Release all actual payload/native owners, then validate original source retirement. */
+    void dispose();
+    std::shared_ptr<IMPIContext> mpi_;
+    OriginalMappedNativeCohorts cohorts_;
+    std::array<Frame,4> frames_;
+    std::unique_ptr<PreparedNativeLookupFixture> original_;
+    std::shared_ptr<IWorkerGPUContext> worker_;
+    void* stream_=nullptr;
+    DeviceId local_=DeviceId::invalid();
+    bool admitted_=false,disposed_=false;
+};
 
-        /** Complete retained transaction shape built on each MPI endpoint. */
-        enum class RetainedMappedGraphRecipe : std::uint8_t
-        {
-            AdmissionPublication, ///< Wait for admission, then publish once.
-            AlternatingBankRoundTrip, ///< Exchange every ordered MoE stage.
-        };
-
-        /** @return Main-prefill role bit accepted by the one-layer fixture. */
-        constexpr std::uint32_t prefillRoleBit() noexcept
-        {
-            return std::uint32_t{1}
-                   << static_cast<std::uint32_t>(
-                          MoEOverlayInferenceGraphRole::MainPrefill);
-        }
-
-        /** @return Backend authority for one exact planner-selected GPU. */
-        IBackend *backendFor(DeviceId device) noexcept
-        {
-            if (device.is_cuda())
-                return getCUDABackend();
-            if (device.is_rocm())
-                return getROCmBackend();
-            return nullptr;
-        }
-
-        /**
-         * @brief Turn one rank-local predicate into a shared test checkpoint.
-         *
-         * Every rank reaches the same all-reduce even when its local operation
-         * failed. This prevents an assertion on one process from abandoning its
-         * peer inside a later MPI or shared-memory rendezvous.
-         */
-        bool allRanksSucceeded(bool local_success) noexcept
-        {
-            int local = local_success ? 1 : 0;
-            int global = 0;
-            return MPI_Allreduce(
-                       &local,
-                       &global,
-                       1,
-                       MPI_INT,
-                       MPI_MIN,
-                       MPI_COMM_WORLD) == MPI_SUCCESS &&
-                   global != 0;
-        }
-
-        /** @brief Poll one exact terminal event without synchronizing a device. */
-        bool awaitEvent(
-            IBackend *backend,
-            int ordinal,
-            void *event,
-            std::chrono::steady_clock::duration timeout) noexcept
-        {
-            const auto deadline = std::chrono::steady_clock::now() + timeout;
-            while (backend && event &&
-                   std::chrono::steady_clock::now() < deadline)
-            {
-                bool ready = false;
-                if (!backend->queryEvent(event, ordinal, &ready))
-                    return false;
-                if (ready)
-                    return true;
-                std::this_thread::yield();
-            }
-            return false;
-        }
-
-        /** @return Fixed rank-batch storage used only to derive mapping layout. */
-        std::shared_ptr<MoEOverlayRankBatchWireWorkspace> makeWorkspace()
-        {
-            return std::make_shared<MoEOverlayRankBatchWireWorkspace>(
-                MoEOverlayRankBatchWireWorkspace::Config{
-                    .participant_ids = {kTargetParticipant},
-                    .max_total_rows = 1u,
-                    .max_total_entries = static_cast<std::size_t>(kTopK),
-                    .d_model = kDModel,
-                    .top_k = kTopK,
-                });
-        }
-
-        /** @brief Build the identical topology recipe on both MPI endpoints. */
-        MoEOverlayRankBatchTransportConfig makeTransportConfig(
-            std::shared_ptr<MPIContext> context,
-            int source_rank,
-            int target_rank,
-            DeviceId local_device,
-            std::string channel_identity)
-        {
-            return {
-                .mpi_ctx = std::move(context),
-                .source_world_rank = source_rank,
-                .target_world_rank = target_rank,
-                .workspace = makeWorkspace(),
-                .max_rows_per_participant = 1u,
-                .max_entries_per_participant =
-                    static_cast<std::size_t>(kTopK),
-                .d_model = kDModel,
-                .top_k = kTopK,
-                .tier_index = 1,
-                .domain_ordinal = 9,
-                .channel_identity = std::move(channel_identity),
-                .transaction_slot_count = 8u,
-                .transaction_topology = {
-                    .workspace_generation = 17u,
-                    .topology_fingerprint_low = 0x1234567812345678ull,
-                    .topology_fingerprint_high = 0x8765432187654321ull,
-                    .source_world_rank = source_rank,
-                    .target_world_rank = target_rank,
-                },
-                .source_endpoint = {
-                    .world_rank = source_rank,
-                    .participant_id = kSourceParticipant,
-                    .tier_priority = 0,
-                    .domain_ordinal = 4,
-                },
-                .target_tier_priority = 1,
-                .activation_graph_families = {{
-                    .graph_role_mask = prefillRoleBit(),
-                    .model_layer_indices = {kModelLayer},
-                }},
-                .local_lanes = {{
-                    .participant_id = kTargetParticipant,
-                    .device = local_device,
-                }},
-            };
-        }
-
-        /**
-         * @brief Own one process-local endpoint of the two-process transaction.
-         */
-        class AdmissionEndpoint final
-        {
-        public:
-            /** @brief Bind immutable endpoint topology; resources arrive later. */
-            AdmissionEndpoint(
-                int world_rank,
-                int source_rank,
-                int target_rank,
-                DeviceId device)
-                : world_rank_(world_rank),
-                  source_rank_(source_rank),
-                  target_rank_(target_rank),
-                  device_(device),
-                  backend_(backendFor(device))
-            {
-            }
-
-            /**
-             * @brief Release blocked waits, then destroy graph/stream/mapping.
-             */
-            ~AdmissionEndpoint()
-            {
-                publishAbortFromHost();
-                if (backend_ && stream_ && terminal_ &&
-                    backend_->recordEvent(
-                        terminal_, device_.gpu_ordinal(), stream_))
-                {
-                    (void)awaitEvent(
-                        backend_,
-                        device_.gpu_ordinal(),
-                        terminal_,
-                        std::chrono::seconds(2));
-                }
-                graph_.reset();
-                if (backend_ && terminal_)
-                    backend_->destroyEvent(
-                        terminal_, device_.gpu_ordinal());
-                if (backend_ && stream_)
-                    backend_->destroyStream(
-                        stream_, device_.gpu_ordinal());
-                transport_.reset();
-            }
-
-            AdmissionEndpoint(const AdmissionEndpoint &) = delete;
-            AdmissionEndpoint &operator=(const AdmissionEndpoint &) = delete;
-
-            /** @brief Construct the real POSIX transport on this MPI process. */
-            bool initializeTransport(
-                std::shared_ptr<MPIContext> context,
-                const std::string &channel_identity)
-            {
-                if (!backend_ ||
-                    backend_->deviceCount() <= device_.gpu_ordinal())
-                {
-                    error_ = "required local GPU is unavailable";
-                    return false;
-                }
-                try
-                {
-                    transport_ = std::make_unique<
-                        MoEOverlayNodeLocalRankBatchTransport>(
-                        makeTransportConfig(
-                            std::move(context),
-                            source_rank_,
-                            target_rank_,
-                            device_,
-                            channel_identity));
-                    lane_ = transport_->activationDeviceLane(
-                        kTargetParticipant,
-                        /*graph_family_ordinal=*/0u,
-                        device_);
-                }
-                catch (const std::exception &exception)
-                {
-                    error_ = exception.what();
-                    return false;
-                }
-                if (!lane_.valid())
-                {
-                    error_ = "production transport returned an invalid lane";
-                    return false;
-                }
-                return true;
-            }
-
-            /**
-             * @brief Capture one complete endpoint-owned mapped transaction.
-             *
-             * The round-trip recipe matches production ordering: the source
-             * publishes dispatch then acquires return, while the follower
-             * acquires dispatch then publishes return. Both reuse two physical
-             * banks across all retained stages with no intervening host work.
-             *
-             * @param recipe Typed retained transaction shape.
-             * @param stage_count Ordered stages for the round-trip recipe.
-             * @return True only when the exact-stream graph is executable.
-             */
-            bool materializeGraph(
-                RetainedMappedGraphRecipe recipe,
-                std::uint32_t stage_count = 0u)
-            {
-                if ((recipe ==
-                         RetainedMappedGraphRecipe::AdmissionPublication &&
-                     stage_count != 0u) ||
-                    (recipe ==
-                         RetainedMappedGraphRecipe::AlternatingBankRoundTrip &&
-                     stage_count == 0u))
-                {
-                    error_ =
-                        "retained mapped graph recipe has invalid stage geometry";
-                    return false;
-                }
-                try
-                {
-                    auto &context =
-                        GPUDeviceContextPool::instance().getContext(device_);
-                    stream_ = backend_->createStream(device_.gpu_ordinal());
-                    terminal_ = backend_->createEvent(device_.gpu_ordinal());
-                    graph_ = context.createGraphCapture(stream_);
-                    if (!stream_ || !terminal_ || !graph_ ||
-                        !graph_->beginCapture())
-                    {
-                        error_ = "could not begin exact-stream admission graph";
-                        return false;
-                    }
-                    engine_.enqueueMappedTimelineWait64(
-                        *lane_.mapped_region,
-                        lane_.admission_signal_offset,
-                        kMoEOverlayActivationAdmissionTimeline,
-                        device_,
-                        stream_);
-                    if (recipe ==
-                        RetainedMappedGraphRecipe::AdmissionPublication)
-                    {
-                        const std::size_t output_offset =
-                            world_rank_ == source_rank_
-                                ? lane_.dispatch_signal_offsets[0]
-                                : lane_.return_signal_offsets[0];
-                        engine_.enqueueMappedTimelinePublish64(
-                            *lane_.mapped_region,
-                            output_offset,
-                            kPublishedTimeline,
-                            device_,
-                            stream_);
-                    }
-                    else
-                    {
-                        const bool source = world_rank_ == source_rank_;
-                        for (std::uint32_t stage = 0u;
-                             stage < stage_count;
-                             ++stage)
-                        {
-                            const std::uint32_t bank =
-                                moeOverlayActivationBufferIndex(stage);
-                            const std::uint64_t timeline =
-                                moeOverlayActivationLeasedTimelineValue(
-                                    moeOverlayActivationBufferVisit(stage));
-                            if (source)
-                            {
-                                engine_.enqueueMappedTimelinePublish64(
-                                    *lane_.mapped_region,
-                                    lane_.dispatch_signal_offsets[bank],
-                                    timeline,
-                                    device_,
-                                    stream_);
-                                engine_.enqueueMappedTimelineWait64(
-                                    *lane_.mapped_region,
-                                    lane_.return_signal_offsets[bank],
-                                    timeline,
-                                    device_,
-                                    stream_);
-                            }
-                            else
-                            {
-                                engine_.enqueueMappedTimelineWait64(
-                                    *lane_.mapped_region,
-                                    lane_.dispatch_signal_offsets[bank],
-                                    timeline,
-                                    device_,
-                                    stream_);
-                                engine_.enqueueMappedTimelinePublish64(
-                                    *lane_.mapped_region,
-                                    lane_.return_signal_offsets[bank],
-                                    timeline,
-                                    device_,
-                                    stream_);
-                            }
-                        }
-                    }
-                    const std::size_t expected_nodes =
-                        recipe ==
-                                RetainedMappedGraphRecipe::AdmissionPublication
-                            ? 2u
-                            : 1u + 2u * stage_count;
-                    if (!graph_->endCapture() ||
-                        graph_->nodeCount() != expected_nodes ||
-                        !graph_->instantiate())
-                    {
-                        error_ =
-                            "mapped capture did not produce the exact retained executable";
-                        return false;
-                    }
-                }
-                catch (const std::exception &exception)
-                {
-                    error_ = exception.what();
-                    return false;
-                }
-                return true;
-            }
-
-            /** @brief Arm through the same CPU protocol used by the follower. */
-            bool armIfFollower()
-            {
-                if (world_rank_ != target_rank_)
-                    return true;
-                try
-                {
-                    const auto config = transport_->activationEpochConfig(
-                        kTargetParticipant, 0u);
-                    protocol_ = std::make_unique<
-                        MoEOverlayActivationEpochProtocol>(
-                        transport_->activationEpochControl(
-                            kTargetParticipant, 0u),
-                        config);
-                    const MoEOverlayInferenceTopologyIdentity topology{
-                        .workspace_generation = config.workspace_generation,
-                        .topology_fingerprint_low =
-                            config.topology_fingerprint_low,
-                        .topology_fingerprint_high =
-                            config.topology_fingerprint_high,
-                        .source_world_rank = source_rank_,
-                        .target_world_rank = target_rank_,
-                    };
-                    const MoEOverlayInferenceCommandIdentity command{
-                        .request_generation = 1u,
-                        .command_id = 1u,
-                        .initial_placement_epoch = kPlacementEpoch,
-                    };
-                    const auto ticket =
-                        makeMoEOverlayInferenceExecutionTicket(
-                            topology,
-                            command,
-                            /*transaction_ordinal=*/1u,
-                            /*logical_step_id=*/1u,
-                            kPlacementEpoch,
-                            MoEOverlayInferenceGraphRole::MainPrefill,
-                            /*request_count=*/1,
-                            /*logical_rows_per_request=*/1,
-                            /*physical_rows_per_request=*/1);
-                    const auto deadline =
-                        std::chrono::steady_clock::now() +
-                        std::chrono::seconds(10);
-                    const auto deadline_ns = static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            deadline.time_since_epoch())
-                            .count());
-                    identity_ = protocol_->arm(
-                        ticket,
-                        /*epoch_generation=*/1u,
-                        deadline_ns,
-                        &error_);
-                }
-                catch (const std::exception &exception)
-                {
-                    error_ = exception.what();
-                    return false;
-                }
-                return identity_.has_value();
-            }
-
-            /** @brief Submit the retained graph and its terminal event. */
-            bool launch()
-            {
-                return graph_ && graph_->launch() &&
-                       backend_->recordEvent(
-                           terminal_, device_.gpu_ordinal(), stream_);
-            }
-
-            /** @brief Observe only the exact endpoint terminal event. */
-            bool awaitTerminal()
-            {
-                const bool ready = awaitEvent(
-                    backend_,
-                    device_.gpu_ordinal(),
-                    terminal_,
-                    std::chrono::seconds(5));
-                if (!ready)
-                    error_ = "retained admission graph terminal timed out";
-                return ready;
-            }
-
-            /** @return Host-acquired source publication from either mapping. */
-            std::uint64_t dispatchTimeline(
-                std::uint32_t bank = 0u) const noexcept
-            {
-                return lane_.control_host &&
-                               bank < kMoEOverlayActivationBufferCount
-                           ? std::atomic_ref<std::uint64_t>(
-                                 lane_.control_host->buffers[bank]
-                                     .dispatch_signal.value)
-                                 .load(std::memory_order_acquire)
-                           : 0u;
-            }
-
-            /** @return Host-acquired follower publication from either mapping. */
-            std::uint64_t returnTimeline(
-                std::uint32_t bank = 0u) const noexcept
-            {
-                return lane_.control_host &&
-                               bank < kMoEOverlayActivationBufferCount
-                           ? std::atomic_ref<std::uint64_t>(
-                                 lane_.control_host->buffers[bank]
-                                     .return_signal.value)
-                                 .load(std::memory_order_acquire)
-                           : 0u;
-            }
-
-            /** @return Last rank-local diagnostic. */
-            const std::string &error() const noexcept { return error_; }
-
-        private:
-            /** @brief Release any outstanding mapped GEQ wait during teardown. */
-            void publishAbortFromHost() noexcept
-            {
-                if (!lane_.control_host)
-                    return;
-                std::atomic_ref<std::uint64_t>(
-                    lane_.control_host->admission.ready_signal)
-                    .store(
-                        kMoEOverlayActivationAbortTimeline,
-                        std::memory_order_release);
-                for (std::uint32_t bank = 0u;
-                     bank < kMoEOverlayActivationBufferCount;
-                     ++bank)
-                {
-                    std::atomic_ref<std::uint64_t>(
-                        lane_.control_host->buffers[bank]
-                            .dispatch_signal.value)
-                        .store(
-                            kMoEOverlayActivationAbortTimeline,
-                            std::memory_order_release);
-                    std::atomic_ref<std::uint64_t>(
-                        lane_.control_host->buffers[bank]
-                            .return_signal.value)
-                        .store(
-                            kMoEOverlayActivationAbortTimeline,
-                            std::memory_order_release);
-                }
-            }
-
-            int world_rank_ = -1;
-            int source_rank_ = -1;
-            int target_rank_ = -1;
-            DeviceId device_ = DeviceId::invalid();
-            IBackend *backend_ = nullptr;
-            TransferEngine engine_;
-            std::unique_ptr<MoEOverlayNodeLocalRankBatchTransport> transport_;
-            MoEOverlayMappedActivationDeviceLane lane_;
-            void *stream_ = nullptr;
-            void *terminal_ = nullptr;
-            std::unique_ptr<IGPUGraphCapture> graph_;
-            std::unique_ptr<MoEOverlayActivationEpochProtocol> protocol_;
-            std::optional<MoEOverlayActivationEpochIdentity> identity_;
-            std::string error_;
-        };
-
-        /** @brief Execute one topology direction with matched MPI checkpoints. */
-        bool runDirection(
-            int source_rank,
-            int target_rank,
-            DeviceId source_device,
-            DeviceId target_device,
-            const std::string &identity,
-            RetainedMappedGraphRecipe recipe =
-                RetainedMappedGraphRecipe::AdmissionPublication,
-            std::uint32_t stage_count = 0u)
-        {
-            int world_rank = -1;
-            int world_size = 0;
-            if (MPI_Comm_rank(MPI_COMM_WORLD, &world_rank) != MPI_SUCCESS ||
-                MPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS ||
-                world_size != 2)
-            {
-                return false;
-            }
-            const DeviceId local_device =
-                world_rank == source_rank ? source_device : target_device;
-            auto context = std::make_shared<MPIContext>(
-                world_rank, world_size, MPI_COMM_WORLD);
-            AdmissionEndpoint endpoint(
-                world_rank, source_rank, target_rank, local_device);
-
-            const bool transport_ok = endpoint.initializeTransport(
-                context, identity);
-            if (!allRanksSucceeded(transport_ok))
-            {
-                ADD_FAILURE() << "transport setup failed on rank "
-                              << world_rank << ": " << endpoint.error();
-                return false;
-            }
-
-            const bool capture_ok = endpoint.materializeGraph(
-                recipe, stage_count);
-            if (!allRanksSucceeded(capture_ok))
-            {
-                ADD_FAILURE() << "graph materialization failed on rank "
-                              << world_rank << ": " << endpoint.error();
-                return false;
-            }
-
-            const bool arm_ok = endpoint.armIfFollower();
-            if (!allRanksSucceeded(arm_ok))
-            {
-                ADD_FAILURE() << "admission arm failed on rank "
-                              << world_rank << ": " << endpoint.error();
-                return false;
-            }
-
-            const bool launch_ok = endpoint.launch();
-            if (!allRanksSucceeded(launch_ok))
-            {
-                ADD_FAILURE() << "graph launch failed on rank "
-                              << world_rank << ": " << endpoint.error();
-                return false;
-            }
-
-            const bool terminal_ok = endpoint.awaitTerminal();
-            if (!allRanksSucceeded(terminal_ok))
-            {
-                ADD_FAILURE() << "admission graph failed on rank "
-                              << world_rank << ": " << endpoint.error();
-                return false;
-            }
-
-            bool visible = true;
-            if (recipe ==
-                RetainedMappedGraphRecipe::AdmissionPublication)
-            {
-                visible =
-                    endpoint.dispatchTimeline() == kPublishedTimeline &&
-                    endpoint.returnTimeline() == kPublishedTimeline;
-            }
-            else
-            {
-                std::array<std::uint64_t,
-                           kMoEOverlayActivationBufferCount>
-                    expected{};
-                for (std::uint32_t stage = 0u;
-                     stage < stage_count;
-                     ++stage)
-                {
-                    expected[moeOverlayActivationBufferIndex(stage)] =
-                        moeOverlayActivationLeasedTimelineValue(
-                            moeOverlayActivationBufferVisit(stage));
-                }
-                for (std::uint32_t bank = 0u;
-                     bank < kMoEOverlayActivationBufferCount;
-                     ++bank)
-                {
-                    visible = visible &&
-                              endpoint.dispatchTimeline(bank) ==
-                                  expected[bank] &&
-                              endpoint.returnTimeline(bank) ==
-                                  expected[bank];
-                }
-            }
-            if (!allRanksSucceeded(visible))
-            {
-                ADD_FAILURE() << "cross-process mapped publications were not "
-                                 "visible on rank "
-                              << world_rank << " dispatch="
-                              << endpoint.dispatchTimeline() << " return="
-                              << endpoint.returnTimeline();
-                return false;
-            }
-            return true;
-        }
-    } // namespace
-
-    TEST(Test__MappedActivationAdmissionMPI,
-         FollowerHostArmReleasesCUDAAndROCmGraphsInBothRankDirections)
-    {
-        int world_rank = -1;
-        int world_size = 0;
-        ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank), MPI_SUCCESS);
-        ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &world_size), MPI_SUCCESS);
-        if (world_size != 2)
-            GTEST_SKIP() << "requires exactly two MPI ranks";
-
-        const bool forward_hardware =
-            world_rank == 0
-                ? backendFor(DeviceId::cuda(0)) &&
-                      backendFor(DeviceId::cuda(0))->deviceCount() >= 1
-                : backendFor(DeviceId::rocm(0)) &&
-                      backendFor(DeviceId::rocm(0))->deviceCount() >= 1;
-        if (!allRanksSucceeded(forward_hardware))
-            GTEST_SKIP() << "requires CUDA on rank 0 and ROCm on rank 1";
-
-        ASSERT_TRUE(runDirection(
-            /*source_rank=*/0,
-            /*target_rank=*/1,
-            DeviceId::cuda(0),
-            DeviceId::rocm(0),
-            "mapped_admission_mpi_cuda_source"));
-        ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
-        ASSERT_TRUE(runDirection(
-            /*source_rank=*/1,
-            /*target_rank=*/0,
-            DeviceId::rocm(0),
-            DeviceId::cuda(0),
-            "mapped_admission_mpi_rocm_source"));
+void OriginalAdmissionSuite::prepare(){
+    // Complete original topology before endpoint-only transport construction.
+    checkpoint([&]{requireAdmission(mpi_->topology()!=nullptr,"Original mapped admission topology is unavailable");});
+    const auto devices=cohorts_.localDevices(mpi_->rank());
+    checkpoint([&]{if(!devices.empty()){
+        requireAdmission(devices.size()==1,"Admission recipe requires exactly its declared local endpoint");local_=devices.front();
+        original_=PreparedNativeLookupFixture::prepare(devices,mpi_->rank());worker_=original_->permit(local_).worker();stream_=worker_->defaultStream();
+    }});
+    for(std::size_t index=0;index<frames_.size();++index){auto& frame=frames_[index];const auto& binding=frame.cohorts;
+        std::uint64_t generation=mpi_->rank()==binding.sourceRank()?original_->permit(local_).generation():0;
+        std::uint32_t process=mpi_->rank()==binding.sourceRank()?std::uint32_t(::getpid()):0;
+        std::array<std::int32_t,3> original_identity{std::bit_cast<std::int32_t>(std::uint32_t(generation)),
+            std::bit_cast<std::int32_t>(std::uint32_t(generation>>32)),std::bit_cast<std::int32_t>(process)};
+        mpi_->broadcast_int32(original_identity.data(),original_identity.size(),binding.sourceRank());
+        generation=std::bit_cast<std::uint32_t>(original_identity[0])|(std::uint64_t(std::bit_cast<std::uint32_t>(original_identity[1]))<<32);
+        process=std::bit_cast<std::uint32_t>(original_identity[2]);
+        auto& config=frame.config;config.mpi_ctx=mpi_;config.source_world_rank=binding.sourceRank();config.target_world_rank=binding.peerRank();
+        config.workspace=std::make_shared<MoEOverlayRankBatchWireWorkspace>(MoEOverlayRankBatchWireWorkspace::Config{
+            .participant_ids={target_participant},.max_total_rows=1,.max_total_entries=topk,.d_model=width,.top_k=topk});
+        config.max_rows_per_participant=1;config.max_entries_per_participant=topk;config.d_model=width;config.top_k=topk;
+        config.tier_index=1;config.domain_ordinal=9;config.channel_identity="original_mapped_admission_"+std::to_string(process)+"_"+std::to_string(index);
+        config.transaction_slot_count=8;config.transaction_topology={.workspace_generation=generation,
+            .topology_fingerprint_low=0x6d6170706564+index,.topology_fingerprint_high=0x61646d697373,
+            .source_world_rank=binding.sourceRank(),.target_world_rank=binding.peerRank()};
+        config.source_endpoint={.world_rank=binding.sourceRank(),.participant_id=source_participant,.tier_priority=0,.domain_ordinal=4};
+        config.target_tier_priority=1;
+        std::vector<std::int32_t> layers(frame.recipe==AdmissionRecipe::Publication?1:retained_stages);std::iota(layers.begin(),layers.end(),5);
+        config.activation_graph_families={{.graph_role_mask=1u<<unsigned(MoEOverlayInferenceGraphRole::MainPrefill),.model_layer_indices=std::move(layers)}};
+        config.activation_layout=planMoEOverlayNodeLocalActivationLayout({.participant_count=1,.max_rows_per_participant=1,
+            .max_entries_per_participant=topk,.d_model=width,.activation_graph_family_count=1});
+        if(!devices.empty())config.local_lanes={{.participant_id=target_participant,.device=local_}};
     }
+    checkpoint([&]{if(original_){
+        const auto host=original_->resource(DeviceId::cpu()),gpu=original_->resource(local_);PhysicalMemoryPlanBuilder bill;
+        const auto add=[&](const PhysicalMemoryPlan& part){for(const auto& row:part.resources())bill.add(row);};
+        add(RetainedParticipantGraphExecutable::generalBOM(host,gpu,frames_.size()));
+        add(MoEOverlayActivationBatchResources::coldPublicationBOM(host,gpu));
+        for(const auto& frame:frames_){const auto& config=frame.config;const auto& layout=config.activation_layout;
+            bill.add(host,PhysicalMemoryOwner::ActivationTransportStaging,
+                (mpi_->rank()==config.source_world_rank?layout.sourceOwnedBytes():layout.targetOwnedBytes())+
+                MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes());
+            bill.add(gpu,PhysicalMemoryOwner::ActivationTransportStaging,MoEOverlayActivationBatchResources::grantGPUBytes());
+        }
+        original_->admit(bill.build());admitted_=true;
+    }});
+    // Each actor creates only its original local endpoint; native registration
+    // enters the ordinary real rank-pair startup protocol on this communicator.
+    checkpoint([&]{if(original_)for(auto& frame:frames_){frame.config.physical_memory_authority=original_->memory();
+        frame.transport=std::make_shared<MoEOverlayNodeLocalRankBatchTransport>(frame.config);
+        frame.lane=frame.transport->activationDeviceLane(target_participant,0,local_);
+        requireAdmission(frame.lane.valid(),"Original mapped admission endpoint has no actual grant");
+        frame.protocol=std::make_unique<MoEOverlayActivationEpochProtocol>(frame.transport->activationEpochControl(target_participant,0),frame.transport->activationEpochConfig(target_participant,0));
+        frame.graph=Graph::original(original_->permit(local_),stream_);
+        worker_->submitAndWait([&]{auto& graph=Graph::capture(frame.graph);ScopedBackendGraphCapture recording(*worker_,graph,"original mapped admission metadata parent",nullptr);
+            requireAdmission(recording.begin(),"Original admission native capture failed");auto& transfer=TransferEngine::instance();
+            transfer.enqueueMappedTimelineWait64(*frame.lane.mapped_region,frame.lane.admission_signal_offset,kMoEOverlayActivationAdmissionTimeline,local_,stream_);
+            const bool source=mpi_->rank()==frame.cohorts.sourceRank();
+            if(frame.recipe==AdmissionRecipe::Publication)transfer.enqueueMappedTimelinePublish64(*frame.lane.mapped_region,
+                source?frame.lane.dispatch_signal_offsets[0]:frame.lane.return_signal_offsets[0],publication,local_,stream_);
+            else for(std::uint32_t stage=0;stage<retained_stages;++stage){const auto bank=moeOverlayActivationBufferIndex(stage);
+                const auto value=moeOverlayActivationLeasedTimelineValue(moeOverlayActivationBufferVisit(stage));
+                if(source){transfer.enqueueMappedTimelinePublish64(*frame.lane.mapped_region,frame.lane.dispatch_signal_offsets[bank],value,local_,stream_);
+                    transfer.enqueueMappedTimelineWait64(*frame.lane.mapped_region,frame.lane.return_signal_offsets[bank],value,local_,stream_);}
+                else{transfer.enqueueMappedTimelineWait64(*frame.lane.mapped_region,frame.lane.dispatch_signal_offsets[bank],value,local_,stream_);
+                    transfer.enqueueMappedTimelinePublish64(*frame.lane.mapped_region,frame.lane.return_signal_offsets[bank],value,local_,stream_);}}
+            recording.finish();requireAdmission(graph.nodeCount()==(frame.recipe==AdmissionRecipe::Publication?2u:1u+2u*retained_stages),"Original admission parent changed its exact native node population");
+            requireAdmission(graph.prepareRuntimeContextStorage(original_->memory()) && graph.instantiate(),"Original admission parent instantiation failed");
+        });
+    }});
+}
 
-    /**
-     * @test Two process-local mappings sustain a full retained MoE timeline.
-     */
-    TEST(Test__MappedActivationAdmissionMPI,
-         FortyEightStageRetainedRoundTripCompletesInBothRankDirections)
-    {
-        int world_rank = -1;
-        int world_size = 0;
-        ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank), MPI_SUCCESS);
-        ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &world_size), MPI_SUCCESS);
-        if (world_size != 2)
-            GTEST_SKIP() << "requires exactly two MPI ranks";
-
-        const bool forward_hardware =
-            world_rank == 0
-                ? backendFor(DeviceId::cuda(0)) &&
-                      backendFor(DeviceId::cuda(0))->deviceCount() >= 1
-                : backendFor(DeviceId::rocm(0)) &&
-                      backendFor(DeviceId::rocm(0))->deviceCount() >= 1;
-        if (!allRanksSucceeded(forward_hardware))
-            GTEST_SKIP() << "requires CUDA on rank 0 and ROCm on rank 1";
-
-        ASSERT_TRUE(runDirection(
-            /*source_rank=*/0,
-            /*target_rank=*/1,
-            DeviceId::cuda(0),
-            DeviceId::rocm(0),
-            "mapped_round_trip_mpi_cuda_source",
-            RetainedMappedGraphRecipe::AlternatingBankRoundTrip,
-            kRetainedMoEStageCount));
-        ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
-        ASSERT_TRUE(runDirection(
-            /*source_rank=*/1,
-            /*target_rank=*/0,
-            DeviceId::rocm(0),
-            DeviceId::cuda(0),
-            "mapped_round_trip_mpi_rocm_source",
-            RetainedMappedGraphRecipe::AlternatingBankRoundTrip,
-            kRetainedMoEStageCount));
+void OriginalAdmissionSuite::run(AdmissionRecipe recipe){
+    for(auto& frame:frames_)if(frame.recipe==recipe){
+        checkpoint([&]{if(original_ && mpi_->rank()==frame.cohorts.peerRank()){
+            const MoEOverlayInferenceCommandIdentity command{.request_generation=1,.command_id=1,.initial_placement_epoch=41};
+            const auto ticket=makeMoEOverlayInferenceExecutionTicket(frame.config.transaction_topology,command,1,1,41,MoEOverlayInferenceGraphRole::MainPrefill,1,1,1);
+            std::string error;frame.identity=frame.protocol->arm(ticket,1,30'000'000'000ULL,&error);requireAdmission(bool(frame.identity),error.c_str());
+        }});
+        checkpoint([&]{if(original_)worker_->submitAndWait([&]{frame.pending=true;frame.submitted=true;requireAdmission(Graph::submit(frame.graph,1),"Original admission parent launch failed");});});
+        checkpoint([&]{if(original_){await();requireAdmission(Graph::observeTerminal(frame.graph),"Original admission parent lacks actual terminal evidence");frame.pending=false;
+            std::array<std::uint64_t,kMoEOverlayActivationBufferCount> expected{};
+            if(recipe==AdmissionRecipe::Publication)expected[0]=publication;
+            else for(std::uint32_t stage=0;stage<retained_stages;++stage)expected[moeOverlayActivationBufferIndex(stage)]=moeOverlayActivationLeasedTimelineValue(moeOverlayActivationBufferVisit(stage));
+            auto& control=*frame.lane.control_host;
+            for(std::size_t bank=0;bank<expected.size();++bank){
+                requireAdmission(std::atomic_ref<std::uint64_t>(control.buffers[bank].dispatch_signal.value).load(std::memory_order_acquire)==expected[bank],"Original cross-process dispatch timeline differs");
+                requireAdmission(std::atomic_ref<std::uint64_t>(control.buffers[bank].return_signal.value).load(std::memory_order_acquire)==expected[bank],"Original cross-process return timeline differs");}
+        }});
     }
+}
+
+void OriginalAdmissionSuite::abortPending()noexcept{
+    for(auto& frame:frames_)if(frame.pending && frame.lane.control_host){auto& control=*frame.lane.control_host;
+        for(auto& bank:control.buffers){std::atomic_ref<std::uint64_t>(bank.dispatch_signal.value).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);
+            std::atomic_ref<std::uint64_t>(bank.return_signal.value).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);}
+        std::atomic_ref<std::uint64_t>(control.admission.ready_signal).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);}
+}
+void OriginalAdmissionSuite::dispose(){
+    if(disposed_)return;abortPending();await();
+    for(auto& frame:frames_)if(frame.graph && frame.submitted)requireAdmission(Graph::observeTerminal(frame.graph),"Original admission final retirement lacks native terminal");
+    for(auto& frame:frames_){frame.graph.reset();frame.identity.reset();frame.protocol.reset();frame.lane={};frame.transport.reset();frame.config.physical_memory_authority.reset();}
+    worker_.reset();if(original_){if(admitted_)original_->requirePayloadRetired();original_->retire();original_->requireExactRetired();original_.reset();}
+    disposed_=true;
+}
+} // namespace
+
+/** One admitted original source owns both existing test bodies and all four native frames. */
+class Test__MappedActivationAdmissionMPI:public ::testing::Test {
+protected:
+    /** Prepare one complete source family per original process, never an independent per-test adopter. */
+    static void SetUpTestSuite(){source=std::make_unique<OriginalAdmissionSuite>();source->prepare();}
+    /** Every native/PMA owner leaves scope before the original MPI main retires the session. */
+    static void TearDownTestSuite(){source.reset();}
+    static inline std::unique_ptr<OriginalAdmissionSuite> source;
+};
+TEST_F(Test__MappedActivationAdmissionMPI,FollowerHostArmReleasesCUDAAndROCmGraphsInBothRankDirections){source->run(AdmissionRecipe::Publication);}
+TEST_F(Test__MappedActivationAdmissionMPI,FortyEightStageRetainedRoundTripCompletesInBothRankDirections){source->run(AdmissionRecipe::AlternatingBanks);}
 } // namespace llaminar2::test

@@ -25,7 +25,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <mutex>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -82,6 +84,7 @@ namespace llaminar2
         ExternalForward,     ///< One external auxiliary forward owns it.
         HostedChildForward,  ///< A child temporarily borrows its hosted parent.
         ReleasePublished,    ///< The immutable release event is consumable.
+        CapturedHostedParent, ///< A complete hosted follower graph owns both reader boundaries.
     };
 
     /**
@@ -219,6 +222,7 @@ namespace llaminar2
         case State::ExternalReader:
         case State::ExternalSequence:
         case State::HostedParent:
+        case State::CapturedHostedParent:
         case State::CapturedMainForward:
         case State::ExternalForward:
         case State::HostedChildForward:
@@ -254,6 +258,7 @@ namespace llaminar2
             return Action::RejectMissingBoundary;
         case State::ExternalSequence:
         case State::HostedParent:
+        case State::CapturedHostedParent:
         case State::CapturedMainForward:
         case State::ExternalForward:
         case State::HostedChildForward:
@@ -343,7 +348,8 @@ namespace llaminar2
                 MoEOverlayEpochLeaseState desired) noexcept
             {
                 /* A release state without its stream receipt is incomplete. */
-                if (desired == MoEOverlayEpochLeaseState::ReleasePublished)
+                if (desired == MoEOverlayEpochLeaseState::ReleasePublished ||
+                    desired == MoEOverlayEpochLeaseState::CapturedHostedParent)
                     return false;
                 return commitImpl(desired, nullptr);
             }
@@ -362,7 +368,7 @@ namespace llaminar2
             [[nodiscard]] bool publishRelease(
                 void *producer_stream) noexcept
             {
-                if (!producer_stream)
+                if (!producer_stream || initial_state_ == MoEOverlayEpochLeaseState::CapturedHostedParent)
                     return false;
                 return commitImpl(
                     MoEOverlayEpochLeaseState::ReleasePublished,
@@ -393,6 +399,7 @@ namespace llaminar2
                     return to == State::ExternalReader ||
                            to == State::ExternalSequence ||
                            to == State::HostedParent ||
+                           to == State::CapturedHostedParent ||
                            to == State::CapturedMainForward ||
                            to == State::ExternalForward ||
                            (from == State::ReleasePublished &&
@@ -407,6 +414,7 @@ namespace llaminar2
                     return to == State::HostedChildForward ||
                            to == State::ReleasePublished;
                 case State::CapturedMainForward:
+                case State::CapturedHostedParent:
                 case State::ExternalForward:
                     return to == State::ReleasePublished;
                 case State::HostedChildForward:
@@ -476,6 +484,53 @@ namespace llaminar2
         [[nodiscard]] Submission beginSubmission() noexcept
         {
             return Submission(*this);
+        }
+
+        /**
+         * @brief Submit the retained follower parent containing both device reader boundaries.
+         * @param stream Exact non-default native stream used for the predecessor wait, graph and terminal event.
+         * @param wait_release Enqueue the preceding released-event wait on stream, returning success.
+         * @param launch Enqueue the complete retained parent on stream, returning success.
+         * @param record_release Record the released event on stream, returning success.
+         * @return False if no claim can be made or the predecessor wait cannot be enqueued.
+         * @throws std::runtime_error If the complete graph launch fails after admission.
+         *
+         * The first submission claims the complete parent after joining any previous
+         * release. The claim prevents other owners from submitting a child or release
+         * while the mutex is dropped for the native launch and event record. A second
+         * submission publishes the new event exactly once. Failure to record or publish
+         * a terminal event after launch is fatal before the claim can be retired.
+         */
+        template<class WaitRelease, class Launch, class RecordRelease>
+        [[nodiscard]] bool submitCompleteCapturedHostedParent(void* stream,
+            WaitRelease&& wait_release, Launch&& launch, RecordRelease&& record_release)
+        {
+            using State = MoEOverlayEpochLeaseState;
+            if (reinterpret_cast<std::uintptr_t>(stream) <= 2)
+                return false;
+            {
+                auto claim = beginSubmission();
+                const auto before = claim.state();
+                if (before != State::Idle && before != State::ReleasePublished)
+                    return false;
+                if (before == State::ReleasePublished &&
+                    (!claim.publishedReleaseProducerStream() || !wait_release(stream)))
+                    return false;
+                if (!claim.commitImpl(State::CapturedHostedParent, nullptr))
+                    return false;
+            }
+
+            if (!launch(stream))
+                throw std::runtime_error("Original follower complete parent failed after epoch ownership admission");
+            const auto record = [&]() noexcept { return record_release(stream); };
+            if (!record())
+                std::terminate();
+
+            auto release = beginSubmission();
+            if (release.state() != State::CapturedHostedParent ||
+                !release.commitImpl(State::ReleasePublished, stream))
+                std::terminate();
+            return true;
         }
 
     private:

@@ -720,11 +720,11 @@ inline OrchestrationConfig canonicalQwen4ExpSourceAdmissionConfig(
 inline void requireQwen4ExpSourceExecutionPlan(const ModelParityCase &cell, int rank,
     const OrchestrationConfig &authored, const RankExecutionPlan &actual, const HardwareInventory &hardware)
 {
-    if (rank < 0 || rank >= cell.topology.mpi_ranks || actual.rank != rank)
+    if (rank < 0 || rank >= cell.topology.executionRankCount() || actual.rank != rank)
         throw std::invalid_argument("QFN source admission plan changed owning rank");
     const auto cpu_joint_members = qwen4ExpCPUJointSocketMembers(cell);
     const bool cpu_joint = !cpu_joint_members.empty();
-    if (cell.topology.mpi_ranks != 1 && !cpu_joint)
+    if (cell.topology.executionRankCount() != 1 && !cpu_joint)
         throw std::invalid_argument("QFN gold-free plan proof requires a reviewed rank-local topology");
     const auto expected = canonicalQwen4ExpSourceAdmissionConfig(authored, rank);
     const auto domains = expected.executionDomainDefinitions();

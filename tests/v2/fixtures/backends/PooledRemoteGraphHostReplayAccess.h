@@ -27,6 +27,16 @@ struct PooledRemoteGraphHostReplayAccess final {
         return slots.acquire(identity,original,stream,program);
 #endif
     }
+    /** @brief Actual native-General source-slot acquisition; no installed flat selection is fabricated. */
+    static auto acquireNativeSlots(RetainedParticipantGraphSourceSlots& slots,std::uint64_t identity,
+        const PreparedGPUContextUsePermit& original,const PooledNativeOwnerGraphProgram& program,void* stream=nullptr){
+        return slots.acquire(identity,original,stream?stream:original.worker()->defaultStream(),PooledStorageOwnerProgram(program));
+    }
+    /** @brief Release the same native-General slot only after its original terminal proof. */
+    static void releaseNativeSlots(RetainedParticipantGraphSourceSlots& slots,std::uint64_t identity,
+        const PooledNativeOwnerGraphProgram& program,const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){
+        slots.release(identity,PooledStorageOwnerProgram(program),owner);
+    }
     /** @brief Original old-code control retains its original retirement path and ProcessRuntime obligations. */
     static void releaseSlots(RetainedParticipantGraphSourceSlots& slots,std::uint64_t identity,
         const PooledRemoteGraphProgram& program,const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){

@@ -88,6 +88,8 @@ def audit(manifest: Path, reports: list[Path]) -> dict:
                     or not any(name.startswith("V2_Unit_") for name in tests)
                     or not any(name.startswith("V2_Integration_") for name in tests)):
                 raise ValueError("passing acquisition lacks its successful shared Unit/preflight receipt")
+            from production_artifacts import validate_preflight_qualification
+            validate_preflight_qualification(tests, report.get("preflight_qualification"))
             artifact = row.get("artifacts")
             if not isinstance(artifact, str) or not Path(artifact).is_absolute():
                 raise ValueError("acquisition omitted its original absolute artifact directory")

@@ -62,11 +62,15 @@ namespace llaminar2
         {
         case MoEOverlayInferenceGraphRole::MainPrefill:
             return MoEOverlayServicePhaseHint::Prefill;
+        case MoEOverlayInferenceGraphRole::OrdinaryForwardOnly:
         case MoEOverlayInferenceGraphRole::MainDecode:
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
             return MoEOverlayServicePhaseHint::Decode;
         case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
         case MoEOverlayInferenceGraphRole::MTPDraft:
             return MoEOverlayServicePhaseHint::GroupedVerifier;
+        case MoEOverlayInferenceGraphRole::GenerationAdmission:
         case MoEOverlayInferenceGraphRole::None:
             return MoEOverlayServicePhaseHint::Auto;
         }

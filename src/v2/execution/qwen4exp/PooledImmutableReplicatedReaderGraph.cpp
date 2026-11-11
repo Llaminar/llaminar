@@ -2,8 +2,8 @@
  * @file PooledImmutableReplicatedReaderGraph.cpp
  * @brief Participant-local compact result/ACK graph nodes around the original pooled source.
  *
- * No foreign query IDs or CPU source frames are created. Existing captured
- * channel epochs authenticate each message; the result header borrows the
+ * No foreign query IDs or CPU source frames are created. Original native
+ * completion receipts authenticate each payload and fixed-header abort authority; the result header borrows the
  * source frame's actual interval and each reader checks its own live count.
  */
 #include "PooledImmutableReplicatedReaderGraph.h"
@@ -28,23 +28,9 @@ using Wire = rr::Wire;
 std::uint64_t messageKey(Wire wire, const q::PooledImmutableReplicatedReaderTransport& reader,
     DeviceRowRange rows, std::uint32_t elements)
 {
-    std::uint64_t value = 0x51464e5245414445ULL;
-    const auto mix = [&](std::uint64_t word) { value = (value ^ word) * 1099511628211ULL; };
-    if (reader.nativeCollective()) {
-        // Same logical operation across exclusive bucket graphs. Every actual
-        // stage still seals full shape/count/root identity and Header/receipt.
-        return rr::nativeMessageKey(wire, {reader.coordinate(),
-            static_cast<std::uint32_t>(reader.nativeResult().nativeStorage()->cohort()->degree()),
-            static_cast<std::uint32_t>(rows.physicalRows()), elements}, q::pooled_native::Version);
-    } else {
-        const auto shape = rows.captureIdentity();
-        for (const auto word : {static_cast<std::uint64_t>(wire), std::uint64_t{reader.coordinate()},
-                static_cast<std::uint64_t>(shape.count != nullptr), static_cast<std::uint64_t>(shape.count_capacity),
-                static_cast<std::uint64_t>(shape.first_physical_row), static_cast<std::uint64_t>(shape.physical_rows),
-                static_cast<std::uint64_t>(shape.repeats_per_row), static_cast<std::uint64_t>(shape.schema_version),
-                std::uint64_t{elements}, std::uint64_t{q::pooled_native::Version}}) mix(word);
-    }
-    return value ? value : 1;
+    return rr::nativeMessageKey(wire,{reader.coordinate(),
+        reader.consumerCount(),
+        static_cast<std::uint32_t>(rows.physicalRows()),elements},q::pooled_native::Version);
 }
 /** @brief Fold every original immutable row-count producer coordinate into capture identity. */
 void mixRows(std::uint64_t& value, DeviceRowRange rows)
@@ -126,7 +112,7 @@ public:
         const bool sourceAction = action_ == rr::Action::PrepareResultHeader ||
             action_ == rr::Action::PrepareResult || action_ == rr::Action::ConfirmAck;
         if (sourceAction != source_ || (action_ == rr::Action::AcknowledgeResult ||
-            (action_ == rr::Action::ConfirmAck && reader_->nativeCollective())) != bool(payload_))
+            (action_ == rr::Action::ConfirmAck)) != bool(payload_))
             throw std::invalid_argument("Shared PLE reader phase changed its actual source/reader role");
         identity_ = graphCaptureVariantSignature();
     }
@@ -169,13 +155,12 @@ public:
             q::pooled_native::Version, transport_->sourceBoundary()->pooledStorage()->coordinator()->plan().parameters().table, rows_, frame, &bank->incoming, &bank->outgoing,
             action_ == rr::Action::AcknowledgeResult ? &bank->payload_bytes : &bank->header_bytes,
             &bank->output_bytes, control_.healthy(), control_.error(),
-            action_ == rr::Action::AcknowledgeResult && !reader_->nativeCollective() ? payloadCompletion(execution.nativeStream())
-                : CapturedTransferReceiveCompletion::notRequired(),
-            (action_ == rr::Action::AcknowledgeResult || action_ == rr::Action::ConfirmAck) && reader_->nativeCollective() ?
+            CapturedTransferReceiveCompletion::notRequired(),
+            (action_ == rr::Action::AcknowledgeResult || action_ == rr::Action::ConfirmAck) ?
                 nativePayloadCompletion() : NativeReceiveCompletionView::notRequired(),
-            (action_ == rr::Action::AcceptResultHeader || action_ == rr::Action::ConfirmAck) && reader_->nativeCollective() ?
+            (action_ == rr::Action::AcceptResultHeader || action_ == rr::Action::ConfirmAck) ?
                 nativeFixedHeaderAuthority() : ncclLlaminarCompletionAuthority{},
-            reader_->nativeCollective() ? messageKey(Wire::Payload, *reader_, rows_, geometry.rowElements()) : 0};
+            messageKey(Wire::Payload,*reader_,rows_,geometry.rowElements())};
         if (device().is_cuda()) {
 #if defined(HAVE_CUDA)
             rr::enqueueCUDAPooledReplicatedReader(action_, args, execution.nativeStream());
@@ -206,17 +191,16 @@ public:
     std::uint64_t graphCaptureVariantSignature() const override
     {
         prepared_.validateIfSealed();
-        std::uint64_t value = reader_->nativeCollective() ?
-            reinterpret_cast<std::uintptr_t>(reader_->nativeResult().nativeStorage().get()) : reader_->result()->identity().nonce;
+        std::uint64_t value = reinterpret_cast<std::uintptr_t>(reader_->nativeResult().nativeStorage().get());
         const auto mix = [&](std::uint64_t word) { value = (value ^ word) * 1099511628211ULL; };
-        if (!reader_->nativeCollective()) mix(reader_->acknowledgement()->identity().nonce);
+
         mix(reader_->nativeCollective());
-        if (reader_->nativeCollective()) {
-            const auto& original = reader_->nativeResult().nativeStorage();
-            const auto authority = original->authority(device()).binding();
-            mix(reinterpret_cast<std::uintptr_t>(authority.abortFlag));
-            mix(reinterpret_cast<std::uintptr_t>(authority.deviceCommunicator));
-        }
+
+        const auto& original = reader_->nativeResult().nativeStorage();
+        const auto authority = original->authority(device()).binding();
+        mix(reinterpret_cast<std::uintptr_t>(authority.abortFlag));
+        mix(reinterpret_cast<std::uintptr_t>(authority.deviceCommunicator));
+
         mix(reinterpret_cast<std::uintptr_t>(transport_.get()));
         mix(reinterpret_cast<std::uintptr_t>(output_.root.get()));
         mix(output_.offset); mix(output_.bytes); mix(static_cast<std::uint64_t>(output_.buffer));
@@ -286,8 +270,6 @@ private:
     rr::Action action_;
     bool source_;
     const ReaderTransfer* payload_;
-    /** @return Read-only original payload endpoint receipt; no GPU state is read by this host method. */
-    CapturedTransferReceiveCompletion payloadCompletion(void* stream) const;
     /** @return Actual local payload receipt after its explicit whole-launch graph dependency. */
     NativeReceiveCompletionView nativePayloadCompletion() const;
     /** @return Original fixed native authority; never infers delivery from a stale byte word. */
@@ -326,41 +308,29 @@ public:
         if (!binding_) {
             const bool source = device() == reader_->originalSource().device();
             const auto& bank = reader_->control(source ? CapturedTransferEndpoint::Producer : CapturedTransferEndpoint::Consumer);
-            const auto& channel = wire_ == Wire::Ack ? reader_->acknowledgement() : reader_->result();
             const auto key = messageKey(wire_, *reader_, rows_, transport_->readerGeometry()->rowElements());
-            auto& transfer = TransferEngine::instance();
-            if (reader_->nativeCollective()) {
-                const auto& channel = wire_ == Wire::Ack ? reader_->nativeAcknowledgement() : reader_->nativeResult();
-                if (wire_ == Wire::Payload) {
-                    auto fixed = channel.bind(side_, {key, output_.bytes}, output_.root, output_.offset);
-                    const auto intervalOffset = (source ? offsetof(rr::Control, outgoing) : offsetof(rr::Control, incoming)) +
-                        offsetof(rr::Header, interval);
-                    auto errorOwner = arena_->getSharedTensor(BufferId::MTP_GENERATION_CONTROL);
-                    const auto base = reinterpret_cast<std::uintptr_t>(errorOwner->gpu_data_ptr());
-                    const auto error = reinterpret_cast<std::uintptr_t>(control_.error());
-                    if (error < base) throw std::logic_error("Native reader error changed its original controller root");
-                    q::PooledNativeCompletionFrame frame{
-                        q::PooledNativeTransferSpan(bank, intervalOffset, sizeof(q::adaptive_lookup::pooled::Interval)),
-                        q::PooledNativeTransferSpan(errorOwner, error - base, sizeof(std::int32_t)),
-                        static_cast<std::int32_t>(sampling_math::DeviceGenerationError::ImmutableStorageFailure)};
-                    binding_.emplace(fixed.withNativeCounted(q::PooledNativeTransferSpan(bank,
-                        source ? offsetof(rr::Control, output_bytes) : offsetof(rr::Control, payload_bytes),
-                        sizeof(std::uint64_t)), q::PooledNativeCountedMessage::ReaderResult, std::move(frame)));
-                } else {
-                    binding_.emplace(channel.bind(side_, {key, sizeof(rr::Header)}, bank,
-                        side_ == CapturedTransferEndpoint::Producer ? offsetof(rr::Control, outgoing) : offsetof(rr::Control, incoming)));
-                }
-            } else if (wire_ == Wire::Payload) {
-                binding_.emplace(transfer.bindDeviceCountedTransfer(transfer.bindCapturedTransfer(channel,
-                    side_, {key, output_.bytes}, std::static_pointer_cast<ITensor>(output_.root), output_.offset),
-                    bank, source ? offsetof(rr::Control, output_bytes) : offsetof(rr::Control, payload_bytes)));
+
+            const auto& channel = wire_ == Wire::Ack ? reader_->nativeAcknowledgement() : reader_->nativeResult();
+            if (wire_ == Wire::Payload) {
+                auto fixed = channel.bind(side_, {key, output_.bytes}, output_.root, output_.offset);
+                const auto intervalOffset = (source ? offsetof(rr::Control, outgoing) : offsetof(rr::Control, incoming)) +
+                    offsetof(rr::Header, interval);
+                auto errorOwner = arena_->getSharedTensor(BufferId::MTP_GENERATION_CONTROL);
+                const auto base = reinterpret_cast<std::uintptr_t>(errorOwner->gpu_data_ptr());
+                const auto error = reinterpret_cast<std::uintptr_t>(control_.error());
+                if (error < base) throw std::logic_error("Native reader error changed its original controller root");
+                q::PooledNativeCompletionFrame frame{
+                    q::PooledNativeTransferSpan(bank, intervalOffset, sizeof(q::adaptive_lookup::pooled::Interval)),
+                    q::PooledNativeTransferSpan(errorOwner, error - base, sizeof(std::int32_t)),
+                    static_cast<std::int32_t>(sampling_math::DeviceGenerationError::ImmutableStorageFailure)};
+                binding_.emplace(fixed.withNativeCounted(q::PooledNativeTransferSpan(bank,
+                    source ? offsetof(rr::Control, output_bytes) : offsetof(rr::Control, payload_bytes),
+                    sizeof(std::uint64_t)), q::PooledNativeCountedMessage::ReaderResult, std::move(frame)));
             } else {
-                auto fixed = transfer.bindCapturedTransfer(channel, side_, {key, sizeof(rr::Header)}, bank,
-                    side_ == CapturedTransferEndpoint::Producer ? offsetof(rr::Control, outgoing) : offsetof(rr::Control, incoming));
-                if (side_ == CapturedTransferEndpoint::Consumer)
-                    fixed = transfer.bindDeviceCountedTransfer(std::move(fixed), bank, offsetof(rr::Control, header_bytes));
-                binding_.emplace(std::move(fixed));
+                binding_.emplace(channel.bind(side_, {key, sizeof(rr::Header)}, bank,
+                    side_ == CapturedTransferEndpoint::Producer ? offsetof(rr::Control, outgoing) : offsetof(rr::Control, incoming)));
             }
+
         }
         binding_->prepare(stream);
         setGPUStream(stream);
@@ -388,8 +358,7 @@ public:
     ComputeStageType type() const override { return ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER; }
     /** @return An actual native endpoint, independent of NCCL/RCCL collective capture eligibility. */
     CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority() const noexcept override
-    { return reader_->nativeCollective() ? CollectiveGraphCaptureAuthority::RuntimeBackend :
-        CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer; }
+    { return CollectiveGraphCaptureAuthority::RuntimeBackend; }
     std::string name() const override { return "PooledImmutableReplicatedReaderTransfer"; }
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override { return GraphLaunchPreparationPolicy::CaptureOnly; }
     bool supportsPaddedPrefillRealLengthContract() const override { return true; }
@@ -400,17 +369,16 @@ public:
     std::uint64_t graphCaptureVariantSignature() const override
     {
         prepared_.validateIfSealed();
-        std::uint64_t value = reader_->nativeCollective() ?
-            reinterpret_cast<std::uintptr_t>(reader_->nativeResult().nativeStorage().get()) : reader_->result()->identity().nonce;
+        std::uint64_t value = reinterpret_cast<std::uintptr_t>(reader_->nativeResult().nativeStorage().get());
         const auto mix = [&](std::uint64_t word) { value = (value ^ word) * 1099511628211ULL; };
-        if (!reader_->nativeCollective()) mix(reader_->acknowledgement()->identity().nonce);
+
         mix(reader_->nativeCollective());
-        if (reader_->nativeCollective()) {
-            const auto& original = reader_->nativeResult().nativeStorage();
-            const auto authority = original->authority(device()).binding();
-            mix(reinterpret_cast<std::uintptr_t>(authority.abortFlag));
-            mix(reinterpret_cast<std::uintptr_t>(authority.deviceCommunicator));
-        }
+
+        const auto& original = reader_->nativeResult().nativeStorage();
+        const auto authority = original->authority(device()).binding();
+        mix(reinterpret_cast<std::uintptr_t>(authority.abortFlag));
+        mix(reinterpret_cast<std::uintptr_t>(authority.deviceCommunicator));
+
         mix(reinterpret_cast<std::uintptr_t>(output_.root.get()));
         mix(output_.offset); mix(output_.bytes); mix(static_cast<std::uint64_t>(output_.buffer));
         mix(control_.captureIdentity()); mixRows(value, rows_);
@@ -419,19 +387,11 @@ public:
         mix(static_cast<std::uint64_t>(wire_)); mix(static_cast<std::uint64_t>(side_));
         return value ? value : 1;
     }
-    /** @return Original consumer receipt addresses after ordinary preparation, without enqueuing or reading state. */
-    CapturedTransferReceiveCompletion completion(void* stream) const
-    {
-        if (wire_ != Wire::Payload || side_ != CapturedTransferEndpoint::Consumer || !binding_)
-            throw std::logic_error("Shared PLE ACK requires its original prepared payload consumer");
-        requireDeclarations(*arena_, *transport_, *reader_, device(), control_, rows_, output_, count_);
-        prepared_.validate();
-        return binding_->mappedCompletion(stream);
-    }
+
     /** @return Same original native local receipt for an explicit dependent ACK/confirm phase. */
     NativeReceiveCompletionView nativeCompletion() const
     {
-        if (wire_ != Wire::Payload || !binding_ || !reader_->nativeCollective())
+        if (wire_ != Wire::Payload || !binding_)
             throw std::logic_error("Native PLE ACK requires its original prepared payload endpoint");
         prepared_.validate();
         return binding_->nativeCompletion();
@@ -488,17 +448,11 @@ private:
     std::optional<q::PooledImmutableTransferBinding> binding_;
     std::uint64_t identity_;
 };
-CapturedTransferReceiveCompletion ReaderPhase::payloadCompletion(void* stream) const
-{
-    if (!payload_ || !payload_->matches(reader_.get(), transport_.get(), Wire::Payload, CapturedTransferEndpoint::Consumer,
-            control_, rows_, output_, count_))
-        throw std::logic_error("Shared PLE ACK lost its original payload completion owner");
-    return payload_->completion(stream);
-}
+
 NativeReceiveCompletionView ReaderPhase::nativePayloadCompletion() const
 {
     const auto side = source_ ? CapturedTransferEndpoint::Producer : CapturedTransferEndpoint::Consumer;
-    if (!payload_ || !reader_->nativeCollective() ||
+    if (!payload_ ||
         !payload_->matches(reader_.get(), transport_.get(), Wire::Payload, side, control_, rows_, output_, count_))
         throw std::logic_error("Native PLE ACK/confirm lost its exact original local payload endpoint");
     return payload_->nativeCompletion();
@@ -550,7 +504,7 @@ std::shared_ptr<const PooledImmutableReplicatedReaderCompletion> appendPooledRep
         phase(nodes.extent, rr::Action::PrepareResult);
         const auto* payload = wire(nodes.payloadSent, Wire::Payload, CapturedTransferEndpoint::Producer);
         wire(nodes.ackReceived, Wire::Ack, CapturedTransferEndpoint::Consumer);
-        phase(nodes.ackValidated, rr::Action::ConfirmAck, reader->nativeCollective() ? payload : nullptr);
+        phase(nodes.ackValidated, rr::Action::ConfirmAck, payload);
         fragment.addDependency(nodes.headerSent, nodes.header);
         fragment.addDependency(nodes.extent, nodes.headerSent);
         fragment.addDependency(nodes.payloadSent, nodes.extent);

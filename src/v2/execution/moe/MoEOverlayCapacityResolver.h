@@ -40,6 +40,9 @@
 
 namespace llaminar2
 {
+    class MoEOverlayActivationBatchInventory;
+    struct MoEOverlayPhysicalLaneDemandPlan;
+
     struct CPUSerialExpertStorageAdmission;
     /** @brief Whether a tier's live quota is setup-resolved or explicitly fixed. */
     enum class MoEOverlayLiveQuotaMode : std::uint8_t
@@ -405,6 +408,10 @@ namespace llaminar2
     /** @brief Immutable capacity result consumed by placement and admission. */
     struct MoEOverlayResolvedCapacityPlan
     {
+        /** Selected original source roster; process-local metadata, never serialized as live authority. */
+        std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
+        /** Same source-scoped passive GPU incidence/choice declaration consumed by materialization. */
+        std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_gpu_lane_demand;
         /// CPU declaration identities retained verbatim through setup and model reuse.
         std::vector<std::shared_ptr<const CPUSerialExpertStorageAdmission>> cpu_serial_expert_storage;
         int num_experts = 0;

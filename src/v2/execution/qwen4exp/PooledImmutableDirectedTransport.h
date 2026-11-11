@@ -5,8 +5,8 @@
  * Opposite-vendor remote owners reuse two original captured channels across
  * Pin, Free, Victim, Source, Publication, Read and retirement. Homogeneous native cohorts
  * continuation owners use their original native completed-byte communicator.
- * Same-vendor owners outside that communicator are unsupported; local owners
- * create no remote channel.
+ * Storage-only same-vendor owners join an explicit source-owned native union;
+ * model reader membership stays unchanged. Local owners create no remote edge.
  * Participant graphs and recurring hosted transaction submission remain explicit
  * consumers; this owner launches no graph and holds no model or residency state.
  */
@@ -38,15 +38,13 @@ class PooledImmutableReplicatedReaderTransport final {
 public:
     /** @return Original declared reader coordinate, independent of physical storage coordinates. */
     std::uint32_t coordinate() const noexcept { return coordinate_; }
+    /** @return Original model-reader population, independent of storage-only transport members. */
+    std::uint32_t consumerCount()const noexcept{return consumer_count_;}
     /** @return Original source worker, independent of compute enumeration order. */
     const PreparedGPUContextUsePermit& originalSource() const noexcept { return source_; }
     /** @return Original reader worker permit retained until both native endpoints retire. */
     const PreparedGPUContextUsePermit& originalReader() const noexcept { return reader_; }
-    /** @return Existing source-to-reader channel, phase-reused for result header and live output. */
-    const std::shared_ptr<CapturedTransferChannel>& result() const noexcept { return result_; }
-    /** @return Existing reader-to-source ACK channel. */
-    const std::shared_ptr<CapturedTransferChannel>& acknowledgement() const noexcept { return acknowledgement_; }
-    /** @return Explicit original NCCL/RCCL route, absent on an original cross-vendor channel. */
+    /** @return Whether the required original native result endpoint remains bound. */
     bool nativeCollective() const noexcept { return bool(native_result_); }
     /** @return Source-to-reader original native fixed/header and counted payload endpoint. */
     const PooledImmutableTransferChannel& nativeResult() const noexcept { return native_result_; }
@@ -59,20 +57,17 @@ public:
 private:
     friend class PooledImmutableDirectedTransport;
     /** @brief Construct only through the original cold transport owner after complete inventory validation. */
-    PooledImmutableReplicatedReaderTransport(std::uint32_t coordinate,
+    PooledImmutableReplicatedReaderTransport(std::uint32_t coordinate,std::uint32_t consumerCount,
         PreparedGPUContextUsePermit source, PreparedGPUContextUsePermit reader,
-        std::shared_ptr<CapturedTransferChannel> result, std::shared_ptr<CapturedTransferChannel> acknowledgement,
         std::array<PhysicalMemoryAllocationLease,2> claims,
         std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls,
         PooledImmutableTransferChannel nativeResult = {}, PooledImmutableTransferChannel nativeAck = {},
         PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32)
-        : coordinate_(coordinate), source_(std::move(source)), reader_(std::move(reader)),
-          result_(std::move(result)), acknowledgement_(std::move(acknowledgement)),
+        : coordinate_(coordinate),consumer_count_(consumerCount), source_(std::move(source)), reader_(std::move(reader)),
           control_claims_(std::move(claims)), controls_(std::move(controls)),
           native_result_(std::move(nativeResult)), native_acknowledgement_(std::move(nativeAck)), profile_(profile) {}
-    std::uint32_t coordinate_;
+    std::uint32_t coordinate_,consumer_count_;
     PreparedGPUContextUsePermit source_, reader_;
-    std::shared_ptr<CapturedTransferChannel> result_, acknowledgement_;
     std::array<PhysicalMemoryAllocationLease,2> control_claims_;
     std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls_;
     PooledImmutableTransferChannel native_result_, native_acknowledgement_;
@@ -98,7 +93,7 @@ public:
         PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32);
     /** @brief Bind original source permits/streams and existing directed waves once outside capture.
      * @param boundary Actual service/source owner retaining the original prepared participant cohort.
-     * @param originalInventory Original rank discovery owner; required for every explicit same-vendor mapped or peer route.
+     * @param originalInventory Original rank discovery owner authenticating the retained source/worker topology; homogeneous endpoints require their original native cohort.
      * @return Strong two-channel chain owner; no peer graph/worker/stream is created here.
      */
     static std::shared_ptr<const PooledImmutableDirectedTransport> create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,

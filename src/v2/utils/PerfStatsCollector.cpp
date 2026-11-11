@@ -543,7 +543,7 @@ namespace llaminar2
         /** Append one delimited step to both independent digest lanes. */
         void appendSequenceStep(
             PerfStatAccumulator &record,
-            std::initializer_list<uint64_t> words) noexcept
+            std::span<const uint64_t> words) noexcept
         {
             constexpr uint64_t kLowOffset = 14695981039346656037ull;
             constexpr uint64_t kLowPrime = 1099511628211ull;
@@ -577,7 +577,7 @@ namespace llaminar2
 
         /** @brief Retain exact extrema using one fixed-width vector pair per counter family. */
         void observeSequenceRanges(PerfStatAccumulator &record,
-            std::initializer_list<uint64_t> words)
+            std::span<const uint64_t> words)
         {
             if (record.count == 0u)
             {
@@ -921,6 +921,28 @@ namespace llaminar2
         if(!isDomainEnabled(identity.impl_->key.domain))return;
         if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
         addCounterSequence(identity.impl_->key,value,words);
+    }
+
+    bool PerfStatsCollector::matchesCounterSequence(const PerfStatRecord &record,
+        std::span<const uint64_t> words, std::size_t words_per_step)
+    {
+        if (record.kind != PerfStatRecord::Kind::Counter || words.empty() || words_per_step == 0 ||
+            words.size() % words_per_step != 0 || record.count != words.size() / words_per_step ||
+            record.sequence_word_count != words.size())
+            return false;
+
+        PerfStatAccumulator expected;
+        for (std::size_t offset = 0; offset < words.size(); offset += words_per_step)
+        {
+            const auto step = words.subspan(offset, words_per_step);
+            observeSequenceRanges(expected, step);
+            appendSequenceStep(expected, step);
+            ++expected.count;
+        }
+        return record.sequence_digest_lo == expected.sequence_digest_lo &&
+            record.sequence_digest_hi == expected.sequence_digest_hi &&
+            record.sequence_minimum_words == expected.sequence_minimum_words &&
+            record.sequence_maximum_words == expected.sequence_maximum_words;
     }
 
     void PerfStatsCollector::recordTimingNs(

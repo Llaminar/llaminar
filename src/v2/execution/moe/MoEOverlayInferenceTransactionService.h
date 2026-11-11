@@ -27,6 +27,7 @@
 
 #include <mpi.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -145,6 +147,16 @@ namespace llaminar2
             const MoEOverlayInferenceTransactionTicket &ticket,
             std::string *error = nullptr);
 
+        /** @brief Poll one exact remote receipt and local send release without waiting. */
+        MoEOverlayInferenceCompletionFenceProgress tryAwaitCompletion(
+            const MoEOverlayInferenceTransactionTicket &ticket, std::string *error = nullptr);
+
+        /** @brief Progress one ticket receive without waiting; empty success means pending. */
+        [[nodiscard]] MoEOverlayInferenceTransactionReceiveResult tryReceive();
+
+        /** @return Fixed bound on concurrently retained transaction identities. */
+        [[nodiscard]] std::size_t slotCapacity() const noexcept { return config_.send_slot_count; }
+
         /**
          * @brief Receive exactly one ticket required by the follower scheduler.
          *
@@ -237,6 +249,7 @@ namespace llaminar2
         Config config_;
         mutable std::vector<SendSlot> send_slots_;
         std::size_t next_send_slot_ = 0;
+        std::vector<MoEOverlayInferenceTransactionTicket> executing_tickets_; ///< Setup-bounded unretired receive identities.
         MoEOverlayInferenceTransactionTicket receive_ticket_{};
         MPI_Request receive_request_ = MPI_REQUEST_NULL;
         ReceiveLifecycle receive_lifecycle_ = ReceiveLifecycle::Idle;
@@ -249,10 +262,26 @@ namespace llaminar2
      * sparse data-plane execution. They must not sample, mutate continuation KV,
      * or manufacture token state merely because a control ticket arrived.
      */
+    /** @brief Explicit immediate terminal or retained poll-only native completion ownership. */
+    struct MoEOverlayInferenceAsyncSubmission
+    {
+        MoEOverlayInferenceCompletionFenceProgress progress = MoEOverlayInferenceCompletionFenceProgress::Failed;
+        std::shared_ptr<IMoEOverlayInferenceCompletionFence> completion;
+    };
+
     class IMoEOverlayInferenceTransactionExecutor
     {
     public:
         virtual ~IMoEOverlayInferenceTransactionExecutor() = default;
+
+        /** @brief Submit one graph; Pending must retain the actual producer's armed native fence. */
+        virtual MoEOverlayInferenceAsyncSubmission submitMoEOverlayInferenceTransaction(
+            const MoEOverlayInferenceTransactionTicket &ticket, std::string *error = nullptr)
+        {
+            return {executeMoEOverlayInferenceTransaction(ticket, error) ?
+                MoEOverlayInferenceCompletionFenceProgress::Ready :
+                MoEOverlayInferenceCompletionFenceProgress::Failed, {}};
+        }
 
         /**
          * @brief Execute exactly the graph family and geometry named by a ticket.
@@ -333,6 +362,13 @@ namespace llaminar2
         virtual bool retire(
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) = 0;
+        /** @brief Poll retirement; unsupported publishers fail instead of blocking implicitly. */
+        virtual MoEOverlayInferenceCompletionFenceProgress tryRetire(
+            const MoEOverlayPublishedInferenceTransaction &, std::string *error = nullptr)
+        {
+            if (error) *error = "Publisher has no asynchronous retirement implementation";
+            return MoEOverlayInferenceCompletionFenceProgress::Failed;
+        }
         /** @brief Publish the successful terminal ticket. */
         virtual bool complete(
             std::uint64_t placement_epoch,
@@ -382,6 +418,10 @@ namespace llaminar2
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) override;
 
+        /** @brief Poll exact remote completion and release its protocol slot only when ready. */
+        MoEOverlayInferenceCompletionFenceProgress tryRetire(
+            const MoEOverlayPublishedInferenceTransaction &transaction, std::string *error = nullptr) override;
+
         /** @brief Publish the successful terminal after every handle retired. */
         bool complete(
             std::uint64_t placement_epoch,
@@ -405,6 +445,12 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayInferenceProtocolState state() const noexcept
         {
             return protocol_.state();
+        }
+
+        /** @return Original protocol's last authenticated epoch, including transaction advances. */
+        [[nodiscard]] std::uint64_t currentPlacementEpoch() const noexcept
+        {
+            return protocol_.currentPlacementEpoch();
         }
 
         /** @return Ordinal that the next execution or terminal must use. */
@@ -1337,13 +1383,20 @@ namespace llaminar2
          */
         explicit MoEOverlayInferenceTransactionFollower(Config config);
 
+        /** @brief Retain every failed command's native fence until its producer is proven terminal. */
+        ~MoEOverlayInferenceTransactionFollower();
+
         /**
          * @brief Receive and execute tickets until Complete or Abort arrives.
          *
          * The method performs no token, sampler, logits, or KV coordination. It
          * is intended to run inside the remote rank's coordinated worker command.
+         * @param admitted_command Original outer command provenance when already
+         * published by the global-rank owner; tickets must retain that authority.
+         * @return Completed command or the first protocol/native failure.
          */
-        [[nodiscard]] MoEOverlayInferenceFollowerCommandResult runOneCommand();
+        [[nodiscard]] MoEOverlayInferenceFollowerCommandResult runOneCommand(
+            std::optional<MoEOverlayInferenceCommandIdentity> admitted_command = std::nullopt);
 
         /** @return Protocol state for diagnostics and adversarial tests. */
         [[nodiscard]] MoEOverlayInferenceProtocolState state() const noexcept
@@ -1355,6 +1408,40 @@ namespace llaminar2
         /** @brief Prove channel, protocol, and local follower ownership agree. */
         void validateConstruction() const;
 
+        /** @brief One cold-capacity slot owns its native producer and optional timing sample. */
+        struct PendingExecution
+        {
+            MoEOverlayInferenceTransactionTicket ticket;
+            std::size_t slot_index;
+            MoEOverlayInferenceCompletionFenceProgress submission_progress; ///< Typed immediate/native submission proof.
+            std::shared_ptr<IMoEOverlayInferenceCompletionFence> fence;
+            std::optional<MoEOverlayInferenceInterferenceScope> scope;
+            std::chrono::steady_clock::time_point execution_begin;
+
+            /** @brief Transfer a retained execution into a setup-capacity queue slot. */
+            PendingExecution(MoEOverlayInferenceTransactionTicket value, std::size_t slot,
+                MoEOverlayInferenceAsyncSubmission terminal,
+                std::optional<MoEOverlayInferenceInterferenceScope> sample,
+                std::chrono::steady_clock::time_point begin)
+                : ticket(value), slot_index(slot), submission_progress(terminal.progress),
+                  fence(std::move(terminal.completion)), scope(std::move(sample)), execution_begin(begin) {}
+            PendingExecution(PendingExecution &&) noexcept = default;
+            /** @brief Compact only after the old slot's sample and native ownership retire. */
+            PendingExecution &operator=(PendingExecution &&other) noexcept
+            {
+                if (this == &other) return *this;
+                scope.reset();
+                ticket = other.ticket;
+                slot_index = other.slot_index;
+                submission_progress = other.submission_progress;
+                fence = std::move(other.fence);
+                if (other.scope) scope.emplace(std::move(*other.scope));
+                other.scope.reset();
+                execution_begin = other.execution_begin;
+                return *this;
+            }
+        };
+        std::vector<PendingExecution> pending_; ///< Allocated once; failure never drops native ownership.
         std::shared_ptr<MoEOverlayMPIInferenceTransactionChannel> channel_;
         IMoEOverlayInferenceTransactionExecutor *executor_ = nullptr;
         MoEOverlayInferenceTransactionProtocol protocol_;

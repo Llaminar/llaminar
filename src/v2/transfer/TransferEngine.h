@@ -12,10 +12,12 @@
 #include "memory/CPUMappedPublicationRoot.h"
 
 #include "MappedTransferProgressABI.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "CapturedTransferEndpointScheduling.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +35,10 @@
 // Forward declarations
 namespace llaminar2
 {
+    class PreparedGPUContextUsePermit;
+    class PlanningHostDeviceMeasurement;
+    class IWorkerGPUContext;
+    namespace test { struct ComponentTransferExecutionPoolFixtureAccess; }
     namespace qwen4exp { class PooledImmutableLocalHotReadyRoot; }
     class TransferEngine;
     class PhysicalMemoryAuthority;
@@ -44,14 +50,19 @@ namespace llaminar2
     class ImmutableNativeDeviceRead;
 
     class CapturedTransferChannel;
+    class CapturedTransferRankPlan;
+    class CapturedTransferRankSession;
+    class PipelineActivationFanout;
+    struct PipelineActivationFanoutValidation;
+    class IMPIContext;
     struct RankInventory;
     struct CapturedTransferInvocation;
     enum class CapturedTransferInvocationRetirement;
     class CapturedTransferReceiveCompletion;
-    enum class CapturedTransferPayloadStorage : std::uint8_t;
     class CapturedTransferBinding;
     struct CapturedTransferChannelBatchEntry;
     class WorkspaceBufferLease;
+    class GPUCaptureDependencyRoster;
     struct CapturedTransferMessage;
     enum class CapturedTransferEndpoint : std::uint32_t;
 
@@ -522,7 +533,13 @@ namespace llaminar2
     private:
         friend class TransferEngine;
 
-        /** @brief Declare one positive-capacity exact-device identity. */
+        /**
+         * @brief Declare one positive-capacity exact-device identity.
+         * @param bytes Immutable native capacity.
+         * @param device Exact allocating GPU.
+         * @param access Immutable visibility required by all consumers.
+         * @throws std::invalid_argument On invalid capacity, device or visibility.
+         */
         DeviceTransferBuffer(size_t bytes, DeviceId device);
 
         /**
@@ -638,17 +655,48 @@ namespace llaminar2
          */
         [[nodiscard]] void *stream() const;
 
+        /**
+         * @brief Borrow the exact original source authority retained by this pool.
+         * @return Same pool-owned prepared worker/PMA permit, never a substituted source.
+         * @throws std::logic_error For an incomplete or unadmitted lane.
+         */
+        [[nodiscard]] const PreparedGPUContextUsePermit &originalContext() const;
+
     private:
         friend class TransferEngine;
+        friend struct test::ComponentTransferExecutionPoolFixtureAccess;
 
-        /** @brief Bind one checked stream to its pool lifetime and device. */
+        /** Explicit infrastructure scope; no component lane can mint original admission. */
+        enum class Authority : std::uint8_t { None, OriginalPrepared, ComponentFixture };
+        /** Private tag accepted only by the named test infrastructure boundary. */
+        struct ComponentFixtureTag {};
+
+        /** @brief Bind an actual component stream without creating a source or permit.
+         * @param pool_lifetime Strong worker/pool owner through the final lane borrow.
+         * @param stream Exact context-owned non-default stream.
+         * @param device Actual GPU endpoint, without rank/NUMA provenance.
+         * @param lane_index Stable pool-local coordinate.
+         */
+        PersistentTransferExecutionLane(ComponentFixtureTag, std::shared_ptr<void> pool_lifetime,
+            void *stream, DeviceId device, size_t lane_index) noexcept;
+
+        /** @brief Bind a checked stream to its SAME pool/source lifetime.
+         * @param pool_lifetime Existing complete cold setup transaction.
+         * @param original Aliasing pointer to that same pool's original prepared permit.
+         * @param stream Exact non-null admitted background stream.
+         * @param device Original physical GPU endpoint.
+         * @param lane_index Stable pool-local concurrency coordinate.
+         */
         PersistentTransferExecutionLane(
             std::shared_ptr<void> pool_lifetime,
+            std::shared_ptr<const PreparedGPUContextUsePermit> original,
             void *stream,
             DeviceId device,
             size_t lane_index) noexcept;
 
+        Authority authority_ = Authority::None; ///< Source admission and component infrastructure are disjoint.
         std::shared_ptr<void> pool_lifetime_; ///< Complete setup transaction.
+        std::shared_ptr<const PreparedGPUContextUsePermit> original_; ///< Aliased SAME pool control block/source.
         void *stream_ = nullptr; ///< Exact context-owned background stream.
         DeviceId device_ = DeviceId::invalid(); ///< Exact execution endpoint.
         size_t lane_index_ = 0u; ///< Stable pool-local concurrency identity.
@@ -921,6 +969,7 @@ namespace llaminar2
         std::vector<DeviceId> devices_; ///< Canonical exact endpoint set.
         std::vector<DeviceAlias> aliases_; ///< One alias per @ref devices_.
         std::vector<BackendRegistration> registrations_; ///< One per GPU family.
+        friend class MappedHostTransferArena;
         // Retire after native free/unregister; child slices retain this owner.
         std::shared_ptr<PhysicalMemoryAllocationLease> allocation_claim_;
         std::shared_ptr<void> lifetime_; ///< Frees pages or retains the parent.
@@ -959,6 +1008,19 @@ namespace llaminar2
             size_t slice_count = 0u; ///< Immutable logical allocations.
         };
 
+        /** @brief One original immutable allocation, in exact construction order. */
+        struct AllocationRequest { size_t bytes; size_t alignment; };
+        /**
+         * @brief Quote the existing geometrically growing page-backed arena.
+         * @param requests Complete ordered positive allocations; alignment must divide a native page.
+         * @return Exact original host backing bytes, including allocator/alignment slack.
+         * @throws std::invalid_argument For an empty/invalid declaration.
+         * @throws std::overflow_error For unrepresentable backing geometry.
+         */
+        static size_t backingBytes(std::span<const AllocationRequest> requests);
+        /** @brief Reject an underconsumed immutable declaration at its cold construction boundary.
+         * @throws std::logic_error If any admitted allocation remains undeclared/materialized out of order. */
+        void requireDeclarationConsumed() const;
         ~MappedHostTransferArena() = default;
 
         MappedHostTransferArena(const MappedHostTransferArena &) = delete;
@@ -1016,6 +1078,15 @@ namespace llaminar2
             IBackend *(*backend_resolver)(DeviceId),
             std::span<const DeviceId> devices);
 
+        /** @brief Original shared slab-growth rule used by quote and allocation.
+         * @param bytes Positive new slice payload.
+         * @param alignment Positive required alignment.
+         * @param committed Exact earlier backing capacity.
+         * @return Page-rounded new backing size.
+         * @throws std::overflow_error For unrepresentable growth. */
+        static size_t nextBackingBytes(size_t bytes, size_t alignment, size_t committed);
+        std::shared_ptr<PhysicalMemoryAuthority> memory_; ///< Same original admission issuer, never a second ledger.
+        std::vector<AllocationRequest> declaration_; ///< Immutable exact request order, no live state shadow.
         IBackend *(*backend_resolver_)(DeviceId) = nullptr; ///< Copied test resolver.
         std::vector<DeviceId> devices_; ///< Sorted immutable endpoint identity.
         mutable std::mutex mutex_; ///< Serializes setup-time bump allocation.
@@ -1239,6 +1310,17 @@ namespace llaminar2
          */
         void initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
             std::span<const std::byte> source, void *stream) const;
+
+        /** @brief Initialize immutable Batch metadata with its original context-owned cold event.
+         * @param destination Exact original workspace lease; no allocation occurs here.
+         * @param source Complete retained host metadata bytes, excluding allocation padding.
+         * @param stream Exact original GPU setup stream, outside graph capture.
+         * @param resources Original source-owned cold publication event; its mutex spans actual completion.
+         * @details Reuses the existing public initialization contract, with one admitted native
+         * event across serial metadata publications. It never borrows internal capture edges.
+         */
+        void initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
+            std::span<const std::byte> source,void *stream,GPUCaptureDependencyRoster &resources)const;
 
         /// Construct a TransferEngine with an injected backend resolver
         /// (for testing with MockBackend).
@@ -1500,6 +1582,18 @@ namespace llaminar2
             const PersistentTransferStagingSlice &staging) const;
 
         /**
+         * @brief Price the exact independent native background stream population.
+         * @param lane_count Positive physical concurrent lane count, independent of layers/graphs.
+         * @param host Original rank CPU physical resource.
+         * @param gpu Exact original GPU physical resource.
+         * @return Existing conservative one-stream bounds summed under the original PMA owner.
+         * @throws std::invalid_argument For zero/foreign resource geometry.
+         * @throws std::overflow_error For an unrepresentable stream population quote.
+         */
+        [[nodiscard]] static PhysicalMemoryPlan persistentTransferExecutionLanesBOM(
+            size_t lane_count,PhysicalMemoryResource host,PhysicalMemoryResource gpu);
+
+        /**
          * @brief Materialize a bounded shared background execution-stream pool.
          *
          * One logical migration cycle may contain several projection, edge, and
@@ -1517,6 +1611,7 @@ namespace llaminar2
          * @param lane_count Positive physical participant/cycle concurrency.
          * @param device Exact CUDA/ROCm endpoint owning every stream.
          * @param pool_name Stable non-empty semantic pool identity.
+         * @param original Exact prepared worker/PMA permit retaining this pool through all lane borrowers.
          * @return Exactly @p lane_count typed execution-lane handles.
          * @throws std::invalid_argument for invalid geometry or identity.
          * @throws std::runtime_error when any exact stream cannot materialize.
@@ -1525,7 +1620,8 @@ namespace llaminar2
         allocatePersistentTransferExecutionLanes(
             size_t lane_count,
             DeviceId device,
-            const std::string &pool_name) const;
+            const std::string &pool_name,
+            const PreparedGPUContextUsePermit &original) const;
 
         /**
          * @brief Register an immutable caller-owned host region for captured DMA.
@@ -1644,23 +1740,23 @@ namespace llaminar2
             DeviceId producer, void *producer_setup_stream,
             DeviceId consumer, void *consumer_setup_stream, size_t capacity) const;
         /**
-         * @brief Materialize native peer payload from the original cached bidirectional hardware declaration.
-         * @param authority Same admitted channel PMA retaining every control/cursor/payload lease.
-         * @param host_device Original CPU control allocator, never a host payload mirror.
-         * @param producer Original payload-owning GPU.
-         * @param producer_setup_stream Exact original producer setup stream.
-         * @param consumer Original peer reader GPU.
-         * @param consumer_setup_stream Exact original consumer setup stream.
-         * @param capacity Positive admitted maximum, never the runtime communication extent.
-         * @param original_inventory Original cached rank discovery with both directed peer edges Complete.
-         * @return One retained peer channel after worker-local enablement and exact cold initialization.
-         * @throws std::exception For missing/partial/foreign evidence or failed native enable/materialization.
+         * @brief Materialize only this original MPI rank's endpoint over authenticated same-node shared backing.
+         * @param plan Same sealed original role/geometry value used before admission.
+         * @param session Original model cohort; all ranks visit the same boundary in order.
+         * @param local_authority Matching stage PMA on an endpoint rank; absent on uninvolved ranks.
+         * @param local_setup_stream Exact local endpoint initialization stream; null only on uninvolved ranks.
+         * @return This rank's channel owner, or null on uninvolved original ranks.
+         *
+         * Existing setup consensus surrounds claims, original shared-file creation/
+         * first touch, local registration and cursor initialization. Only the source
+         * writes initial shared control. All local graphs and original remote peers
+         * must retire before the enclosing model owner releases these channels.
+         * No GPU context is created from a remote ordinal and no native operation
+         * allocates, registers or reads a host payload during replay.
          */
-        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createPeerCapturedTransferChannel(
-            PhysicalMemoryAuthority &authority, DeviceId host_device,
-            DeviceId producer, void *producer_setup_stream,
-            DeviceId consumer, void *consumer_setup_stream, size_t capacity,
-            const RankInventory &original_inventory) const;
+        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createRankCapturedTransferChannel(
+            const CapturedTransferRankPlan &plan, const std::shared_ptr<CapturedTransferRankSession> &session,
+            const std::shared_ptr<PhysicalMemoryAuthority> &local_authority, void *local_setup_stream) const;
 
         /** @brief Bind an original parent admission before submitting any endpoint.
          * @param channel Existing same-PMA physical owner, retained through native retirement.
@@ -1735,6 +1831,22 @@ namespace llaminar2
             std::shared_ptr<CapturedTransferChannel> channel, CapturedTransferEndpoint role,
             CapturedTransferMessage message, std::shared_ptr<const WorkspaceBufferLease> storage,
             size_t offset = 0) const;
+
+        /**
+         * @brief Bind original INT32 live rows without allocating a byte-count scalar.
+         * @param capacity_binding Exact endpoint with the maximum physical payload extent.
+         * @param row_storage Original retained INT32 tensor owning the stream-ordered live row count.
+         * @param row_offset Byte offset of that INT32 scalar inside its original allocation.
+         * @param row_bytes Positive immutable bytes per row, dividing the captured maximum.
+         * @return Producer lowering or consumer agreement check in the existing acquire kernel.
+         *
+         * Producer snapshots checked rows*row_bytes once. Consumer acquires that
+         * exact producer publication and checks its own freshly materialized rows
+         * before any copy or model/KV consumer. Zero rows communicate metadata only.
+         */
+        [[nodiscard]] CapturedTransferBinding bindDeviceRowCountedTransfer(
+            CapturedTransferBinding capacity_binding, std::shared_ptr<ITensor> row_storage,
+            size_t row_offset, std::uint64_t row_bytes) const;
 
         /**
          * @brief Turn a fixed capacity binding into a GPU-counted message contract.
@@ -1907,6 +2019,18 @@ namespace llaminar2
          */
         [[nodiscard]] std::shared_ptr<MappedHostTransferArena>
         createMappedHostArena(std::span<const DeviceId> devices) const;
+        /**
+         * @brief Bind an exact declared arena to its original admitted physical authority.
+         * @param devices Exact local GPU aliases, authenticated by original setup.
+         * @param authority Same original rank-local PMA, already containing backingBytes(requests).
+         * @param requests Complete allocation sequence, immutable before any native creator.
+         * @return Arena whose native page backing retains its sole claim through the last slice.
+         * @throws std::invalid_argument For invalid declaration or missing authority.
+         * @throws std::logic_error For an authority not admitted for every endpoint.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferArena> createMappedHostArena(
+            std::span<const DeviceId> devices, std::shared_ptr<PhysicalMemoryAuthority> authority,
+            std::span<const MappedHostTransferArena::AllocationRequest> requests) const;
 
         /**
          * @brief Bind one mapped acquire edge for a fused packet kernel.
@@ -2518,6 +2642,10 @@ namespace llaminar2
         /// lifetime through the read, and publish the exact receiving stream.
         /// Same-vendor GPU paths never block for device completion. Both tensor
         /// owners must remain alive until their published events have completed.
+        /// A GPU-to-CPU boundary imports the original producer event and completes
+        /// exactly the requested prefix into the existing destination bank before
+        /// returning. The source remains GPU-authoritative; this copy does not
+        /// publish its complete host mirror as current.
         /// @param src Tensor owning the published source generation.
         /// @param dst Tensor receiving the active bytes.
         /// @param dst_device Exact CPU/GPU destination.
@@ -2891,6 +3019,53 @@ namespace llaminar2
         static TransferEngine &instance();
 
     private:
+        friend class PlanningHostDeviceMeasurement;
+        /**
+         * @brief Shared bounded copy body for admitted lanes and isolated planning calibration.
+         * @param device Exact owning GPU of both registered regions.
+         * @param stream Non-null original stream whose functions were prepared before capture.
+         * @param direction Explicit copy direction.
+         * @param device_region Stable bounded device storage owner.
+         * @param device_offset First device byte.
+         * @param mapped_region Original registered host storage and alias owner.
+         * @param mapped_offset First mapped byte.
+         * @param bytes Positive live extent within both owners.
+         * @throws std::exception For invalid stream, ownership, bounds or failed native enqueue.
+         * @details Only the admitted-lane API and the closed planning calibration
+         * boundary may call this body; it creates no stream or native resource.
+         */
+        void enqueueMappedKernelCopyOnPreparedStream(DeviceId device, void *stream,
+            MappedTransferDirection direction, DeviceTransferBuffer &device_region, size_t device_offset,
+            const MappedHostTransferRegion &mapped_region, size_t mapped_offset, size_t bytes) const;
+
+        friend struct test::ComponentTransferExecutionPoolFixtureAccess;
+
+        /**
+         * @brief Named tests-only native component boundary, never original admission.
+         * @param lane_count Actual concurrent stream population.
+         * @param device Actual GPU endpoint selected by the component fixture.
+         * @param pool_name Stable test infrastructure name, isolated from admitted pools.
+         * @return Strongly retained component lanes that reject originalContext().
+         */
+        [[nodiscard]] std::vector<PersistentTransferExecutionLane>
+        allocateComponentTransferExecutionLanes(size_t lane_count, DeviceId device,
+            const std::string &pool_name) const;
+
+        /**
+         * @brief Shared cold native kernel/stream preparation with an explicit creator.
+         * @param lane_count Positive physical concurrency, never a graph-family count.
+         * @param device Actual GPU owning all streams.
+         * @param pool_name Stable complete namespace supplied by the authority-specific caller.
+         * @param context Strongly retained exact worker owned by that caller.
+         * @param creator Explicit admitted or component-only creator; never chosen from a missing permit.
+         * @param created_count Receives the actual number of newly created native streams.
+         * @return Exact non-default streams after mapped-copy kernel preparation on their worker.
+         */
+        [[nodiscard]] std::vector<void*> preparePersistentTransferStreams(size_t lane_count,
+            DeviceId device, const std::string &pool_name, IWorkerGPUContext &context,
+            const std::function<void*(const std::string&,bool*)> &creator,
+            size_t &created_count) const;
+
         /**
          * @brief Shared native allocation body for closed, typed CPU publication owners.
          * @param payload_bytes Exact useful mapped payload extent.
@@ -2906,26 +3081,12 @@ namespace llaminar2
             DeviceId consumer, PhysicalMemoryOwner owner,
             const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
 
+        friend class PipelineActivationFanout;
+        /** @brief Original fanout owner alone lowers completed-native validation on its exact stream. */
+        void enqueuePipelineActivationFanoutValidation(const PipelineActivationFanoutValidation &binding,
+            DeviceId device, void *stream) const;
         friend class TensorBase;
         friend class MappedHostTransferArena;
-
-        /**
-         * @brief Common physical owner after the public factory authenticates its explicit route.
-         * @param authority Original admitted channel ledger.
-         * @param host_device CPU control/payload allocator according to the selected route.
-         * @param producer Original local producer and its exact setup stream.
-         * @param producer_setup_stream Original non-default producer stream.
-         * @param consumer Original local consumer.
-         * @param consumer_setup_stream Original non-default consumer stream.
-         * @param capacity Positive capture-time envelope; device descriptors own live extents.
-         * @param storage Validated immutable payload route; no fallback or discovery occurs here.
-         * @return Complete physical channel or full materialization rollback.
-         */
-        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createCapturedTransferChannelWithStorage(
-            PhysicalMemoryAuthority &authority, DeviceId host_device,
-            DeviceId producer, void *producer_setup_stream,
-            DeviceId consumer, void *consumer_setup_stream, size_t capacity,
-            CapturedTransferPayloadStorage storage) const;
 
         /**
          * @brief Shared native channel lowering for ordinary or acquired-fork submission.

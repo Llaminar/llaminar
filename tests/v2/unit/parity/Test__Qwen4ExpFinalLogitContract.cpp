@@ -25,6 +25,9 @@ class FinalLogitProbe : public ParityTestBase
 {
 public:
     using ParityTestBase::acceptsFinalLogitDecodeEvidence;
+    using ParityTestBase::acceptsOwnedPipelineRawEvidence;
+    using ParityTestBase::pipelineParityLayerObservations;
+    using ParityTestBase::acceptsFinalLogitSummaryRawEvidence;
     using ParityTestBase::acceptsFinalLogitRawEvidence;
     using ParityTestBase::finalizeDecodeSummaryNumerics;
     using ParityTestBase::finalizeDecodeLayerNumerics;
@@ -453,3 +456,243 @@ TEST(Qwen4ExpFinalLogits, PartialPrefixRejectsMissingPartialAndNonfiniteRows)
 }
 
 } // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+/** @brief Actual original comparator outputs projected into reversed diagnostic ownership. */
+struct SplitPipelineFixture
+{
+    ParityConfig cfg=config();
+    std::array<std::vector<LayerStats>,2> local;
+    std::array<std::vector<PipelineParityStageOwnership>,2> scopes;
+    std::vector<PipelineParityObservation> headers;
+    std::vector<PipelineParityLayerObservation> cells;
+    /**
+     * @brief Preserve the canonical comparator/required-stage law for both phases.
+     * @param phase Original phase. @param index Original Decode index or minus one for Prefill.
+     * Rank0 deliberately owns the tail, so no rank-order heuristic can succeed.
+     */
+    SplitPipelineFixture(ParityForwardPhase phase=ParityForwardPhase::Prefill,int index=-1)
+    {
+        cfg.uses_cross_rank_pipeline=true;
+        scopes[0]={{1,0,24,48,false,true}};
+        scopes[1]={{0,1,0,24,true,false}};
+        const auto original=layers(cfg,phase==ParityForwardPhase::Decode ? std::optional{index}:std::nullopt);
+        const auto boundary=prefill(cfg);
+        for(int rank=0;rank<2;++rank)
+        {
+            for(const auto& layer:original)
+                if(layer.layer_idx>=scopes[rank][0].first_layer && layer.layer_idx<scopes[rank][0].last_layer)
+                    local[rank].push_back(layer);
+            PipelineParityObservation observed;
+            observed.rank=rank;observed.world=2;observed.layers=48;observed.phase=static_cast<int>(phase);observed.step=index;
+            observed.scope_valid=1;
+            observed.local_raw_valid=bool(FinalLogitProbe::acceptsOwnedPipelineRawEvidence(local[rank],scopes[rank],cfg,phase,rank));
+            observed.embedding_claims=rank==1;observed.logits_claims=rank==0;
+            if(rank==1 && phase==ParityForwardPhase::Prefill)
+            {
+                observed.embedding_valid=boundary.embedding_evidence_valid;
+                observed.embedding_cosine=boundary.embedding_cosine;
+            }
+            if(rank==0)
+            {
+                const auto actual=step(index<0?0:index,cfg);
+                observed.has_logits=actual.has_logit_data;observed.logits_valid=actual.logit_evidence_valid;
+                observed.kl=actual.kl_divergence;observed.cosine=actual.cosine_similarity;
+                observed.logit_passed=cfg.final_logit_mean_kl->accepts(observed.kl,phase==ParityForwardPhase::Prefill);
+            }
+            headers.push_back(observed);
+            rebuild(rank);
+        }
+    }
+    /** @brief Reproject changed raw observations through the actual original framework helper.
+     * @param rank Actual authored owner whose diagnostic records changed. */
+    void rebuild(int rank)
+    {
+        if(cells.size()!=96)cells.resize(96);
+        if(headers.size()>std::size_t(rank))
+        {
+            const auto phase=static_cast<ParityForwardPhase>(headers[rank].phase);
+            headers[rank].local_raw_valid=bool(FinalLogitProbe::acceptsOwnedPipelineRawEvidence(local[rank],scopes[rank],cfg,phase,rank));
+            const auto projected=FinalLogitProbe::pipelineParityLayerObservations(local[rank],scopes[rank],48,headers[rank].local_raw_valid,rank);
+            std::copy(projected.begin(),projected.end(),cells.begin()+rank*48);
+        }
+    }
+    /** @return Actual merger result; no test-owned acceptance implementation. */
+    PipelineParityEvidence merge(ParityForwardPhase phase=ParityForwardPhase::Prefill,int index=-1) const
+    { return mergePipelineParityEvidence(headers,cells,48,phase,index); }
+};
+}
+
+/** @test Both original half-model comparators jointly satisfy the exact same full48 policy. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineCompletePartitionAndReversedBoundaryOwners)
+{
+    SplitPipelineFixture fixture;
+    ASSERT_EQ(fixture.local[0].size(),24u);ASSERT_EQ(fixture.local[1].size(),24u);
+    const auto evidence=fixture.merge();
+    for(int replay=0;replay<3;++replay)
+    {
+        const auto repeated=fixture.merge();
+        EXPECT_EQ(repeated.headRank(),evidence.headRank());
+        EXPECT_EQ(repeated.tail().kl,evidence.tail().kl);
+    }
+    EXPECT_EQ(evidence.headRank(),1);EXPECT_EQ(evidence.tailRank(),0);
+    EXPECT_TRUE(evidence.matches(ParityForwardPhase::Prefill,-1,48));
+    auto summary=prefill(fixture.cfg);
+    summary.layer_stats=fixture.local[0];summary.pipeline_evidence=evidence;
+    FinalLogitProbe::finalizePrefillSummaryNumerics(summary,fixture.cfg,false,true);
+    EXPECT_TRUE(summary.overall_passed);
+    EXPECT_EQ(summary.layer_stats.size(),24u); // Original local CSV rows remain local.
+    summary.lm_head_kl=fixture.cfg.final_logit_mean_kl->prefill_maximum;
+    FinalLogitProbe::finalizePrefillSummaryNumerics(summary,fixture.cfg,false,true);
+    EXPECT_FALSE(summary.overall_passed); // Exact unchanged strict numerical boundary.
+    auto unchanged=config();auto local=prefill(unchanged);
+    FinalLogitProbe::finalizePrefillSummaryNumerics(local,unchanged,false,true);
+    EXPECT_TRUE(local.overall_passed);EXPECT_FALSE(local.pipeline_evidence);
+}
+
+/** @test Missing, duplicate, foreign and malformed original raw observations cannot certify a union. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineRejectsMissingDuplicateAndForeignRawEvidence)
+{
+    {
+        SplitPipelineFixture fixture;
+        const auto retained=fixture.local[0].back();
+        fixture.local[0].pop_back();fixture.rebuild(0);
+        EXPECT_THROW(fixture.merge(),std::invalid_argument);
+        fixture.local[0].push_back(retained);fixture.rebuild(0);
+        EXPECT_NO_THROW(fixture.merge()); // Reset restores data, with identical original scope.
+    }
+    {
+        SplitPipelineFixture fixture;fixture.local[0].push_back(fixture.local[0].front());fixture.rebuild(0);
+        EXPECT_THROW(fixture.merge(),std::invalid_argument);
+    }
+    {
+        SplitPipelineFixture fixture;fixture.local[0][0]=fixture.local[1][0];fixture.rebuild(0);
+        EXPECT_THROW(fixture.merge(),std::invalid_argument);
+    }
+    {
+        SplitPipelineFixture fixture;fixture.local[0][0].stage_results.clear();fixture.rebuild(0);
+        EXPECT_THROW(fixture.merge(),std::invalid_argument);
+    }
+    {
+        SplitPipelineFixture fixture;fixture.scopes[0][0].rank=1;
+        EXPECT_FALSE(FinalLogitProbe::acceptsOwnedPipelineRawEvidence(fixture.local[0],fixture.scopes[0],fixture.cfg,ParityForwardPhase::Prefill,0));
+        EXPECT_THROW(FinalLogitProbe::pipelineParityLayerObservations(fixture.local[0],fixture.scopes[0],48,true,0),std::invalid_argument);
+    }
+}
+
+/** @test Phase/step/world/boundary claims and literal original source identity stay exact. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineRejectsConflictingOwnershipAndStaleIdentity)
+{
+    for(int fault=0;fault<7;++fault)
+    {
+        SplitPipelineFixture fixture;
+        switch(fault)
+        {
+        case 0:fixture.headers[0].embedding_claims=1;break;
+        case 1:fixture.headers[0].step=0;break;
+        case 2:fixture.headers[0].phase=static_cast<int>(ParityForwardPhase::Decode);break;
+        case 3:fixture.headers[1].world=3;break;
+        case 4:fixture.headers[0].rank=1;break;
+        case 5:fixture.cells[0].claims=1;fixture.cells[0].records=1;fixture.cells[0].valid_records=1;break;
+        case 6:fixture.headers[0].kl=std::numeric_limits<float>::quiet_NaN();break;
+        }
+        EXPECT_THROW(fixture.merge(),std::invalid_argument);
+    }
+    EXPECT_NO_THROW(requirePipelineParityIdentities(std::array<std::string,2>{"original source/reference/request","original source/reference/request"}));
+    EXPECT_THROW(requirePipelineParityIdentities(std::array<std::string,2>{"original source/reference/request","other source/reference/request"}),std::invalid_argument);
+    EXPECT_THROW(requirePipelineParityIdentities(std::array<std::string,2>{"",""}),std::invalid_argument);
+}
+
+/** @test Each original Decode step retains query provenance and the strict per-step logit budget. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineDecodeStepIsCompleteAndNeverAveraged)
+{
+    auto cfg=config();cfg.uses_cross_rank_pipeline=true;
+    DecodeParitySummary summary;summary.steps_total=2;
+    for(int index=0;index<2;++index)
+    {
+        SplitPipelineFixture fixture(ParityForwardPhase::Decode,index);
+        auto actual=step(index,cfg);actual.layer_stats=fixture.local[0];
+        actual.pipeline_evidence=fixture.merge(ParityForwardPhase::Decode,index);
+        EXPECT_FALSE(actual.pipeline_evidence->matches(ParityForwardPhase::Decode,index+1,48));
+        summary.step_stats.push_back(std::move(actual));
+        EXPECT_THROW(fixture.merge(ParityForwardPhase::Decode,index+1),std::invalid_argument);
+    }
+    FinalLogitProbe::finalizeDecodeSummaryNumerics(summary,cfg,true);
+    EXPECT_TRUE(summary.overall_passed);
+    summary.step_stats[1].kl_divergence=cfg.final_logit_mean_kl->decode_maximum;
+    FinalLogitProbe::finalizeDecodeSummaryNumerics(summary,cfg,true);
+    EXPECT_FALSE(summary.overall_passed);
+    summary.step_stats[1].pipeline_evidence.reset();
+    EXPECT_FALSE(FinalLogitProbe::acceptsFinalLogitSummaryRawEvidence(summary.step_stats[1],cfg,ParityForwardPhase::Decode,1));
+}
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Communicated decoder records contain only actual claims/observations, including partial and idle owners. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineLiveMetadataRetainsOnlyActualRecordsAcrossResetReplay)
+{
+    SplitPipelineFixture fixture;
+    std::vector<PipelineParityLayerRecord> joined;
+    std::array<std::size_t,3> counts{};
+    for(std::size_t rank=0;rank<2;++rank)
+    {
+        const auto compact=compactPipelineParityLayers(std::span(fixture.cells).subspan(rank*48,48));
+        EXPECT_EQ(compact.size(),24u);
+        counts[rank]=compact.size();joined.insert(joined.end(),compact.begin(),compact.end());
+    }
+    // A completely idle original rank has no layer payload; only its bounded count/header remains.
+    const std::vector<PipelineParityLayerObservation> idle(48);
+    EXPECT_TRUE(compactPipelineParityLayers(idle).empty());
+    EXPECT_EQ(joined.size()*sizeof(PipelineParityLayerRecord),48u*16u);
+    auto expanded=expandPipelineParityLayers(joined,counts,48);
+    ASSERT_EQ(expanded.size(),144u);
+    for(std::size_t i=0;i<fixture.cells.size();++i)
+    {
+        EXPECT_EQ(expanded[i].claims,fixture.cells[i].claims);
+        EXPECT_EQ(expanded[i].records,fixture.cells[i].records);
+        EXPECT_EQ(expanded[i].valid_records,fixture.cells[i].valid_records);
+    }
+    for(auto& header:fixture.headers)header.world=3;
+    PipelineParityObservation empty;empty.rank=2;empty.world=3;empty.layers=48;
+    empty.phase=static_cast<int>(ParityForwardPhase::Prefill);empty.step=-1;
+    empty.scope_valid=1;empty.local_raw_valid=1;fixture.headers.push_back(empty);
+    EXPECT_NO_THROW(mergePipelineParityEvidence(fixture.headers,expanded,48,ParityForwardPhase::Prefill,-1));
+    // A large-to-small replay recomputes useful metadata and cannot send old retained capacity.
+    std::vector<PipelineParityLayerObservation> partial(48);partial[7]={1,1,1};
+    for(int replay=0;replay<3;++replay)
+    {
+        const auto compact=compactPipelineParityLayers(partial);
+        ASSERT_EQ(compact.size(),1u);EXPECT_EQ(compact.front().layer,7u);
+        const std::array<std::size_t,3> partial_counts{1,0,0};
+        const auto reset=expandPipelineParityLayers(compact,partial_counts,48);
+        EXPECT_EQ(reset[7].claims,1u);EXPECT_EQ(reset[8].claims,0u);
+        EXPECT_THROW(mergePipelineParityEvidence(fixture.headers,reset,48,ParityForwardPhase::Prefill,-1),std::invalid_argument);
+    }
+}
+/** @test Malformed compact wire extents reject; nonzero invalid observations remain visible to the exact merger. */
+TEST(Qwen4ExpFinalLogits, SplitPipelineLiveMetadataRejectsMalformedRecordsWithoutHidingForeignEvidence)
+{
+    const std::array<std::size_t,2> one{1,0};
+    const PipelineParityLayerRecord valid{0,{1,1,1}};
+    const std::array<std::size_t,2> two{2,0};
+    EXPECT_THROW(expandPipelineParityLayers(std::array{valid,valid},two,48),std::invalid_argument);
+    EXPECT_THROW(expandPipelineParityLayers(std::array{PipelineParityLayerRecord{48,{1,1,1}}},one,48),std::invalid_argument);
+    EXPECT_THROW(expandPipelineParityLayers(std::array{PipelineParityLayerRecord{0,{}}},one,48),std::invalid_argument);
+    EXPECT_THROW(expandPipelineParityLayers(std::array{valid},two,48),std::invalid_argument);
+    EXPECT_THROW(expandPipelineParityLayers(std::array{valid},std::array<std::size_t,2>{0,0},48),std::invalid_argument);
+    EXPECT_THROW(expandPipelineParityLayers(std::array{valid},one,0),std::invalid_argument);
+    SplitPipelineFixture fixture;
+    // An unowned actual record must cross the wire and fail the original exact checker.
+    fixture.cells[0]={0,1,1};
+    const auto first=compactPipelineParityLayers(std::span(fixture.cells).first(48));
+    const auto second=compactPipelineParityLayers(std::span(fixture.cells).subspan(48));
+    std::vector<PipelineParityLayerRecord> joined(first);joined.insert(joined.end(),second.begin(),second.end());
+    const auto expanded=expandPipelineParityLayers(joined,std::array<std::size_t,2>{first.size(),second.size()},48);
+    EXPECT_EQ(expanded[0].records,1u);EXPECT_EQ(expanded[0].claims,0u);
+    EXPECT_THROW(mergePipelineParityEvidence(fixture.headers,expanded,48,ParityForwardPhase::Prefill,-1),std::invalid_argument);
+}
+}

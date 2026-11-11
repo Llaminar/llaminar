@@ -209,14 +209,16 @@ void PooledImmutableOwnerPreparedStorage::bindInvocationChannel(const CapturedTr
     original_invocation_ = std::make_shared<const CapturedTransferBinding>(original);
 }
 void PooledImmutableOwnerPreparedStorage::bindNativeInvocation(
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, int participant)
+    NativeLocalTPContextBorrow cohort, int participant)
 {
-    if (isGraphCaptureActive() || original_invocation_ || native_invocation_cohort_ || !cohort)
+    if (isGraphCaptureActive() || original_invocation_ || native_invocation_cohort_)
         throw std::logic_error("Pooled native owner requires its once-bound original continuation invocation");
-    cohort->requireConsumer(plan_.parameters().device, participant);
-    const auto original = cohort->context().nativeCompletionAuthority(participant);
-    if (cohort->context().degree() != 2 || !original.valid())
-        throw std::invalid_argument("Pooled native owner requires its actual original TP2 communicator");
+    const auto use=cohort.acquire();auto& context=use.context();
+    if(participant<0 || participant>=context.degree() ||
+        context.devices().at(participant).toLocalDeviceId()!=plan_.parameters().device)
+        throw std::invalid_argument("Pooled native owner changed its original transport coordinate");
+    const auto original=context.nativeCompletionAuthority(participant);
+    if(!original.valid())throw std::invalid_argument("Pooled native owner requires its original completion authority");
     native_invocation_participant_ = participant;
     native_invocation_authority_ = original.binding();
     native_invocation_cohort_ = std::move(cohort);
@@ -229,10 +231,9 @@ void PooledImmutableOwnerPreparedStorage::releaseInvocationChannel(const Capture
     original_invocation_.reset();
 }
 void PooledImmutableOwnerPreparedStorage::releaseNativeInvocation(
-    const std::shared_ptr<const Qwen4ExpReplicatedPLECohort>& original, int participant)
+    const NativeLocalTPContextBorrow& original, int participant)
 {
-    if (isGraphCaptureActive() || original_invocation_ || !original || native_invocation_cohort_.get() != original.get() ||
-        native_invocation_cohort_.owner_before(original) || original.owner_before(native_invocation_cohort_) ||
+    if (isGraphCaptureActive() || original_invocation_ || !native_invocation_cohort_ || !native_invocation_cohort_->sameOriginal(original) ||
         native_invocation_participant_ != participant)
         throw std::logic_error("Retiring native pooled invocation changed its original cohort/control block");
     native_invocation_authority_ = {};
@@ -242,7 +243,9 @@ void PooledImmutableOwnerPreparedStorage::releaseNativeInvocation(
 ncclLlaminarCompletionAuthority PooledImmutableOwnerPreparedStorage::nativeInvocationAuthority() const
 {
     if (!native_invocation_cohort_) return {};
-    native_invocation_cohort_->requireConsumer(plan_.parameters().device, native_invocation_participant_);
+    const auto use=native_invocation_cohort_->acquire();
+    if(use.context().devices().at(native_invocation_participant_).toLocalDeviceId()!=plan_.parameters().device)
+        throw std::logic_error("Pooled native invocation lost its original member");
     if (!native_invocation_authority_.abortFlag || !native_invocation_authority_.deviceCommunicator)
         throw std::logic_error("Pooled native owner lost its original communicator/abort authority");
     return native_invocation_authority_;
@@ -252,7 +255,8 @@ std::uint64_t PooledImmutableOwnerPreparedStorage::invocationChannelIdentity() c
     if (original_invocation_) return original_invocation_->captureIdentity();
     if (!native_invocation_cohort_) return 0;
     const auto original = nativeInvocationAuthority();
-    std::uint64_t value = reinterpret_cast<std::uintptr_t>(&native_invocation_cohort_->context());
+    const auto use=native_invocation_cohort_->acquire();
+    std::uint64_t value = reinterpret_cast<std::uintptr_t>(&use.context());
     value = (value ^ reinterpret_cast<std::uintptr_t>(original.abortFlag)) * 1099511628211ULL;
     value = (value ^ reinterpret_cast<std::uintptr_t>(original.deviceCommunicator)) * 1099511628211ULL;
     value = (value ^ static_cast<unsigned>(native_invocation_participant_)) * 1099511628211ULL;

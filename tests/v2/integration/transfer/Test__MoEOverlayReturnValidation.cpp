@@ -6,13 +6,21 @@
  * This fixture keeps a retained graph and persistent mapped/device addresses,
  * changes only packet data between completed submissions, and proves both the
  * terminal status and absence of payload publication on every rejected replay.
- * The full peer-arrival and anti-ABA lifetime proofs remain in the owning mapped
- * packet suite; this test isolates adversarial descriptor/route validation.
+ * Each exact case is a separate original MPI2 process lifetime: the observed
+ * NUMA owner alone prepares its GPU/source/PMA; the idle original rank retains
+ * setup/retirement participation. One General graph and all mapped/device roots
+ * are admitted before capture. Data resets reuse topology; only terminal queries
+ * expose results. These single-GPU component cases isolate descriptor validation,
+ * while the original-rank peer suite owns peer arrival and anti-ABA progress.
  */
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
-#include "backends/GPUDeviceContextPool.h"
+#include "fixtures/backends/OriginalRankLocalNativeReplay.h"
+#include "fixtures/backends/PreparedNativeLookupFixture.h"
+#include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "collective/CollectiveTimeoutPolicy.h"
 #include "backends/IGPUGraphCapture.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
@@ -21,6 +29,11 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <thread>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,51 +64,121 @@ namespace
     /** Model-free packet regressions belong to the existing preflight target. */
     class MoEOverlayReturnValidation : public ::testing::TestWithParam<ReturnCase> {};
 
-    TEST_P(MoEOverlayReturnValidation, RetainedGraphRejectsCorruptionWithoutPayloadPublication)
-    {
-        const auto parameter = GetParam();
-        auto *const backend = getBackendFor(parameter.device);
-        ASSERT_NE(backend, nullptr);
-        ASSERT_GT(backend->deviceCount(), parameter.device.gpu_ordinal());
-        auto &context = GPUDeviceContextPool::instance().getContext(parameter.device);
-        context.submitAndWait([&] {
-            const bool single = parameter.path == ReturnPath::Single ||
-                parameter.path == ReturnPath::SingleBatch;
-            const int rows = single ? 1 : 65;
-            constexpr int top_k = 4;
-            constexpr int width = 67; // Vector-copy tails and unaligned rows.
-            const std::size_t capacity = static_cast<std::size_t>(rows) * top_k;
-            const std::size_t entries = static_cast<std::size_t>(rows) * 2u;
-            const std::size_t bytes = capacity * width * sizeof(float);
-            TransferEngine engine;
-            const std::array devices{parameter.device};
-            void *const stream = context.getOrCreateAuxiliaryStream("return_validation_regression");
-            ASSERT_NE(stream, nullptr);
-            auto control_memory = engine.allocateMappedHostRegion(
-                sizeof(MoEOverlayActivationEpochControl), devices);
-            auto metadata = engine.allocateMappedHostRegion(7u * capacity * sizeof(int), devices);
-            auto payload = engine.allocateMappedHostRegion(bytes, devices);
-            auto grant_source = engine.allocateMappedHostRegion(
-                sizeof(MoEOverlayActivationDeviceEpochGrant), devices);
-            auto grant_device = engine.allocateDeviceTransferBuffer(
-                sizeof(MoEOverlayActivationDeviceEpochGrant), parameter.device);
-            auto output = engine.allocateDeviceTransferBuffer(bytes, parameter.device);
-            auto lane_valid = engine.allocateDeviceTransferBuffer(sizeof(int), parameter.device);
-            auto lane_source = engine.allocateMappedHostRegion(
-                sizeof(MoEOverlayActivationSingleRowReturnConsumeLaunch), devices);
-            auto lane_device = engine.allocateDeviceTransferBuffer(
-                sizeof(MoEOverlayActivationSingleRowReturnConsumeLaunch), parameter.device);
+    /** @brief Reject setup/enqueue failures before releasing any original native owner. */
+    void requireReturn(bool condition, const char *message)
+    { if (!condition) throw std::runtime_error(message); }
 
+    /** @brief Drain the exact original stream before exceptional graph/buffer destruction. */
+    struct ReturnTerminalRetirement final
+    {
+        std::function<void()> retire;
+        /** @brief Preserve the first diagnostic and fail fatally if native retirement is unprovable. */
+        ~ReturnTerminalRetirement() noexcept
+        {
+            try { if (retire) retire(); }
+            catch (const std::exception &error) {
+                std::cerr << "Original return-validation retirement failed: " << error.what() << '\n';
+                std::terminate();
+            }
+        }
+    };
+
+    /** @brief Replay one declared return entrypoint on its actual original NUMA-owned GPU. */
+    void runOriginalReturnValidation(const ReturnCase &parameter)
+    {
+        using Graph = llaminar2::test::RetainedParticipantGraphExecutableFixtureAccess;
+        const std::array devices{parameter.device};
+        auto original = llaminar2::test::PreparedNativeLookupFixture::prepare(
+            devices, MPIContextFactory::global()->rank());
+        const bool single = parameter.path == ReturnPath::Single || parameter.path == ReturnPath::SingleBatch;
+        const int rows = single ? 1 : 65;
+        constexpr int top_k = 4;
+        constexpr int width = 67; // Vector-copy tails and unaligned rows.
+        const std::size_t capacity = static_cast<std::size_t>(rows) * top_k;
+        const std::size_t entries = static_cast<std::size_t>(rows) * 2u;
+        const std::size_t bytes = capacity * width * sizeof(float);
+        // One immutable declaration feeds both BOM and materialization. These
+        // roots are component protocol operands, not fabricated model tensors.
+        const std::array mapped_bytes{
+            sizeof(MoEOverlayActivationEpochControl), 7u * capacity * sizeof(int), bytes,
+            sizeof(MoEOverlayActivationDeviceEpochGrant),
+            sizeof(MoEOverlayActivationSingleRowReturnConsumeLaunch), bytes, bytes};
+        const std::array device_bytes{sizeof(MoEOverlayActivationDeviceEpochGrant), bytes,
+            sizeof(int), sizeof(MoEOverlayActivationSingleRowReturnConsumeLaunch)};
+        PhysicalMemoryPlanBuilder plan;
+        for (const auto size : mapped_bytes)
+            plan.add(original->resource(DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
+                TransferEngine::mappedHostRegionAllocationBytes(size));
+        for (const auto size : device_bytes)
+            plan.add(original->resource(parameter.device), PhysicalMemoryOwner::ActivationTransportStaging, size);
+        const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
+            original->resource(DeviceId::cpu()), original->resource(parameter.device), 1);
+        for (const auto &line : graph_bom.resources()) plan.add(line);
+        original->admit(plan.build());
+        {
+            auto memory = original->memory();
+            auto worker = original->permit(parameter.device).worker();
+            // This is the worker-owned admitted native stream, not the
+            // CUDA/HIP null or legacy runtime-default stream.
+            void *const stream = worker->defaultStream();
+            requireReturn(reinterpret_cast<std::uintptr_t>(stream) > 2u, "Original return validation lost its exact stream");
+            TransferEngine engine;
+            // Claims outlive native allocations/registrations; the terminal
+            // guard below drains before graph and operand destruction.
+            std::vector<PhysicalMemoryAllocationLease> claims;
+            std::array<std::shared_ptr<MappedHostTransferRegion>, 7> mapped;
+            std::array<std::shared_ptr<DeviceTransferBuffer>, 4> device;
+            worker->submitAndWait([&] {
+                for (std::size_t index = 0; index < mapped.size(); ++index) {
+                    claims.push_back(memory->claimNewAllocation(DeviceId::cpu(),
+                        PhysicalMemoryOwner::ActivationTransportStaging,
+                        TransferEngine::mappedHostRegionAllocationBytes(mapped_bytes[index])));
+                    mapped[index] = engine.allocateMappedHostRegion(mapped_bytes[index], devices);
+                }
+                for (std::size_t index = 0; index < device.size(); ++index) {
+                    claims.push_back(memory->claimNewAllocation(parameter.device,
+                        PhysicalMemoryOwner::ActivationTransportStaging, device_bytes[index]));
+                    device[index] = engine.allocateDeviceTransferBuffer(device_bytes[index], parameter.device);
+                }
+            });
+            const auto &control_memory = mapped[0], &metadata = mapped[1], &payload = mapped[2],
+                &grant_source = mapped[3], &lane_source = mapped[4], &poison_source = mapped[5], &snapshot = mapped[6];
+            const auto &grant_device = device[0], &output = device[1], &lane_valid = device[2], &lane_device = device[3];
             auto *const control = static_cast<MoEOverlayActivationEpochControl *>(control_memory->mutableHostData());
             auto *const mapped_control = static_cast<MoEOverlayActivationEpochControl *>(control_memory->deviceAlias(parameter.device));
             auto *const slots = static_cast<int *>(metadata->mutableHostData());
             auto *const mapped_slots = static_cast<int *>(metadata->deviceAlias(parameter.device));
             auto *const grant = static_cast<MoEOverlayActivationDeviceEpochGrant *>(grant_source->mutableHostData());
             auto *const source = static_cast<float *>(payload->mutableHostData());
-            std::vector<float> poison(capacity * width, -333.0f), actual(poison.size()), expected(poison.size());
-            for (std::size_t i = 0; i < poison.size(); ++i)
-                source[i] = static_cast<float>(static_cast<int>(i % 997u) - 498) * 0.125f;
-
+            auto *const poison = static_cast<float *>(poison_source->mutableHostData());
+            auto *const actual = static_cast<const float *>(snapshot->mutableHostData());
+            const auto elements = capacity * width;
+            std::vector<float> expected(elements);
+            std::fill_n(poison, elements, -333.0f);
+            std::unique_ptr<IMoEKernel> kernel;
+            worker->submitAndWait([&] {
+                kernel = parameter.device.is_cuda()
+                    ? std::unique_ptr<IMoEKernel>(std::make_unique<CUDAMoEKernel>(parameter.device.ordinal))
+                    : std::unique_ptr<IMoEKernel>(std::make_unique<ROCmMoEKernel>(parameter.device.ordinal));
+            });
+            auto graph = Graph::original(original->permit(parameter.device), stream);
+            const auto await = [&] {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                    collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+                for (;;) {
+                    GPUStreamExecutionState state = GPUStreamExecutionState::Pending;
+                    worker->submitAndWait([&] { state = worker->queryStreamExecutionState(
+                        stream, "original return-validation terminal"); });
+                    if (state == GPUStreamExecutionState::Complete) break;
+                    requireReturn(std::chrono::steady_clock::now() < deadline,
+                        "Original return-validation terminal timed out");
+                    std::this_thread::yield();
+                }
+            };
+            ReturnTerminalRetirement retirement{[&] {
+                await();
+                requireReturn(Graph::observeTerminal(graph), "Original return-validation graph remained pending");
+            }};
             constexpr std::uint32_t stage = 1u;
             constexpr int layer = 5;
             const auto bank = moeOverlayActivationBufferIndex(stage);
@@ -122,43 +205,43 @@ namespace
                 *static_cast<MoEOverlayActivationSingleRowReturnConsumeLaunch *>(lane_source->mutableHostData()) = single_packet;
             else
                 *static_cast<MoEOverlayActivationReturnConsumeLaunch *>(lane_source->mutableHostData()) = packet;
-            engine.enqueueMappedHostToPersistentDeviceRegion(*lane_source, 0u,
-                lane_device->mutableDeviceData(), sizeof(single_packet), 0u, sizeof(single_packet),
-                parameter.device, stream);
-            std::unique_ptr<IMoEKernel> kernel = parameter.device.is_cuda()
-                ? std::unique_ptr<IMoEKernel>(std::make_unique<CUDAMoEKernel>(parameter.device.ordinal))
-                : std::unique_ptr<IMoEKernel>(std::make_unique<ROCmMoEKernel>(parameter.device.ordinal));
-            auto graph = context.createGraphCapture(stream);
-            // Only failure/terminal collection may block the host in this test.
-            // Declare the drain after graph/buffers so it retires before them.
-            auto drain = [&](void *) { (void)backend->synchronizeStream(stream, parameter.device.ordinal); };
-            std::unique_ptr<void, decltype(drain)> terminal_guard(&context, drain);
-            ASSERT_TRUE(graph->beginCapture());
-            switch (parameter.path)
-            {
-            case ReturnPath::Single:
-                ASSERT_TRUE(kernel->consumeSingleRowMoEOverlayActivationReturn({.stream = stream}, single_packet));
-                break;
-            case ReturnPath::SingleBatch:
-                ASSERT_TRUE(kernel->consumeSingleRowMoEOverlayActivationReturnBatch({.stream = stream}, {
-                    .lanes = static_cast<const MoEOverlayActivationSingleRowReturnConsumeLaunch *>(lane_device->deviceData()),
-                    .lane_valid = static_cast<int *>(lane_valid->mutableDeviceData()),
-                    .canonical_route_contributions_fp32 = packet.canonical_route_contributions_fp32,
-                    .lane_count = 1u, .d_model = width, .top_k = top_k}));
-                break;
-            case ReturnPath::Multi:
-                ASSERT_TRUE(kernel->consumeMoEOverlayActivationReturn({.stream = stream}, packet));
-                break;
-            case ReturnPath::MultiBatch:
-                ASSERT_TRUE(kernel->consumeMultiRowMoEOverlayActivationReturnBatch({.stream = stream}, {
-                    .lanes = static_cast<const MoEOverlayActivationReturnConsumeLaunch *>(lane_device->deviceData()),
-                    .lane_valid = static_cast<int *>(lane_valid->mutableDeviceData()),
-                    .canonical_route_contributions_fp32 = packet.canonical_route_contributions_fp32,
-                    .lane_count = 1u, .physical_rows = rows, .d_model = width, .top_k = top_k}));
-                break;
-            }
-            ASSERT_TRUE(graph->endCapture());
-            ASSERT_TRUE(graph->instantiate());
+            worker->submitAndWait([&] {
+                engine.enqueueMappedHostToPersistentDeviceRegion(*lane_source, 0u,
+                    lane_device->mutableDeviceData(), sizeof(single_packet), 0u, sizeof(single_packet),
+                    parameter.device, stream);
+            });
+            await(); // Cold immutable descriptor upload precedes native recording.
+            worker->submitAndWait([&] {
+                auto &definition = Graph::capture(graph);
+                ScopedBackendGraphCapture capture(*worker, definition, "original return validation");
+                requireReturn(capture.begin(), "Original return recording did not begin");
+                switch (parameter.path)
+                {
+                case ReturnPath::Single:
+                    requireReturn(kernel->consumeSingleRowMoEOverlayActivationReturn({.stream = stream}, single_packet), "Original single return recording failed");
+                    break;
+                case ReturnPath::SingleBatch:
+                    requireReturn(kernel->consumeSingleRowMoEOverlayActivationReturnBatch({.stream = stream}, {
+                        .lanes = static_cast<const MoEOverlayActivationSingleRowReturnConsumeLaunch *>(lane_device->deviceData()),
+                        .lane_valid = static_cast<int *>(lane_valid->mutableDeviceData()),
+                        .canonical_route_contributions_fp32 = packet.canonical_route_contributions_fp32,
+                        .lane_count = 1u, .d_model = width, .top_k = top_k}), "Original single Batch return recording failed");
+                    break;
+                case ReturnPath::Multi:
+                    requireReturn(kernel->consumeMoEOverlayActivationReturn({.stream = stream}, packet), "Original multi return recording failed");
+                    break;
+                case ReturnPath::MultiBatch:
+                    requireReturn(kernel->consumeMultiRowMoEOverlayActivationReturnBatch({.stream = stream}, {
+                        .lanes = static_cast<const MoEOverlayActivationReturnConsumeLaunch *>(lane_device->deviceData()),
+                        .lane_valid = static_cast<int *>(lane_valid->mutableDeviceData()),
+                        .canonical_route_contributions_fp32 = packet.canonical_route_contributions_fp32,
+                        .lane_count = 1u, .physical_rows = rows, .d_model = width, .top_k = top_k}), "Original multi Batch return recording failed");
+                    break;
+                }
+                capture.finish();
+                requireReturn(definition.prepareRuntimeContextStorage(memory) && definition.instantiate(),
+                    "Original return executable admission failed");
+            });
 
             const std::array faults{
                 ReturnFault::None, ReturnFault::Digest, ReturnFault::Epoch, ReturnFault::Stage,
@@ -180,7 +263,7 @@ namespace
                     // Alternate valid route ownership and payload bytes at the
                     // same retained addresses. Cached metadata must follow each
                     // new publication, not only repeat an unchanged first map.
-                    for (std::size_t i = 0; i < poison.size(); ++i)
+                    for (std::size_t i = 0; i < elements; ++i)
                         source[i] = static_cast<float>(static_cast<int>(i % 113u) - 56 + static_cast<int>(replay));
                     for (std::size_t entry = 0; entry < entries; ++entry)
                     {
@@ -222,15 +305,18 @@ namespace
                     case ReturnFault::CompactOverflow: slots[capacity + entries - 1u] = static_cast<int>(capacity); break;
                     case ReturnFault::GrantOrder: ++grant->last_consumed_stage; break;
                     }
-                    ASSERT_TRUE(backend->hostToDevice(output->mutableDeviceData(), poison.data(), bytes,
-                        parameter.device.ordinal, stream));
-                    engine.enqueueMappedHostToPersistentDeviceRegion(*grant_source, 0u,
-                        grant_device->mutableDeviceData(), sizeof(*grant), 0u, sizeof(*grant), parameter.device, stream);
-                    ASSERT_TRUE(graph->launchOnStream(stream));
-                    ASSERT_TRUE(backend->synchronizeStream(stream, parameter.device.ordinal));
-                    ASSERT_TRUE(backend->deviceToHost(actual.data(), output->deviceData(), bytes,
-                        parameter.device.ordinal, stream));
-                    expected = poison;
+                    worker->submitAndWait([&] {
+                        engine.enqueueMappedHostToPersistentDeviceRegion(*poison_source, 0u,
+                            output->mutableDeviceData(), bytes, 0u, bytes, parameter.device, stream);
+                        engine.enqueueMappedHostToPersistentDeviceRegion(*grant_source, 0u,
+                            grant_device->mutableDeviceData(), sizeof(*grant), 0u, sizeof(*grant), parameter.device, stream);
+                        requireReturn(Graph::submit(graph, replay), "Original return replay submission failed");
+                        engine.enqueuePersistentDeviceRegionToMappedHost(output->deviceData(), bytes, 0u,
+                            *snapshot, 0u, bytes, parameter.device, stream);
+                    });
+                    await();
+                    requireReturn(Graph::observeTerminal(graph), "Original return replay did not publish its terminal");
+                    std::copy_n(poison, elements, expected.data());
                     const bool accepted = current == ReturnFault::None;
                     if (accepted)
                         for (std::size_t entry = 0; entry < entries; ++entry)
@@ -238,13 +324,25 @@ namespace
                             const auto offset = static_cast<size_t>(slots[entry]) * width;
                             std::copy_n(source + offset, width, expected.data() + offset);
                         }
-                    EXPECT_EQ(std::memcmp(actual.data(), expected.data(), bytes), 0);
+                    EXPECT_EQ(std::memcmp(actual, expected.data(), bytes), 0);
                     EXPECT_EQ(control->continuation_status.code, static_cast<std::uint32_t>(accepted
                         ? MoEOverlayActivationStatusCode::Success
                         : current == ReturnFault::GrantOrder ? MoEOverlayActivationStatusCode::OutOfOrder
                         : MoEOverlayActivationStatusCode::PayloadMismatch));
                 }
             }
+        }
+        original->requirePayloadRetired();
+        original->retire();
+        original->requireExactRetired();
+    }
+
+    TEST_P(MoEOverlayReturnValidation, RetainedGraphRejectsCorruptionWithoutPayloadPublication)
+    {
+        const auto parameter = GetParam();
+        llaminar2::test::originalRankLocalReplay(parameter.device.type, 1, [&](const auto &devices) {
+            requireReturn(devices.size() == 1u, "Original return replay lost its single-GPU geometry");
+            runOriginalReturnValidation({devices.front(), parameter.path, parameter.name});
         });
     }
 

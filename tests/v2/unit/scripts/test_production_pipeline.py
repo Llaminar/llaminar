@@ -94,10 +94,18 @@ def full_manifest():
     return {**manifest(), "scope": "all", "cells": [cell(), untagged]}
 
 
+def fixture_preflight_qualification():
+    """Authored no-optional-geometry fixture; original producer validates this same partition."""
+    return {"schema": 1, "registered": ["V2_Unit_A", "V2_Integration_B"],
+            "selected": ["V2_Unit_A", "V2_Integration_B"], "requirements": {},
+            "hardware": None, "unqualified": {}}
+
+
 def parity_report():
     """Complete mock numerical evidence uses the same full fixture membership."""
     return {"correctness_passed": True, "performance_requirements_met": True,
             "artifact_contract_passed": True, "preflight_return_code": 0,
+            "preflight_qualification": fixture_preflight_qualification(),
             "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2,
             "exact_matrix_cell_count": len(full_manifest()["cells"]),
             "campaigns": [{"campaign": "campaign", "return_code": 0, "outcome": "completed",
@@ -109,6 +117,7 @@ def prerequisite_report():
     """Canonical model-free receipt, separate from mathematical diagnostics."""
     return {"preflight_return_code": 0, "preflight_elapsed_seconds": 1,
             "preflight_build_directory": "/src/build_v2_integration", "preflight_completed_ns": 123,
+            "preflight_qualification": fixture_preflight_qualification(),
             "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2}
 
 
@@ -982,7 +991,8 @@ class GenerationAcquisitionAuditTests(unittest.TestCase):
             report = {"schema": 1, "mode": "collect-controls" if name == "serial" else "compare-controls",
                 "source_revision": "revision", "certification_eligible": False, "complete": True,
                 "passed": True, "selected": 1, "preflight_return_code": 0, "preflight_test_count": 2,
-                "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "cells": [{
+                "preflight_qualification": fixture_preflight_qualification(),
+            "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "cells": [{
                     "case": "Suite." + name, "configuration": self.records[name], "return_code": 0,
                     "evidence_error": None, "artifacts": str(self.root / name / "row")}]}
             path = self.root / name / "report.json"
@@ -1710,7 +1720,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                 root = Path(folder)
                 output = root / "results"
                 with patch.object(prerequisites_runner, "run_production_test_preflight",
-                                  return_value=(code, 1.0, ())) as execute:
+                                  return_value=parity.PreflightResult(code, 1.0, (), None)) as execute:
                     self.assertEqual(prerequisites_runner.main([
                         "--build-dir", str(root), "--output", str(output)]), code)
                     execute.assert_called_once_with(root, None, installed_build_receipt=None,
@@ -5151,6 +5161,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-kernarg-metadata.patch", toolchain)
         self.assertIn("patches/rocm-hip-preferred-queue-unshared.patch", toolchain)
+        self.assertIn("patches/rocm-hip-timed-sdma-marker.patch", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/proof.py", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/selector-contract.cpp.in", toolchain)
         # These graph backports and the native-stack/SDMA-sharing repairs are upstream.
@@ -5231,6 +5242,7 @@ class InfrastructureTests(unittest.TestCase):
                 ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-timed-sdma-marker.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]
@@ -5800,9 +5812,11 @@ class InfrastructureTests(unittest.TestCase):
              patch.object(prebuilt_test_image, "validate") as validate, \
              patch.object(parity, "_validate_preflight_index_selection") as preview, \
                      patch.object(parity, "_run_process", return_value=0) as execute:
-            status, _, tests = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
-        self.assertEqual(status, 0)
-        self.assertEqual(len(tests), 2)
+            result = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(len(result.tests), 2)
+        self.assertEqual(result.qualification["selected"], list(result.tests))
+        self.assertEqual(result.qualification["unqualified"], {})
         validate.assert_called_once()
         self.assertEqual(execute.call_count, 2)
         commands = [call.args[0] for call in execute.call_args_list]

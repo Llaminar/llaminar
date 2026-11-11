@@ -9,6 +9,8 @@
  */
 
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
+#include "backends/HostMemoryCapacity.h"
 #include "mocks/MockMPIContext.h"
 #include "fixtures/mpi/OwnedSharedBackingReplay.h"
 #include "mocks/MockMPITopology.h"
@@ -76,7 +78,7 @@ namespace
         auto startup=std::dynamic_pointer_cast<OwnedSharedBackingReplayContext>(context);
         if(!startup)throw std::logic_error("Node-local replay needs explicit startup delivery");
         startup->bind(ownedSharedBackingReplayLink(identity));
-        return MoEOverlayRankBatchTransportConfig{
+        MoEOverlayRankBatchTransportConfig config{
             .mpi_ctx = std::move(context),
             .source_world_rank = 0,
             .target_world_rank = 1,
@@ -133,6 +135,23 @@ namespace
                  .device = DeviceId::cpu()},
             },
         };
+        // This device-free two-rank protocol fixture admits each role's exact
+        // first-touch mapping pages and its actual CPU grant roots. No native
+        // backend, anonymous reserve or parallel materialization ledger exists.
+        const auto capacity=observeSystemMemoryCapacity();
+        const int rank=config.mpi_ctx->rank();
+        const PhysicalMemoryResource host{rank,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
+        PhysicalMemoryPlanBuilder plan;
+        const auto& layout=config.activation_layout;
+        plan.add(host,PhysicalMemoryOwner::ActivationTransportStaging,
+            (rank==config.source_world_rank?layout.sourceOwnedBytes():0)+
+            (rank==config.target_world_rank?layout.targetOwnedBytes():0)+
+            config.local_lanes.size()*config.activation_graph_families.size()*
+                MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes());
+        config.physical_memory_authority=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()),rank);
+        return config;
+
     }
 
     /** @brief Derive a collision-free identity for parallel unit-test processes. */
@@ -925,4 +944,28 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport, OriginalNativeSlotLayoutReject
     changed=layout;changed.geometry.original_native_slots=MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(2);
     EXPECT_FALSE(changed.valid());
     changed=layout;changed.original_native_slots.offset=changed.metadata_pages.end();EXPECT_FALSE(changed.valid());
+}
+
+/**
+ * @test Reject a duplicate physical GPU through the real production constructor before allocation.
+ * The mocks supply device-free rank metadata only; rejection precedes backend,
+ * mapping, tensor, stream or prepared-source construction on both GPU families.
+ */
+TEST(Test__MoEOverlayNodeLocalRankBatchTransport, RankLocalDuplicatePhysicalGPURejectsBeforeAllocation)
+{
+    for (const auto family : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto config = makeConfig(makeContext(0, 2), uniqueIdentity("duplicate_gpu"));
+        config.endpoint_scope = MoEOverlayActivationEndpointScope::RankLocalGPU;
+        config.source_world_rank = config.target_world_rank = 0;
+        config.rank_local_source_device = DeviceId(family, 3);
+        config.local_lanes = {{.participant_id = kParticipants.front(), .device = config.rank_local_source_device},
+                              {.participant_id = kParticipants.front(), .device = config.rank_local_source_device}};
+        try {
+            MoEOverlayNodeLocalRankBatchTransport impossible(std::move(config));
+            FAIL() << "Duplicate original GPU roles reached allocation";
+        } catch (const std::invalid_argument &error) {
+            EXPECT_NE(std::string(error.what()).find("both distinct original GPU grants"), std::string::npos);
+        }
+    }
 }

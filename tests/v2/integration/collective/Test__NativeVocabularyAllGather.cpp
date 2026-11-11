@@ -17,6 +17,7 @@
  * Explicit ordinary multi-row demand previews that same existing stage against
  * an exact PMA bank before capture, with no retained MTP family or hot growth.
  */
+#include "../../fixtures/backends/OriginalRankLocalNativeReplay.h"
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -72,6 +73,8 @@ namespace
     void verify(DeviceId first, PublicationFixture fixture = PublicationFixture::Counted,
                 int participants = 2, int columns = 257)
     {
+        test::originalRankLocalReplay(first.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm, participants, [&](const auto &cohort) {
+
         const bool ordinary_single = fixture == PublicationFixture::OrdinaryNoMTP;
         const bool ordinary_projected = fixture == PublicationFixture::OrdinaryProjectedNoMTP;
         const bool serial_family = fixture == PublicationFixture::SerialFamily || fixture == PublicationFixture::FixedSerial || ordinary_projected;
@@ -85,7 +88,7 @@ namespace
         std::vector<GlobalDeviceAddress> membership;
         for (int ordinal = participants - 1; ordinal >= 0; --ordinal)
         {
-            devices.push_back(first.is_cuda() ? DeviceId::cuda(ordinal) : DeviceId::rocm(ordinal));
+            devices.push_back(cohort[ordinal]);
             membership.push_back(GlobalDeviceAddress::fromLocalDeviceId(devices.back()));
         }
         auto tp = createLocalTPContext(membership, {},
@@ -135,10 +138,10 @@ namespace
                             const auto bank = VocabularyGatherWorkspaceContract::requirements(
                                 demand.resolveForSequence(1, 16), full_columns).total_bytes_with_alignment();
                             PhysicalMemoryPlanBuilder plan;
-                            plan.add({.world_rank = 0, .device = device, .total_bytes = bank,
+                            plan.add({.world_rank = MPIContextFactory::global()->rank(), .device = device, .total_bytes = bank,
                                       .admission_available_bytes = bank}, PhysicalMemoryOwner::ExecutionWorkspace, bank);
                             ordinary_memory = std::make_shared<PhysicalMemoryAuthority>(
-                                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+                                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), MPIContextFactory::global()->rank());
                         }
                         auto family_owner = ordinary_projected
                             ? std::make_unique<WorkspaceAllocator>(ordinary_memory)
@@ -327,6 +330,8 @@ namespace
                 try { std::rethrow_exception(error); }
                 catch (const std::exception &failure) { ADD_FAILURE() << failure.what(); }
             }
+
+        });
     }
 }
 #ifdef HAVE_CUDA

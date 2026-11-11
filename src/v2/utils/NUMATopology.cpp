@@ -9,6 +9,10 @@
  * Missing or multi-node facts remain unknown for admission to reject.
  * @author David Sanftenberg
  * @date 2025-10-31
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #include "NUMATopology.h"
@@ -22,10 +26,12 @@
 #include <limits>
 #include <string_view>
 
-// Conditional includes for optional dependencies
-#ifdef HAVE_HWLOC
+// Required only for the explicit cold MPI-placement observation below. The
+// existing optional HAVE_HWLOC ownership detector remains independently gated.
 #include <hwloc.h>
-#endif
+#include <hwloc/plugins.h>
+#include <set>
+#include <stdexcept>
 
 // GPU headers - CANNOT include both CUDA and HIP in same translation unit (type conflicts)
 // When both are enabled, use extern declarations from GPUEnumeration.h instead
@@ -47,6 +53,90 @@
 
 namespace llaminar2
 {
+    std::vector<MPICorePlacement> NUMATopology::observeMPICorePlacement()
+    {
+        struct TopologyOwner
+        {
+            hwloc_topology_t value = nullptr;
+            /** @brief Retire successful or partial CPU discovery on every exit. */
+            ~TopologyOwner() { if (value) hwloc_topology_destroy(value); }
+        } topology;
+        if (hwloc_topology_init(&topology.value) != 0)
+            throw std::runtime_error("Cannot initialize canonical CPU MPI placement topology");
+        // Native GPU discovery belongs exclusively to HardwareInventory's
+        // backend branches. This CPU projection must not open any GPU runtime,
+        // including through hwloc's optional I/O/plugin discovery phases.
+        if (hwloc_topology_set_io_types_filter(topology.value, HWLOC_TYPE_FILTER_KEEP_NONE) != 0)
+            throw std::runtime_error("Cannot restrict MPI placement discovery to CPU objects");
+        // Exclude non-CPU discovery phases for all components, including
+        // optional plugins absent from a particular package. Naming a missing
+        // component is an error in hwloc, so a hardcoded plugin-name list would
+        // incorrectly reject otherwise valid CPU-only installations.
+        const unsigned excluded = HWLOC_DISC_PHASE_PCI | HWLOC_DISC_PHASE_IO |
+            HWLOC_DISC_PHASE_MISC | HWLOC_DISC_PHASE_ANNOTATE;
+        const auto phases = std::string("all:") + std::to_string(excluded);
+        if (hwloc_topology_set_components(topology.value, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, phases.c_str()) != 0)
+            throw std::runtime_error("Cannot exclude GPU/I/O phases from CPU MPI placement discovery");
+        if (hwloc_topology_load(topology.value) != 0 || !hwloc_topology_is_thissystem(topology.value))
+            throw std::runtime_error("CPU MPI placement requires actual local hwloc topology");
+        std::vector<MPICorePlacement> result;
+        for (auto *core = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_CORE, nullptr);
+             core; core = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_CORE, core))
+        {
+            if (!core->cpuset || hwloc_bitmap_iszero(core->cpuset) ||
+                core->logical_index > static_cast<unsigned>(std::numeric_limits<int>::max()))
+                throw std::runtime_error("CPU MPI placement has an invalid physical core");
+            int owner = -1;
+            for (auto *node = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_NUMANODE, nullptr);
+                 node; node = hwloc_get_next_obj_by_type(topology.value, HWLOC_OBJ_NUMANODE, node))
+            {
+                if (!node->cpuset || !hwloc_bitmap_intersects(core->cpuset, node->cpuset)) continue;
+                if (owner >= 0 || !hwloc_bitmap_isincluded(core->cpuset, node->cpuset) ||
+                    node->os_index > static_cast<unsigned>(std::numeric_limits<int>::max()))
+                    throw std::runtime_error("CPU MPI placement core has ambiguous observed NUMA ownership");
+                owner = static_cast<int>(node->os_index);
+            }
+            if (owner < 0)
+                throw std::runtime_error("CPU MPI placement core lacks exact observed NUMA ownership");
+            MPICorePlacement placement{owner, static_cast<int>(core->logical_index), {}};
+            for (int cpu = hwloc_bitmap_first(core->cpuset); cpu >= 0; cpu = hwloc_bitmap_next(core->cpuset, cpu))
+                placement.os_cpu_ids.push_back(cpu);
+            result.push_back(std::move(placement));
+        }
+        if (result.empty())
+            throw std::runtime_error("CPU MPI placement has no observed physical cores");
+        return result;
+    }
+
+    std::map<int,std::vector<int>> NUMATopology::logicalMPICoresForNUMANodes(
+        std::span<const MPICorePlacement> observed, std::span<const int> selected_nodes)
+    {
+        if (observed.empty() || selected_nodes.empty())
+            throw std::invalid_argument("MPI placement requires original observed cores and selected NUMA membership");
+        std::set<int> cores, cpus;
+        std::map<int,std::vector<int>> groups;
+        for (const auto &core : observed)
+        {
+            if (core.os_numa_node < 0 || core.logical_core_index < 0 || core.os_cpu_ids.empty() ||
+                !cores.insert(core.logical_core_index).second)
+                throw std::invalid_argument("MPI placement contains contradictory OS/logical core observations");
+            for (const int cpu : core.os_cpu_ids)
+                if (cpu < 0 || !cpus.insert(cpu).second)
+                    throw std::invalid_argument("MPI placement contains duplicate/unknown OS CPU membership");
+            groups[core.os_numa_node].push_back(core.logical_core_index);
+        }
+        std::map<int,std::vector<int>> selected;
+        for (const int node : selected_nodes)
+        {
+            const auto found = groups.find(node);
+            if (node < 0 || found == groups.end() || !selected.emplace(node, found->second).second)
+                throw std::invalid_argument("MPI placement cannot select an unknown/duplicate observed NUMA node");
+            auto &logical = selected.at(node);
+            std::sort(logical.begin(), logical.end());
+        }
+        return selected;
+    }
+
     // Forward declarations of private helper functions
     static int detectViaHwloc();
     static int detectViaProcfs();

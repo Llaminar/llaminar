@@ -1,44 +1,37 @@
 # QFN tuning dashboard
 
-Updated 2026-11-10. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-11. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Current nine-slot CPU-ILP slice: **339.306/40.566 P/D**, versus control
-335.999/40.798. All 768 IDs/MTP match; movement differs, so no causal model
-speedup claimed. Global defaults unchanged; 500/40 remains open. [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md).
-Cycle proposal **1.23× faster**, model gain unproven;14 focused gates pass.
-[Cycle results](../2026-11/QFN_ORDERED_MIGRATION_CYCLES_20261110.md).
-[Measured M448 dispatch](../2026-11/QFN_ROCM_M448_NATIVE_Q8_20261110.md),
-[migration continuation](../2026-11/QFN_ACTIVE_PROGRESS_MIGRATION_20261110.md),
-[cache/planner](../2026-11/QFN_CACHE_AND_PLACEMENT_ECONOMY_20261110.md).
-Historical remote-GPU rates are numerical controls, **not a placement speedup
-baseline**. Standalone benchmark rank→PID publication remains open.
+**Active target: QFN PP(EP(4×MI50), EP(4×MI50)), ngrams sharded in VRAM
+across all eight GPUs.** Tune prefill and decode toward measured compute and
+memory-bandwidth limits; no throughput target is substituted for profiling.
+**Functional:** all **5,256** selected Unit/preflight tests passed, zero skips;
+39 absent-hardware cases remain unqualified. Includes 24 formats per GPU
+backend and the full 32-case EP4/EP4 preparation/lifecycle matrix. Parent
+interruption prevented a whole-run receipt; user requested checkpointing the
+passing slice and skipping the redundant repeat. Numerical/model gates next.
+**Implementation:** published-capacity ownership and retained-request ordering
+repaired; original MPI/source authority preserved.
+[Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
+**Performance:** the exact eight-GPU model cell has no qualified baseline yet.
+[Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
+[fixed VRAM ngram plan](QFN_FIXED_VRAM_PIPELINE_PLAN_2026-11-10.md).
+
+Former hybrid target retained as a control: 2×MI50 +2×CPU TP achieved
+**339.306/40.566 P/D** with the nine-slot CPU-ILP slice. All 768 IDs/MTP matched,
+but movement differed, so no causal model speedup was claimed.
+[Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md),
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
-Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
-control showed **+7.09% P**, with unchanged output IDs/MTP.
-Automatic sizing: five slots **8066 total,4033/card**; nine **7940,3970/card**.
-Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
-and 16/32 GiB RAM/disk prefix budgets.
 
-**MPI/CMA fix is pushed in `2eda003d6`.** Typed registered migration backing
-passes 17 native/transfer and 21 exact-feature checks; clean model output/MTP
-matches with zero read errors. Throughput is approximately flat versus the
-explicit-none control. Full preflight, exact-feature GPU/model and OpenCode
-qualification remain open; previous broad-tree passes are not that certificate.
-
-**Current tuning:** modern scope retains105 geometries,315 completed M1 jobs
-and11 grouped cells; no broad resweep. M3 overlay: **11% component gain**, model flat.
-CPU Auto: all21 byte-exact; mixed FFN improves **2.5–14%** in16 formats,
-five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
-Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
-[All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
-**Latest CPU slice:** exact pair-dot ILP passes bytes and spill inspection;
-QFN gate/up improves **4.5%**, persistent FFN **1.9–2.5%**. Five nibble formats
-qualified in both roles; full preflight next. [Results](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md).
+**Retained CPU work:** Auto scheduling is byte-exact in all21 formats;
+QFN FFN component gains are **26–31%**. Pair-dot ILP improves gate/up **4.5%**
+and persistent FFN **1.9–2.5%**. These remain scoped component results.
+[All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md),
+[ILP results](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md).
 **GNU wait policy stays unchanged:** unset **299.560P/38.994D**; spin0
 199.393/29.381 and spin1000 203.445/32.726 regress. All 768 IDs/MTP/config/initial
 placement match. Runtime pause-loop cycle shares are not removable wall time.
@@ -85,8 +78,9 @@ is paused after a profiler/driver assertion; native events remain available.
 
 ## Canonical functional and performance matrix
 
-The current target is these **six hardware rows**, across RAM/SSD ngram backing
-and bounded RAM/VRAM row caches with promotion/demotion. [Coverage plan][target-matrix]
+The matrix retains **six hardware rows** across RAM/SSD ngram backing and bounded
+RAM/VRAM row caches, plus the new **Q7 active eight-GPU target** with GPU-sharded
+ngrams. [Coverage plan][target-matrix]
 owns the pairing strategy; the existing typed test definitions own commands.
 Q6 tests ngram ownership on continuation GPUs, follower GPUs, and both. Its four
 MI50s must execute real expert work. Any required CPU expert backing is explicit.
@@ -103,6 +97,7 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | ⚪ model parity pending | — | — | — | — | — | — |
 
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
 Small C0/C64 row-cache fixtures force movement; performance uses useful admitted

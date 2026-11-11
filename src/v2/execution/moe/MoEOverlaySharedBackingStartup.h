@@ -15,7 +15,7 @@
 namespace llaminar2 {
     class IMPIContext;
     /** @brief Distinct real consumers sharing one construction protocol. */
-    enum class MoEOverlaySharedBackingKind : std::uint64_t { ActivationRows=1, DeviceControllerFabric=2 };
+    enum class MoEOverlaySharedBackingKind : std::uint64_t { ActivationRows=1, DeviceControllerFabric=2, PlanningHostDevice=3, PipelineActivation=4 };
     /** @brief Immutable existing namespace/epoch facts naming one startup transaction. */
     struct MoEOverlaySharedBackingEpoch final {
         MoEOverlaySharedBackingKind kind;

@@ -25,7 +25,7 @@ namespace llaminar2
     namespace
     {
         using Json = nlohmann::json;
-        constexpr auto kSchema = "llaminar.planning-communication.v4";
+        constexpr auto kSchema = "llaminar.planning-communication.v5";
 
         /** @brief Reject incomplete evidence before it can influence selection. */
         void require(bool condition, const char *detail)
@@ -54,9 +54,7 @@ namespace llaminar2
         /** @return Complete physical host/GPU identity, including rank-owned first touch. */
         Json identity(const PlanningHostDeviceRequest &request)
         {
-            return {{"rank", request.rank()}, {"node", request.physicalNode()}, {"host_numa", request.hostNumaNode()},
-                {"device", {int(request.device().type), request.device().ordinal}}, {"uuid", request.uuid()},
-                {"bulk_bytes", request.bulkBytes()}};
+            return Json::parse(request.serialize());
         }
 
         /** @return Wire bytes for immutable control/receipt metadata, never transfer payloads. */
@@ -103,10 +101,13 @@ namespace llaminar2
             }
             for (const auto &sample : plan.hostDevice())
             {
-                if (sample.rank() != rank) continue;
+                if (sample.hostRank() != rank && sample.gpuRank() != rank) continue;
                 PhysicalMemoryPlanBuilder builder;
-                PlanningHostDeviceMeasurement::contributeMemory(sample, host,
-                    planningObservedResource(observed, sample.device()), builder);
+                if (sample.hostRank() == rank)
+                    PlanningHostDeviceMeasurement::contributeHostMemory(sample, host, builder);
+                if (sample.gpuRank() == rank)
+                    PlanningHostDeviceMeasurement::contributeExecutionMemory(sample,
+                        planningObservedResource(observed, sample.device()), builder);
                 alternatives.push_back(builder.build());
             }
             PhysicalMemoryPlanBuilder packets;
@@ -229,9 +230,9 @@ namespace llaminar2
         // Keep a bounded per-GPU basis for the candidate subsets, rather than
         // changing the inference transport or probing each candidate. PP and
         // heterogeneous overlay searches also need host staging. Preserve
-        // every eligible executor's original host scope. Cross-rank CPU
-        // packet measurements above keep their real peer membership; remote
-        // GPU visibility does not grant this rank native execution authority.
+        // each owned GPU's original same-machine host first-touch scopes.
+        // Those host roles never gain native execution authority from visibility;
+        // they establish shared pages for the existing NUMA-local GPU executor.
         if (request.allows(OrchestrationStrategy::PipelineParallel) || request.allows(OrchestrationStrategy::ExpertOverlay) ||
             (request.allows(OrchestrationStrategy::TensorParallel) &&
                 (routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
@@ -246,7 +247,10 @@ namespace llaminar2
                     return std::tuple{a.type, a.ordinal} < std::tuple{b.type, b.ordinal};
                 });
                 for (auto device : devices)
-                    result.host_device_.push_back(PlanningHostDeviceRequest::fromInventory(rank, device, payload));
+                    for (const auto &host : inventory.ranks)
+                        if (inventory.connectionBetweenRanks(rank.rank, host.rank).locality() != RankConnectionLocality::CrossNode)
+                            result.host_device_.push_back(PlanningHostDeviceRequest::fromInventory(inventory,
+                                {rank.rank, device}, {host.rank}, payload));
             }
         return result;
     }
@@ -356,7 +360,7 @@ namespace llaminar2
                 const size_t index = integer(entry.at("index"));
                 require(index < plan.hostDevice().size() && !completed_host.contains(index), "duplicate/foreign host-device index");
                 const auto &sample = plan.hostDevice()[index];
-                require(sample.rank() == receipt.discovery_rank, "host-device result from wrong first-touch process");
+                require(sample.gpuRank() == receipt.discovery_rank, "host-device result from wrong GPU executor");
                 PlanningHostDeviceObservations observed{sample, {}};
                 for (const auto &phase : entry.at("phases"))
                 {
@@ -424,17 +428,21 @@ namespace llaminar2
                         if (sample.discovery_rank == rank)
                             local.emplace_back(index, PlanningLocalTPMeasurement::measure(sample.request, memory));
                     }
-                    for (size_t index = 0; index < plan->hostDevice().size(); ++index)
-                    {
-                        const auto &sample = plan->hostDevice()[index];
-                        if (sample.rank() == rank)
-                            local_host.emplace_back(index, PlanningHostDeviceMeasurement::measure(sample, memory));
-                    }
                 }
                 return encodeLocal(*plan, local, local_host);
-            }, [&](auto receipts) {
-                if (round + 1 == rounds) completed = acceptLocal(*plan, inventory.world_size, receipts);
-            });
+            }, [](auto) {});
+        // Each bounded GPU/host coordinate needs both original roles. Visit it
+        // on every rank; its existing phase protocol owns placement and retirement.
+        for (size_t index = 0; index < plan->hostDevice().size(); ++index)
+            if (auto observed = PlanningHostDeviceMeasurement::collect(plan->hostDevice()[index], mpi, memory))
+                local_host.emplace_back(index, std::move(*observed));
+        exchangePlanningSamples(mpi, [&](int count) {
+            return std::vector<std::vector<uint8_t>>(count, plan->serialize());
+        }, [&](auto identity) {
+            require(std::vector<uint8_t>(identity.begin(), identity.end()) == plan->serialize(),
+                "completed communication basis disagrees across ranks");
+            return encodeLocal(*plan, local, local_host);
+        }, [&](auto receipts) { completed = acceptLocal(*plan, inventory.world_size, receipts); });
         std::vector<PlanningMPITransferObservation> packets;
         if (!plan->mpi().empty())
             packets = PlanningMPITransferMeasurement::measure(mpi, memory, DeviceId::cpu(), [&] { return plan->mpi(); });

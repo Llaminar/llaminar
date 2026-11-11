@@ -116,23 +116,39 @@ ResolvedImmutableRowTablePlacement::gpuAdaptiveLocalHotCaches() const
     return std::get<GPUAdaptive>(value_).local_hot;
 }
 
-ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout)
-    :value_(FixedHeadShards{std::move(layout)})
+ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout,
+    std::shared_ptr<const ImmutableFixedHeadPipelineProjection> pipeline)
+    :value_(FixedHeadShards{std::move(layout), std::move(pipeline)})
 {
     const auto &g=std::get<FixedHeadShards>(value_).layout;
     const std::array tiers{ImmutableRowStorage::VRAM};
     if(g.residency()!=ImmutableRowTableResidency::Fixed || g.tiers()!=ImmutableRowTableTiers::of(tiers) ||
-        g.owners().empty() || g.owners().size()!=g.consumers().size() || g.fixedRanges().size()!=g.owners().size() ||
+        g.owners().empty() || (!fixedHeadPipeline() && g.owners().size()!=g.consumers().size()) ||
+        g.fixedRanges().size()!=g.owners().size() ||
         !g.sourceServices().empty() || !g.replicaGroups().empty() || g.gpuCoordinator() || g.maximumInflightRows())
         throw std::invalid_argument("Fixed head shards require exact VRAM primary owners and no other storage/service mode");
+    if (const auto* original = fixedHeadPipeline()) {
+        if (original->owners().size() != g.owners().size() ||
+            original->consumers().size() != g.consumers().size() ||
+            !std::is_permutation(original->consumers().begin(), original->consumers().end(), g.consumers().begin()))
+            throw std::invalid_argument("Fixed PLE pipeline changed its original storage or consumer roster");
+        for (const auto& range : g.fixedRanges())
+            (void)original->owner(range.owner.allocator);
+    }
     for(const auto &o:g.owners())
     {
         if(o.key.tier!=ImmutableRowStorage::VRAM || !o.fixed_rows || o.cache_rows ||
-            std::find(g.consumers().begin(),g.consumers().end(),o.key.allocator)==g.consumers().end() ||
+            (!fixedHeadPipeline() &&
+                std::find(g.consumers().begin(),g.consumers().end(),o.key.allocator)==g.consumers().end()) ||
             std::count_if(g.fixedRanges().begin(),g.fixedRanges().end(),[&](const auto &r) {
                 return r.owner==o.key && r.role==ImmutableRowTableCopyRole::Primary && r.rows==o.fixed_rows;})!=1)
             throw std::invalid_argument("A fixed head owner must retain exactly one complete declared native primary range");
     }
+}
+const ImmutableFixedHeadPipelineProjection* ResolvedImmutableRowTablePlacement::fixedHeadPipeline() const noexcept
+{
+    const auto* fixed = std::get_if<FixedHeadShards>(&value_);
+    return fixed ? fixed->pipeline.get() : nullptr;
 }
 bool ResolvedImmutableRowTablePlacement::isFixedHeadShards() const noexcept {return std::holds_alternative<FixedHeadShards>(value_);}
 bool ResolvedImmutableRowTablePlacement::isHostAdaptive() const noexcept {return std::holds_alternative<HostAdaptive>(value_);}
@@ -164,9 +180,11 @@ const ImmutableRowTableExtent &ResolvedImmutableRowTablePlacement::extent() cons
 ImmutableRowAllocatorInventory ResolvedImmutableRowTablePlacement::allocators() const noexcept
 {
     if(const auto *w=std::get_if<WholeTier>(&value_))return {w->allocators};
-    // This component admits owner==consumer. The layout's existing consumer
-    // inventory is the immutable identity view, not another stored owner map.
-    if(const auto *f=std::get_if<FixedHeadShards>(&value_))return {f->layout.consumers()};
+    // Pipeline stages may retain source shards without performing the PLE
+    // lookup. Project every original storage owner directly from the layout;
+    // the separate consumer inventory only grants permission to issue reads.
+    if(const auto *f=std::get_if<FixedHeadShards>(&value_))
+        return ImmutableRowAllocatorInventory(std::span<const ImmutableRowTableLayoutOwner>{f->layout.owners()});
     // Preserve the existing pool role. A reader's local cache is a distinct
     // admitted component, not another owner of the shared directory.
     if(const auto *a=std::get_if<GPUAdaptive>(&value_))

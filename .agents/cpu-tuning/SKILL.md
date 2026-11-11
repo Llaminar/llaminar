@@ -23,6 +23,14 @@ placement; GPU capture and native-event requirements do not apply.
 - Preserve the production arithmetic order. Grouped verifier rows must remain
   byte-identical to serial M=1 decode for every supported format and positive
   thread count.
+- **Prefer register-resident work.** Keep reusable operands, accumulators and
+  short-lived intermediates in registers through their consumers. Choose
+  layouts, tiles, live ranges and fusion to eliminate unnecessary temporary
+  buffers, stores and reloads. Preserve independent accumulator chains and the
+  numerical contract while shortening live ranges. Apply the
+  [hot-loop spill workflow](#classify-spills-by-execution-regime) separately to
+  AVX2 and AVX-512; qualify the generated code and measured latency, including
+  shuffle and dependency costs, rather than optimizing register count alone.
 - Use physical cores as the default worker budget. Treat SMT, cross-socket
   placement, and nested BLAS/OpenMP teams as separate, explicitly measured
   modes.
@@ -266,6 +274,10 @@ source annotation; prologue saves, scalar pointer slots, exception paths, and
 unreached ISA branches are not hot-loop vector spills. Build AVX2 and AVX-512
 separately because an AVX-512 build can hide pressure in code that is meant to
 represent the 16-register AVX2 regime.
+
+Inspect the production-selected entry and its arithmetic helpers after fusion,
+inlining or dispatch changes. A spill-free standalone microkernel does not
+qualify a fused caller with different live ranges and register allocation.
 
 For compute-bound GEMM and grouped-verifier candidates, a vector spill in the
 K loop disqualifies the candidate. Keep a no-spill geometry available and

@@ -108,15 +108,16 @@ namespace llaminar2
         for (const auto &[pair, present] : coordinates)
             require(std::all_of(present.begin(), present.end(), [](bool found) { return found; }),
                 "incomplete MPI control/outbound/return basis");
-        std::set<std::tuple<int, DeviceType, std::string>> host_coordinates;
+        std::set<std::tuple<int, int, DeviceType, std::string>> host_coordinates;
         for (const auto &observed : host_device_)
         {
             PlanningHostDeviceMeasurement::validate(observed);
             const auto &request = observed.request;
-            require(request == PlanningHostDeviceRequest::fromInventory(rank(request.rank()), request.device(), request.bulkBytes()),
+            require(request == PlanningHostDeviceRequest::fromInventory(inventory_,
+                {request.gpuRank(), request.device()}, {request.hostRank()}, request.bulkBytes()),
                 "GPU/host receipt belongs to another first-touch or physical endpoint scope");
-            require(host_coordinates.emplace(request.rank(), request.device().type, request.uuid()).second,
-                "duplicate GPU/host physical sample for one first-touch rank");
+            require(host_coordinates.emplace(request.gpuRank(), request.hostRank(), request.device().type, request.uuid()).second,
+                "duplicate GPU executor/host first-touch sample");
         }
     }
 
@@ -205,7 +206,8 @@ namespace llaminar2
             "invalid GPU/host query mechanism/direction/payload");
         const auto &endpoint = gpu(gpu_rank, device);
         const auto found = std::find_if(host_device_.begin(), host_device_.end(), [&](const auto &observed) {
-            return observed.request.rank() == host_rank && observed.request.device().type == device.type &&
+            return observed.request.gpuRank() == gpu_rank && observed.request.hostRank() == host_rank &&
+                observed.request.device().type == device.type &&
                 observed.request.uuid() == endpoint.uuid;
         });
         require(found != host_device_.end(), "missing exact GPU and host first-touch scope; another rank is not a substitute");
@@ -221,7 +223,8 @@ namespace llaminar2
         const PlanningPayloadServiceCurve curve(1, small->service.elapsedSeconds() / invocations,
             large->payload_bytes, large->service.elapsedSeconds() / invocations);
         return {curve.seconds(payload), PlanningCommunicationBasis::SameProtocolPayloadCurve,
-            "GPU-host byte primitive; host-rank=" + std::to_string(host_rank) +
+            "GPU-host byte primitive; gpu-executor-rank=" + std::to_string(gpu_rank) +
+            "; host-rank=" + std::to_string(host_rank) +
             "; host-numa=" + std::to_string(found->request.hostNumaNode()) +
             "; mechanism=" + std::to_string(int(mechanism)) + "; direction=" + std::to_string(int(direction)) +
             "; excludes packet routing/protocol waits and MPI; no inferred NUMA relocation"};

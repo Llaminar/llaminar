@@ -18,6 +18,7 @@
 #include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
+#include <map>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -393,6 +394,18 @@ namespace llaminar2
          */
         [[nodiscard]] static std::vector<MoEOverlayBoundTierParticipant>
         boundParticipants(const MoERoutedExpertPlacementPlan &plan);
+
+        /**
+         * @brief Declare the shared original per-GPU movement stream population.
+         * @param plan Original bound tier/participant topology; layers do not multiply pools.
+         * @param world_rank Original physical owner whose local endpoints are selected.
+         * @param maximum_execution_streams Independent streams per actual local participant.
+         * @return GPU-keyed exact pool sizes shared by fixed BOM and native materialization.
+         * @throws std::invalid_argument For invalid rank, zero width or malformed topology.
+         * @throws std::overflow_error For an unrepresentable physical stream count.
+         */
+        [[nodiscard]] static std::map<DeviceId,std::size_t> executionStreamCounts(
+            const MoERoutedExpertPlacementPlan &plan,int world_rank,std::size_t maximum_execution_streams);
 
         /**
          * @brief Price every persistent staging allocation in the real fabric.

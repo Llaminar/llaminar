@@ -403,7 +403,7 @@ namespace llaminar2
             return MoEExpertPlacementTarget(placement.tier_idx, placement.owner_participant);
         }
         const auto &cohort = *placement.shard_cohort;
-        if (cohort.participants().size() < 2 || cohort.participants().size() > 8 ||
+        if (cohort.participants().size() < 2 || cohort.participants().size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
             placement.owner_participant != -1 || placement.device.is_valid() ||
             placement.owner_world_rank_known || placement.owner_world_rank != -1 ||
             placement.domain_participant_index != -1 ||

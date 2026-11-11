@@ -17125,11 +17125,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             readFile(root / "src/v2/execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp"),
             "bool PipelineDeviceGeneration::prepareSpeculativeParticipants(",
             "bool PipelineDeviceGeneration::composeSpeculativeParticipants()")));
+    const auto pipeline_source = readFile(
+        root / "src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp");
+    const auto pipeline_original_admission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(pipeline_source,
+            "PipelineDeviceGeneration::originalAdmission() const",
+            "PipelineDeviceGeneration::domainFor(")));
+    const auto pipeline_follower_admission = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(pipeline_source,
+            "bool PipelineDeviceGeneration::admitOriginalFollower(",
+            "bool PipelineDeviceGeneration::begin(")));
     const auto pipeline_admission = removeAsciiWhitespace(
-        stripCommentsAndStringLiterals(sliceBetween(
-            readFile(root / "src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp"),
+        stripCommentsAndStringLiterals(sliceBetween(pipeline_source,
             "bool PipelineDeviceGeneration::begin(",
-            "bool PipelineDeviceGeneration::prepareParticipants(")));
+            "PipelineDeviceGeneration::nativeStageMaintenance(")));
     const auto declared_execution_policy = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
@@ -17499,21 +17508,31 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_EQ(continuation_entry.find("publishForcedDeviceResidentConditionToken("), std::string::npos);
     EXPECT_EQ(continuation_entry.find("materializeDeviceResidentGeneration("), std::string::npos);
 
-    EXPECT_NE(pipeline_speculative.find(
-        "constauto&tail_admission=stages_[terminalIndex()]->active_device_generation_admission_;"), std::string::npos);
+    EXPECT_NE(pipeline_original_admission.find(
+        "if(rank_topology_)returnrank_admission_;returnstages_[terminalIndex()]->active_device_generation_admission_;"),
+        std::string::npos)
+        << "An original-rank pipeline borrows published admission; a local pipeline borrows the actual tail.";
+    EXPECT_NE(pipeline_speculative.find("constauto&tail_admission=originalAdmission();"), std::string::npos);
     EXPECT_NE(pipeline_speculative.find("if(!tail_admission)"), std::string::npos);
-    EXPECT_NE(pipeline_speculative.find("constauto&policy=tail_admission->depth_policy;"), std::string::npos)
-        << "Follower bounds borrow the terminal's immutable policy; they never own a second sampler/controller admission.";
+    EXPECT_NE(pipeline_speculative.find(
+        "constautodepths=deviceGenerationSpeculativeDepthRange(tail_admission->depth_policy);if(!depths)returnfalse;"),
+        std::string::npos)
+        << "Follower bounds consume the typed projection of the original policy.";
+    EXPECT_NE(pipeline_speculative.find(
+        "loop.minimum_draft_depth=depths->minimum;loop.maximum_draft_depth=depths->maximum;"),
+        std::string::npos);
     EXPECT_EQ(pipeline_speculative.find("stage.active_device_generation_admission_"), std::string::npos);
-    EXPECT_NE(pipeline_speculative.find(
-        "loop.minimum_draft_depth=policy.mode==sampling_math::DeviceGenerationPolicyMode::Dynamic?policy.minimum_depth:policy.initial_depth;"),
+    EXPECT_EQ(pipeline_speculative.find("beginDeviceResidentGeneration("), std::string::npos);
+    EXPECT_NE(pipeline_admission.find(
+        "if(hasLocalTail()&&!tailDomain().runner->beginDeviceResidentGeneration(request))returnfalse;"),
         std::string::npos);
-    EXPECT_NE(pipeline_speculative.find(
-        "loop.maximum_draft_depth=policy.mode==sampling_math::DeviceGenerationPolicyMode::Dynamic?policy.maximum_depth:policy.initial_depth;"),
-        std::string::npos);
-    EXPECT_NE(pipeline_admission.find("domains_.back().runner->beginDeviceResidentGeneration(request)"), std::string::npos);
-    EXPECT_NE(pipeline_admission.find("stage.active_device_generation_admission_||"), std::string::npos)
-        << "Follower admission must continue rejecting a controller shadow.";
+    EXPECT_EQ(countOccurrences(pipeline_admission, "beginDeviceResidentGeneration("), 1u)
+        << "The original tail is the sole controller admission site.";
+    EXPECT_NE(pipeline_admission.find("if(!admitOriginalFollower(i,request))returnfalse;"), std::string::npos);
+    EXPECT_NE(pipeline_follower_admission.find("stage.active_device_generation_admission_||"), std::string::npos)
+        << "Follower admission must reject an active controller shadow.";
+    EXPECT_EQ(pipeline_follower_admission.find("stage.active_device_generation_admission_="), std::string::npos);
+    EXPECT_EQ(pipeline_follower_admission.find("beginDeviceResidentGeneration("), std::string::npos);
     EXPECT_EQ(pipeline_admission.find("stage.active_device_generation_admission_="), std::string::npos);
     EXPECT_EQ(
         dynamic_parent_admission.find("primaryDeviceId().is_cuda()"),

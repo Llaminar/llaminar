@@ -40,7 +40,8 @@ REPLAY_DECLARATIONS = {
     "NativeContextPreparationReplayAccess": {
         "src/v2/planning/PhysicalMemoryAuthority.h", "src/v2/backends/NativeContextOpaqueContract.h",
         "src/v2/backends/NativeContextPreparation.h", "src/v2/backends/PreparedGPUWorkerThread.h",
-        "src/v2/backends/GPUDeviceContextPool.h"},
+        "src/v2/backends/GPUDeviceContextPool.h",
+        "src/v2/backends/RetainedParticipantGraphExecutable.h"},
     "NativeContextBirthDiagnosticAccess": {
         "src/v2/collective/NativeStoragePreparationPmaBinding.h",
         "src/v2/backends/NativeContextPreparation.h", "src/v2/backends/PreparedGPUWorkerThread.h"},

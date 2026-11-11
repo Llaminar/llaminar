@@ -12,6 +12,7 @@
  * GPU default without relying on a historical FP32 threshold exemption.
  */
 
+#include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
@@ -155,7 +156,7 @@ namespace
                 for (auto &output : p.fork_outputs)
                     output = transfers.allocateDeviceTransferBuffer(kCopyBytes, p.device);
             p.staging = transfers.allocatePersistentTransferStagingSlices(kCopyBytes, kLanes, p.device);
-            p.execution = transfers.allocatePersistentTransferExecutionLanes(
+            p.execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(transfers,
                 kLanes, p.device, "captured_collective_maintenance");
             for (std::size_t lane = 0; lane < kLanes; ++lane)
                 p.produced.push_back(transfers.allocateDeviceTransferBuffer(kCopyBytes, p.device));

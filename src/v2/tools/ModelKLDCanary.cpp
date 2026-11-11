@@ -130,7 +130,7 @@ json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestration
     auto surface = joint_follower
         ? accuracy::qfnCPUJointFollowerSurface(runner.config(),runner.executionPlan(),
             owner->prepared_weight_plan,*owner->prepared_routed_weight_plan)
-        : accuracy::qfnObservationSurface(runner.executionPlan());
+        : accuracy::qfnObservationSurface(runner.executionPlan(),&runner.config());
     const auto &expected = request.corpus().at("source");
     requireQFN(model.path() == runner.config().model_path, "QFN original model path differs from actual parsed configuration");
     const auto paths = model.artifactPaths();
@@ -222,7 +222,8 @@ json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestration
                    !owner->pipeline_prepared_plan,
                    "QFN observer lacks its actual ordinary CPU prepared/store/PMA owner");
     }
-    else if (surface == accuracy::QFNObservationSurface::CPUTailPipeline)
+    else if (surface == accuracy::QFNObservationSurface::CPUTailPipeline ||
+             surface == accuracy::QFNObservationSurface::FixedNativePipeline)
     {
         requireQFN(owner->pipeline_prepared_plan && owner->pipeline_prepared_plan->admission() &&
                    owner->pipeline_prepared_plan->admission()->physicalAdmission() &&
@@ -381,7 +382,7 @@ bool qfnResetBytesEqual(const std::filesystem::path &a, const std::filesystem::p
  */
 json requireQFNPath(IOrchestrationRunner &runner, const json &observation)
 {
-    const auto physical=accuracy::qfnObservationSurface(runner.executionPlan());
+    const auto physical=accuracy::qfnObservationSurface(runner.executionPlan(),&runner.config());
     const auto surface=physical==accuracy::QFNObservationSurface::HomogeneousLocalTP
         ? static_cast<accuracy::QFNObservationSurface>(observation.at("surface").get<int>()):physical;
     accuracy::requireQFN(physical!=accuracy::QFNObservationSurface::HomogeneousLocalTP ||
@@ -394,6 +395,9 @@ json requireQFNPath(IOrchestrationRunner &runner, const json &observation)
     };
     for (const auto &address : runner.executionPlan().local_tp_devices) add(address);
     for (const auto &address : runner.executionPlan().local_pp_devices) add(address);
+    if (surface==accuracy::QFNObservationSurface::FixedNativePipeline)
+        for (const auto& stage:runner.executionPlan().local_pp_stage_tp_info)
+            for (const auto& member:stage.devices) add(member);
     add(runner.executionPlan().primary_device);
     if (!PerfStatsCollector::isDomainEnabled("forward_graph"))
         throw std::runtime_error("QFN observer requires actual forward_graph path evidence");
@@ -469,25 +473,28 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         using accuracy::requireQFN;
         auto config=OrchestrationConfigParser{}.parseArgs(engine_argc,engine_argv);
         const auto request=accuracy::QFNObserverRequest::parse(workload,config);
+        const bool observed_pipeline=isObservedFixedNativePipeline(config);
         distributed_joint=accuracy::qfnDistributedCPUJointIntent(config);
-        if(!distributed_joint)requireQFN(!std::filesystem::exists(output),"QFN observer output directory must be fresh");
-        if (distributed_joint || MPIBootstrapPhase::classifyDeviceIntent(config) == BootstrapDeviceIntent::CpuOnly)
+        const bool original_multi_rank=distributed_joint || observed_pipeline;
+        const int original_size=original_multi_rank?config.mpi_procs:1;
+        if(!original_multi_rank)requireQFN(!std::filesystem::exists(output),"QFN observer output directory must be fresh");
+        if (original_multi_rank || MPIBootstrapPhase::classifyDeviceIntent(config) == BootstrapDeviceIntent::CpuOnly)
         {
             // Reuse production's NUMA/physical-core launch before creating an
             // output owner or admitting a model. The child parses the exact
             // original wrapper/engine arguments again; no Python affinity map
             // or rewritten config can override the canonical verifier.
-            requireQFN(distributed_joint || (config.mpi_procs == 1 && config.hostfile.empty() &&
+            requireQFN(original_multi_rank || (config.mpi_procs == 1 && config.hostfile.empty() &&
                 !config.execution_rank_selection), "QFN CPU observer requires explicit one-rank local bootstrap");
             const auto launch = MPIBootstrap::detectMPIEnvironment();
-            requireQFN(!launch.is_mpi_process || launch.detected_world_size == (distributed_joint?config.mpi_procs:1),
+            requireQFN(!launch.is_mpi_process || launch.detected_world_size == original_size,
                        "QFN observer rejects unexpected bootstrap membership");
             const auto bootstrap = MPIBootstrapPhase{}.execute(config, original_argc, original_argv,
                 MPIBootstrapArgumentPolicy::PreserveOriginalArguments);
             if (bootstrap.action == BootstrapResult::Action::EXIT)
                 return bootstrap.exit_code;
         }
-        if(!distributed_joint) {
+        if(!original_multi_rank) {
             owns_output=std::filesystem::create_directories(output);
             requireQFN(owns_output,"QFN observer cannot create its output directory");
         }
@@ -497,9 +504,26 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         for(const char *key:{"backend","runtime_config_digest","arithmetic"}) result[key]=request.topology().at(key);
         result["topology_id"]=request.topology().at("id");
         const auto launch=MPIBootstrap::detectMPIEnvironment();
-        requireQFN(!launch.is_mpi_process || launch.detected_world_size==(distributed_joint?config.mpi_procs:1),
-                   "QFN observer rejects multi-rank or unresolved MPI launch membership");
+        requireQFN(!launch.is_mpi_process || launch.detected_world_size==original_size,
+                   "QFN observer rejects unresolved original MPI launch membership");
+        const auto original_selection=config.execution_rank_selection;
         auto startup=RuntimeInitPhase().execute(config,engine_argc,engine_argv);
+        if(observed_pipeline && !std::holds_alternative<AppContext>(startup)) {
+            // The production initializer already retired this excluded rank's
+            // original MPI session. It cannot publish numerical or model work.
+            requireQFN(std::get<RuntimeInitExit>(startup)==RuntimeInitExit::Completed &&
+                original_selection && launch.detected_rank>=0 &&
+                launch.detected_rank<original_size && !original_selection->executionRank(launch.detected_rank),
+                "QFN selected pipeline lost its active original runtime");
+            requireQFN(std::filesystem::is_directory(output),
+                "QFN inactive discovery rank has no terminal artifact owner");
+            publish(output/("rank-"+std::to_string(launch.detected_rank)+".json"),
+                {{"schema","llaminar.qfn-observed-pipeline-rank.v1"},{"discovery_rank",launch.detected_rank},
+                 {"discovery_size",original_size},{"execution_rank",nullptr},{"active",false},
+                 {"runtime_config_digest",request.topology().at("runtime_config_digest")},
+                 {"corpus_manifest_digest",result.at("corpus_manifest_digest")},{"native_retired",true}});
+            return 0;
+        }
         requireQFN(std::holds_alternative<AppContext>(startup),"QFN runtime did not return its original model owner");
         auto context=std::move(std::get<AppContext>(startup));
         requireQFN(context.mpi_ctx && context.mpi_ctx->world_size()==(distributed_joint?config.mpi_procs:1),
@@ -508,6 +532,14 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         requireQFN(bool(context.runner), "QFN observer lost its original runner");
         accuracy::requireQFNOriginalRank(context.runner->executionPlan(), observation_rank);
         const bool authority=context.coordinatedRequestRole()==CoordinatedRequestRole::Authority;
+        if(observed_pipeline) {
+            requireQFN(authority && original_selection &&
+                original_selection->executionRank(launch.detected_rank)==observation_rank,
+                "QFN fixed pipeline substituted its original selected request owner");
+            owns_output=std::filesystem::create_directories(output);
+            requireQFN(owns_output,"QFN observer cannot create its selected original output owner");
+            result["observed_pipeline_binding"]=observeFixedNativePipelineBinding(*context.runner,*context.mpi_ctx);
+        }
         if(distributed_joint) {
             requireQFN(context.runner->coordinatedRootRank()==0,"QFN CPU joint observer lost original rank-zero authority");
             const auto ready=RankInitializationLifecycle::execute({0,"qfn_observer_output"},[&] {
@@ -531,13 +563,15 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         result["native_identity"]={{"executable_sha256",*executable},
             {"actual_config_sha256",accuracy::qfnMetadataDigest(result["actual_owner"].at("actual_config"))},
             {"actual_source_descriptor_sha256",result["actual_owner"].at("source_file_set_identity")}};
-        const bool local_tp=accuracy::qfnObservationSurface(runner.executionPlan())==accuracy::QFNObservationSurface::HomogeneousLocalTP;
+        const bool local_tp=accuracy::qfnObservationSurface(runner.executionPlan(),&runner.config())==accuracy::QFNObservationSurface::HomogeneousLocalTP;
         const auto publication_before=local_tp?qfnTPHostPublications(runner.executionPlan().local_tp_devices.size()):0;
         std::uint64_t expected_publications=0;
+        std::uint64_t expected_prefill_rows=0;
         for(const auto &history:request.corpus().at("histories"))
         {
             result["cases"].push_back(observeQFNHistory(runner,history,output));
             expected_publications+=history.at("decode_rows").get<std::uint64_t>();
+            expected_prefill_rows+=history.at("prompt_ids").size();
         }
         const auto &reset=request.corpus().at("reset_control");
         json baseline, replay;
@@ -569,6 +603,7 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
                     {"first_sequence_id", scope.first_sequence_id},
                     {"next_sequence_id", scope.next_sequence_id}}}};
             expected_publications += original_history.at("decode_rows").get<std::uint64_t>();
+            expected_prefill_rows += original_history.at("prompt_ids").size();
         }
         else
         {
@@ -578,6 +613,7 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
             result["reset_case"]=observeQFNHistory(runner,replay,output);
         }
         expected_publications+=replay.at("decode_rows").get<std::uint64_t>();
+        expected_prefill_rows+=replay.at("prompt_ids").size();
         if(local_tp)
         {
             const auto after=qfnTPHostPublications(runner.executionPlan().local_tp_devices.size());
@@ -591,6 +627,14 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         result["path_records"]=requireQFNPath(runner,result["actual_owner"]);
         // Recheck original admitted source/policies before terminal teardown.
         requireQFN(authenticateQFN(request,runner,original_owner)==result["actual_owner"],"QFN original owner/config changed across histories");
+        if(observed_pipeline) {
+            requireQFN(observeFixedNativePipelineBinding(runner,*context.mpi_ctx)==result["observed_pipeline_binding"],
+                "QFN original selected fixed owners changed across histories");
+            // The first forced token stages its pending input and contributes
+            // no model row. Every observed decode row is one later true input.
+            result["fixed_native_pipeline_terminal"]=observeFixedNativePipelineTerminal(
+                runner, expected_prefill_rows+expected_publications);
+        }
         };
         const auto record_follower=[&](const ModelContextReuseContract& original_owner) {
             requireQFN(original_owner.prepared_routed_weight_plan && original_owner.physical_memory_authority &&
@@ -609,6 +653,16 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
             json ranks=json::array();
             for(int rank=0;rank<config.mpi_procs;++rank)ranks.push_back("rank-"+std::to_string(rank)+".json");
             result["distributed_observer"]={{"world_size",config.mpi_procs},{"authority_rank",0},{"rank_reports",ranks}};
+        }
+        if(observed_pipeline) {
+            // The selected rank has retired the runner before publishing its
+            // proof. Excluded ranks report only their original MPI retirement.
+            const int original_owner=result.at("observed_pipeline_binding").at("original_owner").get<int>();
+            publish(output/("rank-"+std::to_string(original_owner)+".json"),
+                {{"schema","llaminar.qfn-observed-pipeline-rank.v1"},{"discovery_rank",original_owner},
+                 {"discovery_size",original_size},{"execution_rank",observation_rank},{"active",true},
+                 {"runtime_config_digest",request.topology().at("runtime_config_digest")},
+                 {"corpus_manifest_digest",result.at("corpus_manifest_digest")},{"native_retired",true}});
         }
         requireQFN(PerfStatsCollector::flushFromEnv(),"QFN observer cannot publish original path counters");
         result["proofs"]={{"source_authenticated",true},{"production_path_authenticated",true},

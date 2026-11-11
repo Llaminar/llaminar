@@ -15,6 +15,10 @@
  * ancestor still owns cleanup after every rank and daemon actually retires.
  *
  * @author David Sanftenberg
+ *
+ * Cached CPU placement keeps OS NUMA/PU identities separate from MPI logical
+ * core indices. Discovery publishes exact per-node facts once; launch and
+ * admission reject missing or contradictory observations without rediscovery.
  */
 
 #include "MPIBootstrap.h"
@@ -32,6 +36,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
+#include <limits>
 
 namespace llaminar2
 {
@@ -489,6 +494,40 @@ namespace llaminar2
     // OpenMP Environment Configuration
     // ========================================================================
 
+    MPINUMAMapping MPINUMAMapping::fromObservedPlacement(std::span<const MPICorePlacement> placement,
+        std::span<const int> selected_nodes)
+    {
+        const auto observed = NUMATopology::logicalMPICoresForNUMANodes(placement, selected_nodes);
+        if (observed.empty() || observed.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("MPI NUMA mapping requires observed nonempty node membership");
+        MPINUMAMapping result;
+        std::set<int> unique;
+        for (const auto &[node, cpus] : observed)
+        {
+            if (node < 0 || cpus.empty())
+                throw std::invalid_argument("MPI NUMA mapping requires known nodes with logical cores");
+            // OpenMPI4.1's original rank-file parser owns a fixed64-byte
+            // slot_list and does not reject truncation. Reject unrepresentable
+            // native syntax here rather than launch with a partial core set.
+            constexpr size_t kOpenMPI41SlotListBytes = 64;
+            const auto logical_cores = formatCpuList(cpus);
+            if (logical_cores.size() >= kOpenMPI41SlotListBytes)
+                throw std::invalid_argument("Observed NUMA logical-core list exceeds OpenMPI4.1 native rankfile slot capacity");
+            // Native rankfile syntax consumes global hwloc logical core IDs.
+            // This mapping is local-only. OpenMPI4.1 inspects the rankfile
+            // before applying --host, so a relative +n0 cannot establish its
+            // allocation. Name localhost directly, never an OS NUMA label.
+            result.rank_file_contents_ += "rank " + std::to_string(result.nodes_.size()) +
+                "=localhost slot=" + logical_cores + "\n";
+            result.nodes_.push_back(node);
+            for (const int cpu : cpus)
+                if (cpu < 0 || !unique.insert(cpu).second)
+                    throw std::invalid_argument("MPI NUMA mapping requires distinct original logical core sets");
+        }
+        result.cpu_set_ = formatCpuList(std::vector<int>(unique.begin(), unique.end()));
+        return result;
+    }
+
     void MPIBootstrap::configureOpenMPPlacement(const MPILaunchConfig &config)
     {
         if (config.omp_places.empty() || config.omp_proc_bind.empty())
@@ -567,7 +606,7 @@ namespace llaminar2
         int argc, char *argv[],
         const MPILaunchConfig &config,
         const CPUTopology &topology,
-        MPIBootstrapArgumentPolicy arguments)
+        MPIBootstrapArgumentPolicy arguments, const std::string &observed_numa_rankfile)
     {
         if (arguments != MPIBootstrapArgumentPolicy::FilterLaunchArguments &&
             arguments != MPIBootstrapArgumentPolicy::PreserveOriginalArguments)
@@ -578,6 +617,17 @@ namespace llaminar2
 
         // Number of processes
         int num_procs = config.num_procs;
+        if (config.numa_mapping)
+        {
+            if (!config.hostfile.empty() || !config.cpu_set.empty() || config.bind_to_socket || config.map_by_socket ||
+                (num_procs > 0 && static_cast<size_t>(num_procs) != config.numa_mapping->nodes().size()))
+                throw std::invalid_argument("Observed NUMA mapping requires one local rank per node and no competing placement");
+            num_procs = static_cast<int>(config.numa_mapping->nodes().size());
+            if (observed_numa_rankfile.empty() || observed_numa_rankfile.find_first_of("\n\r") != std::string::npos)
+                throw std::invalid_argument("Observed NUMA mapping requires its original guardian-owned rankfile");
+        }
+        else if (!observed_numa_rankfile.empty())
+            throw std::invalid_argument("A NUMA rankfile cannot replace an undeclared launcher placement");
         if (num_procs <= 0 && config.hostfile.empty())
         {
             num_procs = topology.num_sockets;
@@ -620,6 +670,18 @@ namespace llaminar2
         // requests multiple processing elements per rank; bind-to socket with
         // PE=N is rejected and plain bind-to socket may bind only one core plus
         // its SMT sibling on some systems.
+        if (config.numa_mapping)
+        {
+            // OpenMPI4.1 aliases cpu-set to its rank-file mapper, which
+            // conflicts with explicit ppr mapping and replaces NUMA binding.
+            // Use its native per-rank map directly, with the cached complete
+            // logical core set for each observed NUMA partition.
+            // The rankfile names the local host directly; no scheduler/hostfile
+            // allocation or competing --host selector is needed.
+            cmd.insert(cmd.end(), {"--rankfile", observed_numa_rankfile,
+                "--mca", "rmaps_rank_file_physical", "0",
+                "--mca", "hwloc_base_use_hwthreads_as_cpus", "0"});
+        }
         if (config.bind_to_socket)
         {
             cmd.push_back("--bind-to");
@@ -736,10 +798,36 @@ namespace llaminar2
             configureOpenMPPlacement(config); // Never export the launcher's numeric geometry.
         configureLauncherEnvironment();
 
-        // Build command
-        auto cmd = buildMPIRunCommand(argc, argv, config, topology, arguments);
-
         MPISessionOwner::requireProcessOwner();
+        std::optional<MPISessionOwner::SharedFile> numa_rankfile;
+        if (config.numa_mapping)
+        {
+            const auto directory = MPISessionOwner::sharedDirectory();
+            if (!directory)
+                throw std::logic_error("Observed NUMA launch requires its original guardian-owned directory");
+            // Independent frontend children may share one process guardian.
+            // A successful exec retains its file until that ancestor retires;
+            // never collide with or replace a sibling launch's original file.
+            numa_rankfile.emplace(directory->createUnique("observed-numa.rankfile-"));
+            const auto &contents = config.numa_mapping->rankFileContents();
+            size_t written = 0;
+            while (written < contents.size())
+            {
+                const auto count = ::write(numa_rankfile->descriptor(), contents.data() + written,
+                    contents.size() - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0)
+                    throw std::runtime_error("Cannot write original observed-NUMA rankfile");
+                written += static_cast<size_t>(count);
+            }
+            numa_rankfile->requireExtent(contents.size());
+        }
+        // On exec failure SharedFile authenticates and removes its exact inode.
+        // Successful exec retains the name beneath the original ancestor until
+        // all native MPI descendants retire and that owner removes its roots.
+        auto cmd = buildMPIRunCommand(argc, argv, config, topology, arguments,
+            numa_rankfile ? numa_rankfile->path() : std::string{});
+
         // The main-entry ancestor already owns this complete process subtree.
         // Replacing this child with mpirun keeps one owner for all its ranks.
         std::vector<char *> c_argv;
@@ -798,7 +886,8 @@ namespace llaminar2
                   << " (" << topology.threads_per_core << " threads/core)" << std::endl;
 
         // MPI configuration
-        int num_procs = config.num_procs > 0 ? config.num_procs : topology.num_sockets;
+        int num_procs = config.numa_mapping ? static_cast<int>(config.numa_mapping->nodes().size()) :
+            (config.num_procs > 0 ? config.num_procs : topology.num_sockets);
         int omp_threads = config.omp_threads_per_rank > 0
                               ? config.omp_threads_per_rank
                               : topology.cores_per_socket;
@@ -825,6 +914,10 @@ namespace llaminar2
         {
             std::cout << "CPU Set: " << config.cpu_set << std::endl;
         }
+
+        if (config.numa_mapping)
+            std::cout << "Placement: native rankfile, one rank per observed NUMA partition, logical cores: "
+                      << config.numa_mapping->cpuSet() << std::endl;
 
         // MPI environment status
         if (env.is_mpi_process)

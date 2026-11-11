@@ -1083,6 +1083,29 @@ namespace
         file->original={actual.st_dev,actual.st_ino,actual.st_uid};
         return SharedFile(std::move(file));
     }
+    MPISessionOwner::SharedFile MPISessionOwner::SharedDirectory::createUnique(const std::string &prefix) const
+    {
+        if(!state_)throw std::logic_error("Moved owned shared directory cannot create a temporary file");
+        state_->requireName(prefix);
+        state_->requireName(prefix+"XXXXXX");
+        auto file=std::make_unique<SharedFile::State>();
+        file->directory=state_;file->creator=true;
+        // mkostemp owns exclusive name selection. Resolve beneath the retained
+        // directory descriptor so a path replacement cannot redirect creation.
+        // The name survives MPI exec; the original ancestor retires it after
+        // descendants finish. A later launch in that ancestor gets another name.
+        std::string temporary="/proc/self/fd/"+std::to_string(state_->descriptor)+"/"+prefix+"XXXXXX";
+        file->descriptor=::mkostemp(temporary.data(),O_CLOEXEC);
+        if(file->descriptor<0)throw std::system_error(errno,std::generic_category(),"cannot create unique owned launch file");
+        file->basename=temporary.substr(temporary.find_last_of('/')+1);
+        file->path=state_->path+"/"+file->basename;
+        struct stat actual{};
+        if(::fstat(file->descriptor,&actual)!=0 || !S_ISREG(actual.st_mode) || actual.st_uid!=::geteuid() ||
+           (actual.st_mode&0777)!=0600 || actual.st_dev!=state_->original.device)
+            throw std::runtime_error("Unique owned launch file has invalid physical identity");
+        file->original={actual.st_dev,actual.st_ino,actual.st_uid};
+        return SharedFile(std::move(file));
+    }
     MPISessionOwner::SharedFile MPISessionOwner::SharedDirectory::openExisting(const std::string &basename, SharedIdentity creator,
         std::uint64_t expected_bytes) const
     {

@@ -26,13 +26,14 @@ ClusterInventory publicationInventory()
     RankInventory rank;
     rank.rank = rank.node_id = rank.local_rank = 0;
     rank.hostname = "publication-host";
+    rank.cpu.numa_node = 0;
     rank.cpu_cores = rank.cpu_worker_threads = 8;
     rank.cpu_execution = test::kSyntheticCPUExecutionGeometry;
     rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = 512ULL << 30;
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
         rank.gpus.push_back({.type = backend, .local_device_id = 0,
             .memory_bytes = 512ULL << 30, .free_memory_bytes = 500ULL << 30,
-            .compute_units = 64, .uuid = std::string(deviceTypeToString(backend)) + "-publication"});
+            .compute_units = 64, .uuid = std::string(deviceTypeToString(backend)) + "-publication", .numa_node = 0});
     inventory.ranks.push_back(std::move(rank));
     inventory.buildNodeAggregations();
     return inventory;

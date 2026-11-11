@@ -137,6 +137,53 @@ namespace llaminar2
                 });
         }
 
+        /**
+         * @brief Assemble original native stripes in the existing linked head order.
+         * @param source Original directory geometry in GGUF K/N order.
+         * @param axis Concatenation axis in logical matrix order.
+         * @param spans Exact ordered intervals along that axis.
+         * @return Final source assembly without allocating or reading a parent tensor.
+         */
+        NativeWeightSourceAssembly orderedCPUNativeAssembly(
+            const NativeWeightSourceGeometry &source, NativeWeightSourceAssembly::Axis axis,
+            const std::vector<GDNHeadSpan> &spans)
+        {
+            using Axis = NativeWeightSourceAssembly::Axis;
+            const auto &shape = source.original_shape;
+            if (shape.empty() || shape.size() > 2 || spans.empty() ||
+                !source.native_group_elements || !source.native_group_bytes)
+                throw std::invalid_argument("CPU ordered assembly needs original native matrix or vector geometry");
+            const size_t rows = shape.size() == 2 ? shape[1] : 1;
+            const size_t columns = shape[0];
+            const bool by_row = axis == Axis::Rows;
+            NativeWeightSourceAssembly assembly{.axis = axis,
+                .final_rows = by_row ? 0 : rows, .final_columns = by_row ? columns : 0};
+            auto &assembled_extent = by_row ? assembly.final_rows : assembly.final_columns;
+            const size_t original_extent = by_row ? rows : columns;
+            assembly.segments.reserve(spans.size());
+            for (const auto span : spans) {
+                if (span.start < 0 || span.count <= 0)
+                    throw std::invalid_argument("CPU ordered assembly has an invalid original interval");
+                const auto first = static_cast<size_t>(span.start);
+                const auto count = static_cast<size_t>(span.count);
+                const auto first_column = by_row ? 0 : first;
+                const auto stripe_columns = by_row ? columns : count;
+                if (first > original_extent || count > original_extent - first ||
+                    count > std::numeric_limits<size_t>::max() - assembled_extent ||
+                    first_column % source.native_group_elements ||
+                    stripe_columns % source.native_group_elements ||
+                    stripe_columns / source.native_group_elements >
+                        std::numeric_limits<size_t>::max() / source.native_group_bytes)
+                    throw std::invalid_argument("CPU ordered assembly exceeds its source or splits native groups");
+                assembly.segments.push_back({.original_expert = 0, .selected_expert_ordinal = 0,
+                    .first_row = by_row ? first : 0, .rows = by_row ? count : rows,
+                    .first_column = first_column, .columns = stripe_columns,
+                    .native_row_bytes = stripe_columns / source.native_group_elements * source.native_group_bytes});
+                assembled_extent += count;
+            }
+            return assembly;
+        }
+
         uint64_t stableMaterializedBindingId(
             const WeightRequirement &requirement,
             const InferenceStrategy &strategy)
@@ -340,8 +387,9 @@ namespace llaminar2
          * @param device Preparation participant being entered.
          * @param include_expert_jobs Whether this invocation actually prepares expert handles.
          *
-         * Static GPU matrices require the declared original participant scope
-         * and source root. They cannot enter overlay or unscoped preparation.
+         * Static GPU matrices require the original source and explicit expert
+         * work. CPU joint fragments can enter the dense pass with expert work
+         * excluded when their native source transaction already committed them.
          */
         void validateStaticProjectionPreparation(const FrozenModelWeightSet &frozen, DeviceId device,
                                                    bool include_expert_jobs = true)
@@ -350,11 +398,17 @@ namespace llaminar2
             {
                 if (!binding.projection_ownership || !bindingTargetsDevice(binding, device))
                     continue;
-                if (device.is_gpu() || binding.cpu_joint_source)
+                if (device.is_gpu())
                 {
                     (void)ExpertGemmRegistry::staticProjectionScope(binding);
                     if (!include_expert_jobs || (!binding.projection_source_owner && !binding.native_source))
                         throw std::invalid_argument("Static GPU preparation requires its original source owner and explicit expert work");
+                }
+                else if (binding.cpu_joint_source)
+                {
+                    (void)ExpertGemmRegistry::staticProjectionScope(binding);
+                    if (!binding.native_source && (!include_expert_jobs || !binding.projection_source_owner))
+                        throw std::invalid_argument("CPU joint preparation requires its original source transaction or explicit expert work");
                 }
                 if (!binding.tensor || binding.tensor->shape().size() != 2)
                     throw std::invalid_argument("Static expert GEMM preparation requires projectedExpertMatrices, not a 3D source parent");
@@ -2797,6 +2851,62 @@ namespace llaminar2
             source.native_group_elements, source.native_group_bytes);
     }
 
+    std::optional<WeightRequirement> WeightManager::projectCPUDenseTPRequirement(
+        const WeightRequirement &requirement,
+        const std::shared_ptr<const TensorParallelConfig> &tp_config) const
+    {
+        // Explicit vocabulary and expert selections, assembled source windows,
+        // and replicated views already carry their complete source authority.
+        if (!tp_config || tp_config->worldSize() <= 1 || requirement.tp_domain < 0 ||
+            requirement.bypass_tensor_parallel || requirement.derivation != WeightDerivationKind::Source ||
+            requirement.slice != WeightSliceSpec{} || requirement.native_source_assembly ||
+            requirement.projection_ownership || isRoutedExpertRole(requirement.role))
+            return std::nullopt;
+
+        const auto &assignment = tp_config->forRank(requirement.tp_rank_or_device_index);
+        const auto &name = requirement.source_name.empty() ? requirement.canonical_name : requirement.source_name;
+        const auto mode = getShardingMode(name);
+        if (mode == ShardingMode::REPLICATE || !loader_.hasTensor(name))
+            return std::nullopt;
+        const auto source = loader_.nativeWeightSourceGeometry(name);
+        const auto &shape = source.original_shape;
+        const bool input_parallel = mode == ShardingMode::INPUT_PARALLEL;
+        if ((mode != ShardingMode::COLUMN_PARALLEL && mode != ShardingMode::ROW_PARALLEL && !input_parallel) ||
+            (shape.size() != 2 && !(mode == ShardingMode::COLUMN_PARALLEL && shape.size() == 1)))
+            throw std::invalid_argument("CPU dense TP source has incompatible schema or original axes: " + name);
+        // GGUF describes matrices as K/N, while source rows/columns and schema
+        // sharding describe the logical N/K matrix. A vector uses logical rows.
+        const bool vector = shape.size() == 1;
+        const size_t total = input_parallel || vector ? shape[0] : shape[1];
+        const bool fused = mode == ShardingMode::COLUMN_PARALLEL && !vector &&
+            sharding_config_.getDimensionType(name) == WeightDimensionType::FusedQKVHeads;
+        const int gdn_elements = (mode == ShardingMode::COLUMN_PARALLEL || input_parallel)
+            ? gdnValueElementsPerHead(name, total) : 0;
+        auto projected = requirement;
+        if (fused || gdn_elements > 0) {
+            const auto spans = fused
+                ? fusedQKVSourceSpans(name, total, assignment, tp_config)
+                : gdnHeadAssignmentFor(assignment, *tp_config).valueElementSpans(gdn_elements);
+            using Axis = NativeWeightSourceAssembly::Axis;
+            projected.native_source_assembly = orderedCPUNativeAssembly(
+                source, input_parallel || vector ? Axis::Columns : Axis::Rows, spans);
+            projected.derivation = WeightDerivationKind::FusedSubblockConcat;
+        } else {
+            size_t start = 0, count = 0;
+            computeSliceBoundaries(name, total, assignment, *tp_config, start, count);
+            if (!count || start > total || count > total - start)
+                throw std::invalid_argument("CPU dense TP source exceeds its original slice axis: " + name);
+            if (input_parallel) {
+                projected.slice = {.col_start = start, .col_count = count, .inner_is_presliced = true};
+                projected.derivation = WeightDerivationKind::ColumnSlice;
+            } else {
+                projected.slice = {.row_start = start, .row_count = count, .inner_is_presliced = true};
+                projected.derivation = WeightDerivationKind::RowSlice;
+            }
+        }
+        return projected;
+    }
+
     FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
     {
         const auto tp_config = tensorParallelConfig();
@@ -2869,7 +2979,11 @@ namespace llaminar2
                             tied_source=&candidate;
                         }
                 }
-                materializeCPURequirement(requirement,plan.strategy(),plan.physicalMemoryOwner(),source_budget,builder,existing,tied_source);
+                const auto projected = projectCPUDenseTPRequirement(requirement, tp_config);
+                const auto projected_tied = tied_source ? projectCPUDenseTPRequirement(*tied_source, tp_config) : std::nullopt;
+                materializeCPURequirement(projected ? *projected : requirement, plan.strategy(),
+                    plan.physicalMemoryOwner(), source_budget, builder, existing,
+                    projected_tied ? &*projected_tied : tied_source);
                 continue;
             }
             const std::string &load_name = requirement.source_name.empty()
@@ -4421,6 +4535,10 @@ namespace llaminar2
             for(const auto& [scope,sources]:joint_layers) {
                 const auto& projection=*sources.front().projection_ownership;
                 if(expert_gemm_registry_.acquireStaticProjectionLayer(scope,projection,sources))continue;
+                // The dense pass may validate a committed native bank, but only
+                // explicit expert preparation may publish a missing bank.
+                if (!include_expert_jobs)
+                    throw std::logic_error("CPU dense preparation requires the complete original joint fragment bank");
                 // The registry validates the complete selected declaration before
                 // packing; each packed allocation retains the original PMA/NUMA.
                 for(const auto& binding:sources) {
@@ -8389,11 +8507,8 @@ namespace llaminar2
     }
 
     GDNHeadAssignment WeightManager::gdnHeadAssignmentFor(
-        const DeviceShardingAssignment &assignment) const
+        const DeviceShardingAssignment &assignment, const TensorParallelConfig &tp_config) const
     {
-        const auto tp_config = tensorParallelConfig();
-        if (!tp_config)
-            throw std::runtime_error("[WeightManager] GDN linked sharding requires TensorParallelConfig");
         if (!has_gdn_dimensions_ || gdn_n_k_heads_ <= 0 ||
             gdn_n_v_heads_ <= 0 || gdn_d_state_ <= 0)
         {
@@ -8405,7 +8520,7 @@ namespace llaminar2
             gdn_n_v_heads_,
             assignment.head_start,
             assignment.head_count,
-            tp_config->totalHeads());
+            tp_config.totalHeads());
     }
 
     GDNHeadAssignment WeightManager::gdnHeadAssignmentForEqualRank(
@@ -8462,22 +8577,12 @@ namespace llaminar2
             throw std::invalid_argument("[WeightManager] Row-span concat requires non-empty geometry for: " + name);
 
         if (device.is_cpu()) {
-            const auto source=loader_.nativeWeightSourceGeometry(name);
-            if (source.original_shape.size()!=2 || source.original_shape[0]!=source_cols ||
-                source_cols%source.native_group_elements ||
-                source_cols/source.native_group_elements>std::numeric_limits<size_t>::max()/source.native_group_bytes)
-                throw std::invalid_argument("CPU ordered rows changed original native source K");
-            NativeWeightSourceAssembly assembly{.axis=NativeWeightSourceAssembly::Axis::Rows,
-                .final_rows=0,.final_columns=source_cols};
-            for (const auto span:spans) {
-                if (span.start<0 || span.count<=0 || size_t(span.count)>std::numeric_limits<size_t>::max()-assembly.final_rows)
-                    throw std::invalid_argument("CPU ordered rows have invalid original stripe extents");
-                assembly.segments.push_back({.original_expert=0,.selected_expert_ordinal=0,
-                    .first_row=size_t(span.start),.rows=size_t(span.count),.first_column=0,.columns=source_cols,
-                    .native_row_bytes=source_cols/source.native_group_elements*source.native_group_bytes});
-                assembly.final_rows+=size_t(span.count);
-            }
-            return loadCPUWeightRange(name,device,WeightDerivationKind::FusedSubblockConcat,{},std::move(assembly),original_tp_rank);
+            const auto source = loader_.nativeWeightSourceGeometry(name);
+            if (source.original_shape.size() != 2 || source.original_shape[0] != source_cols)
+                throw std::invalid_argument("CPU ordered rows changed original native source geometry");
+            auto assembly = orderedCPUNativeAssembly(source, NativeWeightSourceAssembly::Axis::Rows, spans);
+            return loadCPUWeightRange(name, device, WeightDerivationKind::FusedSubblockConcat,
+                {}, std::move(assembly), original_tp_rank);
         }
 
         std::vector<std::shared_ptr<TensorBase>> slices;
@@ -8546,23 +8651,12 @@ namespace llaminar2
             throw std::invalid_argument("[WeightManager] Column-span concat requires non-empty geometry for: " + name);
 
         if (device.is_cpu()) {
-            const auto source=loader_.nativeWeightSourceGeometry(name);
-            if (source.original_shape.size()!=2 || source.original_shape[1]!=source_rows)
-                throw std::invalid_argument("CPU ordered columns changed original native source N");
-            NativeWeightSourceAssembly assembly{.axis=NativeWeightSourceAssembly::Axis::Columns,
-                .final_rows=source_rows,.final_columns=0};
-            for (const auto span:spans) {
-                if (span.start<0 || span.count<=0 || size_t(span.start)%source.native_group_elements ||
-                    size_t(span.count)%source.native_group_elements ||
-                    size_t(span.count)/source.native_group_elements>std::numeric_limits<size_t>::max()/source.native_group_bytes ||
-                    size_t(span.count)>std::numeric_limits<size_t>::max()-assembly.final_columns)
-                    throw std::invalid_argument("CPU ordered columns have invalid original native stripe groups");
-                assembly.segments.push_back({.original_expert=0,.selected_expert_ordinal=0,
-                    .first_row=0,.rows=source_rows,.first_column=size_t(span.start),.columns=size_t(span.count),
-                    .native_row_bytes=size_t(span.count)/source.native_group_elements*source.native_group_bytes});
-                assembly.final_columns+=size_t(span.count);
-            }
-            return loadCPUWeightRange(name,device,WeightDerivationKind::FusedSubblockConcat,{},std::move(assembly),original_tp_rank);
+            const auto source = loader_.nativeWeightSourceGeometry(name);
+            if (source.original_shape.size() != 2 || source.original_shape[1] != source_rows)
+                throw std::invalid_argument("CPU ordered columns changed original native source geometry");
+            auto assembly = orderedCPUNativeAssembly(source, NativeWeightSourceAssembly::Axis::Columns, spans);
+            return loadCPUWeightRange(name, device, WeightDerivationKind::FusedSubblockConcat,
+                {}, std::move(assembly), original_tp_rank);
         }
 
         std::vector<std::shared_ptr<TensorBase>> slices;
@@ -8716,22 +8810,13 @@ namespace llaminar2
             static_cast<size_t>(elements_per_head);
 
         std::shared_ptr<TensorBase> packed;
-        if (dimensions.size()==1 && device.is_cpu()) {
-            const auto source=loader_.nativeWeightSourceGeometry(name);
-            if (source.original_shape!=dimensions)
+        if (dimensions.size() == 1 && device.is_cpu()) {
+            const auto source = loader_.nativeWeightSourceGeometry(name);
+            if (source.original_shape != dimensions)
                 throw std::invalid_argument("CPU ordered scalar source changed original vector geometry");
-            NativeWeightSourceAssembly assembly{.axis=NativeWeightSourceAssembly::Axis::Columns,
-                .final_rows=1,.final_columns=local_elements};
-            for (const auto span:spans) {
-                if(span.start<0 || span.count<=0 || size_t(span.start)%source.native_group_elements ||
-                    size_t(span.count)%source.native_group_elements ||
-                    size_t(span.count)/source.native_group_elements>std::numeric_limits<size_t>::max()/source.native_group_bytes)
-                    throw std::invalid_argument("CPU ordered scalar source splits its native groups");
-                assembly.segments.push_back({.original_expert=0,.selected_expert_ordinal=0,.first_row=0,.rows=1,
-                    .first_column=size_t(span.start),.columns=size_t(span.count),
-                    .native_row_bytes=size_t(span.count)/source.native_group_elements*source.native_group_bytes});
-            }
-            packed=loadCPUWeightRange(name,device,WeightDerivationKind::FusedSubblockConcat,{},std::move(assembly),rank);
+            auto assembly = orderedCPUNativeAssembly(source, NativeWeightSourceAssembly::Axis::Columns, spans);
+            packed = loadCPUWeightRange(name, device, WeightDerivationKind::FusedSubblockConcat,
+                {}, std::move(assembly), rank);
         }
         else if (dimensions.size() == 1)
         {
@@ -8839,10 +8924,10 @@ namespace llaminar2
         const std::string &name,
         size_t total_size,
         const DeviceShardingAssignment &assignment,
+        const TensorParallelConfig &tp_config,
         size_t &out_start,
         size_t &out_count) const
     {
-        const auto tp_config = tensorParallelConfig();
         if (!has_sharding_config_)
         {
             throw std::runtime_error("[WeightManager] No sharding config set - cannot compute slice boundaries");
@@ -8854,7 +8939,7 @@ namespace llaminar2
         {
         case WeightDimensionType::Heads:
         {
-            const int total_heads = tp_config->totalHeads();
+            const int total_heads = tp_config.totalHeads();
             if (total_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads in TensorParallelConfig");
@@ -8870,7 +8955,7 @@ namespace llaminar2
 
         case WeightDimensionType::KVHeads:
         {
-            const int total_kv_heads = tp_config->totalKVHeads();
+            const int total_kv_heads = tp_config.totalKVHeads();
             if (total_kv_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_kv_heads in TensorParallelConfig");
@@ -8904,7 +8989,7 @@ namespace llaminar2
 
         case WeightDimensionType::ProportionalHeads:
         {
-            const int total_heads = tp_config->totalHeads();
+            const int total_heads = tp_config.totalHeads();
             if (total_heads <= 0)
             {
                 throw std::runtime_error("[WeightManager] Invalid total_heads for ProportionalHeads slicing");
@@ -8939,7 +9024,7 @@ namespace llaminar2
             gdnValueElementsPerHead(name, total_size) > 0)
         {
             const GDNHeadAssignment head_assignment =
-                gdnHeadAssignmentFor(assignment);
+                gdnHeadAssignmentFor(assignment, *tp_config);
             return loadGDNValueRows(
                 name, device, head_assignment, assignment.local_rank,
                 tp_config->worldSize(), dimensions);
@@ -8949,7 +9034,7 @@ namespace llaminar2
         size_t slice_count = 0;
 
         // Use config to determine dimension type for slicing
-        if (!computeSliceBoundaries(name, total_size, assignment, slice_start, slice_count))
+        if (!computeSliceBoundaries(name, total_size, assignment, *tp_config, slice_start, slice_count))
         {
             throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for 1D tensor: " + name);
         }
@@ -9034,7 +9119,7 @@ namespace llaminar2
                 total_rows == expected_gdn_fused_rows)
             {
                 const GDNHeadAssignment head_assignment =
-                    gdnHeadAssignmentFor(assignment);
+                    gdnHeadAssignmentFor(assignment, *tp_config);
                 return loadGDNFusedQKVColumnParallel(
                     name, device, head_assignment, assignment.local_rank,
                     tp_config->worldSize(), dimensions);
@@ -9042,7 +9127,7 @@ namespace llaminar2
             if (gdnValueElementsPerHead(name, total_rows) > 0)
             {
                 const GDNHeadAssignment head_assignment =
-                    gdnHeadAssignmentFor(assignment);
+                    gdnHeadAssignmentFor(assignment, *tp_config);
                 return loadGDNValueRows(
                     name, device, head_assignment, assignment.local_rank,
                     tp_config->worldSize(), dimensions);
@@ -9061,7 +9146,7 @@ namespace llaminar2
         size_t row_count = 0;
 
         // Use config-based dimension type to determine slicing
-        if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
+        if (!computeSliceBoundaries(name, total_rows, assignment, *tp_config, row_start, row_count))
         {
             throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for 2D column-parallel: " + name);
         }
@@ -9103,21 +9188,10 @@ namespace llaminar2
         return result;
     }
 
-    std::shared_ptr<TensorBase> WeightManager::loadFusedQKVColumnParallel(
-        const std::string &name,
-        DeviceId device,
-        const DeviceShardingAssignment &assignment,
-        const std::vector<size_t> &dimensions)
+    std::vector<GDNHeadSpan> WeightManager::fusedQKVSourceSpans(
+        const std::string &name, size_t total_rows, const DeviceShardingAssignment &assignment,
+        const std::shared_ptr<const TensorParallelConfig> &tp_config) const
     {
-        const auto tp_config = tensorParallelConfig();
-        const size_t total_rows = dimensions[0];
-        const size_t cols = dimensions[1];
-        if (!tp_config)
-            throw std::runtime_error(
-                "[WeightManager] FusedQKV assignment loading requires TensorParallelConfig");
-        const int world_size = tp_config->worldSize();
-        const int rank = assignment.local_rank;
-
         const ModelDimensions model_dimensions{
             .n_heads = model_n_heads_,
             .n_kv_heads = model_n_kv_heads_,
@@ -9167,7 +9241,25 @@ namespace llaminar2
             append_source_span(
                 slice->q_total + slice->k_total, value_span);
         }
+        return source_spans;
+    }
 
+    std::shared_ptr<TensorBase> WeightManager::loadFusedQKVColumnParallel(
+        const std::string &name,
+        DeviceId device,
+        const DeviceShardingAssignment &assignment,
+        const std::vector<size_t> &dimensions)
+    {
+        const auto tp_config = tensorParallelConfig();
+        const size_t total_rows = dimensions[0];
+        const size_t cols = dimensions[1];
+        if (!tp_config)
+            throw std::runtime_error(
+                "[WeightManager] FusedQKV assignment loading requires TensorParallelConfig");
+        const int world_size = tp_config->worldSize();
+        const int rank = assignment.local_rank;
+
+        const auto source_spans = fusedQKVSourceSpans(name, total_rows, assignment, tp_config);
         auto result_tensor = loadNativeRowSpanConcat(
             name, device, source_spans, cols, assignment.local_rank);
         const size_t total_out_rows = result_tensor->shape()[0];
@@ -9198,8 +9290,6 @@ namespace llaminar2
                                             << " [" << total_rows << ", " << cols << "]"
                                             << " -> [" << total_out_rows << ", " << cols << "]"
                                             << " (" << static_cast<int>(native_type) << " native)"
-                                            << " source_blocks [" << slice->q_total << ","
-                                            << slice->k_total << "," << slice->v_total << "]"
                                             << " (typed assignment layout)");
 
         return result;
@@ -9218,7 +9308,7 @@ namespace llaminar2
         size_t row_count = 0;
 
         // Use config-based dimension type to determine row slicing
-        if (!computeSliceBoundaries(name, total_rows, assignment, row_start, row_count))
+        if (!computeSliceBoundaries(name, total_rows, assignment, *tp_config, row_start, row_count))
         {
             throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for row-parallel: " + name);
         }
@@ -9272,7 +9362,7 @@ namespace llaminar2
             gdnValueElementsPerHead(name, total_cols) > 0)
         {
             const GDNHeadAssignment head_assignment =
-                gdnHeadAssignmentFor(assignment);
+                gdnHeadAssignmentFor(assignment, *tp_config);
             return loadGDNValueColumns(
                 name, device, head_assignment, assignment.local_rank,
                 tp_config->worldSize(), dimensions);
@@ -9282,7 +9372,7 @@ namespace llaminar2
         size_t col_start = 0;
         size_t col_count = 0;
 
-        if (!computeSliceBoundaries(name, total_cols, assignment, col_start, col_count))
+        if (!computeSliceBoundaries(name, total_cols, assignment, *tp_config, col_start, col_count))
         {
             throw std::runtime_error("[WeightManager] Failed to compute slice boundaries for input-parallel: " + name);
         }

@@ -249,7 +249,10 @@ namespace llaminar2
         const ModelConfig &model_config,
         const ClusterInventory &cluster_inventory)
     {
-        LOG_DEBUG("Building execution plans for " << cluster_inventory.world_size
+        // Automatic admission revisits this geometry for many candidates.
+        // Keep participant details at TRACE; the selected orchestration
+        // reports lifecycle summaries through its owning runner.
+        LOG_TRACE("Building execution plans for " << cluster_inventory.world_size
                                                   << " ranks, model " << model_config.name);
 
         std::vector<RankExecutionPlan> plans;
@@ -257,7 +260,7 @@ namespace llaminar2
 
         if (config.usesNamedDomains())
         {
-            LOG_DEBUG("Using named domains mode");
+            LOG_TRACE("Using named domains mode");
             auto domains = resolveDomains(config, cluster_inventory);
             auto pp_stages = resolvePPStages(config, model_config, domains, cluster_inventory);
 
@@ -326,7 +329,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("Using simple TP/PP mode");
+            LOG_TRACE("Using simple TP/PP mode");
             for (int rank = 0; rank < cluster_inventory.world_size; ++rank)
             {
                 plans.push_back(buildSimplePlan(
@@ -619,7 +622,7 @@ namespace llaminar2
                 domain.rank_to_index[rank] = idx++;
             }
 
-            LOG_DEBUG("Resolved domain '" << domain.name << "' with "
+            LOG_TRACE("Resolved domain '" << domain.name << "' with "
                                           << domain.devices.size() << " devices on "
                                           << domain.ranks.size() << " ranks");
 
@@ -1023,6 +1026,7 @@ namespace llaminar2
                             tp_info.devices = domain.devices;
                             tp_info.tp_weights = domain.weights;
                             tp_info.tp_backend = domain.backend;
+                            tp_info.domain_name = domain.name;
                             plan.local_pp_stage_tp_info.push_back(std::move(tp_info));
                             break;
                         }

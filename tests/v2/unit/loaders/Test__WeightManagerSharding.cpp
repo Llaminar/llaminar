@@ -2311,6 +2311,142 @@ TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSou
     }
 }
 
+/**
+ * @brief Materialize the factory's implicit dense CPU TP plan within its exact admitted shard BOM.
+ *
+ * The source fixture uses real original native windows. Explicit expected
+ * ranges size PMA independently of the implicit plan being exercised, so a
+ * regression to whole-source loading fails before publishing the final graph.
+ */
+TEST(CPUOriginalTPSourceWindow, ImplicitPlanUsesExactOriginalDenseShardAndRetainsIt)
+{
+    const DeviceId device = DeviceId::cpu();
+    constexpr int original_rank = 1;
+    const std::string query = "blk.0.attn_q.weight";
+    const std::string output = "blk.0.attn_output.weight";
+    const std::string fused = "blk.0.attn_qkv.weight";
+    const std::string norm = "blk.0.attn_norm.weight";
+    const std::string vocab = "output.weight";
+    MockModelLoader loader;
+    loader.addFP32RandomTensor(query, {128, 64}, -1.f, 1.f, 901);
+    loader.addTensor(output, TestTensorFactory::createQ4_0Random({96, 128}, 902));
+    loader.addFP32RandomTensor(fused, {192, 64}, -1.f, 1.f, 903);
+    loader.addFP32OnesTensor(norm, {64});
+    loader.addFP32RandomTensor(vocab, {64, 64}, -1.f, 1.f, 904);
+    const auto original_query = loader.loadTensor(query);
+    const auto original_fused = loader.loadTensor(fused);
+    ASSERT_TRUE(original_query);
+    ASSERT_TRUE(original_fused);
+
+    WeightManager manager(loader, nullptr, nullptr, WeightDistributionStrategy::SHARDED, WeightPrecision::NATIVE);
+    auto schema = Qwen2SchemaFactory{}.getWeightShardingConfig();
+    schema.exact_matches[fused] = WeightShardingMode::ColumnParallel;
+    schema.exact_dimension_matches[fused] = WeightDimensionType::FusedQKVHeads;
+    manager.setWeightShardingConfig(schema);
+    manager.setModelDimensions(8, 2, 16);
+    manager.setTensorParallelConfig(std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 8, 2, 128, 64, std::vector<DeviceId>{device, device})));
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{59118};
+    strategy.devices = {device};
+    strategy.tp_degree = 2;
+    WeightPlan implicit(strategy);
+    WeightPlan admitted(strategy);
+    for (const auto &name : {query, output, fused, norm, vocab}) {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = device;
+        requirement.tp_domain = 0;
+        requirement.tp_rank_or_device_index = original_rank;
+        if (name == vocab)
+            requirement.slice = {.source_rows = 64, .source_cols = 64, .row_start = 32, .row_count = 32};
+        implicit.add(requirement);
+        if (name == query) {
+            requirement.derivation = WeightDerivationKind::RowSlice;
+            requirement.slice = {.row_start = 64, .row_count = 64, .inner_is_presliced = true};
+        } else if (name == output) {
+            requirement.derivation = WeightDerivationKind::ColumnSlice;
+            requirement.slice = {.col_start = 64, .col_count = 64, .inner_is_presliced = true};
+        } else if (name == fused) {
+            requirement.derivation = WeightDerivationKind::FusedSubblockConcat;
+            requirement.native_source_assembly = NativeWeightSourceAssembly{
+                .axis = NativeWeightSourceAssembly::Axis::Rows, .final_rows = 96, .final_columns = 64,
+                .segments = {
+                    {.first_row = 64, .rows = 64, .columns = 64, .native_row_bytes = 64 * sizeof(float)},
+                    {.first_row = 144, .rows = 16, .columns = 64, .native_row_bytes = 64 * sizeof(float)},
+                    {.first_row = 176, .rows = 16, .columns = 64, .native_row_bytes = 64 * sizeof(float)},
+                }};
+        }
+        admitted.add(std::move(requirement));
+    }
+    ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(strategy.model_id));
+    admitCPUWeightPlansForTest(manager, loader, {&admitted}, original_rank);
+    const auto memory = manager.physicalMemoryAuthority();
+    ASSERT_TRUE(memory);
+    ASSERT_EQ(memory->worldRank(), original_rank);
+
+    const auto frozen = manager.materialize(implicit);
+    const auto &bindings = frozen.bindings();
+    ASSERT_EQ(bindings.size(), 5u);
+    for (const auto &binding : bindings) {
+        EXPECT_EQ(binding.identity.tp_rank_or_device_index, original_rank);
+        ASSERT_TRUE(binding.native_source);
+    }
+    const auto &q = bindings[0];
+    EXPECT_EQ(q.identity.derivation, WeightDerivationKind::RowSlice);
+    EXPECT_EQ(q.native_source->range.first_row, 64u);
+    EXPECT_EQ(q.native_source->finalRows(), 64u);
+    EXPECT_EQ(q.native_source->finalColumns(), 64u);
+    ASSERT_TRUE(q.tensor && q.tensor->raw_data());
+    EXPECT_EQ(std::memcmp(q.tensor->raw_data(),
+        static_cast<const float *>(original_query->raw_data()) + 64 * 64, 64 * 64 * sizeof(float)), 0);
+
+    const auto &o = bindings[1];
+    EXPECT_EQ(o.identity.derivation, WeightDerivationKind::ColumnSlice);
+    EXPECT_EQ(o.native_source->original.original_type, TensorType::Q4_0);
+    EXPECT_EQ(o.native_source->range.first_column, 64u);
+    EXPECT_EQ(o.native_source->finalRows(), 96u);
+    EXPECT_EQ(o.native_source->finalColumns(), 64u);
+    EXPECT_EQ(o.native_source->range.native_row_bytes, 2u * o.native_source->original.native_group_bytes);
+    ASSERT_TRUE(o.prepared);
+    const auto packed = manager.preparedWeightStore()->gemmKernelLifetime(*o.prepared);
+    ASSERT_TRUE(packed);
+    EXPECT_EQ(packed->get_n(), 96);
+    EXPECT_EQ(packed->get_k(), 64);
+
+    const auto &qkv = bindings[2];
+    EXPECT_EQ(qkv.identity.derivation, WeightDerivationKind::FusedSubblockConcat);
+    EXPECT_EQ(qkv.native_source->assembly, admitted.requirements()[2].native_source_assembly);
+    ASSERT_TRUE(qkv.tensor && qkv.tensor->raw_data());
+    const auto *original_qkv = static_cast<const float *>(original_fused->raw_data());
+    const auto *assembled_qkv = static_cast<const float *>(qkv.tensor->raw_data());
+    EXPECT_EQ(std::memcmp(assembled_qkv, original_qkv + 64 * 64, 64 * 64 * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(assembled_qkv + 64 * 64, original_qkv + 144 * 64, 16 * 64 * sizeof(float)), 0);
+    EXPECT_EQ(std::memcmp(assembled_qkv + 80 * 64, original_qkv + 176 * 64, 16 * 64 * sizeof(float)), 0);
+
+    EXPECT_EQ(bindings[3].identity.derivation, WeightDerivationKind::Source);
+    EXPECT_EQ(bindings[3].native_source->range.first_column, 0u);
+    EXPECT_EQ(bindings[3].native_source->finalColumns(), 64u);
+    EXPECT_EQ(bindings[4].identity.derivation, WeightDerivationKind::Source);
+    EXPECT_EQ(bindings[4].native_source->range.first_row, 32u);
+    EXPECT_EQ(bindings[4].native_source->finalRows(), 32u);
+
+    constexpr auto live = PhysicalMemoryMaterializationKind::NewAllocation;
+    constexpr auto weights = PhysicalMemoryOwner::PrimaryModelWeights;
+    EXPECT_EQ(memory->claimedBytes(device, weights, live), memory->plannedBytes(device, weights));
+    EXPECT_EQ(memory->claimedBytes(device, PhysicalMemoryOwner::WeightLoadStaging, live), 0u);
+    const auto reads = loader.nativeSourceReadCallCount();
+    ASSERT_GT(reads, 0u);
+    const auto replay = manager.materialize(implicit);
+    ASSERT_EQ(replay.bindings().size(), bindings.size());
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        EXPECT_EQ(replay.bindings()[i].binding_id, bindings[i].binding_id);
+        EXPECT_EQ(replay.bindings()[i].tensor, bindings[i].tensor);
+    }
+    EXPECT_EQ(loader.nativeSourceReadCallCount(), reads);
+    EXPECT_EQ(memory->claimedBytes(device, weights, live), memory->plannedBytes(device, weights));
+}
+
 /** @test GPU-qualified cache enumeration retains canonical names without initializing a backend. */
 TEST(WeightManagerCPUShardCache, GPUImmutableHostSourceEnumerationRetainsCanonicalNames)
 {

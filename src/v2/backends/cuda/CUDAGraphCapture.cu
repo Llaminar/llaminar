@@ -2049,6 +2049,56 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAGraphCapture::appendActiveCaptureChild(const IGPUGraphCapture &child)
+    {
+        const auto *recorded = dynamic_cast<const CUDAGraphCapture *>(&child);
+        if (!native_capture_active_ || !recorded || recorded == this ||
+            recorded->device_ordinal_ != device_ordinal_ || recorded->projection_owner_ != projection_owner_ ||
+            recorded->recording_role_ != RecordingRole::Owner || recorded->native_capture_active_ ||
+            !recorded->graph_ || !recorded->node_count_ || recorded->exec_ ||
+            !activateOwner("appendActiveCaptureChild"))
+            return false;
+
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        unsigned long long capture_id = 0;
+        cudaGraph_t destination = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t count = 0;
+        const auto query = cudaStreamGetCaptureInfo(stream_, &status, &capture_id,
+            &destination, &dependencies, &edge_data, &count);
+        if (query != cudaSuccess || status != cudaStreamCaptureStatusActive || !capture_id ||
+            !destination || destination == recorded->graph_ || (graph_ && destination != graph_) ||
+            (count && !dependencies))
+        {
+            LOG_ERROR("[CUDAGraphCapture] Shared child could not resolve its active stream frontier: "
+                      << cudaGetErrorString(query));
+            return false;
+        }
+        // A child has one ordinary entry. Do not reinterpret programmatic
+        // launch/partial completion edges as full-memory dependencies.
+        for (std::size_t i = 0; edge_data && i < count; ++i)
+        {
+            const auto &edge = edge_data[i];
+            if (edge.from_port || edge.to_port || edge.type ||
+                std::any_of(edge.reserved, edge.reserved + sizeof(edge.reserved), [](auto byte) { return byte != 0; }))
+            {
+                LOG_ERROR("[CUDAGraphCapture] Shared child requires full-completion frontier edges");
+                return false;
+            }
+        }
+        cudaGraphNode_t node = nullptr;
+        auto result = cudaGraphAddChildGraphNode(&node, destination, dependencies, count, recorded->graph_);
+        if (result == cudaSuccess && node)
+            result = cudaStreamUpdateCaptureDependencies(stream_, &node, nullptr, 1u, cudaStreamSetCaptureDependencies);
+        if (result != cudaSuccess || !node)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Shared child frontier import failed: " << cudaGetErrorString(result));
+            return false;
+        }
+        return true;
+    }
+
     bool CUDAGraphCapture::endCapture()
     {
         if (!native_capture_active_) return false;

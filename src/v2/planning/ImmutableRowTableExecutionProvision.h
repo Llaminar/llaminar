@@ -85,6 +85,9 @@ private:
                               g.mtp_terminal_logits_layout,
                               g.generation_request_capacity,
                               g.ngram_fixed_head_participants,
+                              g.ngram_fixed_pipeline_local_heads,
+                              g.ngram_fixed_pipeline_gathered_heads,
+                              g.ngram_fixed_pipeline_scratch_words,
                               g.attention_arithmetic,
                               g.attention_phase_schedule,
                               g.mtp_shifted_kv_head_layout};

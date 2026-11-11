@@ -2537,12 +2537,11 @@ namespace llaminar2::test
             << "Optional PerfStats detail must not contaminate the economy "
                "measurement used by placement";
 
-        const size_t endpoint_detail_end = execute_body.find(
-            "if (profiling_enabled)", diagnostic_publish);
-        ASSERT_NE(endpoint_detail_end, std::string::npos);
-        const std::string endpoint_detail = execute_body.substr(
-            diagnostic_publish,
-            endpoint_detail_end - diagnostic_publish);
+        // Only the typed identity supplies PerfStats tags. A neighboring
+        // conditional profiler may legitimately consume live route aggregates.
+        const std::string endpoint_detail = braceBalancedDeclarationRegion(
+            execute_body.substr(diagnostic_publish), "MoEOverlayEndpointIdentity");
+        ASSERT_FALSE(endpoint_detail.empty());
         for (const std::string_view forbidden_tag : {
                  "active_experts",
                  "active_routes",
@@ -3105,14 +3104,9 @@ namespace llaminar2::test
         EXPECT_EQ(ffn_body.find("graph.addDependency(graph_rebalance_collect_node,\n                                        prefix + \"moe_expert_ffn_overlay_fast\")"),
                   std::string::npos)
             << "A hardcoded overlay producer dependency breaks plain LocalTP apportioned expert rebalance.";
-        EXPECT_NE(contents.find("supportsDeviceSideGraphRebalanceTransfer"), std::string::npos)
-            << "The homogeneous-domain gate must be phrased in terms of the selected graph-side transfer path.";
         EXPECT_NE(contents.find("moe_env.device_rebalance_maintenance_graph"),
                   std::string::npos)
             << "Async maintenance must have an explicit transfer-mode branch.";
-        EXPECT_NE(contents.find("!tp_ctx.supportsRawAllgatherOnStreamGraphCapture())"),
-                  std::string::npos)
-            << "Async maintenance must fail closed unless raw NCCL/RCCL allgather is graph-capturable on the maintenance stream.";
         const size_t selector_start =
             contents.find("selectGraphRebalanceTransferMode(");
         ASSERT_NE(selector_start, std::string::npos);
@@ -3121,6 +3115,21 @@ namespace llaminar2::test
         ASSERT_NE(selector_end, std::string::npos);
         const std::string selector_body =
             contents.substr(selector_start, selector_end - selector_start);
+        const auto compact_gate = withoutWhitespace(selector_body);
+        EXPECT_NE(compact_gate.find("if(moe_env.device_rebalance_maintenance_graph){"
+                                   "if(!tp_ctx.supportsRawAllgatherOnStreamGraphCapture()){"), std::string::npos)
+            << "Compact maintenance must check graph-capturable raw NCCL/RCCL on the selected context.";
+        const auto capability = selector_body.find("!tp_ctx.supportsRawAllgatherOnStreamGraphCapture()");
+        const auto unsupported = selector_body.find("return std::nullopt;", capability);
+        const auto compact = selector_body.find("return DeviceMoERebalanceTransferMode::CompactTransferSlots;");
+        ASSERT_NE(capability, std::string::npos);
+        ASSERT_NE(unsupported, std::string::npos);
+        ASSERT_NE(compact, std::string::npos);
+        EXPECT_LT(unsupported, compact)
+            << "The selected backend's missing native graph capability must fail before compact transfer is admitted.";
+        EXPECT_NE(withoutWhitespace(ffn_body).find("selectGraphRebalanceTransferMode(*local_tp_ctx,"),
+                  std::string::npos)
+            << "Graph lowering must pass the original local context into the checked selector.";
         EXPECT_EQ(selector_body.find("DeviceMoERebalanceTransferMode::CollectiveSidebandPayload"),
                   std::string::npos)
             << "The graph-side transfer selector must not choose fixed-size payload arenas.";
@@ -4506,6 +4515,21 @@ namespace llaminar2::test
             << "Every Qwen-family production parity fixture must install the exact bucket after authenticating token_ids";
     }
 
+    /** @test Typed endpoint identity extraction cannot absorb adjacent live aggregate diagnostics. */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, EndpointIdentityRegionRejectsUnboundedTagMutation)
+    {
+        const std::string allowed =
+            "recordEndpointPacket(MoEOverlayEndpointIdentity{.layer=0}, timings);"
+            "if (profiling_enabled && cpu) record(active_routes.size());";
+        const auto identity = braceBalancedDeclarationRegion(allowed, "MoEOverlayEndpointIdentity");
+        ASSERT_FALSE(identity.empty());
+        EXPECT_EQ(identity.find("active_routes"), std::string::npos);
+        const auto forbidden = braceBalancedDeclarationRegion(
+            "recordEndpointPacket(MoEOverlayEndpointIdentity{.layer=active_routes.size()}, timings);",
+            "MoEOverlayEndpointIdentity");
+        EXPECT_NE(forbidden.find("active_routes"), std::string::npos);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ParityMovementProofRequiresPayloadCopyBytesAndApply)
     {
         const fs::path root = findRepoRoot();
@@ -4528,6 +4552,11 @@ namespace llaminar2::test
         ASSERT_NE(movement_end, std::string::npos);
         const std::string movement =
             parity_base.substr(movement_start, movement_end - movement_start);
+        EXPECT_NE(movement.find("parityMoEMovementFacts(records)"), std::string::npos);
+        const std::string movement_facts = braceBalancedDeclarationRegion(
+            readFile(root / "tests/v2/integration/parity/ParityRunnerEvidence.h"),
+            "inline std::array<float, 4> parityMoEMovementFacts(");
+        ASSERT_FALSE(movement_facts.empty());
         for (const char *counter : {
                  "committed_expert_migrations",
                  "cpu_native_copy_bytes",
@@ -4542,7 +4571,7 @@ namespace llaminar2::test
                  "device_rebalance_request_applied_payload_lower_bound",
                  "device_rebalance_request_useful_payload_bytes_lower_bound"})
         {
-            EXPECT_NE(movement.find(counter), std::string::npos)
+            EXPECT_NE(movement_facts.find(counter), std::string::npos)
                 << "Physical movement proof must consume " << counter;
         }
         EXPECT_NE(movement.find("EXPECT_GT(global[0], 0.0f)"),
@@ -5115,6 +5144,11 @@ namespace llaminar2::test
             generic_parity.substr(
                 movement_evidence_start,
                 movement_evidence_end - movement_evidence_start);
+        EXPECT_NE(movement_evidence_body.find("parityMoEMovementFacts(records)"), std::string::npos);
+        const std::string cumulative_facts = braceBalancedDeclarationRegion(
+            readFile(root / "tests/v2/integration/parity/ParityRunnerEvidence.h"),
+            "inline std::array<float, 4> parityMoEMovementFacts(");
+        ASSERT_FALSE(cumulative_facts.empty());
         for (const char *cumulative_counter : {
                  "committed_expert_migrations",
                  "device_rebalance_wave_copied_arrivals_total",
@@ -5122,7 +5156,7 @@ namespace llaminar2::test
                  "device_rebalance_request_useful_payload_bytes_lower_bound"})
         {
             EXPECT_NE(
-                movement_evidence_body.find(cumulative_counter),
+                cumulative_facts.find(cumulative_counter),
                 std::string::npos)
                 << "Canonical movement certification must consume cumulative "
                    "request evidence for "
@@ -11465,10 +11499,17 @@ namespace llaminar2::test
             fabric_header.find("MoEExpertOwnerMap canonical_owner_map;"),
             std::string::npos)
             << "The terminal seal must carry the owner map represented by its banks";
-        EXPECT_NE(
-            rebind.find("seal.canonical_owner_map"),
-            std::string::npos)
+        EXPECT_NE(rebind.find("replaceParticipantResidencyFromSeal(seal, *residency, &registry_error)"),
+                  std::string::npos)
+            << "Runner must pass the original complete physical seal to its registry owner";
+        const std::string registry_rebind = braceBalancedDeclarationRegion(
+            readFile(root / "src/v2/loaders/ExpertGemmRegistry.cpp"),
+            "bool ExpertGemmRegistry::replaceParticipantResidencyFromSeal(");
+        ASSERT_FALSE(registry_rebind.empty());
+        EXPECT_NE(registry_rebind.find("seal.canonical_owner_map"), std::string::npos)
             << "Registry rebinding must consume only the self-contained physical seal";
+        EXPECT_EQ(registry_rebind.find("moe_expert_overlay_residency_authority_"), std::string::npos);
+        EXPECT_EQ(registry_rebind.find("acquireSnapshot"), std::string::npos);
         EXPECT_EQ(
             rebind.find("moe_expert_overlay_residency_authority_"),
             std::string::npos)
@@ -11683,6 +11724,16 @@ namespace llaminar2::test
             adapter_status.find("orch_runner_->moeOptimizationStatus()"),
             std::string::npos)
             << "The public inference surface must preserve optimization authority";
+
+        const std::string terminal_header = readFile(
+            root / "src/v2/execution/runner/ObservedFixedPipelineEvidence.h");
+        EXPECT_EQ(terminal_header.find("PerfStatsCollector::snapshot"), std::string::npos)
+            << "The fixed-pipeline binding interface cannot observe the telemetry ledger";
+        const std::string terminal_observer = braceBalancedDeclarationRegion(
+            benchmark, "nlohmann::json observeFixedNativePipelineTerminal(");
+        ASSERT_FALSE(terminal_observer.empty());
+        EXPECT_NE(terminal_observer.find("PerfStatsCollector::snapshot"), std::string::npos)
+            << "Only the existing benchmark observation boundary reads completed fixed-pipeline records";
 
         const fs::path source_root = root / "src/v2";
         for (const auto &entry : fs::recursive_directory_iterator(source_root))
@@ -11937,9 +11988,15 @@ namespace llaminar2::test
             fabric_materialization.find(
                 "config.maximum_concurrent_cycles"),
             std::string::npos);
+        // The admitted map is the one physical-stream authority. Materializers
+        // consume it unchanged rather than rebuilding the budget formula.
         EXPECT_NE(
-            fabric_materialization.find(
-                "config.maximum_execution_streams"),
+            withoutWhitespace(fabric_materialization).find(
+                "execution_stream_counts=impl.lane_demand_plan.original_execution_streams;"),
+            std::string::npos);
+        EXPECT_NE(
+            withoutWhitespace(fabric_materialization).find(
+                "allocatePersistentTransferExecutionLanes(execution_stream_counts.at(device),"),
             std::string::npos);
         EXPECT_NE(
             fabric_materialization.find(
@@ -11992,6 +12049,10 @@ namespace llaminar2::test
         const fs::path fabric_path =
             root /
             "src/v2/execution/moe/MoEOverlayPhysicalResidencyFabric.cpp";
+        const fs::path planner_path =
+            root / "src/v2/execution/moe/MoEOverlayLocalCapacityPlanner.cpp";
+        const fs::path admission_path =
+            root / "src/v2/execution/moe/MoEOverlayCapacityAdmission.cpp";
         const std::array<fs::path, 3> lane_paths{
             root /
                 "src/v2/execution/moe/ExpertTierWeightTransferLane.cpp",
@@ -12012,6 +12073,8 @@ namespace llaminar2::test
                  transfer_header,
                  transfer_source,
                  fabric_path,
+                 planner_path,
+                 admission_path,
                  cuda_test_path,
                  rocm_test_path,
                  cmake_path,
@@ -12025,6 +12088,8 @@ namespace llaminar2::test
         const std::string header = readFile(transfer_header);
         const std::string transfer = readFile(transfer_source);
         const std::string fabric = readFile(fabric_path);
+        const std::string planner = readFile(planner_path);
+        const std::string admission = readFile(admission_path);
         const std::string cuda_test = readFile(cuda_test_path);
         const std::string rocm_test = readFile(rocm_test_path);
         const std::string cmake = readFile(cmake_path);
@@ -12054,18 +12119,40 @@ namespace llaminar2::test
                 "allocatePersistentTransferExecutionLanes("),
             1u)
             << "One physical pool per GPU must precede logical lane expansion";
-        // Piece/cycle command multiplicity does not multiply physical queues.
-        // Authenticate the actual allocator argument and its separate policy.
-        EXPECT_NE(
-            materialize.find("physicalStreamCount(multiplicity)"),
+        // Admission and materialization share the canonical participant count;
+        // the fabric consumes that retained original map rather than rebuilding
+        // an inline multiplicity formula after pools have already been created.
+        const auto authenticate = braceBalancedDeclarationRegion(
+            fabric, "void authenticatePhysicalLaneDemand(");
+        ASSERT_FALSE(authenticate.empty());
+        EXPECT_NE(authenticate.find("MoEOverlayCapacityAdmission::executionStreamCounts("),
             std::string::npos);
+        EXPECT_NE(authenticate.find("config.maximum_execution_streams"), std::string::npos);
+        EXPECT_NE(withoutWhitespace(authenticate).find(
+            "impl.lane_demand_plan.original_execution_streams=declared_streams;"), std::string::npos);
+        EXPECT_NE(withoutWhitespace(materialize).find(
+            "execution_stream_counts=impl.lane_demand_plan.original_execution_streams;"), std::string::npos);
+        EXPECT_NE(withoutWhitespace(materialize).find(
+            "allocatePersistentTransferExecutionLanes(execution_stream_counts.at(device),"), std::string::npos);
+        EXPECT_EQ(materialize.find("MoEOverlayCapacityAdmission::executionStreamCounts("), std::string::npos)
+            << "Native creators must consume the already authenticated stream program";
+        EXPECT_NE(planner.find("MoEOverlayCapacityAdmission::executionStreamCounts("), std::string::npos);
+        EXPECT_NE(planner.find("TransferEngine::persistentTransferExecutionLanesBOM("), std::string::npos);
+        EXPECT_NE(withoutWhitespace(planner).find("demand->original_execution_streams=counts;"), std::string::npos);
         const auto physical_streams = braceBalancedDeclarationRegion(
-            materialize, "const auto physicalStreamCount =");
+            admission, "MoEOverlayCapacityAdmission::executionStreamCounts(");
         ASSERT_FALSE(physical_streams.empty());
-        EXPECT_NE(physical_streams.find("config.maximum_execution_streams"),std::string::npos);
+        EXPECT_NE(physical_streams.find("boundParticipants(plan)"), std::string::npos);
         EXPECT_NE(withoutWhitespace(physical_streams).find(
-            "multiplicity*config.maximum_execution_streams"),std::string::npos);
-        EXPECT_EQ(physical_streams.find("maximum_concurrent_cycles"),std::string::npos);
+            "count=checkedAdd(count,maximum_execution_streams,"), std::string::npos);
+        EXPECT_EQ(physical_streams.find("maximum_concurrent_cycles"), std::string::npos);
+        for (const auto &source : {fabric, planner})
+        {
+            EXPECT_EQ(source.find("physicalStreamCount"), std::string::npos);
+            EXPECT_EQ(withoutWhitespace(source).find(
+                "multiplicity*config.maximum_execution_streams"), std::string::npos)
+                << "Only the canonical admission helper owns physical-stream count arithmetic";
+        }
         EXPECT_NE(materialize.find("parallelLaneCount(participant_multiplicity.at(device))"),
             std::string::npos)
             << "Command/progress capacity still owns the independent cycle budget";
@@ -12109,19 +12196,24 @@ namespace llaminar2::test
      * mapped allocator. Registering an already first-touched anonymous tensor
      * generates an ATS invalidation per page on Vega20 and can overflow the
      * fixed IH2 retry ring when participants materialize concurrently. The
-     * The two exceptions below own process/rank-shared mappings that cannot be
+     * The named infrastructure exceptions own process/rank-shared mappings that cannot be
      * replaced by one backend-private allocation. Node-local route exchange
      * is intentionally absent: its same-family mapping is now allocated by
      * TransferEngine, which gives each participating GPU a portable alias
      * without late external registration.
+     * Planning's two buffers are first-touched by their original host rank
+     * and imported by the NUMA-local GPU executor through the same shared-file
+     * lifetime; a backend-private allocation cannot preserve that placement.
      */
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
          ExternalMappedRegistrationIsRestrictedToTrueSharedPageOwners)
     {
         const fs::path root = findRepoRoot();
-        const std::array<std::pair<fs::path, size_t>, 4> allowed{
+        const std::array<std::pair<fs::path, size_t>, 6> allowed{
             std::pair{
-                fs::path{"src/v2/transfer/TransferEngine.cpp"}, 2u},
+                fs::path{"src/v2/transfer/TransferEngine.cpp"}, 1u},
+            std::pair{
+                fs::path{"src/v2/transfer/CapturedTransferChannel.cpp"}, 1u},
             std::pair{
                 fs::path{"src/v2/execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.cpp"},
                 1u},
@@ -12131,9 +12223,38 @@ namespace llaminar2::test
             std::pair{
                 fs::path{"src/v2/execution/moe/MoEOverlayNodeLocalRouteExchange.cpp"},
                 0u},
+            std::pair{
+                fs::path{"src/v2/planning/PlanningHostDeviceMeasurement.cpp"},
+                2u},
         };
         constexpr std::string_view needle =
             "registerExternalMappedHostRegion(";
+
+        // A file-wide count alone would allow this call to move into a local
+        // tensor path. Pin the sole exception to the authenticated rank owner.
+        const auto rank_transfer = readFile(root / "src/v2/transfer/CapturedTransferChannel.cpp");
+        const auto pages_begin = rank_transfer.find("class RankCapturedPages final");
+        const auto pages_end = rank_transfer.find("struct CapturedTransferRankSession::Entry", pages_begin);
+        ASSERT_NE(pages_begin, std::string::npos);
+        ASSERT_NE(pages_end, std::string::npos);
+        const auto pages = withoutWhitespace(rank_transfer.substr(pages_begin, pages_end - pages_begin));
+        EXPECT_NE(pages.find("establishMoEOverlaySharedBacking(mpi,"), std::string::npos);
+        EXPECT_NE(pages.find("MoEOverlaySharedBackingKind::PipelineActivation"), std::string::npos);
+        EXPECT_NE(pages.find("::mmap(nullptr,bytes_,PROT_READ|PROT_WRITE,MAP_SHARED,file_.descriptor(),0)"),
+                  std::string::npos);
+        const auto rank_begin = rank_transfer.find("TransferEngine::createRankCapturedTransferChannel(");
+        const auto rank_end = rank_transfer.find("CapturedTransferChannel::memoryFor(size_t capacity)", rank_begin);
+        ASSERT_NE(rank_begin, std::string::npos);
+        ASSERT_NE(rank_end, std::string::npos);
+        const auto rank_constructor = withoutWhitespace(rank_transfer.substr(rank_begin, rank_end - rank_begin));
+        EXPECT_NE(rank_constructor.find("constautompi=session->original_;"), std::string::npos);
+        EXPECT_NE(rank_constructor.find("role=plan.localRole(mpi->rank());"), std::string::npos);
+        EXPECT_NE(rank_constructor.find("pages=std::make_shared<RankCapturedPages>(plan,*mpi,channel->identity_);"),
+                  std::string::npos);
+        EXPECT_NE(rank_constructor.find(
+            "channel->mapped_=registerExternalMappedHostRegion(pages->allocation(),geometry.mapped_host_bytes,devices,pages);"),
+            std::string::npos)
+            << "Only the original authenticated MAP_SHARED owner may retain an external rank alias.";
 
         const fs::path source_root = root / "src/v2";
         ASSERT_TRUE(fs::exists(source_root));

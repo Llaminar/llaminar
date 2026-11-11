@@ -24,12 +24,13 @@ ClusterInventory candidateInventory(DeviceType backend,int ranks=1,bool gpu_ever
     ClusterInventory result;result.world_size=ranks;
     for(int rank=0;rank<ranks;++rank) {
         RankInventory r;r.rank=rank;r.node_id=rank;r.local_rank=0;r.hostname="candidate-"+std::to_string(rank);
+        // Authored CPU and GPU observations share this host's one physical node.
         r.cpu.numa_node=0;r.cpu.memory_bytes=512ull<<30;r.cpu.free_memory_bytes=500ull<<30;
         r.cpu.compute_units=r.cpu_cores=r.cpu_worker_threads=8;r.numa_nodes=1;
         r.cpu_execution=test::kSyntheticCPUExecutionGeometry;
         if(backend!=DeviceType::CPU&&(rank==0||gpu_every_rank))
             r.gpus.push_back({.type=backend,.local_device_id=2,.memory_bytes=512ull<<30,
-                .free_memory_bytes=500ull<<30,.compute_units=64,.uuid="candidate-gpu-"+std::to_string(rank),.numa_node=3});
+                .free_memory_bytes=500ull<<30,.compute_units=64,.uuid="candidate-gpu-"+std::to_string(rank),.numa_node=0});
         result.ranks.push_back(std::move(r));
     }
     result.buildNodeAggregations();return result;
@@ -83,7 +84,8 @@ AutomaticOrchestrationCandidate multirankNgramCandidate(const PlanningModelSourc
     for(const auto &rank:inventory.ranks) {
         const auto ordinal=rank.gpus.front().local_device_id;
         domain.participants.push_back(backend==DeviceType::CUDA
-            ?GlobalDeviceAddress::cuda(ordinal,3,rank.hostname):GlobalDeviceAddress::rocm(ordinal,3,rank.hostname));
+            ?GlobalDeviceAddress::cuda(ordinal,rank.gpus.front().numa_node,rank.hostname)
+            :GlobalDeviceAddress::rocm(ordinal,rank.gpus.front().numa_node,rank.hostname));
     }
     domain.routed_compute_policy=config.routed_expert_compute_policy;
     auto overlay=std::make_shared<MoERoutedExpertPlacementPlan>();overlay->enabled=true;

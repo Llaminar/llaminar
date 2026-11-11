@@ -251,7 +251,6 @@ namespace llaminar2
                 params_.depth_transaction_trace_device ||
                 params_.verifier_input_tokens_device || params_.verifier_input_token_stride ||
                 params_.committed_verifier_identity_device || params_.publish_shifted_kv ||
-                params_.dynamic_moe_commit_boundary ||
                 !params_.shifted_kv_caches.empty() || params_.shifted_target_cached_tokens_device ||
                 params_.shifted_accepted_state_counts_device || params_.penalty_policy_device ||
                 params_.generated_token_counts_device || params_.vocab_size)
@@ -313,11 +312,21 @@ namespace llaminar2
             return false;
         }
         if (params_.dynamic_moe_commit_boundary &&
-            (params_.authority != Authority::BoundedGeneration ||
-             !params_.dynamic_moe_commit_boundary->valid()))
+            ((params_.authority != Authority::BoundedGeneration && params_.authority != Authority::PipelineFollower) ||
+             !params_.dynamic_moe_commit_boundary->valid() ||
+             (params_.authority == Authority::PipelineFollower && !params_.pipeline_moe_commit_evidence)))
         {
             LOG_ERROR(
                 "[MTPSpeculativeStatePublicationStage] Dynamic MoE cadence must be a complete controller-owned publication transition");
+            return false;
+        }
+        if (params_.pipeline_moe_commit_evidence &&
+            (!params_.pipeline_moe_commit_evidence->valid() ||
+             (params_.authority != Authority::PipelineFollower &&
+              (params_.pipeline_moe_commit_evidence->meta_device != params_.outcome_meta_device ||
+               params_.pipeline_moe_commit_evidence->meta_stride != params_.outcome_meta_stride))))
+        {
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Pipeline cadence evidence changed its original compact-field producer");
             return false;
         }
         if (params_.publish_shifted_kv &&
@@ -576,9 +585,9 @@ namespace llaminar2
         const DynamicMoECommitBoundaryBinding &boundary =
             *params_.dynamic_moe_commit_boundary;
         if (!params_.backend->enqueueAdvanceSpeculativeCommitBoundary(
-                params_.outcome_meta_device,
+                params_.authority == Authority::PipelineFollower ? params_.pipeline_moe_commit_evidence->meta_device : params_.outcome_meta_device,
                 params_.request_count,
-                params_.outcome_meta_stride,
+                params_.authority == Authority::PipelineFollower ? params_.pipeline_moe_commit_evidence->meta_stride : params_.outcome_meta_stride,
                 boundary.decode_rounds_committed_device,
                 boundary.decode_rounds_until_maintenance_device,
                 boundary.maintenance_due_device,
@@ -801,11 +810,14 @@ namespace llaminar2
                     contract.addPreallocatedOutput(binding.id, binding.dtype);
             }
         }
-        // Committed metadata and local cache/state bindings are persistent raw
-        // addresses, not sampler arena slots. A follower must not reserve dummy
-        // vocabulary, response or predictor buffers to satisfy this contract.
-        if (params_.authority == Authority::PipelineFollower)
+        // A follower reads only exact tail-authored cadence fields when its
+        // own controller consumes them. It never acquires outcome writes,
+        // vocabulary, response or predictor storage through this dependency.
+        if (params_.authority == Authority::PipelineFollower) {
+            if (params_.dynamic_moe_commit_boundary && params_.pipeline_moe_commit_evidence)
+                contract.addInput(BufferId::STOCHASTIC_BATCH_OUTPUT_META, "INT32");
             return contract;
+        }
         contract.addInput(
             BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS,
             "INT32");
@@ -900,6 +912,7 @@ namespace llaminar2
                    other.committed_verifier_identity_device &&
                self.dynamic_moe_commit_boundary ==
                    other.dynamic_moe_commit_boundary &&
+               self.pipeline_moe_commit_evidence == other.pipeline_moe_commit_evidence &&
                self.request_count == other.request_count &&
                self.verifier_rows_per_request ==
                    other.verifier_rows_per_request &&

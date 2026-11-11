@@ -45,6 +45,63 @@ bool joinPipelineMTP(TPWorkerPool &workers)
 }
 }
 
+bool PipelineDeviceGeneration::publishOriginalFollowerMTPState(
+    size_t index, int physical_rows, std::string *error)
+{
+    auto &stage = *stages_[index];
+    const auto verifier = stage.forward_engine_
+        ? stage.forward_engine_->lastAllPositionVerifierForwardGraph() : std::nullopt;
+    if (!verifier || !*verifier || !verifier->graph ||
+        verifier->signature.seq_len != physical_rows)
+    {
+        if (error) *error = "Pipeline follower lost its exact grouped verifier";
+        return false;
+    }
+    void *const stream = verifier->stream;
+    // Close the verifier's existing transaction borrow after its exact
+    // completion event. Followers never admit a second controller.
+    if (!stream || !stage.device_generation_state_ready_.handoff.borrowed() ||
+        stage.device_generation_state_ready_.handoff.borrowerRole() != DeviceTimelineRole::AllPositionVerifier ||
+        !stage.waitForPendingAllPositionVerifierStateReady(stream, "pipeline_initial_mtp_commit") ||
+        !stage.materializePipelineFollowerMTPPublicationGraph(*verifier->graph, verifier->signature,
+            verifier->signature.seq_len, error) ||
+        !stage.executeMTPStatePublicationGraph(stream, error) ||
+        !stage.recordAcceptedSpecPublicationReady(stream, "pipeline_initial_mtp_commit") ||
+        !stage.publishDeviceGenerationStateReady(stream, 1,
+            DeviceGenerationStatePublicationKind::CommittedTransaction))
+        return false;
+    if (rank_topology_ && !hasLocalTail())
+        rank_transaction_terminals_[index].stream = stream;
+    return true;
+}
+
+bool PipelineDeviceGeneration::publishOriginalRankFollowerState(int physical_rows, std::string *error)
+{
+    if (!rank_topology_ || hasLocalTail() || phase_ != Phase::Admitted || physical_rows < 2)
+    {
+        if (error) *error = "Rank follower publication requires its original admitted exact verifier";
+        return false;
+    }
+    phase_ = Phase::Failed;
+    std::vector<std::string> failures(stages_.size());
+    workers_->dispatch([&, this](size_t index) {
+        return publishOriginalFollowerMTPState(index, physical_rows, &failures[index]);
+    });
+    if (!joinPipelineMTP(*workers_))
+    {
+        if (error)
+            for (size_t index = 0; index < failures.size(); ++index)
+                if (!failures[index].empty())
+                {
+                    *error = "Pipeline participant " + std::to_string(index) + ": " + failures[index];
+                    break;
+                }
+        return false;
+    }
+    phase_ = Phase::Admitted;
+    return true;
+}
+
 bool PipelineDeviceGeneration::publishMTPOutcome(
     const DeviceSpeculativePublicationRequest &request, std::string *error)
 {
@@ -56,33 +113,11 @@ bool PipelineDeviceGeneration::publishMTPOutcome(
     phase_ = Phase::Failed;
     std::vector<std::string> failures(stages_.size());
     workers_->dispatch([&, this](size_t index) {
-        auto &stage = *stages_[index];
         if (terminalParticipant(index))
             return index != terminalIndex() ||
-                domains_.back().runner->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(request, &failures[index]);
+                tailDomain().runner->publishAcceptedMTPSpecStateBatchFromDeviceOutcome(request, &failures[index]);
 
-        const auto verifier = stage.forward_engine_
-            ? stage.forward_engine_->lastAllPositionVerifierForwardGraph() : std::nullopt;
-        if (!verifier || !*verifier || !verifier->graph ||
-            verifier->signature.seq_len != request.physicalVerifierRowsPerRequest())
-        {
-            failures[index] = "Pipeline follower lost its exact grouped verifier";
-            return false;
-        }
-        void *const stream = verifier->stream;
-        // Close the verifier's existing transaction borrow after its exact
-        // completion event. Followers never admit a second controller.
-        if (!stream || !stage.device_generation_state_ready_.handoff.borrowed() ||
-            stage.device_generation_state_ready_.handoff.borrowerRole() != DeviceTimelineRole::AllPositionVerifier ||
-            !stage.waitForPendingAllPositionVerifierStateReady(stream, "pipeline_initial_mtp_commit") ||
-            !stage.materializePipelineFollowerMTPPublicationGraph(*verifier->graph, verifier->signature,
-                verifier->signature.seq_len, &failures[index]) ||
-            !stage.executeMTPStatePublicationGraph(stream, &failures[index]) ||
-            !stage.recordAcceptedSpecPublicationReady(stream, "pipeline_initial_mtp_commit") ||
-            !stage.publishDeviceGenerationStateReady(stream, 1,
-                DeviceGenerationStatePublicationKind::CommittedTransaction))
-            return false;
-        return true;
+        return publishOriginalFollowerMTPState(index, request.physicalVerifierRowsPerRequest(), &failures[index]);
     });
     if (!joinPipelineMTP(*workers_))
     {
@@ -105,7 +140,7 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
     // The terminal participant alone owns request policy. Followers borrow
     // these immutable admission bounds without acquiring a sampler/controller
     // shadow; their device state still arrives over the pipeline command edge.
-    const auto &tail_admission = stages_[terminalIndex()]->active_device_generation_admission_;
+    const auto &tail_admission = originalAdmission();
     if (!tail_admission)
     {
         LOG_ERROR("Pipeline speculative materialization requires the terminal request admission");
@@ -115,7 +150,10 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
         auto &stage = *stages_[index];
         if (terminalParticipant(index))
             return index != terminalIndex() ||
-                domains_.back().runner->materializeDeviceResidentGeneration(1, depth, topology, sampling);
+                tailDomain().runner->materializeDeviceResidentGeneration(1, depth, topology, sampling);
+        if (transport_ == Transport::NativeDomains && stage.usesParticipantLocalDeviceMoERebalanceController() &&
+            sparseQueryExecutionProgramIndex(stage.sparseQueryGraphProgram()) == 0 &&
+            !stage.maybeRunDeviceMoERebalanceMaintenanceGraph()) return false;
         const auto verifier = stage.forward_engine_
             ? stage.forward_engine_->lastAllPositionVerifierForwardGraph() : std::nullopt;
         std::string error;
@@ -214,11 +252,10 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
                             {{"execution", deviceGenerationExecutionPolicyName(execution_policy_)},
                              {"physical_rows", std::to_string(branch.verifier_signature.seq_len)}, {"family", "exact_rows"}});
             }
-            const auto &policy = tail_admission->depth_policy;
-            loop.minimum_draft_depth = policy.mode == sampling_math::DeviceGenerationPolicyMode::Dynamic
-                ? policy.minimum_depth : policy.initial_depth;
-            loop.maximum_draft_depth = policy.mode == sampling_math::DeviceGenerationPolicyMode::Dynamic
-                ? policy.maximum_depth : policy.initial_depth;
+            const auto depths = deviceGenerationSpeculativeDepthRange(tail_admission->depth_policy);
+            if (!depths) return false;
+            loop.minimum_draft_depth = depths->minimum;
+            loop.maximum_draft_depth = depths->maximum;
             return true;
         }
         const auto forward = stage.forward_engine_->deviceLoopGraphTemplate(program_signature, &error);
@@ -285,6 +322,8 @@ bool PipelineDeviceGeneration::prepareSpeculativeParticipants(int depth,
             fragments.push_back({"pipeline grouped verifier", forward->capture});
             fragments.push_back({"pipeline accepted-state publication", publication->capture});
         }
+        if (const auto *maintenance = nativeStageMaintenance(index))
+            fragments.push_back({"original follower cadence and maintenance", maintenance});
         const auto generation = stage.workspaceGeneration(stage.state_.device_id);
         if (loop.valid && loop.workspace_generation == generation &&
             loop.pipeline_verifier_identity == program_signature &&
@@ -377,7 +416,7 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
                     words.push_back({.kind = LocalTPCollectiveSidebandKind::Broadcast,
                         .send_buffer = word, .recv_buffer = word, .element_count = 1,
                         .dtype = CollectiveDataType::INT32,
-                        .root_device_index = static_cast<int>(stages_.size() - 1),
+                        .root_device_index = static_cast<int>(terminalIndex()),
                         .name = "pipeline_mtp_continuation"});
                 }
                 if (!collective_->collectiveSidebandSpanOnStream(words, static_cast<int>(index),
@@ -442,7 +481,7 @@ bool PipelineDeviceGeneration::composeSpeculativeParticipants()
 bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
 {
     auto &tail = *stages_[terminalIndex()];
-    auto &owner = *domains_.back().runner;
+    auto &owner = *tailDomain().runner;
     for (size_t index = 0; index < terminalIndex(); ++index)
     {
         auto &stage = *stages_[index];
@@ -471,8 +510,13 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
                 tail.last_device_generation_dispatch_ticket_->workspaceGeneration()) ||
             !ticket.hasSameDispatchDecision(*tail.last_device_generation_dispatch_ticket_))
             return false;
+        if (!advanceHostedFollowerMaintenance()) return false;
+        if (rank_topology_ && (!rank_retire_transaction_ || !rank_retire_transaction_(uint64_t(ticket.committed_output_tokens)))) return false;
         if (!ticket.complete)
         {
+            if (rank_topology_ && (!rank_publish_transaction_ || !rank_publish_transaction_(
+                    MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                    ticket.next_draft_depth + 1, ticket.next_draft_depth))) return false;
             // Validate all participants before the first distributed enqueue.
             for (size_t index = 0; index < terminalIndex(); ++index)
             {
@@ -494,7 +538,7 @@ bool PipelineDeviceGeneration::launchHostedSpeculativeTransactions()
                 auto &stage = *stages_[index];
                 auto &loop = stage.deviceGenerationLoopGraph();
                 auto &branch = loop.pipeline_verifier_branches[stage.mtpPublicationWidthIndex(ticket.next_draft_depth + 1)];
-                if (!branch.capture->launchOnStream(loop.stream.get())) return false;
+                if (!submitHostedFollowerCapture(index, *branch.capture)) return false;
                 PerfStatsCollector::addCounter("generation", "pipeline_mtp_follower_transaction_submissions", 1.0,
                     "decode", stage.state_.device_id.toString(),
                     {{"epoch_boundary", stage.moe_overlay_epoch_execution_binding_ ? "captured" : "not_required"},

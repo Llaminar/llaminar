@@ -857,13 +857,38 @@ namespace llaminar2
         const std::optional<ImmutableRowTableDevicePreparation> &upload, const TransferEngine &transfers,
         const std::optional<AdaptiveImmutableLookupDevicePreparation> &adaptive_setup)
     {
+        if (!authority || authority->worldRank() != placement.worldRank())
+            throw std::invalid_argument("Immutable row consumer requires its original rank authority");
+        const auto execution = placement.lookupForConsumer({authority->worldRank(), consumer});
+        prepareImmutableRowTableOriginal(placement, std::move(authority), consumer, execution,
+            upload, transfers, adaptive_setup);
+    }
+
+    void ModelContext::prepareImmutableRowTableForFixedPipelineOwner(
+        const ResolvedImmutableRowTablePlacement& placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId owner,
+        const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers)
+    {
+        if (!authority || !placement.fixedHeadPipeline() ||
+            authority->worldRank() != placement.worldRank() ||
+            !placement.containsAllocator({authority->worldRank(), owner}))
+            throw std::invalid_argument("Fixed PLE storage upload requires its original pipeline owner");
+        prepareImmutableRowTableOriginal(placement, std::move(authority), owner,
+            ImmutableRowLookupExecution::FixedHeadShardGPU, upload, transfers, std::nullopt);
+    }
+
+    void ModelContext::prepareImmutableRowTableOriginal(const ResolvedImmutableRowTablePlacement& placement,
+        std::shared_ptr<PhysicalMemoryAuthority> authority, DeviceId consumer,
+        ImmutableRowLookupExecution execution,
+        const std::optional<ImmutableRowTableDevicePreparation>& upload, const TransferEngine& transfers,
+        const std::optional<AdaptiveImmutableLookupDevicePreparation>& adaptive_setup)
+    {
         if (isGraphCaptureActive())
             throw std::logic_error("native table materialization is forbidden during graph capture");
         const auto source = immutableRowTableSource();
         if (!authority || placement.worldRank() != authority->worldRank() ||
             placement.extent() != ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()))
             throw std::invalid_argument("native table requires its exact sealed source/PMA rank");
-        const auto execution = placement.lookupForConsumer({authority->worldRank(),consumer});
         if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
         {
             if(upload)throw std::invalid_argument("Adaptive lookup cannot borrow a whole-table upload authority");
@@ -1182,12 +1207,19 @@ namespace llaminar2
                 upload.staging.requireFor(authority,upload.device,placement.extent().rowBytes());
             }
         }
-        for (const auto &consumer : placement.consumers())
-        {
-            const auto found=unique.find(consumer.device);
-            const auto upload=found == unique.end() ? std::optional<ImmutableRowTableDevicePreparation>{} :
+        const auto uploadFor = [&](DeviceId device) {
+            const auto found = unique.find(device);
+            return found == unique.end() ? std::optional<ImmutableRowTableDevicePreparation>{} :
                 std::optional<ImmutableRowTableDevicePreparation>{*found->second};
-            prepareImmutableRowTableForConsumer(placement,authority,consumer.device,upload,transfers);
+        };
+        if (placement.fixedHeadPipeline()) {
+            for (const auto& owner : placement.allocators())
+                prepareImmutableRowTableForFixedPipelineOwner(placement, authority, owner.device,
+                    uploadFor(owner.device), transfers);
+        } else {
+            for (const auto& consumer : placement.consumers())
+                prepareImmutableRowTableForConsumer(placement, authority, consumer.device,
+                    uploadFor(consumer.device), transfers);
         }
         requireImmutableRowTablePlacementComplete(placement,authority);
     }

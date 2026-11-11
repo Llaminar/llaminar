@@ -38,6 +38,8 @@ private:
     friend class ReadAheadNativeResourceFamily;
     friend class ReadAheadNativeParentTerminal;
     friend class NativeOrderingEventGroup;
+    friend class NativeAuxiliaryStreamOwnership;
+    friend class NativePeerTransferEventOwnership;
     /** @brief Move only original tokens; the independently scoped zero GPU allowance has no token. */
     ReadAheadNativeResourceObligation(std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId device,
         std::uint64_t generation,std::string certificate,PhysicalMemoryOwnerReservation host,

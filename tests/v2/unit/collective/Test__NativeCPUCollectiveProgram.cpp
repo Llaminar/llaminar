@@ -150,9 +150,9 @@ TEST(NativeCPUCollectiveProgram, ExcludedSplitAndPendingNativeEntryHonorOriginal
  mpiShutdown();EXPECT_EQ(finalize_calls,1);EXPECT_EQ(poolRow(m).committed_new_bytes,0u);
 }
 
-TEST(NativeCPUCollectiveProgram, AllOneThroughEightDeclaredPopulationsUseSameOriginalLifetimeContract){
+TEST(NativeCPUCollectiveProgram, VariableOriginalPopulationsUseSameLifetimeContract){
  // Recorded endpoint metadata tests no new socket discovery/affinity or native communicator readiness.
- for(int population=1;population<=8;++population){
+ for(int population=1;population<=17;++population){
   SCOPED_TRACE(population);freshMPI();auto mpi=session();
   std::vector<NativeCPUCollectiveProgram::Participant> members;
   for(int i=0;i<population;++i)members.push_back({i,GlobalDeviceAddress::cpu(i)});
@@ -163,7 +163,7 @@ TEST(NativeCPUCollectiveProgram, AllOneThroughEightDeclaredPopulationsUseSameOri
   EXPECT_EQ(reserved(m,PhysicalMemoryOwner::NativeCPUCollectiveDomain),0u);
   mpiShutdown();EXPECT_EQ(reserved(m,PhysicalMemoryOwner::NativeCPUCollectiveProcessPool),0u);
  }
- std::vector<NativeCPUCollectiveProgram::Participant> invalid;
- for(int i=0;i<9;++i)invalid.push_back({i,GlobalDeviceAddress::cpu(i)});
+ std::vector<NativeCPUCollectiveProgram::Participant> invalid{{0,GlobalDeviceAddress::cpu(3)},
+     {1,GlobalDeviceAddress::cpu(3)}};
  EXPECT_THROW((void)NativeCPUCollectiveProgram::expertShardRoutePartials(11,CollectiveBackendType::MPI,std::move(invalid)),std::invalid_argument);
 }

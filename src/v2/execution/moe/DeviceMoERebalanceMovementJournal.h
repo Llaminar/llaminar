@@ -23,6 +23,7 @@
 
 namespace llaminar2
 {
+    struct DeviceMoERebalanceStatus;
     /**
      * @brief Authenticate one native ownership-swap pair before publication.
      * @param outgoing First immutable command in the planner's paired order.
@@ -101,6 +102,8 @@ namespace llaminar2
         DeviceMoERebalanceMovementEdge *edges = nullptr;
         std::uint32_t wave_capacity = 0;
         std::uint32_t edge_capacity = 0;
+        /** Root-only original planner scratch; null for publication-only protocol controls. */
+        const DeviceMoERebalanceStatus *decision_status = nullptr;
 
         /** @return Whether the complete initialized publication prefix is in bounds. */
         [[nodiscard]] LLAMINAR_MOE_JOURNAL_HD bool valid() const noexcept
@@ -208,7 +211,8 @@ namespace llaminar2
         // transaction. Reject rebinding before reading any proposed owner.
         if (view.state != append.binding.state || view.waves != append.binding.waves ||
             view.edges != append.binding.edges || view.wave_capacity != append.binding.wave_capacity ||
-            view.edge_capacity != append.binding.edge_capacity)
+            view.edge_capacity != append.binding.edge_capacity ||
+            view.decision_status != append.binding.decision_status)
             return false;
         const auto current = prepareDeviceMoEMovementJournalAppend(
             view, append.candidate_epoch, append.command_epoch, append.edge_count, append.proof,

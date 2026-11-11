@@ -10,6 +10,7 @@
 #pragma once
 
 #include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
+#include "collective/NativeLocalTPContextBorrow.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
 #include "collective/NativeCollectiveBytes.h"
 #include "backends/NativeContextPreparation.h"
@@ -18,6 +19,8 @@
 #include <optional>
 #include <span>
 #include <variant>
+#include <vector>
+#include <limits>
 
 namespace llaminar2::qwen4exp {
 /** @brief The counted messages in the existing source-owner protocol and final reader result. */
@@ -29,8 +32,6 @@ enum class PooledNativeCountedMessage : std::uint8_t {
 /** @brief Optional reader semantics; shared-only message populations remain byte-identical. */
 enum class PooledNativeReaderMessageProfile : std::uint8_t {ReplicatedFP32,CompactNative};
 
-/** @brief Current source-owned graph admission bound; transport edges never presume a pair. */
-inline constexpr std::size_t kMaximumPooledNativeParticipants=8;
 /**
  * @brief Exact immutable star-edge slots for original operands and local native receipts.
  * Source-private owner messages receive one slot per actual owner edge. Each
@@ -46,18 +47,28 @@ public:
      * @param degree Exact complete native reader population. @param coordinator Original source coordinate.
      * @param positiveOwner One original-member flag per coordinate; source-self is not a remote edge. */
     PooledNativeCompletionLayout(std::size_t degree,std::size_t coordinator,std::span<const std::uint8_t> positiveOwner,
-        PooledNativeReaderMessageProfile profile=PooledNativeReaderMessageProfile::ReplicatedFP32)
+        PooledNativeReaderMessageProfile profile=PooledNativeReaderMessageProfile::ReplicatedFP32,
+        std::span<const std::uint8_t> readers={})
         :degree_(degree),coordinator_(coordinator),profile_(profile) {
         if(profile!=PooledNativeReaderMessageProfile::ReplicatedFP32 && profile!=PooledNativeReaderMessageProfile::CompactNative)
             throw std::invalid_argument("Unknown native pooled reader message profile");
-        if(degree<2 || degree>kMaximumPooledNativeParticipants || coordinator>=degree || positiveOwner.size()!=degree)
+        if(degree<2 || degree>std::size_t(std::numeric_limits<int>::max()) || coordinator>=degree || positiveOwner.size()!=degree ||
+            (!readers.empty() && readers.size()!=degree))
             throw std::invalid_argument("Native pooled layout requires exact admitted original star coordinates");
+        positive_.resize(degree);readers_.assign(degree,1);
         for(std::size_t i=0;i<degree;++i){
             if(positiveOwner[i]>1 || (i==coordinator && positiveOwner[i]))
                 throw std::invalid_argument("Native pooled layout cannot invent a positive source-self edge");
             positive_[i]=positiveOwner[i];
+            if(!readers.empty()) {
+                if(readers[i]>1)throw std::invalid_argument("Native pooled reader flag is not boolean");
+                readers_[i]=readers[i];
+            }
         }
-        operand_allocation_bytes_=TransferEngine::mappedHostRegionAllocationBytes(operandBytes());
+        if(!readers_[coordinator_])throw std::invalid_argument("Native pooled coordinator must retain its original compute role");
+        if(degree>(std::numeric_limits<std::size_t>::max()/sizeof(ncclLlaminarCompletionOperand))/26u)
+            throw std::overflow_error("Native pooled completion metadata extent overflow");
+        operand_allocation_bytes_=operandBytes()?TransferEngine::mappedHostRegionAllocationBytes(operandBytes()):0;
     }
     /** @return Exact original communicator population, independent of physical owners. */
     std::size_t degree()const noexcept{return degree_;}
@@ -65,6 +76,10 @@ public:
     PooledNativeReaderMessageProfile readerProfile()const noexcept{return profile_;}
     /** @return Original source coordinate, independent of physical device ordinal. */
     std::size_t coordinator()const noexcept{return coordinator_;}
+    /** @return Whether this actual endpoint has positive remote storage, independent of compute membership. */
+    bool positiveOwner(std::size_t participant)const {requireParticipant(participant);return positive_[participant];}
+    /** @return Whether this actual endpoint consumes query results; storage-only endpoints never do. */
+    bool reader(std::size_t participant)const {requireParticipant(participant);return readers_[participant];}
     /** @return Counted slots in the original pair declaration. */
     std::size_t slots()const {requirePair();return edgeSlots(1-coordinator_);}
     /** @return Original nominal message coordinate in a pair. */
@@ -124,7 +139,9 @@ private:
     /** @brief Reject implicit endpoint inference when the original cohort contains multiple edges. */
     void requirePair()const {if(degree_!=2)throw std::invalid_argument("Plural native completion requires explicit original edge identity");}
     /** @return Exact static slots for one original source/reader pair. */
-    std::size_t edgeSlots(std::size_t peer)const noexcept{return (positive_[peer]?12:1)+(profile_==PooledNativeReaderMessageProfile::CompactNative?1:0);}
+    std::size_t edgeSlots(std::size_t peer)const noexcept {
+        return (positive_[peer]?11u:0u)+(readers_[peer]?(profile_==PooledNativeReaderMessageProfile::CompactNative?2u:1u):0u);
+    }
     /** @return Exact total incident slots for one original endpoint. */
     std::size_t participantSlots(std::size_t p)const noexcept {
         if(p!=coordinator_)return edgeSlots(p);
@@ -134,6 +151,7 @@ private:
     std::size_t messageSlot(PooledNativeCountedMessage message,std::size_t edge)const {
         const auto value=static_cast<std::size_t>(message);
         if(value>=static_cast<std::size_t>(PooledNativeCountedMessage::Count) ||
+            ((message==PooledNativeCountedMessage::ReaderResult || message==PooledNativeCountedMessage::LocalHotMissKeys) && !readers_[edge]) ||
             (message==PooledNativeCountedMessage::LocalHotMissKeys && profile_!=PooledNativeReaderMessageProfile::CompactNative) ||
             (!positive_[edge] && message!=PooledNativeCountedMessage::ReaderResult && message!=PooledNativeCountedMessage::LocalHotMissKeys))
             throw std::invalid_argument("Native pooled completion has no original counted message on this edge");
@@ -153,7 +171,13 @@ private:
     }
     std::size_t degree_,coordinator_,operand_allocation_bytes_=0;
     PooledNativeReaderMessageProfile profile_;
-    std::array<std::uint8_t,kMaximumPooledNativeParticipants> positive_{};
+    std::vector<std::uint8_t> positive_,readers_; ///< Cold declaration only; retained bindings project exact scalar offsets.
+};
+
+/** @brief Immutable scalar projection of one declared edge, without retaining a topology copy in every graph binding. */
+struct PooledNativeCompletionBindingLayout final {
+    std::size_t degree,coordinator,operand_offset,receipt_offset;
+    PooledNativeReaderMessageProfile profile;
 };
 
 namespace detail {
@@ -350,11 +374,11 @@ private:
     friend class PooledImmutableNativeCompletionStorage;
     /** @brief Fixed useful protocol record on the original communicator; no counted header is sent. */
     static PooledImmutableNativeTransfer fixed(
-        std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
+        NativeLocalTPContextBorrow cohort,
         PreparedGPUContextUsePermit original, CapturedTransferEndpoint side,
         int producerCoordinate, int consumerCoordinate, CapturedTransferMessage message, PooledNativeTransferSpan payload);
     /** @brief Construct only through checked fixed binding, then add typed count metadata. */
-    PooledImmutableNativeTransfer(std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
+    PooledImmutableNativeTransfer(NativeLocalTPContextBorrow cohort,
         PreparedGPUContextUsePermit original, CapturedTransferEndpoint side,
         int producer, int consumer, int participant, CapturedTransferMessage message, PooledNativeTransferSpan payload);
     using CountedFrame = std::variant<PooledNativeCompletionFrame, PooledNativeRequestCompletionFrame>;
@@ -384,7 +408,7 @@ private:
     void requireCurrent() const;
     /** @return Original prepared device subrange; rejects wrong root, extent, device or alignment. */
     void* pointer(const PooledNativeTransferSpan& span, std::size_t alignment = 1) const;
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort_;
+    NativeLocalTPContextBorrow cohort_;
     PreparedGPUContextUsePermit original_;
     CapturedTransferEndpoint side_;
     int producer_, consumer_, participant_;
@@ -394,7 +418,7 @@ private:
     std::optional<PooledNativeTransferSpan> extent_, slice_;
     std::optional<CountedFrame> frame_;
     std::optional<PooledNativeCountedMessage> nominal_;
-    std::optional<PooledNativeCompletionLayout> layout_;
+    std::optional<PooledNativeCompletionBindingLayout> layout_;
     std::shared_ptr<MappedHostTransferRegion> operands_;
     std::shared_ptr<DeviceTransferBuffer> receipts_;
     std::optional<Qwen4ExpPreparedStorage> prepared_;

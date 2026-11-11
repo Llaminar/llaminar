@@ -366,6 +366,7 @@ namespace
         std::vector<std::function<std::unique_ptr<IComputeStage>(const std::string &, DeviceId)>> graph_stage_factories;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        GraphNativeCaptureEnvelope mock_native_capture_envelope = GraphNativeCaptureEnvelope::Ordinary;
         GraphCaptureAuxiliaryBranchFactory mock_auxiliary_factory;
         bool mock_compute_all_position_logits = false;
         bool mock_live_mtp_request_batch_condition = false;
@@ -423,6 +424,7 @@ namespace
                 return GraphBuildResult(build_error_message);
 
             ComputeGraph graph;
+            graph.setNativeCaptureEnvelope(mock_native_capture_envelope);
             const int stage_count = !graph_stage_factories.empty()
                                         ? static_cast<int>(graph_stage_factories.size())
                                         : (graph_stage_types.empty()
@@ -2807,12 +2809,20 @@ TEST_F(
  */
 TEST_F(Test__ForwardExecutionEngine, SetupOnlyDecodeExportsWithoutAnyInferenceLaunch)
 {
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
     for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
     for (const auto role : {ForwardExecutionRole::MainInference,
                            ForwardExecutionRole::GroupedMTPVerifier,
                            ForwardExecutionRole::MTPCondition})
     {
         SCOPED_TRACE(device.toString() + " role=" + std::to_string(static_cast<int>(role)));
+        PerfStatsCollector::reset();
+        const auto executed_forwards = [] {
+            double count = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+                if (record.name == "decode_graph_phase") count += record.value;
+            return count;
+        };
         auto engine = makeEngine(/*cache_enabled=*/true);
         llaminar2::testing::MockDeviceContext gpu_ctx(device,
             device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
@@ -2850,8 +2860,78 @@ TEST_F(Test__ForwardExecutionEngine, SetupOnlyDecodeExportsWithoutAnyInferenceLa
             identity = child->capture;
             EXPECT_EQ(host.committed_forward_output_calls, 0);
             EXPECT_EQ(host.sync_logits_calls, 0);
+            EXPECT_EQ(executed_forwards(), 0) << "Recording a child is not execution of its model rows";
             engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
         }
+        // First real submission reuses the same prepared executable and must
+        // contribute exactly one traversal, with no setup capture counted.
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(executed_forwards(), 1);
+        PerfStatsCollector::reset();
+    }
+}
+
+/**
+ * @brief Prefill through the shared captured executor never counts as decode.
+ *
+ * Native timeline envelopes use the same cache submission path as decode.
+ * Replay and reset must preserve the signature's phase even for one live row;
+ * row geometry and the generic executor's historical name are not phase proof.
+ */
+TEST_F(Test__ForwardExecutionEngine, NativeTimelinePrefillDoesNotCountAsDecode)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}, {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"}, {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"}, {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"}, {"LLAMINAR_FAIL_ON_ZERO", "0"}});
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int live_rows : {1, 17, 64})
+    {
+        SCOPED_TRACE(device.toString() + " rows=" + std::to_string(live_rows));
+        PerfStatsCollector::reset();
+        auto engine = makeEngine();
+        llaminar2::testing::MockDeviceContext context(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&context);
+        host.graph_stage_count = 1;
+        host.mock_native_capture_envelope = GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
+        host.mock_capture_policy.allow_fast_decode = true;
+        std::array<int, 64> tokens{}, positions{};
+        auto input = makeTestInput(64, 1, device, nullptr, nullptr);
+        input.real_seq_len = live_rows;
+        input.bucket_seq_len = 64;
+        input.token_ids_device = tokens.data();
+        input.position_ids_device = positions.data();
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        EXPECT_EQ(host.committed_forward_output_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        constexpr int replays = 20;
+        for (int iteration = 0; iteration < replays; ++iteration)
+        {
+            SCOPED_TRACE(iteration);
+            ASSERT_TRUE(engine.execute(input, output, host));
+            const auto observation = engine.lastExecutedForwardGraph();
+            ASSERT_TRUE(observation.has_value());
+            EXPECT_FALSE(observation->signature.decode);
+            engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host.committed_forward_output_calls, replays);
+        double decode = 0, prefill = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        {
+            if (record.name == "decode_graph_phase") decode += record.value;
+            if (record.name == "prefill_graph_phase" &&
+                record.tags.at("capture_phase") != "materialized_without_launch")
+                prefill += record.value;
+        }
+        EXPECT_EQ(decode, 0) << "Shared cache submission must retain the explicit prefill phase";
+        EXPECT_EQ(prefill, replays) << "The original prefill publisher counts each actual traversal once";
+        PerfStatsCollector::reset();
     }
 }
 

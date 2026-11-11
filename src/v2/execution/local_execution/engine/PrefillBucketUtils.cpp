@@ -13,16 +13,23 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
 
     PrefillChunkSchedulerPolicy PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
-        const std::vector<int> &buckets, int real_start, int real_count)
+        const std::vector<int> &buckets, int real_start, int real_count, PrefillChunkWidthPolicy width_policy)
     {
-        const auto retained = normalizePrefillGraphBuckets(buckets);
+        // An exact family is already admitted. Preserve its original
+        // ordering and multiplicity so the scheduler can reject malformed
+        // declarations instead of accepting an edited family.
+        const auto retained = width_policy == PrefillChunkWidthPolicy::ExactRetained
+            ? buckets : normalizePrefillGraphBuckets(buckets);
         return {
+            .width_policy = width_policy,
             .bucket_sizes = retained,
             // Zero retains the whole ladder: the ordinary planner limits full
             // chunks to its maximum but chooses the smallest shape for a tail.
@@ -32,6 +39,34 @@ namespace llaminar2
             .real_token_start = real_start,
             .real_token_count = real_count,
         };
+    }
+
+    std::vector<int> exactPrefillGraphWidths(int maximum_rows)
+    {
+        if (maximum_rows <= 0)
+            return {};
+        std::vector<int> widths;
+        for (int width = 1; width < maximum_rows;) {
+            widths.push_back(width);
+            if (width > maximum_rows / 2)
+                break;
+            width *= 2;
+        }
+        widths.push_back(maximum_rows);
+        return widths;
+    }
+
+    std::size_t exactPrefillGraphCacheEntries(int maximum_rows, std::optional<int> explicit_limit)
+    {
+        const auto widths = exactPrefillGraphWidths(maximum_rows);
+        if (widths.empty())
+            throw std::invalid_argument("Exact prefill requires a positive admitted maximum");
+        const auto required = widths.size() + kExpertOverlayPrefillGraphIdentityReserve;
+        if (explicit_limit && *explicit_limit < static_cast<int>(required))
+            throw std::invalid_argument("Exact prefill needs " + std::to_string(required) +
+                " cached graph identities, but LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS permits " +
+                std::to_string(*explicit_limit));
+        return required;
     }
 
     std::vector<int> defaultPrefillGraphBuckets()
@@ -324,9 +359,12 @@ namespace llaminar2
             schedule.error = "real_token_start must be non-negative";
             return schedule;
         }
-        if (policy.real_token_count <= 0)
+        const bool exact = policy.width_policy == PrefillChunkWidthPolicy::ExactRetained;
+        if (policy.real_token_count < 0 ||
+            policy.real_token_count > std::numeric_limits<int>::max() - policy.real_token_start ||
+            (!exact && policy.real_token_count == 0))
         {
-            schedule.error = "real_token_count must be positive";
+            schedule.error = "prefill range must be representable and nonempty unless it is exact";
             return schedule;
         }
         if (policy.fixed_chunk_real_tokens < 0)
@@ -356,6 +394,11 @@ namespace llaminar2
         }
 
         const int max_bucket = buckets.back();
+        if (exact && (policy.fixed_chunk_real_tokens ||
+            policy.bucket_sizes != exactPrefillGraphWidths(max_bucket))) {
+            schedule.error = "exact prefill requires its complete retained width family";
+            return schedule;
+        }
         const int chunk_target =
             policy.fixed_chunk_real_tokens > 0 ? policy.fixed_chunk_real_tokens : max_bucket;
         if (chunk_target <= 0 || chunk_target > max_bucket)
@@ -370,7 +413,9 @@ namespace llaminar2
         while (local_offset < policy.real_token_count)
         {
             const int remaining = policy.real_token_count - local_offset;
-            const int real_count = std::min(remaining, chunk_target);
+            const int real_count = exact
+                ? *std::prev(std::upper_bound(buckets.begin(), buckets.end(), remaining))
+                : std::min(remaining, chunk_target);
             /*
              * An explicit chunk interval is also a fixed physical graph
              * contract.  In particular, its final short tail must replay the

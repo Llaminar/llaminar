@@ -414,4 +414,129 @@ namespace llaminar2::test
         EXPECT_EQ(successor.state(), State::ExternalForward);
         EXPECT_EQ(successor.publishedReleaseProducerStream(), nullptr);
     }
+    /** @test Exact terminal publication is repeatable across changes of stream and request reset. */
+    TEST(MoEOverlayEpochLeaseLifecycle, CompleteCapturedHostedParentReplaysAndResets)
+    {
+        MoEOverlayEpochLeaseLifecycle lifecycle;
+        int other_stream_storage = 0;
+        void* const other_stream = &other_stream_storage;
+        void* previous_stream = nullptr;
+        for (int replay = 0; replay < 20; ++replay) {
+            SCOPED_TRACE(replay);
+            void* const stream = replay % 2 == 0 ? releaseStream() : other_stream;
+            int calls = 0;
+            ASSERT_TRUE(lifecycle.submitCompleteCapturedHostedParent(stream,
+                [&](void* actual) {
+                    EXPECT_EQ(actual, stream);
+                    EXPECT_NE(previous_stream, nullptr);
+                    EXPECT_EQ(lifecycle.load(), State::ReleasePublished);
+                    ++calls;
+                    return true;
+                },
+                [&](void* actual) {
+                    EXPECT_EQ(actual, stream);
+                    EXPECT_EQ(lifecycle.load(), State::CapturedHostedParent);
+                    EXPECT_EQ(calls, previous_stream ? 1 : 0);
+                    ++calls;
+                    return true;
+                },
+                [&](void* actual) {
+                    EXPECT_EQ(actual, stream);
+                    EXPECT_EQ(lifecycle.load(), State::CapturedHostedParent);
+                    ++calls;
+                    return true;
+                }));
+            EXPECT_EQ(calls, previous_stream ? 3 : 2);
+            auto terminal = lifecycle.beginSubmission();
+            EXPECT_EQ(terminal.state(), State::ReleasePublished);
+            EXPECT_EQ(terminal.publishedReleaseProducerStream(), stream);
+            previous_stream = stream;
+            if (replay % 4 == 3) {
+                ASSERT_TRUE(terminal.commit(State::Idle));
+                previous_stream = nullptr;
+            }
+        }
+    }
+
+    /** @test Competing host submissions cannot borrow, release or duplicate an admitted complete parent. */
+    TEST(MoEOverlayEpochLeaseLifecycle, CompleteCapturedHostedParentRejectsConcurrentOwners)
+    {
+        MoEOverlayEpochLeaseLifecycle lifecycle;
+        std::promise<void> entered;
+        std::promise<void> resume;
+        auto worker = std::async(std::launch::async, [&] {
+            return lifecycle.submitCompleteCapturedHostedParent(releaseStream(),
+                [](void*) { return false; },
+                [&](void*) {
+                    entered.set_value();
+                    resume.get_future().wait();
+                    return true;
+                },
+                [](void*) { return true; });
+        });
+        entered.get_future().wait();
+        {
+            auto competitor = lifecycle.beginSubmission();
+            EXPECT_EQ(competitor.state(), State::CapturedHostedParent);
+            EXPECT_EQ(competitor.publishedReleaseProducerStream(), nullptr);
+            EXPECT_FALSE(competitor.commit(State::HostedChildForward));
+            EXPECT_FALSE(competitor.publishRelease(releaseStream()));
+            EXPECT_EQ(moeOverlayEpochObservationAction(competitor.state()),
+                MoEOverlayEpochObservationAction::DeferToInferenceOwner);
+            EXPECT_EQ(moeOverlayEpochPlacementMaintenanceAction(competitor.state()),
+                MoEOverlayEpochPlacementMaintenanceAction::RejectLiveInferenceOwner);
+        }
+        int unexpected_calls = 0;
+        const auto unexpected = [&](void*) { ++unexpected_calls; return true; };
+        EXPECT_FALSE(lifecycle.submitCompleteCapturedHostedParent(
+            releaseStream(), unexpected, unexpected, unexpected));
+        EXPECT_EQ(unexpected_calls, 0);
+        resume.set_value();
+        ASSERT_TRUE(worker.get());
+        EXPECT_EQ(lifecycle.load(), State::ReleasePublished);
+    }
+
+    /** @test A rejected predecessor wait preserves its receipt, and failed launch publishes no release. */
+    TEST(MoEOverlayEpochLeaseLifecycle, CompleteCapturedHostedParentFailurePreservesOwnership)
+    {
+        MoEOverlayEpochLeaseLifecycle lifecycle;
+        publishExternalForward(lifecycle);
+        {
+            auto prior = lifecycle.beginSubmission();
+            ASSERT_TRUE(prior.publishRelease(releaseStream()));
+        }
+        int calls = 0;
+        const auto succeeds = [&](void*) { ++calls; return true; };
+        EXPECT_FALSE(lifecycle.submitCompleteCapturedHostedParent(
+            nullptr, succeeds, succeeds, succeeds));
+        for (std::uintptr_t default_stream : {1u, 2u})
+            EXPECT_FALSE(lifecycle.submitCompleteCapturedHostedParent(
+                reinterpret_cast<void*>(default_stream), succeeds, succeeds, succeeds));
+        EXPECT_FALSE(lifecycle.submitCompleteCapturedHostedParent(
+            releaseStream(), [](void*) { return false; }, succeeds, succeeds));
+        EXPECT_EQ(calls, 0);
+        {
+            auto prior = lifecycle.beginSubmission();
+            EXPECT_EQ(prior.state(), State::ReleasePublished);
+            EXPECT_EQ(prior.publishedReleaseProducerStream(), releaseStream());
+        }
+        EXPECT_THROW((void)lifecycle.submitCompleteCapturedHostedParent(
+            releaseStream(), succeeds, [](void*) { return false; }, succeeds), std::runtime_error);
+        EXPECT_EQ(calls, 1);
+        auto unfinished = lifecycle.beginSubmission();
+        EXPECT_EQ(unfinished.state(), State::CapturedHostedParent);
+        EXPECT_EQ(unfinished.publishedReleaseProducerStream(), nullptr);
+        EXPECT_FALSE(unfinished.publishRelease(releaseStream()));
+    }
+
+    /** @test A graph already enqueued without its exact terminal event is fatal. */
+    TEST(MoEOverlayEpochLeaseLifecycle, CompleteCapturedHostedParentRequiresRecordedTerminal)
+    {
+        EXPECT_DEATH({
+            MoEOverlayEpochLeaseLifecycle lifecycle;
+            (void)lifecycle.submitCompleteCapturedHostedParent(releaseStream(),
+                [](void*) { return true; }, [](void*) { return true; }, [](void*) { return false; });
+        }, "");
+    }
+
 } // namespace llaminar2::test

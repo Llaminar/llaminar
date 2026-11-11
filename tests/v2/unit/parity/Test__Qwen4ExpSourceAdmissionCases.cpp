@@ -484,18 +484,25 @@ TEST(Qwen4ExpSourceAdmissionCases, FrozenCPUInventoryAuthenticatesNUMAAddressesR
     first.available_memory_bytes = 768;
     HardwareInventory hardware;
     hardware.cpu_sockets = {first};
+    const ComputeDevice cpu0{.type=ComputeBackendType::CPU,.numa_node=0,.name="synthetic source-admission CPU",
+        .total_memory_bytes=1024,.free_memory_bytes=768,.compute_units=2};
+    auto cpu1=cpu0;cpu1.numa_node=1;
+    hardware.cpu_numa_devices.emplace(0,cpu0);
     EXPECT_THROW(requireQwen4ExpSourceCPUInventory(cell, 0, hardware), std::invalid_argument);
 
     auto second = first;
     second.socket_id = second.numa_node = 1;
     second.physical_cores = {2, 3};
     hardware.cpu_sockets.push_back(second);
+    hardware.cpu_numa_devices.emplace(1,cpu1);
     EXPECT_NO_THROW(requireQwen4ExpSourceCPUInventory(cell, 0, hardware));
 
-    // Two socket records that both expose NUMA0 still cannot satisfy CPU1.
+    // Package annotations cannot replace the now-missing exact NUMA1 observation.
     hardware.cpu_sockets.back().numa_node = 0;
+    hardware.cpu_numa_devices.erase(1);
     EXPECT_THROW(requireQwen4ExpSourceCPUInventory(cell, 0, hardware), std::invalid_argument);
     hardware.cpu_sockets.back().numa_node = 1;
+    hardware.cpu_numa_devices.emplace(1,cpu1);
     auto alias = cell;
     alias.topology.participants.back().address = GlobalDeviceAddress::cpu(0);
     EXPECT_THROW(requireQwen4ExpSourceCPUInventory(alias, 0, hardware), std::invalid_argument);
@@ -544,6 +551,8 @@ HardwareInventory sourceEvidenceHardware()
         socket.memory_bytes = 1024;
         socket.available_memory_bytes = 768;
         hardware.cpu_sockets.push_back(socket);
+        hardware.cpu_numa_devices.emplace(numa,ComputeDevice{.type=ComputeBackendType::CPU,.numa_node=numa,
+            .total_memory_bytes=1024,.free_memory_bytes=768,.compute_units=2});
     }
     for (int ordinal = 0; ordinal < 4; ++ordinal)
     {
@@ -655,6 +664,8 @@ TEST(Qwen4ExpSourceAdmissionCases, ActualCPUExecutionPlanRejectsDroppedReordered
         {"foreign primary NUMA", [](auto &p) { p.primary_device = p.local_tp_devices[1]; }},
         {"wrong owning rank", [](auto &p) { p.rank = 1; }},
         {"foreign endpoint host", [](auto &p) { p.local_tp_devices[1].hostname = "foreign-host"; }},
+        {"missing resolved domain", [](auto &p) { p.my_domains.clear(); }},
+        {"duplicated resolved domain", [](auto &p) { p.my_domains.push_back(p.my_domains.front()); }},
         {"unintended pipeline", [](auto &p) { p.local_pp_devices = {p.primary_device}; }}};
     for (const auto &[label, mutate] : mutations)
     {
@@ -663,8 +674,14 @@ TEST(Qwen4ExpSourceAdmissionCases, ActualCPUExecutionPlanRejectsDroppedReordered
         mutate(changed);
         EXPECT_THROW(requireQwen4ExpSourceExecutionPlan(cell, 0, authored, changed, hardware), std::invalid_argument);
     }
+    // Exact NUMA observations own CPU endpoints. Package annotations may be
+    // incomplete without deleting an independently observed physical locality.
+    auto annotations_only = hardware;
+    annotations_only.cpu_sockets.pop_back();
+    EXPECT_NO_THROW(requireQwen4ExpSourceExecutionPlan(cell, 0, authored, actual, annotations_only));
     auto missing = hardware;
-    missing.cpu_sockets.pop_back();
+    missing.cpu_numa_devices.erase(1);
+    // Retain the NUMA1 package label: it cannot replace its missing observation.
     EXPECT_THROW(requireQwen4ExpSourceExecutionPlan(cell, 0, authored, actual, missing), std::invalid_argument);
 }
 
@@ -1887,9 +1904,12 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUJointWorld2MTPPoliciesKeepOriginalSourceAn
         EXPECT_EQ(cell.topology.mpi_ranks,2);
         for(int rank=0;rank<2;++rank) {
             const auto config=qwen4ExpSourceAdmissionConfig(cell,cell.model.model_path,rank);
-            // The launcher owns world size; in-process source setup discovers
-            // that existing MPI world rather than launching another one.
-            EXPECT_EQ(config.mpi_procs,0);
+            // Public configuration retains the discovery population. The
+            // existing launcher/context owns MPI lifetime; both active CPU
+            // socket participants remain in that original execution world.
+            EXPECT_EQ(config.mpi_procs,cell.topology.mpi_ranks);
+            EXPECT_EQ(cell.topology.executionRankCount(),2);
+            EXPECT_FALSE(config.execution_rank_selection);
             EXPECT_EQ(config.moe_rebalance.mode,MoERebalanceRuntimeMode::Off);
             EXPECT_EQ(config.shared_predictor,parsed.shared_predictor);
             EXPECT_EQ(config.mtp.enabled,parsed.mtp.enabled);

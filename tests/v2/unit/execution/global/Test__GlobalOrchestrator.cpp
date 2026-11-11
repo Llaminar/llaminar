@@ -6,6 +6,8 @@
  * MockMPIContext and MockDeviceRunner (no real MPI or devices needed).
  * Prefix regressions prove that each stage keeps its admitted identity while
  * consumed restore chains retire before new archive capacity is requested.
+ * Hosted activation regressions authenticate the actual parent-allocated
+ * matrix at remote receives and same-rank handoffs across changing live rows.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -22,6 +24,10 @@
 #include <vector>
 
 #include "execution/global/GlobalOrchestrator.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "planning/RankMemoryPlanInputs.h"
+#include "execution/global/OriginalCPUPipelineConstruction.h"
+#include "../../../utils/HostedPipelineTestAdmission.h"
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "tensors/TensorClasses.h"
@@ -50,6 +56,26 @@ namespace llaminar2::test
             last_mtp_condition_token_ = draft_condition_token;
             return forward_mtp_ok_;
         }
+
+        /** @brief Observe original hosted-stage ordering without any device or remote authority. */
+        void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override
+        { main_deferrals.push_back(enabled); }
+        /** @brief Observe the corresponding verifier boundary on the same original stage. */
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override
+        { verifier_deferrals.push_back(enabled); }
+        std::vector<bool> main_deferrals;
+        std::vector<bool> verifier_deferrals;
+
+        /** @brief Observe tail-owned history mutation before the hosted greedy broadcast. */
+        bool applyPenaltiesOnDevice(const LogitPenaltyBatch &penalties, int vocab_size) override
+        {
+            main_penalties.push_back(penalties);
+            penalty_vocab_size = vocab_size;
+            return penalties_ok;
+        }
+        std::vector<LogitPenaltyBatch> main_penalties;
+        int penalty_vocab_size = 0;
+        bool penalties_ok = true;
 
         const float *mtpLogits() const override
         {
@@ -368,7 +394,7 @@ namespace llaminar2::test
             config.vocab_size = VOCAB_SIZE;
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
-            return config;
+            return admitHostedPipelineFixture(std::move(config), 10);
         }
 
         static RankStageAction actionForStage(const GlobalPPTopology &topology,
@@ -1265,7 +1291,7 @@ namespace llaminar2::test
         config.d_model = D_MODEL;
         config.architecture_name = "test_qwen35moe";
 
-        GlobalOrchestrator orch(std::move(config));
+        GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
         const std::vector<int32_t> stop_tokens = {151643, 151645};
         const MTPRequestPenaltyPolicy penalty_policy{
             .presence_penalty = 0.75f,
@@ -1325,7 +1351,7 @@ namespace llaminar2::test
         EXPECT_EQ(mpi.broadcastRoots()[1], 0);
     }
 
-    TEST_F(Test__GlobalOrchestrator, GlobalPPMTPReportsTopologyBypassBeforeDelegation)
+    TEST_F(Test__GlobalOrchestrator, GlobalPPMTPRequiresOriginalGPUOwnersBeforeDelegation)
     {
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStagePPTopo();
@@ -1334,7 +1360,8 @@ namespace llaminar2::test
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
-        EXPECT_NE(orch.mtpDecodeUnsupportedReason().find("GlobalPP"), std::string::npos);
+        EXPECT_EQ(orch.mtpDecodeUnsupportedReason(),
+            "MTP global pipeline requires original GPU stage owners and captured rank transport");
         EXPECT_FALSE(orch.supportsMTPTokenCoordination());
         EXPECT_FALSE(orch.forwardMTP(7));
         EXPECT_FALSE(orch.setComputeAllPositionLogits(true));
@@ -1396,7 +1423,7 @@ namespace llaminar2::test
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen35moe";
 
-            GlobalOrchestrator orch(std::move(config));
+            GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
             EXPECT_EQ(orch.stageRunnerCount(), 2u);
             EXPECT_EQ(orch.stageRunnerForStage(0), gpu_raw);
@@ -1438,7 +1465,7 @@ namespace llaminar2::test
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen35moe";
 
-            GlobalOrchestrator orch(std::move(config));
+            GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
             EXPECT_EQ(orch.stageRunnerCount(), 1u);
             EXPECT_EQ(orch.stageRunnerForDomain("rocm_socket0"), nullptr);
@@ -1470,7 +1497,7 @@ namespace llaminar2::test
         config.d_model = D_MODEL;
         config.architecture_name = "test_qwen35moe";
 
-        GlobalOrchestrator orch(std::move(config));
+        GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
         auto keys = orch.getSnapshotKeys();
 
         EXPECT_NE(std::find(keys.begin(), keys.end(), "layer0_MOE_EXPERT_OUTPUT"), keys.end());
@@ -1699,9 +1726,275 @@ namespace llaminar2::test
         }
     }
 
+    /** @test CPU head/follower ordering never requests an absent vocabulary owner. */
+    TEST_F(Test__GlobalOrchestrator, HostedDecodeOrderingUsesEveryOriginalLocalStage)
+    {
+        const std::vector<bool> toggles{false,true,false,false};
+        for(const bool overlapping:{false,true})
+        for(const int rank:{0,1})
+        {
+            MockMPIContext mpi(rank,2);
+            auto topology=overlapping?buildTwoStageSameTPTopo():buildTwoStagePPTopo();
+            auto config=makeConfig(std::move(topology),rank,2,&mpi,nullptr);
+            const auto plan=GlobalPPRankPlanBuilder::build(config.topology,rank);
+            std::vector<MTPMockDeviceRunner*> actual;
+            for(const auto* action:plan.executeStages())
+            {
+                auto child=std::make_unique<MTPMockDeviceRunner>();
+                actual.push_back(child.get());
+                config.stage_runners.push_back(makeStageRunnerEntry(
+                    config.topology,rank,action->stage_id,std::move(child)));
+            }
+            GlobalOrchestrator parent(admitHostedPipelineFixture(std::move(config),10));
+            for(const bool enabled:toggles)
+            {
+                ASSERT_NO_THROW(parent.setMTPMainDecodeSyncDeferralEnabled(enabled));
+                ASSERT_NO_THROW(parent.setMTPAllPositionVerifierSyncDeferralEnabled(enabled));
+            }
+            ASSERT_EQ(actual.size(),overlapping?2u:1u);
+            for(const auto* child:actual)
+            {
+                EXPECT_EQ(child->main_deferrals,toggles);
+                EXPECT_EQ(child->verifier_deferrals,toggles);
+            }
+        }
+    }
+
+    /** @test Hosted workers enter greedy sampling without mutating a remote tail's logits. */
+    TEST_F(Test__GlobalOrchestrator, HostedGreedyPenaltiesUseOnlyActualVocabularyStage)
+    {
+        const LogitPenaltyBatch penalties({{7, 0.25f}, {19, 0.5f}}, 1.1f);
+        for (const int rank : {0, 1})
+        {
+            ScriptedBroadcastMPIContext mpi(rank, 2);
+            auto child = std::make_unique<MTPMockDeviceRunner>();
+            auto *actual = child.get();
+            GlobalOrchestrator parent(makeConfig(buildTwoStagePPTopo(), rank, 2, &mpi, std::move(child)));
+            ASSERT_TRUE(parent.applyPenaltiesOnDevice(penalties, VOCAB_SIZE));
+            ASSERT_EQ(actual->main_penalties.size(), rank == 1 ? 1u : 0u);
+            if (rank == 1)
+            {
+                const auto &seen = actual->main_penalties.front();
+                ASSERT_EQ(seen.size(), penalties.size());
+                EXPECT_EQ(seen[0].token_id, 7);
+                EXPECT_FLOAT_EQ(seen[0].penalty, 0.25f);
+                EXPECT_FLOAT_EQ(seen.repetitionPenalty(), 1.1f);
+                EXPECT_EQ(actual->penalty_vocab_size, VOCAB_SIZE);
+            }
+            else
+                mpi.scriptInt32({0});
+            const auto broadcasts = mpi.broadcast_call_count();
+            EXPECT_EQ(parent.sampleGreedyOnDevice(), 0);
+            EXPECT_EQ(mpi.broadcast_call_count(), broadcasts + 1);
+            actual->penalties_ok = false;
+            EXPECT_EQ(parent.applyPenaltiesOnDevice(penalties, VOCAB_SIZE), rank == 0);
+        }
+    }
+
     // =========================================================================
     // Phase 2: PP Forward Path with IMPIContext Wrappers
     // =========================================================================
+
+    /** @test Sender-only GPU rank prices the same exact bank its production router materializes. */
+    TEST_F(Test__GlobalOrchestrator, HostedGPUSenderOwnsExactlyOneOriginalRankBank)
+    {
+        auto topology = buildTwoStagePPTopo();
+        topology.stages[0].devices = {GlobalDeviceAddress::cuda(2)};
+        const auto sender = PipelineStageTransferMemory::forGlobalStage(topology, 0, 0);
+        ASSERT_TRUE(sender.requiresHostMemory(DeviceId::cuda(2)));
+        DevicePlanConfig config;
+        config.world_rank = 0;
+        config.device = DeviceId::cuda(2);
+        config.first_layer = 0;
+        config.last_layer = 11;
+        config.associated_host_memory = PhysicalMemoryResource{0, DeviceId::cpu(), 1u << 20, 1u << 20};
+        sender.bind(config, 10);
+        EXPECT_EQ(config.hosted_pipeline_activation_rows, 10);
+        const auto original = GlobalPPRankPlanBuilder::build(topology, 0);
+        ASSERT_TRUE(HostedPipelineActivationStorage::requiresBank(topology, original));
+        MockMPIContext mpi(0, 2);
+        auto admitted = makeConfig(topology, 0, 2, &mpi, std::make_unique<MockDeviceRunner>());
+        const auto memory = admitted.physical_memory;
+        ASSERT_TRUE(memory);
+        const auto declared = HostedPipelineActivationStorage::forRows(10, D_MODEL).physicalBytes();
+        EXPECT_EQ(memory->plannedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging), declared);
+        {
+            GlobalOrchestrator parent(std::move(admitted));
+            std::size_t actual = 0;
+            for (const auto &row : memory->rankAttestation())
+                if (row.identity.device.is_cpu() && row.owner == PhysicalMemoryOwner::ActivationTransportStaging)
+                    actual += row.materialized_new_bytes;
+            EXPECT_EQ(actual, declared);
+        }
+        for (const auto &row : memory->rankAttestation())
+            if (row.identity.device.is_cpu() && row.owner == PhysicalMemoryOwner::ActivationTransportStaging)
+                EXPECT_EQ(row.materialized_new_bytes, 0u);
+        const auto cpu = buildTwoStagePPTopo();
+        EXPECT_FALSE(HostedPipelineActivationStorage::requiresBank(cpu, GlobalPPRankPlanBuilder::build(cpu, 0)));
+        EXPECT_TRUE(HostedPipelineActivationStorage::requiresBank(cpu, GlobalPPRankPlanBuilder::build(cpu, 1)));
+    }
+
+    /** @test Actual hosted forwarding preserves cumulative maintenance decisions and exact child widths. */
+    TEST_F(Test__GlobalOrchestrator, HostedPrefillPreservesResolvedMaintenanceAndExactWidths)
+    {
+        class OriginalStage final : public MockDeviceRunner
+        {
+        public:
+            /** @brief Record only a valid retained family and its original incoming bank. */
+            bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+            {
+                ++materializations;
+                return plan.valid() && plan.pipeline_hidden_input;
+            }
+            /** @return Positive live rows are supported by this device-free CPU participant. */
+            bool supportsPrefillChunkSchedule(int rows) const override { return rows > 0; }
+            /** @brief Replan each real parent-submitted child through the production scheduler. */
+            bool forwardPrefillChunkSchedule(const int *tokens, int rows, const PrefillChunkSchedulerPolicy &policy,
+                int, bool) override
+            {
+                const auto schedule = planPrefillChunkSchedule(policy);
+                if (!tokens || !schedule || schedule.chunks.size() != 1 ||
+                    rows != policy.real_token_count || policy.real_token_start != get_position())
+                    return false;
+                policies.push_back(policy);
+                chunks.push_back(schedule.chunks.front());
+                inputs.emplace_back(tokens, tokens + rows);
+                return MockDeviceRunner::forward(tokens, rows);
+            }
+            int materializations = 0; ///< Setup-only capture-family observation.
+            std::vector<PrefillChunkSchedulerPolicy> policies; ///< Actual child calls through GlobalOrchestrator.
+            std::vector<PrefillChunkPlan> chunks; ///< Actual production scheduler decisions at each child.
+            std::vector<std::vector<int>> inputs; ///< Authored test admission inputs observed by each child.
+        };
+        for (const auto width_policy : {PrefillChunkWidthPolicy::RetainedPadding, PrefillChunkWidthPolicy::ExactRetained})
+        {
+            SCOPED_TRACE(static_cast<int>(width_policy));
+            const bool exact = width_policy == PrefillChunkWidthPolicy::ExactRetained;
+            MockMPIContext mpi(1, 2);
+            auto stage = std::make_unique<OriginalStage>();
+            auto *observed = stage.get();
+            observed->set_position(9); // Original restored frontier, before any new suffix row.
+            GlobalOrchestrator parent(makeConfig(buildTwoStagePPTopo(), 1, 2, &mpi, std::move(stage)));
+            ASSERT_TRUE(parent.materializeServingGraphFamilyWithoutLaunch({
+                .prefill_bucket_rows = {1, 2, 4, 8},
+                .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+            std::vector<int> tokens(29);
+            for (size_t row = 0; row < tokens.size(); ++row) tokens[row] = 101 + static_cast<int>(row);
+            auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+                exact ? exactPrefillGraphWidths(8) : std::vector<int>{4, 8}, 9, 29, width_policy);
+            policy.min_rebalance_interval_tokens = 12;
+            policy.max_rebalance_interval_tokens = 20;
+            ASSERT_TRUE(parent.forwardPrefillChunkSchedule(tokens.data(), 29, policy, 0, true));
+            const std::vector<int> expected_rows = exact ? std::vector<int>{8, 8, 8, 4, 1} : std::vector<int>{8, 8, 8, 5};
+            const std::vector<int> expected_offsets = exact ? std::vector<int>{9, 17, 25, 33, 37} : std::vector<int>{9, 17, 25, 33};
+            const std::vector<bool> expected_allowed = exact ? std::vector<bool>{false, true, true, false, false}
+                                                           : std::vector<bool>{false, true, true, false};
+            const std::vector<bool> expected_required = exact ? std::vector<bool>{false, false, true, false, false}
+                                                            : std::vector<bool>{false, false, true, false};
+            ASSERT_EQ(observed->chunks.size(), expected_rows.size());
+            for (size_t index = 0; index < expected_rows.size(); ++index)
+            {
+                SCOPED_TRACE(index);
+                const auto &child = observed->policies[index];
+                const auto &chunk = observed->chunks[index];
+                const auto physical_rows = exact ? expected_rows[index] : 8;
+                EXPECT_EQ(child.width_policy, width_policy);
+                EXPECT_EQ(child.fixed_chunk_real_tokens, 0);
+                EXPECT_EQ(child.bucket_sizes, exact ? exactPrefillGraphWidths(physical_rows) : std::vector<int>{physical_rows});
+                EXPECT_EQ(chunk.token_offset, expected_offsets[index]);
+                EXPECT_EQ(chunk.real_count, expected_rows[index]);
+                EXPECT_EQ(chunk.bucket_seq_len, physical_rows);
+                EXPECT_EQ(chunk.rebalance_allowed_after, expected_allowed[index]);
+                EXPECT_EQ(chunk.rebalance_required_after, expected_required[index]);
+                EXPECT_EQ(child.min_rebalance_interval_tokens, expected_allowed[index] ? expected_rows[index] : 0);
+                EXPECT_EQ(child.max_rebalance_interval_tokens, expected_required[index] ? expected_rows[index] : 0);
+                const int relative = expected_offsets[index] - 9;
+                EXPECT_EQ(observed->inputs[index], std::vector<int>(tokens.begin() + relative,
+                    tokens.begin() + relative + expected_rows[index]));
+                const auto maintenance = evaluatePrefillChunkMaintenance(chunk, {
+                    .chunk_index = 0, .rebalance_requested = true, .histograms_merged = true});
+                EXPECT_EQ(maintenance.can_run, expected_allowed[index]);
+                EXPECT_EQ(maintenance.required, expected_required[index]);
+            }
+            EXPECT_EQ(parent.get_position(), 38);
+            parent.clear_cache();
+            observed->policies.clear();
+            observed->chunks.clear();
+            observed->inputs.clear();
+            policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+                exact ? exactPrefillGraphWidths(8) : std::vector<int>{4, 8}, 0, 3, width_policy);
+            policy.min_rebalance_interval_tokens = 2;
+            policy.max_rebalance_interval_tokens = 3;
+            ASSERT_TRUE(parent.forwardPrefillChunkSchedule(tokens.data(), 3, policy, 0, true));
+            const std::vector<int> reset_rows = exact ? std::vector<int>{2, 1} : std::vector<int>{3};
+            ASSERT_EQ(observed->chunks.size(), reset_rows.size());
+            for (size_t index = 0; index < reset_rows.size(); ++index)
+            {
+                EXPECT_EQ(observed->chunks[index].real_count, reset_rows[index]);
+                EXPECT_EQ(observed->chunks[index].rebalance_allowed_after, true);
+                EXPECT_EQ(observed->chunks[index].rebalance_required_after, index + 1 == reset_rows.size());
+                EXPECT_EQ(observed->policies[index].width_policy, width_policy);
+            }
+            EXPECT_EQ(observed->chunks.front().token_offset, 0);
+            EXPECT_EQ(parent.get_position(), 3);
+            EXPECT_EQ(observed->materializations, 1);
+        }
+    }
+
+    /** @test Hosted prefill preserves retained shape, restored offsets and native token ingress. */
+    TEST_F(Test__GlobalOrchestrator, HostedPrefillKeepsOneRowRoleAndOriginalTokenIngress)
+    {
+        class OriginalStage final : public MockDeviceRunner
+        {
+        public:
+            /** @return Metadata-only native identity; this Unit body calls no device API. */
+            DeviceId primaryDeviceId() const override { return DeviceId::cuda(2); }
+            /** @brief Accept the same immutable child family supplied by the parent. */
+            bool materializeServingGraphFamilyWithoutLaunch(const ServingGraphFamilyMaterializationPlan &plan) override
+            { return plan.valid() && plan.pipeline_hidden_input; }
+            /** @return Whether this stand-in can observe a positive live schedule. */
+            bool supportsPrefillChunkSchedule(int rows) const override { return rows > 0; }
+            /** @brief Retain actual parent-authored geometry before ordinary mock arithmetic. */
+            bool forwardPrefillChunkSchedule(const int *tokens, int rows, const PrefillChunkSchedulerPolicy &policy,
+                int, bool) override
+            {
+                if (!tokens || rows != policy.real_token_count || policy.real_token_start != get_position())
+                    return false;
+                schedules.push_back(policy);
+                return MockDeviceRunner::forward(tokens, rows);
+            }
+            std::vector<PrefillChunkSchedulerPolicy> schedules;
+        };
+        MockMPIContext mpi(1, 2);
+        auto topology = buildTwoStagePPTopo();
+        topology.stages[1].devices = {GlobalDeviceAddress::cuda(2)};
+        auto stage = std::make_unique<OriginalStage>();
+        auto *observed = stage.get();
+        GlobalOrchestrator parent(makeConfig(std::move(topology), 1, 2, &mpi, std::move(stage)));
+        ASSERT_TRUE(parent.materializeServingGraphFamilyWithoutLaunch({
+            .prefill_bucket_rows = {1, 4, 8}, .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+        std::vector<int> tokens(16);
+        for (std::size_t row = 0; row < tokens.size(); ++row) tokens[row] = 11 + static_cast<int>(row);
+        ASSERT_TRUE(parent.forwardPrefill(tokens.data(), 9));
+        ASSERT_EQ(observed->schedules.size(), 2u);
+        EXPECT_EQ(observed->schedules[0].bucket_sizes, std::vector<int>{8});
+        EXPECT_EQ(observed->schedules[1].bucket_sizes, std::vector<int>{1});
+        EXPECT_EQ(observed->schedules[1].real_token_start, 8);
+        EXPECT_EQ(observed->last_tokens(), std::vector<int>{19});
+        ASSERT_TRUE(parent.forwardPrefill(tokens.data(), 3));
+        ASSERT_EQ(observed->schedules.size(), 3u);
+        EXPECT_EQ(observed->schedules.back().real_token_start, 9);
+        EXPECT_EQ(observed->schedules.back().real_token_count, 3);
+        EXPECT_EQ(observed->schedules.back().bucket_sizes, std::vector<int>{4});
+        EXPECT_EQ(observed->last_tokens(), (std::vector<int>{11, 12, 13}));
+        parent.clear_cache();
+        ASSERT_TRUE(parent.forwardPrefill(tokens.data(), 1));
+        ASSERT_EQ(observed->schedules.size(), 4u);
+        EXPECT_EQ(observed->schedules.back().real_token_start, 0);
+        const int history = 17;
+        ASSERT_TRUE(parent.forward(&history, 1));
+        EXPECT_EQ(observed->last_tokens(), std::vector<int>{history});
+    }
 
     TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank0_SendsViaMPIContext)
     {
@@ -1768,25 +2061,41 @@ namespace llaminar2::test
         EXPECT_EQ(hs->numel(), static_cast<size_t>(5 * D_MODEL));
     }
 
-    TEST_F(Test__GlobalOrchestrator, ForwardPP_Rank1_BufferResizesForPrefillThenDecode)
+    /** @test The actual cold bank preserves ordinary/wide residual rows across shrinking requests. */
+    TEST_F(Test__GlobalOrchestrator, HostedActivationBankPreservesRowsAcrossPrefillAndDecode)
     {
-        // Rank 1 (tail) receives activations — buffer should resize for prefill
-        // then work correctly for decode (seq_len=1)
+        for (const int width : {D_MODEL, 10240})
+        {
+        SCOPED_TRACE(width);
+        // Rank 1 receives exact live prefixes in one cold-admitted stable bank.
+        // Shrinking decode must preserve the original graph-visible address.
         MockMPIContext mpi(1, 2);
         auto topo = buildTwoStagePPTopo();
         auto runner = std::make_unique<MockDeviceRunner>();
-
-        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+        auto* observed=runner.get();
+        auto config=makeConfig(std::move(topo),1,2,&mpi,std::move(runner));
+        config.d_model=width;
+        GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config),10));
 
         // Prefill: seq_len=10
         std::vector<int> tokens_prefill(10, 1);
         EXPECT_TRUE(orch.forward(tokens_prefill.data(), 10));
         EXPECT_EQ(mpi.recv_call_count(), 1u);
+        const auto* original=observed->getHiddenState();
+        ASSERT_NE(original,nullptr);
+        EXPECT_EQ(original->shape(),(std::vector<std::size_t>{10,static_cast<std::size_t>(width)}));
+        EXPECT_EQ(original->numel(),size_t(10*width));
+        const auto* original_address=original->data();
 
         // Decode: seq_len=1
         std::vector<int> tokens_decode = {42};
         EXPECT_TRUE(orch.forward(tokens_decode.data(), 1));
         EXPECT_EQ(mpi.recv_call_count(), 2u);
+        ASSERT_EQ(observed->getHiddenState(),original);
+        EXPECT_EQ(observed->getHiddenState()->data(),original_address);
+        EXPECT_EQ(observed->getHiddenState()->shape(),original->shape());
+        EXPECT_EQ(observed->getHiddenState()->numel(),size_t(10*width));
+        }
     }
 
     TEST_F(Test__GlobalOrchestrator, ThreeStagePP_Rank0_IsHeadOnly)
@@ -2092,7 +2401,7 @@ namespace llaminar2::test
         auto config = makeConfig(std::move(topo), 0, 4, &mpi, std::move(runner));
         config.global_tp_ctx = tp_ctx_raw;
 
-        GlobalOrchestrator orch(std::move(config));
+        GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
         EXPECT_EQ(orch.globalTPContext(), tp_ctx_raw);
     }
@@ -2481,7 +2790,7 @@ namespace llaminar2::test
             for (int stage : {0, 1})
                 config.stage_runners.push_back(makeStageRunnerEntry(
                     config.topology, rank, stage, std::make_unique<MockDeviceRunner>()));
-            GlobalOrchestrator orch(std::move(config));
+            GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
             const auto &plan = orch.rankPlan();
             auto transfers = plan.transferActions();
@@ -2542,7 +2851,7 @@ namespace llaminar2::test
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
 
-            GlobalOrchestrator orch(std::move(config));
+            GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
             std::vector<int> tokens = {5, 6, 7};
             EXPECT_TRUE(orch.forward(tokens.data(), 3)) << "rank " << rank;
@@ -2556,7 +2865,8 @@ namespace llaminar2::test
 
             TensorBase *handoff = stage1_raw->getHiddenState();
             ASSERT_NE(handoff, nullptr) << "rank " << rank;
-            ASSERT_EQ(handoff->numel(), static_cast<size_t>(tokens.size()) * D_MODEL) << "rank " << rank;
+            ASSERT_EQ(handoff->numel(), static_cast<size_t>(10) * D_MODEL) << "rank " << rank;
+            EXPECT_EQ(handoff->shape(),(std::vector<std::size_t>{10,D_MODEL}));
             const float *handoff_data = handoff->data();
             EXPECT_FLOAT_EQ(handoff_data[0], static_cast<float>(rank * 1000)) << "rank " << rank;
             EXPECT_FLOAT_EQ(handoff_data[1], static_cast<float>(rank * 1000 + 1)) << "rank " << rank;
@@ -2633,7 +2943,7 @@ namespace llaminar2::test
         for (int stage : {0, 1})
             config.stage_runners.push_back(makeStageRunnerEntry(
                 config.topology, 1, stage, std::make_unique<MockDeviceRunner>()));
-        GlobalOrchestrator orch(std::move(config));
+        GlobalOrchestrator orch(admitHostedPipelineFixture(std::move(config), 10));
 
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();
@@ -2682,4 +2992,131 @@ namespace llaminar2::test
         EXPECT_EQ(c->program,g->program);
     }
 
+    /** @brief Global ownership unwraps exactly one stage level and preserves real nested TP children. */
+    TEST_F(Test__GlobalOrchestrator, InitialShiftedOutcomeUsesExactStageCheckpoint)
+    {
+        class NestedCheckpointRunner final : public MTPMockDeviceRunner
+        {
+        public:
+            int width = 2;
+            int commits = 0;
+            const PrefixStateSnapshot *observed = nullptr;
+            int observed_request = -1;
+            bool observed_discard = false;
+            /** @return Recorded logical checkpoint with distinct original participant metadata. */
+            PrefixStateSnapshot captureLivePrefixCheckpoint(const PrefixCheckpointCaptureRequest &request) const override
+            {
+                auto result = MTPMockDeviceRunner::captureLivePrefixCheckpoint(request);
+                for (int participant = 0; participant < width; ++participant)
+                {
+                    PrefixStateSnapshot child;
+                    child.valid = result.valid;
+                    child.logical_checkpoint = true;
+                    child.cached_tokens = result.cached_tokens;
+                    child.mtp_cached_tokens = {result.cached_tokens + participant};
+                    result.participant_snapshots.push_back(std::move(child));
+                }
+                return result;
+            }
+            /** @brief Authenticate the unchanged participant-local checkpoint contract at the actual tail. */
+            bool commitMTPInitialShiftedRowFromDeviceOutcome(const PrefixStateSnapshot &checkpoint,
+                const DeviceSpeculativeOutcomeHandle &, int request_index, bool discard) override
+            {
+                ++commits; observed = &checkpoint; observed_request = request_index; observed_discard = discard;
+                return true;
+            }
+        };
+        for (const int width : {1, 2, 4})
+        {
+            MockMPIContext mpi(0, 1);
+            auto runner = std::make_unique<NestedCheckpointRunner>();
+            runner->width = width;
+            auto *tail = runner.get();
+            GlobalOrchestrator orchestrator(makeConfig(buildSingleStageTopo(1), 0, 1, &mpi, std::move(runner)));
+            DeviceSpeculativeOutcomeHandle outcome;
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                const PrefixCheckpointCaptureRequest request{.sequence_index = 0,
+                    .logical_cached_tokens = 96 + replay, .maximum_main_append_tokens = 4,
+                    .maximum_shifted_append_tokens = 4};
+                tail->set_position(request.logical_cached_tokens);
+                const auto captured = orchestrator.captureLivePrefixCheckpoint(request);
+                ASSERT_TRUE(captured.valid);
+                ASSERT_EQ(captured.participant_snapshots.size(), 1u);
+                const auto &expected = captured.participant_snapshots.front();
+                ASSERT_EQ(expected.participant_snapshots.size(), static_cast<size_t>(width));
+                ASSERT_TRUE(orchestrator.commitMTPInitialShiftedRowFromDeviceOutcome(captured, outcome, 0, true));
+                EXPECT_EQ(tail->observed, &expected);
+                EXPECT_EQ(*tail->observed, expected);
+                EXPECT_EQ(tail->observed_request, 0);
+                EXPECT_TRUE(tail->observed_discard);
+                EXPECT_EQ(tail->commits, replay + 1);
+            }
+        }
+    }
+
+    /** @brief Registry projection rejects malformed envelopes without flattening TP ownership. */
+    TEST_F(Test__GlobalOrchestrator, StageCheckpointProjectionRejectsMissingForeignAndStaleOwners)
+    {
+        const auto topology = buildTwoStageSameTPTopo();
+        auto first = std::make_unique<MTPMockDeviceRunner>();
+        auto second = std::make_unique<MTPMockDeviceRunner>();
+        const auto *head = first.get();
+        const auto *tail = second.get();
+        StageRunnerRegistry registry;
+        registry.add(makeStageRunnerEntry(topology, 0, 0, std::move(first)));
+        registry.add(makeStageRunnerEntry(topology, 0, 1, std::move(second)));
+        PrefixStateSnapshot snapshot;
+        snapshot.valid = true; snapshot.cached_tokens = 96;
+        for (int stage = 0; stage < 2; ++stage)
+        {
+            PrefixStateSnapshot child;
+            child.valid = true; child.cached_tokens = 96;
+            for (int participant = 0; participant < 2; ++participant)
+            {
+                PrefixStateSnapshot leaf;
+                leaf.valid = true; leaf.cached_tokens = 96;
+                leaf.mtp_cached_tokens = {stage * 2 + participant};
+                child.participant_snapshots.push_back(std::move(leaf));
+            }
+            snapshot.participant_snapshots.push_back(std::move(child));
+        }
+        EXPECT_EQ(registry.prefixCheckpointForRunner(snapshot, *head), &snapshot.participant_snapshots[0]);
+        EXPECT_EQ(registry.prefixCheckpointForRunner(snapshot, *tail), &snapshot.participant_snapshots[1]);
+        EXPECT_EQ(snapshot.participant_snapshots[1].participant_snapshots.size(), 2u);
+        MTPMockDeviceRunner foreign;
+        EXPECT_EQ(registry.prefixCheckpointForRunner(snapshot, foreign), nullptr);
+        auto invalid = snapshot; invalid.valid = false;
+        EXPECT_EQ(registry.prefixCheckpointForRunner(invalid, *tail), nullptr);
+        invalid = snapshot; invalid.participant_snapshots.pop_back();
+        EXPECT_EQ(registry.prefixCheckpointForRunner(invalid, *tail), nullptr);
+        invalid = snapshot; invalid.participant_snapshots.push_back(snapshot.participant_snapshots[0]);
+        EXPECT_EQ(registry.prefixCheckpointForRunner(invalid, *tail), nullptr);
+        invalid = snapshot; invalid.participant_snapshots[1].valid = false;
+        EXPECT_EQ(registry.prefixCheckpointForRunner(invalid, *tail), nullptr);
+        invalid = snapshot; ++invalid.participant_snapshots[1].cached_tokens;
+        EXPECT_EQ(registry.prefixCheckpointForRunner(invalid, *tail), nullptr);
+    }
+
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Before native CPU duties exist, the actual guarded boundary preserves the original exception/value. */
+TEST_F(Test__GlobalOrchestrator, ColdCPUConstructionWithoutNativeOwnersPreservesOriginalError)
+{
+    DomainCommunicatorRegistry original_domains;
+    MockMPIContext original_parent(1,3);
+    EXPECT_EQ(withOriginalCPUPipelineConstruction(original_domains,original_parent,[]{return 43;}),43);
+    try {
+        withOriginalCPUPipelineConstruction(original_domains,original_parent,[]{
+            throw std::runtime_error("original pre-native source failure");
+        });
+        FAIL()<<"The original construction failure was swallowed";
+    } catch(const std::runtime_error& error) {EXPECT_STREQ(error.what(),"original pre-native source failure");}
+    try {
+        withOriginalCPUPipelineConstruction(original_domains,original_parent,[]{throw 17;});
+        FAIL()<<"The original nonstandard construction failure was swallowed";
+    } catch(int error) {EXPECT_EQ(error,17);}
+    EXPECT_FALSE(original_domains.originalCPUOwners());
+}
+}

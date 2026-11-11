@@ -19,6 +19,8 @@ v2_test_device_scope(v2_test_pooled_complete_cohort DeclaredBackends)
 # Keep exact Unit cases separate for CI margin; preflight populations below retain
 # their original replay counts and standard 30-second guardian deadline.
 set(_cohort_original_unit_cases
+    PooledImmutableCompleteCohort.NativeCaptureGroupMatchesAllPhasesAndRepeatedOriginalRosters
+    PooledImmutableCompleteCohort.NativeCaptureGroupAbortsBeforePartialDispatchOrRecordingJoin
     PooledImmutableCompleteCohort.OriginalCohortP1RemotePositive
     PooledImmutableCompleteCohort.OriginalCohortP1RemoteEmpty
     PooledImmutableCompleteCohort.OriginalCohortP2RemotePositive
@@ -519,3 +521,10 @@ add_v2_test(V2_Integration_PooledRequiredTerminalCohortProofReplay
 if(TEST V2_Integration_PooledRequiredTerminalCohortProofReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledRequiredTerminalCohortProofReplay)
 endif()
+
+# Native collective recording cannot be serialized behind a blocking source job.
+add_v2_test(V2_Integration_PooledNativeColdCaptureOrderingReplay
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py" $<TARGET_FILE:v2_test_pooled_complete_cohort> --gtest_filter=PooledImmutableCompleteCohort.NativeCaptureGroupMatchesAllPhasesAndRepeatedOriginalRosters:PooledImmutableCompleteCohort.NativeCaptureGroupAbortsBeforePartialDispatchOrRecordingJoin
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")

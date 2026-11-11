@@ -176,6 +176,87 @@ class FrozenHistoryReplayTests(unittest.TestCase):
             with self.assertRaises(ValueError):selection.require_binding([str(directory)])
         path.write_text(original);selection.require_binding([str(directory)])
 
+    @patch("os.sched_getaffinity", return_value={0, 1, 2, 3})
+    @patch("model_kld_corpus.physical_workers", return_value=4)
+    def test_selected_fixed_pipeline_exact_prefill_keeps_all_original_rank_receipts(self, _physical, _affinity):
+        """Retain exact 8+1 coverage and authenticate the actual selected discovery owner."""
+        prompt = list(range(1, 10))
+        self.metadata.write_text('token_ids: 1,2,3,4,5,6,7,8,9\ndecode_tokens: 3,4,5\n')
+        self.value.update(prompt_ids=prompt,
+                          full_stage_metadata_digest=hashlib.sha256(self.metadata.read_bytes()).hexdigest())
+        participants = [dict(stage=stage, backend='rocm', ordinal=ordinal, uuid=f'gpu-{ordinal}',
+                             native_isa='gfx906', numa_node=1, pcie_upstream_bdfs=[])
+                        for stage, ordinal in ((0, 2), (0, 4), (1, 6))]
+        domains = [dict(name=f'stage-{stage}', scope='RANK_LOCAL', owner_rank=0,
+                        devices=[dict(hostname='observed', numa_node=1, device_type='ROCm', device_ordinal=entry['ordinal'])
+                                 for entry in participants if entry['stage'] == stage]) for stage in (0, 1)]
+        self.value['expected_config']['configuration'].update(
+            n_threads=2, mpi_procs=2, execution_rank_selection=[1], planning_mode='Apply',
+            ngram_table_policy=dict(storage='VRAM', distribution='FixedHeadSharded'),
+            domain_definitions=domains,
+            pp_stage_definitions=[dict(stage_id=stage, domain_name=f'stage-{stage}') for stage in (0, 1)])
+        self.publish()
+        selection = self.prepare()
+        directory = self.root / 'selected-artifacts'
+        directory.mkdir()
+        binding = dict(schema='llaminar.model-kld-history-binding.v1', descriptor_sha256=selection.sha256,
+                       **{key: self.value[key] for key in ('canonical_cell', 'history_id', 'source_digest',
+                           'full_stage_metadata_digest', 'prompt', 'prompt_ids', 'continuation_ids',
+                           'decode_rows', 'reference_directory')})
+        (directory / 'history_replay_binding.json').write_text(json.dumps(binding))
+        geometry = dict(schema='llaminar.model-kld-history-prefill-geometry.v1',
+            descriptor_sha256=selection.sha256, canonical_cell=self.cell, history_id='original',
+            capture_mode='production_exact_retained', bucket_rows=[1, 2, 4, 8, 16], minimum_rows=1,
+            logical_rows=9, physical_rows=9, native_replay_required=True, native_replay_observed=True,
+            native_devices=['ROCm:2', 'ROCm:4', 'ROCm:6'],
+            chunks=[dict(token_offset=0, logical_rows=8, physical_rows=8),
+                    dict(token_offset=8, logical_rows=1, physical_rows=1)],
+            cpu_execution=dict(requested_workers=2, max_workers=2, allowed_cpus=[2, 3],
+                               physical_cores=2, dynamic=False, unbound=True, places='cores',
+                               cpu_compute_required=False, parallel_work_observed=False))
+        geometry_path = directory / 'history_replay_prefill_geometry.json'
+        geometry_path.write_text(json.dumps(geometry))
+
+        declaration = dict(model_parity_schema=1, id='SyntheticMetadata', inventory_role='numerical_diagnostic',
+            runtime=dict(configuration_policy='observed_pipeline_binding_required_v1',
+                         observed_pipeline_request=dict(backend='rocm', native_isa='gfx906', mpi_ranks=2,
+                                                        stage_sizes=[2, 1])))
+        runtime = dict(configuration_policy='lossless_declared_document_v1',
+                       configuration_document=dict(kind='llaminar.orchestration-config', schema_version=1,
+                                                   configuration=self.value['expected_config']['configuration']))
+        exported = dict(schema=1, exact_cell=self.cell, declaration=declaration,
+                        configuration={**declaration, 'runtime': runtime, 'diagnostic_benchmark': runtime})
+        for rank in range(2):
+            rank_path = directory / 'observed-pipeline' / f'rank-{rank}'
+            rank_path.mkdir(parents=True)
+            (rank_path / 'observed-pipeline-binding.json').write_text(json.dumps(dict(schema=1,
+                cell='SyntheticMetadata', discovery_rank=rank, discovery_size=2, active=rank == 1,
+                execution_rank=0 if rank == 1 else None, original_owner=1, selected_discovery_ranks=[1],
+                original_numa_node=1, original_hostname='observed', requested_native_isa='gfx906',
+                stage_sizes=[2, 1], participants=participants, terminal_join_completed=True,
+                parity_work_succeeded=True)))
+        active = directory / 'observed-pipeline/rank-1/observed-pipeline-config.json'
+        active.write_text(json.dumps(exported))
+        selection.require_binding([directory], declaration)
+        for field, invalid in (
+            ('native_devices', ['ROCm:2', 'ROCm:6']),
+            ('physical_rows', 16),
+            ('chunks', [dict(token_offset=0, logical_rows=8, physical_rows=8)]),
+            ('chunks', [dict(token_offset=0, logical_rows=8, physical_rows=8),
+                        dict(token_offset=7, logical_rows=1, physical_rows=1)])):
+            geometry_path.write_text(json.dumps({**geometry, field: invalid}))
+            with self.assertRaisesRegex(ValueError, 'Frozen exact pipeline'):
+                selection.require_binding([directory], declaration)
+        geometry_path.write_text(json.dumps(geometry))
+        inactive = directory / 'observed-pipeline/rank-0'
+        (inactive / active.name).write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'inactive original'):
+            selection.require_binding([directory], declaration)
+        (inactive / active.name).unlink()
+        (inactive / 'observed-pipeline-binding.json').unlink()
+        with self.assertRaises(FileNotFoundError):
+            selection.require_binding([directory], declaration)
+
     def test_six_steps_require_seven_original_reference_teachers(self):
         self.value['decode_rows'] = 6
         self.value['continuation_ids'] = [3, 4, 5, 6, 7, 8, 9]

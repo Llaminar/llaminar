@@ -15,10 +15,14 @@
 #include "planning/PlanningWeightServiceModel.h"
 #include "planning/PlanningForwardStateWork.h"
 #include "planning/PlanningCommunicationService.h"
+#include "planning/PlanningHostDeviceMeasurement.h"
+#include "planning/PlanningObservedResource.h"
 #include "planning/PlanningCommunicationCost.h"
+#include "planning/RankHardwareOwnership.h"
 #include "planning/AutomaticPlanningStartup.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "utils/MPIContext.h"
+#include "utils/Logger.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -30,6 +34,74 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /** @brief Replay all-rank topology preparation with only one GPU/host role active.
+     * @param backend Required native family, selected only from original owned GPU observations.
+     *
+     * No fixture eagerly calls topology(): the production collector must make
+     * its lazy WORLD construction safe for the idle original peer. A rejected
+     * asymmetric PMA is exercised first, before that construction is legal.
+     */
+    void proveHostDeviceSameRankRolesWithIdlePeer(DeviceType backend)
+    {
+        const auto mpi = MPIContextFactory::global();
+        const auto inventory = mpi->clusterInventory();
+        ASSERT_NE(inventory, nullptr);
+        ASSERT_GE(mpi->world_size(), 2);
+        std::optional<PlanningHostDeviceGPUExecutor> selected;
+        for (const auto& rank : inventory->ranks)
+        {
+            for (const auto& gpu : rank.gpus)
+            {
+                if (gpu.type == backend && rankOwnsGPUDevice(rank, gpu))
+                {
+                    selected = PlanningHostDeviceGPUExecutor{rank.rank, {gpu.type, gpu.local_device_id}};
+                    break;
+                }
+            }
+            if (selected) break;
+        }
+        ASSERT_TRUE(selected.has_value()) << "Required original NUMA-local native executor is absent";
+        const auto request = PlanningHostDeviceRequest::fromInventory(*inventory,
+            *selected, {selected->rank}, 1025);
+        ASSERT_EQ(request.gpuRank(), request.hostRank());
+        const auto& original = inventory->ranks.at(mpi->rank());
+        const auto host = planningObservedResource(original, DeviceId::cpu());
+        PhysicalMemoryPlanBuilder builder;
+        // The idle rank has a genuine empty local sample envelope, rather than
+        // acquiring a GPU or pretending its own host is the selected allocator.
+        builder.add(host, PhysicalMemoryOwner::ActivationTransportStaging, 0);
+        if (mpi->rank() == selected->rank)
+        {
+            PlanningHostDeviceMeasurement::contributeHostMemory(request, host, builder);
+            PlanningHostDeviceMeasurement::contributeExecutionMemory(request,
+                planningObservedResource(original, selected->device), builder);
+        }
+        auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), mpi->rank());
+        const int idle_rank = selected->rank == 0 ? 1 : 0;
+        const auto rejected_memory = mpi->rank() == idle_rank
+            ? std::shared_ptr<PhysicalMemoryAuthority>{} : memory;
+        EXPECT_THROW(PlanningHostDeviceMeasurement::collect(request, mpi, rejected_memory), std::runtime_error);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        for (int replay = 0; replay < 2; ++replay)
+        {
+            const auto result = PlanningHostDeviceMeasurement::collect(request, mpi, memory);
+            EXPECT_EQ(result.has_value(), mpi->rank() == selected->rank);
+            if (result)
+            {
+                EXPECT_EQ(result->request, request);
+                EXPECT_EQ(result->phases.size(), 8u);
+                EXPECT_NO_THROW(PlanningHostDeviceMeasurement::validate(*result));
+            }
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            // This accessor is deliberately AFTER successful production
+            // collection. The original bug never reaches it on the idle rank.
+            EXPECT_NE(mpi->topology(), nullptr);
+        }
+    }
+
     /** @brief Real bounded native/MPI evidence and collective pre-traffic rejection on discovery membership. */
     void proveCommunicationService(DeviceType backend)
     {
@@ -50,20 +122,35 @@ namespace
         EXPECT_EQ(service->native().size(), expected.native().size());
         EXPECT_EQ(service->mpi().size(), expected.mpi().size());
         EXPECT_EQ(service->hostDevice().size(), expected.hostDevice().size());
+        // The expected matrix is derived independently from the original
+        // discovery roles, not from a native reporter's local host surrogate.
+        size_t expected_host_scopes = 0;
+        for (const auto &executor : inventory->ranks)
+            for (const auto &gpu : executor.gpus)
+                if (request.allows(gpu.type) && rankOwnsGPUDevice(executor, gpu))
+                    for (const auto &host : inventory->ranks)
+                        if (inventory->connectionBetweenRanks(executor.rank, host.rank).locality() != RankConnectionLocality::CrossNode)
+                            ++expected_host_scopes;
+        EXPECT_EQ(service->hostDevice().size(), expected_host_scopes);
         const PlanningCommunicationCost costs(*inventory, service->native(), service->mpi(), service->hostDevice());
         for (size_t index = 0; index < service->hostDevice().size(); ++index)
         {
             const auto &observed = service->hostDevice()[index];
             ASSERT_EQ(observed.request, expected.hostDevice()[index]);
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(inventory->getRank(observed.request.gpuRank()),
+                observed.request.device(), "host-device native executor"));
+            EXPECT_EQ(observed.request.hostNumaNode(), inventory->getRank(observed.request.hostRank()).cpu.numa_node);
+            EXPECT_NE(inventory->connectionBetweenRanks(observed.request.gpuRank(), observed.request.hostRank()).locality(),
+                RankConnectionLocality::CrossNode);
             EXPECT_NO_THROW(PlanningHostDeviceMeasurement::validate(observed));
             for (const auto &phase : observed.phases)
             {
-                const auto estimate = costs.hostTransfer(observed.request.rank(), observed.request.device(),
-                    observed.request.rank(), phase.mechanism, phase.direction, phase.payload_bytes);
+                const auto estimate = costs.hostTransfer(observed.request.gpuRank(), observed.request.device(),
+                    observed.request.hostRank(), phase.mechanism, phase.direction, phase.payload_bytes);
                 EXPECT_GT(estimate.seconds, 0);
                 EXPECT_EQ(estimate.basis, PlanningCommunicationBasis::SameProtocolPayloadCurve);
                 std::cout << "HOST_DEVICE_SAMPLE device=" << observed.request.device().toString()
-                    << " rank=" << observed.request.rank() << " host_numa=" << observed.request.hostNumaNode()
+                    << " gpu_rank=" << observed.request.gpuRank() << " host_rank=" << observed.request.hostRank() << " host_numa=" << observed.request.hostNumaNode()
                     << " mechanism=" << int(phase.mechanism) << " direction=" << int(phase.direction)
                     << " bytes=" << phase.payload_bytes << " seconds=" << phase.service.elapsedSeconds() / 3 << '\n';
             }
@@ -199,6 +286,10 @@ namespace
                     return std::nullopt;
                 }
                 if (!service) throw std::logic_error("Root has no completed service model");
+                // One lifecycle boundary distinguishes real cold measurements
+                // from subsequent host admission/ranking without per-candidate I/O.
+                LOG_INFO("[PlanningRequestCostPreparation] measured evidence complete backend="
+                    << deviceTypeToString(backend));
                 return [service = std::move(*service), &prices, &multi_device_prices, &overlay_prices]
                     (const auto &candidate, const auto &workload) {
                     ++prices;
@@ -242,6 +333,14 @@ namespace
                     return cost;
                 };
             });
+        if (result.root_selection)
+        {
+            const auto &counts = result.root_selection->counts();
+            LOG_INFO("[PlanningRequestCostPreparation] selection complete backend="
+                << deviceTypeToString(backend)
+                << " proposed=" << counts.proposed << " evaluated=" << counts.evaluated
+                << " capacity_rejected=" << counts.capacity_rejected);
+        }
         EXPECT_EQ(result.root_selection.has_value(), mpi->is_root());
         if (mpi->is_root())
         {
@@ -609,6 +708,11 @@ TEST(PlanningKernelServiceCatalogMPI, CPU_ProjectionPolicyDisagreementIsCollecti
     }
 }
 #ifdef HAVE_CUDA
+TEST(PlanningKernelServiceCatalogMPI, CUDA_HostDeviceSameRankRolesWithIdlePeer)
+{
+    ensureNvidiaFactoryRegistered();
+    proveHostDeviceSameRankRolesWithIdlePeer(DeviceType::CUDA);
+}
 TEST(PlanningKernelServiceCatalogMPI, CUDA_CommunicationService)
 {
     ensureNvidiaFactoryRegistered();
@@ -616,6 +720,11 @@ TEST(PlanningKernelServiceCatalogMPI, CUDA_CommunicationService)
 }
 #endif
 #ifdef HAVE_ROCM
+TEST(PlanningKernelServiceCatalogMPI, ROCm_HostDeviceSameRankRolesWithIdlePeer)
+{
+    ensureAMDFactoryRegistered();
+    proveHostDeviceSameRankRolesWithIdlePeer(DeviceType::ROCm);
+}
 TEST(PlanningKernelServiceCatalogMPI, ROCm_CommunicationService)
 {
     ensureAMDFactoryRegistered();

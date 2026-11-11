@@ -150,9 +150,9 @@ def cpu_joint_socket_requirements(record: dict, declared: set, observed: dict) -
     return aliased
 
 
-def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
-    """Select exact typed participants against one native local-host observation."""
-    if (type(hardware.get('qfn_source_hardware_schema')) is not int
+def source_hardware_devices(hardware: dict) -> dict:
+    """Validate one complete original native publication and index exact addresses."""
+    if (not isinstance(hardware, dict) or type(hardware.get('qfn_source_hardware_schema')) is not int
             or hardware.get('qfn_source_hardware_schema') != 2
             or hardware.get('scope') != 'local-host-all-ranks'
             or not isinstance(hardware.get('devices'), list) or not hardware['devices']):
@@ -160,7 +160,74 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
     available = [identity(device) for device in hardware['devices']]
     if len(set(available)) != len(available):
         raise ValueError('duplicate native hardware identity')
-    observed_devices = {identity(device): device for device in hardware['devices']}
+    return {identity(device): device for device in hardware['devices']}
+
+
+def observed_pipeline_request(record: dict) -> dict | None:
+    """Validate a deferred ISA/cardinality request without inventing physical addresses."""
+    if 'observed_pipeline_request' not in record:
+        return None
+    request = record['observed_pipeline_request']
+    if (not isinstance(request, dict) or set(request) != {'backend', 'native_isa', 'stage_sizes'}
+            or request['backend'] not in ('cuda', 'rocm')
+            or not isinstance(request['native_isa'], str) or not request['native_isa']
+            or ':' in request['native_isa'] or not isinstance(request['stage_sizes'], list)
+            or len(request['stage_sizes']) < 2
+            or any(type(size) is not int or size <= 0 for size in request['stage_sizes'])
+            or record.get('participants') != []
+            or any(field in record for field in ('storage_participants', 'storage_coordinator',
+                                                'cpu_expert_socket_membership', 'gpu_memory_cap_mb',
+                                                'minimum_cuda_total_memory_bytes', 'minimum_rocm_total_memory_bytes'))):
+        raise ValueError('invalid observed pipeline ISA/cardinality request')
+    return request
+
+
+def observed_native_isa_cohorts(observed: dict, backend: str, native_isa: str) -> dict[int, list[dict]]:
+    """Project exact UUID-unique ISA cohorts from the original hardware observation."""
+    by_numa = {}
+    uuids = set()
+    for address, device in observed.items():
+        if address[0] != backend:
+            continue
+        isa = device.get('native_isa', '')
+        if not isinstance(isa, str):
+            raise ValueError('invalid native ISA observation')
+        if isa.partition(':')[0] != native_isa:
+            continue
+        uuid = device.get('uuid')
+        numa = device.get('numa_node')
+        if (not isinstance(uuid, str) or not uuid or uuid in uuids
+                or type(numa) is not int or numa < 0):
+            raise ValueError('missing or duplicate observed pipeline UUID/NUMA authority')
+        uuids.add(uuid)
+        by_numa.setdefault(numa, []).append(device)
+    return by_numa
+
+
+def observed_pipeline_hardware_requirement(record: dict, observed: dict) -> list[dict]:
+    """Check the requested ISA cohort on one actual NUMA; runtime still owns MPI binding."""
+    request = observed_pipeline_request(record)
+    assert request is not None
+    by_numa = observed_native_isa_cohorts(observed, request['backend'], request['native_isa'])
+    required = sum(request['stage_sizes'])
+    cpu_nodes = {device['numa_node'] for address, device in observed.items() if address[0] == 'cpu'}
+    # Visibility alone cannot supply an MPI owner. A complete GPU cohort must
+    # share a NUMA node with an actual observed CPU discovery participant.
+    eligible = [numa for numa, devices in by_numa.items()
+                if numa in cpu_nodes and len(devices) >= required]
+    if len(eligible) > 1:
+        raise ValueError('observed pipeline request has ambiguous original NUMA ownership')
+    if not eligible or len(cpu_nodes) < record['mpi_ranks']:
+        return [{'role': 'observed_pipeline_cohort', **request, 'required_devices': required,
+                 'observed_eligible_devices_by_numa': {str(numa): len(devices) for numa, devices in by_numa.items()},
+                 'original_discovery_ranks': record['mpi_ranks']}]
+    return []
+
+
+def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
+    """Select exact typed participants against one native local-host observation."""
+    observed_devices = source_hardware_devices(hardware)
+    available = set(observed_devices)
     selected, unavailable = [], {}
     for exact, record in records.items():
         ranks = record.get('mpi_ranks')
@@ -170,8 +237,16 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
                 or not isinstance(record.get('id'), str) or not record['id']
                 or Path(record['id']).name != record['id'] or record['id'] in ('.', '..')
                 or any(c in record['id'] for c in '/\\:*?"<>|\x00')
-                or not isinstance(participants, list) or not participants):
+                or not isinstance(participants, list)
+                or (not participants and 'observed_pipeline_request' not in record)):
             raise ValueError('missing or stale typed source-admission metadata')
+        if observed_pipeline_request(record) is not None:
+            missing = observed_pipeline_hardware_requirement(record, observed_devices)
+            if missing:
+                unavailable[exact] = {'qualification': 'hardware-ineligible-unqualified', 'missing': missing}
+            else:
+                selected.append(exact)
+            continue
         minimums = provisioning_requirements(record)
         declared = set()
         missing = []
@@ -369,9 +444,103 @@ def source_artifact_directory(root: Path, identity: str, rank: int) -> Path:
     return directory
 
 
+def observed_pipeline_bindings(root: Path, record: dict) -> dict[int, dict]:
+    """Authenticate all original active/inactive ranks and their single physical owner."""
+    request = observed_pipeline_request(record)
+    if request is None:
+        return {}
+    hardware_input = json.loads((root / 'observed-pipeline-hardware.json').read_text())
+    observed = source_hardware_devices(hardware_input)
+    if observed_pipeline_hardware_requirement(record, observed):
+        raise ValueError('pipeline binding has no complete original hardware prerequisite')
+    return validate_observed_pipeline_receipts(record,
+        lambda rank: source_artifact_directory(root, record['id'], rank),
+        'source_work_succeeded', observed=observed,
+        inactive_artifacts=('admission.csv', 'retirement.csv', 'admission_memory.txt', 'mtp-setup.csv', 'prefix-cache'))
+
+
+def validate_observed_pipeline_receipts(record: dict, directory_for_rank, outcome_field: str,
+                                        *, observed=None, inactive_artifacts=()) -> dict[int, dict]:
+    """Authenticate one identical original selection and terminal receipt for every discovery rank."""
+    request = observed_pipeline_request(record)
+    if request is None:
+        raise ValueError('pipeline receipts require the original observed topology request')
+    bindings = {}
+    common = None
+    active_ranks = []
+    for rank in range(record['mpi_ranks']):
+        directory = directory_for_rank(rank)
+        path = directory / 'observed-pipeline-binding.json'
+        if directory.is_symlink() or path.is_symlink():
+            raise ValueError('pipeline membership evidence must be owned by its original artifact directory')
+        binding = json.loads(path.read_text())
+        if (not isinstance(binding, dict) or binding.get('schema') != 1
+                or type(binding.get('schema')) is not int or binding.get('cell') != record['id']
+                or type(binding.get('discovery_rank')) is not int or binding['discovery_rank'] != rank
+                or type(binding.get('discovery_size')) is not int or binding['discovery_size'] != record['mpi_ranks']
+                or binding.get('terminal_join_completed') is not True
+                or type(binding.get(outcome_field)) is not bool
+                or type(binding.get('active')) is not bool
+                or binding.get('requested_native_isa') != request['native_isa']
+                or binding.get('stage_sizes') != request['stage_sizes']
+                or any(type(size) is not int for size in binding['stage_sizes'])):
+            raise ValueError('missing or foreign original pipeline membership receipt')
+        selected = binding.get('selected_discovery_ranks')
+        owner = binding.get('original_owner')
+        numa = binding.get('original_numa_node')
+        hostname = binding.get('original_hostname')
+        if (not isinstance(selected, list) or len(selected) != 1 or type(selected[0]) is not int
+                or not 0 <= selected[0] < record['mpi_ranks'] or type(owner) is not int or owner != selected[0]
+                or type(numa) is not int or numa < 0 or not isinstance(hostname, str) or not hostname
+                or binding['active'] != (rank == owner)
+                or ((type(binding.get('execution_rank')) is not int or binding['execution_rank'] != 0)
+                    if binding['active'] else binding.get('execution_rank') is not None)):
+            raise ValueError('pipeline selection substituted an original active/inactive rank')
+        participants = binding.get('participants')
+        if not isinstance(participants, list) or len(participants) != sum(request['stage_sizes']):
+            raise ValueError('pipeline binding has incomplete original participant geometry')
+        uuids = set(); addresses = set(); stages = [0] * len(request['stage_sizes'])
+        for participant in participants:
+            if not isinstance(participant, dict):
+                raise ValueError('invalid pipeline participant receipt')
+            stage = participant.get('stage'); address = identity(participant)
+            uuid = participant.get('uuid'); isa = participant.get('native_isa')
+            if (type(stage) is not int or not 0 <= stage < len(stages)
+                    or address[0] != request['backend'] or participant.get('numa_node') != numa
+                    or not isinstance(uuid, str) or not uuid or uuid in uuids or address in addresses
+                    or not isinstance(isa, str) or isa.partition(':')[0] != request['native_isa']
+                    or not isinstance(participant.get('pcie_upstream_bdfs'), list)
+                    or any(not isinstance(bdf, str) or not bdf for bdf in participant['pcie_upstream_bdfs'])):
+                raise ValueError('pipeline participant lost original UUID/ISA/NUMA/stage identity')
+            if observed is not None:
+                original = observed.get(address)
+                if (original is None or original.get('uuid') != uuid or original.get('native_isa') != isa
+                        or original.get('numa_node') != numa):
+                    raise ValueError('pipeline receipt substituted original native hardware observation')
+            uuids.add(uuid); addresses.add(address); stages[stage] += 1
+        if stages != request['stage_sizes']:
+            raise ValueError('pipeline binding changed authored stage cardinalities')
+        shared = {key: binding[key] for key in ('selected_discovery_ranks', 'original_owner', 'original_hostname',
+                  'original_numa_node', 'requested_native_isa', 'stage_sizes', 'participants', outcome_field)}
+        if common is not None and shared != common:
+            raise ValueError('original ranks disagree on observed pipeline binding')
+        common = shared
+        if binding['active']:
+            active_ranks.append(rank)
+        elif any((directory / name).exists() for name in inactive_artifacts):
+            raise ValueError('inactive original pipeline rank fabricated model admission')
+        bindings[rank] = binding
+    if len(active_ranks) != 1:
+        raise ValueError('pipeline binding omitted or duplicated its actual original owner')
+    return bindings
+
+
 def validate_runner_retirement(root: Path, record: dict) -> None:
     """Validate per-runner/model/prefix cleanup, before global native teardown."""
+    bindings = observed_pipeline_bindings(root, record)
     for rank in range(record['mpi_ranks']):
+        if bindings and not bindings[rank]['active']:
+            continue
         directory = source_artifact_directory(root, record['id'], rank)
         with (directory / 'retirement.csv').open() as stream:
             rows = list(csv.DictReader(stream))
@@ -457,7 +626,13 @@ def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionCo
     validate_native_retirement(root, record)
     if contract == SourceAdmissionContract.POSITIVE:
         validate_cpu_joint_rank_evidence(root, record)
+    bindings = observed_pipeline_bindings(root, record)
+    if bindings and (contract != SourceAdmissionContract.POSITIVE or
+                     not all(binding['source_work_succeeded'] for binding in bindings.values())):
+        raise ValueError('observed pipeline requires completed positive original-source admission')
     for rank in range(record['mpi_ranks']):
+        if bindings and not bindings[rank]['active']:
+            continue
         directory = source_artifact_directory(root, record['id'], rank)
         receipt = directory / {
             SourceAdmissionContract.POSITIVE: 'admission.csv',
@@ -556,6 +731,11 @@ def run_case(entry: dict, record: dict, output: Path, build: Path, environment: 
     """Execute one registered contract; launch errors remain terminal infrastructure failures."""
     xml = output / f'cell-{index:04d}.xml'
     log_path = output / f'cell-{index:04d}.log'
+    if observed_pipeline_request(record) is not None:
+        hardware_input = json.loads((output / 'hardware.json').read_text())
+        if observed_pipeline_hardware_requirement(record, source_hardware_devices(hardware_input)):
+            raise ValueError('observed pipeline lost its original hardware admission before launch')
+        write_json(artifact / 'observed-pipeline-hardware.json', hardware_input)
     invocation = secrets.token_hex(16)
     write_json(artifact / 'native-lifetime-invocation.json', {'schema': 1,
         'invocation': invocation, 'cell': record['id'], 'mpi_ranks': record['mpi_ranks']})

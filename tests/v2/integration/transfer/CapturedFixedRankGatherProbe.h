@@ -10,9 +10,14 @@
  * reservations are PMA-admitted. The original native context separately owns
  * its vendor communicator allocations; this small BOM does not re-account them.
  * Event intervals include device waits; they are not model speedup predictions.
+ * The native cohort is owned by its original MPI rank while other discovery
+ * ranks remain in the existing setup/retirement consensus. GPU width and order
+ * never imply a singleton communicator or permission to use remote NUMA GPUs.
  */
 #pragma once
 #include "CapturedChannelGraphProof.h"
+#include "../../fixtures/backends/OriginalRankLocalNativeCohort.h"
+#include "utils/NUMATopology.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/LocalTPContext.h"
@@ -35,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <limits>
 #include <span>
 #include <thread>
 #include <utility>
@@ -283,19 +289,32 @@ namespace llaminar2::fixed_rank_component_test
         const std::size_t stride = (maximum + guard + 31u) & ~std::size_t{31u};
         const std::size_t peer_stride = timing ? maximum : stride;
         constexpr std::uint32_t poison = 0xa5a5a5a5u;
+        require(devices.size() >= 2 && devices.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+            "Fixed-rank fold requires at least two int-representable participant coordinates");
         const int degree = static_cast<int>(devices.size());
-        require(degree >= 2 && degree <= 4, "Fixed-rank probe supports explicit P2/P4 only");
         const auto first = devices.front();
         for (const auto device : devices)
             require(device.is_gpu() && device.type == first.type &&
                 std::count(devices.begin(), devices.end(), device) == 1, "Fixed-rank membership must be homogeneous and unique");
         const auto mpi = MPIContextFactory::global();
+        require(bool(mpi), "Fixed-rank probe requires its original MPI context");
         const auto inventory = mpi->clusterInventory();
-        require(bool(inventory) && mpi->world_size() == 1, "Fixed-rank probe requires original one-rank inventory");
-        const auto &rank = inventory->ranks.at(mpi->rank());
-        const std::size_t bank_offset = stride, output_offset = bank_offset + degree * peer_stride;
+        require(bool(inventory), "Fixed-rank probe requires its original published inventory");
+        const auto binding = NUMATopology::detectLocalNUMANode();
+        require(binding.detection_succeeded, "Fixed-rank probe requires its actual original CPU binding");
+        const auto &rank = test::requireOriginalRankLocalNativeCohort(
+            *inventory, mpi->rank(), mpi->world_size(), binding.local_numa_node, devices);
+        const auto checkedProduct = [](std::size_t count, std::size_t extent) {
+            if (extent && count > std::numeric_limits<std::size_t>::max() / extent)
+                throw std::overflow_error("Fixed-rank component extent exceeds size_t");
+            return count * extent;
+        };
+        const std::size_t peer_elements = checkedProduct(devices.size(), peer_stride);
+        require(peer_elements <= std::numeric_limits<std::size_t>::max() - 2 * stride,
+            "Fixed-rank original frame extent exceeds size_t");
+        const std::size_t bank_offset = stride, output_offset = bank_offset + peer_elements;
         const std::size_t frame_elements = output_offset + stride;
-        const std::size_t frame_bytes = frame_elements * sizeof(float);
+        const std::size_t frame_bytes = checkedProduct(frame_elements, sizeof(float));
         const auto channel_geometry = CapturedTransferChannel::memoryFor(maximum * sizeof(float));
         const auto mapped_bytes = TransferEngine::mappedHostRegionAllocationBytes(frame_bytes);
         std::vector<ProbeShape> shapes;
@@ -312,17 +331,23 @@ namespace llaminar2::fixed_rank_component_test
                 (!shape.in_place || shape.transactions == 1), "Invalid original fixed-rank functional geometry");
         const int family_count = static_cast<int>(2 * shapes.size());
         PhysicalMemoryPlanBuilder builder;
+        const auto edges = checkedProduct(devices.size(), devices.size() - 1);
         builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
-            degree * (degree - 1) * channel_geometry.mapped_host_bytes + 2 * degree * mapped_bytes);
+            checkedProduct(edges, channel_geometry.mapped_host_bytes));
+        builder.add(planningObservedResource(rank, DeviceId::cpu()), PhysicalMemoryOwner::ActivationTransportStaging,
+            checkedProduct(2 * devices.size(), mapped_bytes));
         for (const auto device : devices)
         {
             const auto resource = planningObservedResource(rank, device);
+            builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging, frame_bytes);
             builder.add(resource, PhysicalMemoryOwner::ActivationTransportStaging,
-                frame_bytes + 2 * (degree - 1) * channel_geometry.cursor_bytes_per_device);
+                checkedProduct(2 * (devices.size() - 1), channel_geometry.cursor_bytes_per_device));
             builder.add(resource, PhysicalMemoryOwner::NativeGraphExecutable,
                 family_count * GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         }
         emit({{"kind", "layout"}, {"members", degree}, {"timing", timing},
+            {"original_world_rank", mpi->rank()}, {"original_world_size", mpi->world_size()},
+            {"original_cpu_numa", rank.cpu.numa_node},
             {"maximum_elements", maximum}, {"source_output_capacity_elements", stride},
             {"peer_stride_elements", peer_stride}, {"bank_offset_bytes", bank_offset * sizeof(float)},
             {"output_offset_bytes", output_offset * sizeof(float)}, {"frame_bytes", frame_bytes},

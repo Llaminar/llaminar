@@ -13,6 +13,7 @@
 #include "DeviceMoERebalanceABI.h"
 #include "DeviceMoERebalancePublication.h"
 #include "DeviceMoERebalanceMovementJournal.h"
+#include "DeviceMoERebalanceCompletedDecision.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
@@ -35,7 +36,7 @@ namespace llaminar2
         kDeviceMoELLEPPlannerMaxParticipants ==
         kDeviceMoEMaxParticipants);
 
-    inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
+    inline constexpr uint32_t kDeviceMoERebalanceMagic = moe_rebalance_abi::kMagic; // "MOER"
     inline constexpr uint32_t kDeviceMoERebalanceVersion =
         moe_rebalance_abi::kVersion;
     inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
@@ -49,6 +50,8 @@ namespace llaminar2
         PlanMissingArrivals = 1u << 2,
         DeferRuntimeApply = 1u << 3,
         CollectLoadStats = 1u << 4,
+        /** Authored Dynamic durable maintenance; never current-batch/cache assignment. */
+        CompletedDynamicDecisions = 1u << 5,
     };
 
     enum class DeviceMoERebalancePlanOp : uint32_t
@@ -291,6 +294,8 @@ namespace llaminar2
          * but its native conditional graph never copies this record to the host.
          */
         DeviceMoERebalanceDispatchTicket dispatch_ticket;
+        /** Successful native policy completions; reset with the request after archival. */
+        DeviceMoERebalanceCompletedDecision completed_decision;
     };
 
     /**
@@ -457,8 +462,8 @@ namespace llaminar2
 
     enum class DeviceMoERebalanceStatusCode : uint32_t
     {
-        Ok = 0,
-        WindowNotReady = 1,
+        Ok = moe_rebalance_abi::kStatusOk,
+        WindowNotReady = moe_rebalance_abi::kStatusWindowNotReady,
         InvalidConfig = 2,
         InvalidRuntime = 3,
         MissingHistogram = 4,
@@ -817,6 +822,7 @@ namespace llaminar2
     static_assert(sizeof(DeviceMoERebalanceWaveProgress) == moe_rebalance_abi::kWaveProgressBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceGraphControllerState>);
     static_assert(sizeof(DeviceMoERebalanceGraphControllerState) == moe_rebalance_abi::kGraphControllerBytes);
+    static_assert(offsetof(DeviceMoERebalanceGraphControllerState, completed_decision) == moe_rebalance_abi::kCompletedDecisionOffset);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
     static_assert(std::is_standard_layout_v<DeviceMoERebalancePlanEntry>);
     static_assert(std::has_unique_object_representations_v<DeviceMoERebalancePlanEntry>,

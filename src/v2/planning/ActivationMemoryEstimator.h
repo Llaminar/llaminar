@@ -51,6 +51,9 @@ struct ActivationGraphMemoryGeometry
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
     int generation_request_capacity = 1; ///< Retained sampler request rows, including disabled MTP capacity.
     int ngram_fixed_head_participants = 0; ///< Source-declared native cohort P2/4/8; zero outside fixed-head lookup.
+    int ngram_fixed_pipeline_local_heads = 0; ///< Actual PLE reader's assembled source heads.
+    int ngram_fixed_pipeline_gathered_heads = 0; ///< Exact gather storage, including no bank for a singleton.
+    std::size_t ngram_fixed_pipeline_scratch_words = 0; ///< Exact original addressed endpoint arena root.
     qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =
         qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
                                                             ///< by execution.

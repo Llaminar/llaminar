@@ -9,10 +9,15 @@
  * ownership tests without loading a model or initializing a device backend.
  * CPU serial storage declarations survive admission and runtime projection.
  * CPU root declarations remain stage-owned across child projection and reuse.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "RankOrchestrator.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/moe/MoEOverlayPipelineStageBinding.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -290,29 +295,32 @@ namespace llaminar2
             .generation_domain = generation_domain.domain()};
         if (stage.moe_runtime)
         {
-            stage.moe_runtime->requireDestination(*child.nested_pp_stage_config,
-                child.devices, child.weights, child.backend, moe_rebalance.mode);
-            // The authority's immutable initial snapshot supplies the plan.
-            // Legacy graph configuration takes a mutable shared_ptr, so lend
-            // a private metadata copy rather than exposing the live snapshot.
-            child.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
-                *stage.moe_runtime->plan());
-            const auto &owners = stage.moe_runtime->owners();
-            child.cpu_serial_expert_storage = owners.cpu_serial_expert_storage;
-            child.moe_expert_overlay_residency_authority = owners.authority;
-            child.moe_expert_overlay_participant_residency = owners.residency;
-            child.moe_expert_overlay_decode_histogram = owners.histogram;
-            child.moe_expert_overlay_mpi_ctx = owners.mpi;
-            child.moe_rank_batch_transport_registry = owners.rank_transport;
-            child.moe_device_controller_fabric = owners.device_fabric;
-            const auto &domains = child.moe_routed_expert_plan->domains;
-            const auto continuation = std::find_if(domains.begin(), domains.end(),
-                [&](const auto &domain) {
-                    return domain.name == child.moe_routed_expert_plan->effectiveBaseModelDomain();
-                });
-            child.routed_expert_compute_policy = continuation->routed_compute_policy;
+            child.installPipelineStageRuntime(*stage.moe_runtime);
         }
         return child;
+    }
+
+    void RankOrchestrator::Config::installPipelineStageRuntime(const MoEOverlayPipelineStageBinding &binding)
+    {
+        if (!nested_pp_stage_config || !cpu_serial_expert_storage.empty() || moe_routed_expert_plan ||
+            moe_expert_overlay_residency_authority || moe_expert_overlay_participant_residency ||
+            moe_expert_overlay_decode_histogram || moe_expert_overlay_mpi_ctx || moe_rank_batch_transport_registry ||
+            moe_device_controller_fabric || moe_expert_overlay_cpu_joint_context ||
+            moe_node_local_route_exchange || !moe_node_local_route_transport_policy.unresolved())
+            throw std::invalid_argument("Pipeline child cannot replace an existing expert runtime");
+        InferenceRunnerConfig projection;
+        projection.pp_stage_config = nested_pp_stage_config;
+        projection.moe_rebalance = moe_rebalance;
+        binding.installRuntime(projection, devices, weights, backend);
+        moe_routed_expert_plan = std::move(projection.moe_routed_expert_plan);
+        cpu_serial_expert_storage = std::move(projection.cpu_serial_expert_storage);
+        moe_expert_overlay_residency_authority = std::move(projection.moe_expert_overlay_residency_authority);
+        moe_expert_overlay_participant_residency = std::move(projection.moe_expert_overlay_participant_residency);
+        moe_expert_overlay_decode_histogram = std::move(projection.moe_expert_overlay_decode_histogram);
+        moe_expert_overlay_mpi_ctx = std::move(projection.moe_expert_overlay_mpi_ctx);
+        moe_rank_batch_transport_registry = std::move(projection.moe_rank_batch_transport_registry);
+        moe_device_controller_fabric = std::move(projection.moe_device_controller_fabric);
+        routed_expert_compute_policy = projection.routed_expert_compute_policy;
     }
 
     /**

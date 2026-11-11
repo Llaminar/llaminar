@@ -9,6 +9,8 @@
  */
 
 #include "MoEOverlayActivationChannelPlan.h"
+#include "MoEOverlayActivationBatchResources.h"
+#include <array>
 
 #include "MoEOverlayActivationPacketABI.h"
 #include "MoEOverlayFollowerRowGeometry.h"
@@ -300,7 +302,7 @@ namespace llaminar2
             input.graph_family_count,
             "retained-family lane bytes");
         const std::size_t grant_bytes = checkedMultiply(
-            sizeof(MoEOverlayActivationDeviceEpochGrant),
+            MoEOverlayActivationBatchResources::grantGPUBytes(),
             input.graph_family_count,
             "retained-family grant bytes");
         const std::size_t max_entries = checkedMultiply(
@@ -354,6 +356,9 @@ namespace llaminar2
         result.graph_family_count = input.graph_family_count;
         result.payload_matrix_bytes = matrix_bytes;
         result.device_grant_bytes_per_lane = grant_bytes;
+        result.host_grant_bytes_per_lane = checkedMultiply(
+            MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes(),input.graph_family_count,
+            "retained-family CPU grant roots");
         result.canonical_route_matrix_bytes =
             canonical_route_matrix_bytes;
         std::map<PhysicalKey, std::size_t> charge_by_resource;
@@ -390,21 +395,17 @@ namespace llaminar2
                 }
                 channel.source_lanes.push_back(source_lane);
                 channel.target_lanes.push_back(target_lane);
-                {
-                    auto &bytes = charge_by_resource[PhysicalKey{
-                        source->world_rank, source->device}];
-                    bytes = checkedAdd(
-                        bytes,
-                        grant_bytes,
-                        "source retained-family grants");
-                }
-                {
-                    auto &bytes = charge_by_resource[PhysicalKey{
-                        participant.world_rank, participant.device}];
-                    bytes = checkedAdd(
-                        bytes,
-                        grant_bytes,
-                        "target retained-family grants");
+                const auto cpu_grant_bytes=checkedMultiply(
+                    MoEOverlayActivationBatchResources::grantUploadDeclaration().physicalBytes(),
+                    input.graph_family_count,"retained-family CPU grant roots");
+                for(const auto endpoint:std::array{PhysicalKey{source->world_rank,source->device},
+                                                   PhysicalKey{participant.world_rank,participant.device}}){
+                    if(endpoint.device.is_gpu()){
+                        auto& gpu=charge_by_resource[endpoint];
+                        gpu=checkedAdd(gpu,grant_bytes,"retained-family GPU grant workspaces");
+                    }
+                    auto& host=charge_by_resource[PhysicalKey{endpoint.world_rank,DeviceId::cpu()}];
+                    host=checkedAdd(host,cpu_grant_bytes,"retained-family CPU grant roots");
                 }
                 if (source->device.is_gpu())
                 {

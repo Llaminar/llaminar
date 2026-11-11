@@ -103,9 +103,12 @@ namespace llaminar2
         {
             return role == MoEOverlayInferenceGraphRole::MainPrefill ||
                    role == MoEOverlayInferenceGraphRole::MainDecode ||
+                   role == MoEOverlayInferenceGraphRole::OrdinaryForwardOnly ||
+                   role == MoEOverlayInferenceGraphRole::GenerationAdmission ||
                    role == MoEOverlayInferenceGraphRole::MTPDraft ||
-                   role ==
-                       MoEOverlayInferenceGraphRole::MTPGroupedVerifier;
+                   role == MoEOverlayInferenceGraphRole::MTPGroupedVerifier ||
+                   role == MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation ||
+                   role == MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken;
         }
 
         /** @return Stable diagnostic name for one ticket action. */
@@ -135,10 +138,18 @@ namespace llaminar2
                 return "main_prefill";
             case MoEOverlayInferenceGraphRole::MainDecode:
                 return "main_decode";
+            case MoEOverlayInferenceGraphRole::OrdinaryForwardOnly:
+                return "ordinary_forward_only";
+            case MoEOverlayInferenceGraphRole::GenerationAdmission:
+                return "generation_admission";
             case MoEOverlayInferenceGraphRole::MTPDraft:
                 return "mtp_draft";
             case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
                 return "mtp_grouped_verifier";
+            case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+                return "mtp_condition_speculative_continuation";
+            case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+                return "mtp_condition_committed_serial_token";
             }
             return "invalid";
         }
@@ -200,6 +211,31 @@ namespace llaminar2
             return 0;
         }
         return final_source_layer - first_model_layer + 1;
+    }
+
+    MoEOverlayInferenceGraphRole moeOverlayPipelineConditionGraphRole(MTPConditionForwardPurpose purpose)
+    {
+        switch (purpose)
+        {
+        case MTPConditionForwardPurpose::SpeculativeContinuation:
+            return MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation;
+        case MTPConditionForwardPurpose::CommittedSerialToken:
+            return MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken;
+        }
+        throw std::invalid_argument("Pipeline condition ticket has an unknown original purpose");
+    }
+
+    MTPConditionForwardPurpose moeOverlayPipelineConditionForwardPurpose(MoEOverlayInferenceGraphRole role)
+    {
+        switch (role)
+        {
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+            return MTPConditionForwardPurpose::SpeculativeContinuation;
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            return MTPConditionForwardPurpose::CommittedSerialToken;
+        default:
+            throw std::invalid_argument("Pipeline condition ticket must name an explicit retained purpose");
+        }
     }
 
     MoEOverlayInferenceGraphFamilyIdentity
@@ -437,8 +473,13 @@ namespace llaminar2
 
     bool MoEOverlayInferenceCommandIdentity::valid() const noexcept
     {
-        return request_generation != 0 && command_id != 0 &&
-               initial_placement_epoch != 0;
+        const bool placement_valid =
+            (placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::ResidencyEpoch &&
+             initial_placement_epoch != 0) ||
+            (placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::RetainedGraph &&
+             initial_placement_epoch == 0) ||
+            placement_identity_kind == MoEOverlayInferencePlacementIdentityKind::ControllerPlacementEpoch;
+        return request_generation != 0 && command_id != 0 && placement_valid;
     }
 
     MoEOverlayInferenceTopologyIdentity
@@ -460,6 +501,7 @@ namespace llaminar2
             .request_generation = request_generation,
             .command_id = command_id,
             .initial_placement_epoch = placement_epoch,
+            .placement_identity_kind = placement_identity_kind,
         };
     }
 
@@ -490,18 +532,16 @@ namespace llaminar2
             prefill_schedule_real_rows == 0 &&
             prefill_schedule_execution_rows == 0 &&
             prefill_schedule_transaction_count == 0 &&
-            prefill_schedule_reserved == 0 &&
             prefill_schedule_fingerprint == 0;
         const auto prefill_schedule = prefillScheduleWorkload();
         const bool valid_prefill_schedule =
-            prefill_schedule_reserved == 0 &&
             prefill_schedule.valid() &&
             prefill_schedule.source == ExpertHistogramSource::PrefillChunk &&
             prefill_schedule.speculative_depth == 0;
         if (magic != kMagic || abi_version != kABIVersion ||
             !validAction(action) || !topologyIdentity().valid() ||
             request_generation == 0 || command_id == 0 ||
-            transaction_ordinal == 0 || placement_epoch == 0 ||
+            transaction_ordinal == 0 || !commandIdentity().valid() ||
             (!no_prefill_schedule && !valid_prefill_schedule))
         {
             return false;
@@ -537,6 +577,12 @@ namespace llaminar2
         case MoEOverlayInferenceGraphRole::MainDecode:
             return logical_rows_per_request == 1 && draft_depth == -1 &&
                    sidecar_depth == -1;
+        case MoEOverlayInferenceGraphRole::GenerationAdmission:
+        case MoEOverlayInferenceGraphRole::OrdinaryForwardOnly:
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            return logical_rows_per_request == 1 && physical_rows_per_request == 1 &&
+                   draft_depth == -1 && sidecar_depth == -1;
         case MoEOverlayInferenceGraphRole::MTPDraft:
             return logical_rows_per_request == 1 && draft_depth > 0 &&
                    sidecar_depth >= 0 && sidecar_depth < draft_depth;
@@ -559,6 +605,7 @@ namespace llaminar2
                << ",transaction=" << transaction_ordinal
                << ",logical_step=" << logical_step_id
                << ",workspace_generation=" << workspace_generation
+               << ",placement_authority=" << static_cast<std::uint32_t>(placement_identity_kind)
                << ",placement_epoch=" << placement_epoch
                << ",retired_decode_progress_tokens="
                << retired_decode_progress_tokens
@@ -649,7 +696,7 @@ namespace llaminar2
                 carries_prefill_schedule
                     ? prefill_schedule_workload.transaction_count
                     : 0,
-            .prefill_schedule_reserved = 0,
+            .placement_identity_kind = command.placement_identity_kind,
             .prefill_schedule_fingerprint =
                 carries_prefill_schedule
                     ? prefill_schedule_workload.schedule_fingerprint
@@ -698,6 +745,7 @@ namespace llaminar2
             .draft_depth = -1,
             .sidecar_depth = -1,
             .error_code = error_code,
+            .placement_identity_kind = command.placement_identity_kind,
         };
         if (!topology.valid() || !command.valid() || !ticket.valid() ||
             placement_epoch < command.initial_placement_epoch)
@@ -855,6 +903,8 @@ namespace llaminar2
         }
         if (ticket.transaction_ordinal != next_transaction_ordinal_)
             return "ExpertOverlay transaction ordinal is duplicate or out of order";
+        if (ticket.placement_identity_kind != active_command_.placement_identity_kind)
+            return "ExpertOverlay transaction changed its placement authority";
         if (ticket.placement_epoch < current_placement_epoch_)
             return "ExpertOverlay transaction regressed its placement epoch";
         if (ticket.action == MoEOverlayInferenceTransactionAction::Execute)

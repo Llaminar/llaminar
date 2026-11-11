@@ -16,10 +16,17 @@ namespace test {struct NativeOrderingEventGroupReplayAccess;struct PooledRemoteG
 /** @brief Exact fixed auxiliary program, never a caller-authored event count. */
 class NativeAuxiliaryResourceProgram final {
 public:
+    /** @return Exact peer-lane completion event and optional two timestamp events. */
+    static constexpr NativeAuxiliaryResourceProgram peerTransferEvents(bool timing){return NativeAuxiliaryResourceProgram(PeerEvents{timing});}
+    constexpr bool isPeerTransferEvents()const noexcept{return std::holds_alternative<PeerEvents>(value_);}
+    constexpr bool peerTransferTiming()const{return std::get<PeerEvents>(value_).timing;}
+    /** @return One auxiliary stream with immutable scheduling class, without fictitious events. */
+    static constexpr NativeAuxiliaryResourceProgram auxiliaryStream(){return NativeAuxiliaryResourceProgram(Stream{});}
     static constexpr NativeAuxiliaryResourceProgram readAheadSide(){return NativeAuxiliaryResourceProgram(Side{});}
     static constexpr NativeAuxiliaryResourceProgram ordering(NativeOrderingEventProgram p){return NativeAuxiliaryResourceProgram(p);}
     /** @return Portable source program only; placement stays in the original instance descriptor. */
     static NativeAuxiliaryResourceProgram pooledRemoteOwner(const PooledRemoteGraphProgram& p){return NativeAuxiliaryResourceProgram(p.qualificationClass());}
+    constexpr bool isAuxiliaryStream()const noexcept{return std::holds_alternative<Stream>(value_);}
     constexpr bool isReadAheadSide()const noexcept{return std::holds_alternative<Side>(value_);}
     constexpr bool isOrdering()const noexcept{return std::holds_alternative<NativeOrderingEventProgram>(value_);}
     constexpr bool isPooledRemoteOwner()const noexcept{return std::holds_alternative<PooledRemoteGraphProgramClass>(value_);}
@@ -29,11 +36,15 @@ public:
     constexpr bool operator==(const NativeAuxiliaryResourceProgram&)const=default;
 private:
     friend struct detail::NativeAuxiliaryQualifiedClass;
+    struct PeerEvents {bool timing;constexpr bool operator==(const PeerEvents&)const=default;};
+    constexpr explicit NativeAuxiliaryResourceProgram(PeerEvents p):value_(p){}
+    struct Stream {constexpr bool operator==(const Stream&)const=default;};
+    constexpr explicit NativeAuxiliaryResourceProgram(Stream p):value_(p){}
     struct Side {constexpr bool operator==(const Side&)const=default;};
     constexpr explicit NativeAuxiliaryResourceProgram(Side p):value_(p){}
     constexpr explicit NativeAuxiliaryResourceProgram(NativeOrderingEventProgram p):value_(p){}
     constexpr explicit NativeAuxiliaryResourceProgram(PooledRemoteGraphProgramClass p):value_(p){}
-    std::variant<Side,NativeOrderingEventProgram,PooledRemoteGraphProgramClass> value_;
+    std::variant<Stream,Side,NativeOrderingEventProgram,PooledRemoteGraphProgramClass,PeerEvents> value_;
 };
 /** @brief Reviewed versioned family envelope; exact geometry remains in the separate capture identity. */
 struct NativeAuxiliaryRemoteFamilyScope final {

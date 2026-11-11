@@ -135,8 +135,7 @@ public:
      * @return Whether an authenticated same-vendor edge selects producer-owned peer payload.
      * @throws std::invalid_argument For invalid, cross-rank or missing explicit same-vendor coverage.
      */
-    static bool usesPeerPayload(PhysicalMemoryAllocatorIdentity coordinator,
-        PhysicalMemoryAllocatorIdentity owner, std::optional<PeerAccessCoverage> observation);
+
     /** @brief Require explicit endpoint policy before BOM or downstream graph composition.
      * @param coordinator Original query GPU.
      * @param owner Original physical storage GPU.

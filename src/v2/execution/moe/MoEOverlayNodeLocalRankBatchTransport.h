@@ -14,6 +14,7 @@
  */
 
 #pragma once
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include "MoEOverlayActivationChannelPlan.h"
 #include "MoEOverlayActivationEpochProtocol.h"
@@ -358,6 +359,7 @@ namespace llaminar2
     struct MoEOverlayRankBatchTransportConfig
     {
         std::shared_ptr<IMPIContext> mpi_ctx; ///< World/topology authority.
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority; ///< Sole original CPU/GPU allocation authority.
         MoEOverlayActivationEndpointScope endpoint_scope =
             MoEOverlayActivationEndpointScope::DistinctRanks;
         /** Exact original source device required by same-rank GPU construction. */

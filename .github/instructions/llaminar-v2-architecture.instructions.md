@@ -545,9 +545,14 @@ capacity query or live ledger.
 
 `PlanningHostDeviceMeasurement` uses that same collection transaction for DMA
 and mapped-kernel byte copies in both directions. Each observation binds the
-physical GPU to the reporting rank's host first-touch scope; GPU affinity does
-not relabel those pages. TransferEngine supplies the prepared exact-stream lane
-and canonical mapped backing extent. Retained graph timing excludes setup,
+physical GPU's original NUMA-local executor to a distinct original same-machine
+host first-touch rank and its observed NUMA. The host role owns the PMA-backed
+shared pages and touches them before registration; only the GPU role owns native
+execution. Same-rank samples use that same protocol with one participant. Existing
+all-rank agreement retains both roles through graph and registration retirement.
+No GPU visibility or another rank's curve substitutes for either ownership role.
+TransferEngine supplies the prepared exact-stream lane and canonical mapped
+backing extent. Retained graph timing excludes setup,
 fresh host publication and exact-byte readback verification. These are byte
 primitives, not complete activation-packet/wait-kernel service; full request
 dependency/cost composition remains a separate responsibility.

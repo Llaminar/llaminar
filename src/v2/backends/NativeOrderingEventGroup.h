@@ -37,6 +37,9 @@ private:
     // The original cache owns its singleton native creator/destructor; this
     // friendship only brackets that existing handle with its admitted group.
     friend class DeviceGraphExecutor;
+    friend class GPUCaptureDependencyRoster;
+    /** @brief Transfer only construction-edge handles into their existing context record. */
+    void delegateNativeHandlesToContext()noexcept;
     friend struct test::NativeOrderingEventGroupReplayAccess;
     /** @brief Mark possible backing retention BEFORE the first original event create attempt. */
     void beginNativeAttempt();

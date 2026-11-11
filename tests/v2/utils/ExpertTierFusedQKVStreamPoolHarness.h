@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "execution/compute_stages/stages/FusedQKVGEMMStage.h"
@@ -349,8 +350,7 @@ namespace llaminar2::test
                                    1u,
                                    device)
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      device,
                                      lane_prefix + ":" + phase.name)

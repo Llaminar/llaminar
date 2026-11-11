@@ -53,6 +53,95 @@ def hardware():
 class QFNSourceAdmissionCI(unittest.TestCase):
     """Missing, foreign and stale evidence must fail rather than reduce coverage."""
 
+    def test_observed_pipeline_isa_hardware_selection(self):
+        record=parameter();record['participants']=[]
+        record['observed_pipeline_request']={'backend':'rocm','native_isa':'gfx906','stage_sizes':[4,4]}
+        devices=[{'backend':'cpu','ordinal':0,'numa_node':node} for node in (7,11)]
+        for ordinal in (9,4,5,3,2,1,0,6,7):
+            devices.append({'backend':'rocm','ordinal':ordinal,'numa_node':11,
+                'uuid':f'physical-{ordinal}','native_isa':'gfx1100' if ordinal==5 else 'gfx906:sramecc+',
+                'name':'MI50' if ordinal==5 else 'ignored'})
+        inventory={'qfn_source_hardware_schema':2,'scope':'local-host-all-ranks','devices':devices}
+        self.assertEqual(select({'exact':record},inventory),(['exact'],{}))
+        for defect in ('missing_isa','foreign_isa','split_numa','unowned_numa','oversized'):
+            changed=copy.deepcopy(inventory);request=copy.deepcopy(record)
+            if defect=='missing_isa':changed['devices'][2].pop('native_isa')
+            if defect=='foreign_isa':changed['devices'][2]['native_isa']='gfx1100'
+            if defect=='split_numa':
+                for device in changed['devices'][2:6]:device['numa_node']=7
+            if defect=='unowned_numa':
+                for device in changed['devices'][2:]:device['numa_node']=13
+            if defect=='oversized':request['observed_pipeline_request']['stage_sizes']=[4,5]
+            with self.subTest(defect=defect),self.assertRaisesRegex(ValueError,'no hardware-eligible'):
+                select({'exact':request},changed)
+        duplicate=copy.deepcopy(inventory);duplicate['devices'][2]['uuid']=duplicate['devices'][-1]['uuid']
+        with self.assertRaisesRegex(ValueError,'UUID'):
+            select({'exact':record},duplicate)
+        fake=copy.deepcopy(record);fake['participants']=[{'rank':0,'backend':'rocm','ordinal':0,'numa_node':11}]
+        with self.assertRaisesRegex(ValueError,'ISA/cardinality'):
+            select({'exact':fake},inventory)
+        cpu=copy.deepcopy(record);cpu['cpu_expert_socket_membership']=[]
+        with self.assertRaisesRegex(ValueError,'ISA/cardinality'):
+            select({'exact':cpu},inventory)
+
+    def test_observed_pipeline_original_active_inactive_retirement(self):
+        record=parameter();record['participants']=[]
+        record['observed_pipeline_request']={'backend':'rocm','native_isa':'gfx906','stage_sizes':[4,4]}
+        participants=[{'stage':index//4,'backend':'rocm','ordinal':ordinal,'numa_node':11,
+            'uuid':f'original-{ordinal}','native_isa':'gfx906:sramecc+','pcie_upstream_bdfs':['bridge','root']}
+            for index,ordinal in enumerate((9,4,3,2,1,0,6,7))]
+        hardware={'qfn_source_hardware_schema':2,'scope':'local-host-all-ranks','devices':
+            [{'backend':'cpu','ordinal':0,'numa_node':node} for node in (7,11)]+participants}
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);(root/'observed-pipeline-hardware.json').write_text(json.dumps(hardware))
+            for rank in (0,1):
+                directory=root/f'source-admission/Opaque/rank-{rank}';directory.mkdir(parents=True)
+                binding={'schema':1,'cell':'Opaque','discovery_rank':rank,'discovery_size':2,
+                    'selected_discovery_ranks':[1],'original_owner':1,'original_hostname':'host',
+                    'original_numa_node':11,'requested_native_isa':'gfx906','stage_sizes':[4,4],
+                    'participants':participants,'active':rank==1,'execution_rank':0 if rank==1 else None,
+                    'terminal_join_completed':True,'source_work_succeeded':True}
+                (directory/'observed-pipeline-binding.json').write_text(json.dumps(binding))
+                native_completion(root,rank)
+            active=root/'source-admission/Opaque/rank-1';inactive=root/'source-admission/Opaque/rank-0'
+            (active/'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+            (active/'admission.csv').write_text('cell,layers,initialized,snapshots_enabled,numerical_inference_executed\nOpaque,48,1,0,0\n')
+            (active/'admission_memory.txt').write_text('actual selected-owner PMA')
+            (active/'mtp-setup.csv').write_text('cell,active,retained_depth,controller_execution_proved\nOpaque,0,0,0\n')
+            validate_retirement(root,record,contract=SourceAdmissionContract.POSITIVE)
+            for defect in ('rank','active','numa','uuid','isa','count','completion','execution'):
+                path=inactive/'observed-pipeline-binding.json';original=path.read_text();binding=json.loads(original)
+                if defect=='rank':binding['discovery_rank']=1
+                if defect=='active':binding['active']=True
+                if defect=='numa':binding['participants'][0]['numa_node']=7
+                if defect=='uuid':binding['participants'][0]['uuid']='foreign-uuid'
+                if defect=='isa':binding['participants'][0]['native_isa']='gfx1100'
+                if defect=='count':binding['stage_sizes']=[3,5]
+                if defect=='completion':binding['terminal_join_completed']=False
+                if defect=='execution':binding['execution_rank']=0
+                path.write_text(json.dumps(binding))
+                with self.subTest(defect=defect),self.assertRaises(ValueError):
+                    validate_retirement(root,record,contract=SourceAdmissionContract.POSITIVE)
+                path.write_text(original)
+            # Failed source contracts can still prove independent model/native
+            # retirement; they never become a successful source admission.
+            for rank in (0,1):
+                path=root/f'source-admission/Opaque/rank-{rank}/observed-pipeline-binding.json'
+                binding=json.loads(path.read_text());binding['source_work_succeeded']=False;path.write_text(json.dumps(binding))
+            validate_native_retirement(root,record)
+            with self.assertRaisesRegex(ValueError,'completed positive'):
+                validate_retirement(root,record,contract=SourceAdmissionContract.POSITIVE)
+            for rank in (0,1):
+                path=root/f'source-admission/Opaque/rank-{rank}/observed-pipeline-binding.json'
+                binding=json.loads(path.read_text());binding['source_work_succeeded']=True;path.write_text(json.dumps(binding))
+            (inactive/'retirement.csv').write_text('fabricated model owner')
+            with self.assertRaisesRegex(ValueError,'fabricated'):
+                validate_retirement(root,record,contract=SourceAdmissionContract.POSITIVE)
+            (inactive/'retirement.csv').unlink()
+            (root/'native-process-retirement/rank-0.csv').unlink()
+            with self.assertRaises(FileNotFoundError):
+                validate_retirement(root,record,contract=SourceAdmissionContract.POSITIVE)
+
     def _exact_driver(self, exact=None, *, population=2, ineligible=False, missing=False,
                       case_error=None, cleanup_error=None):
         """Exercise the actual driver/gather with synthetic metadata, never native execution."""

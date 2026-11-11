@@ -51,6 +51,9 @@
  */
 
 #pragma once
+#include "PipelineParityEvidence.h"
+#include "execution/moe/MoEPipelinePreparedPlan.h"
+#include "execution/runner/OrchestrationRunner.h"
 #include "FinalLogitMeanKLContract.h"
 #include "FrozenParityHistoryReplay.h"
 #include "ParityHardwareRequirements.h"
@@ -192,11 +195,6 @@ namespace llaminar2::test::parity
     // Configuration
     // =============================================================================
 
-    enum class ParityForwardPhase
-    {
-        Prefill,
-        Decode,
-    };
 
     /**
      * @brief Evidence contract for the prefill that precedes decode parity.
@@ -779,6 +777,9 @@ namespace llaminar2::test::parity
         bool lm_head_passed = false;
         bool lm_head_evidence_valid = false; ///< Actual complete finite final-logit operands, not a numerical tolerance.
 
+        std::optional<PipelineParityEvidence> pipeline_evidence; ///< Completed original diagnostic union; no tensor/snapshot storage.
+        bool pipeline_local_embedding_passed=false; ///< Original local fragment, before global scalar metric projection.
+
         // Overall
         int early_layers_passed = 0;
         int total_layers_passed = 0;
@@ -804,6 +805,7 @@ namespace llaminar2::test::parity
         bool top3_match = false; ///< True if PyTorch top-1 appears in Llaminar top-3
         bool passed = false;
         std::vector<LayerStats> layer_stats; ///< Per-layer cosine similarity for this decode step
+        std::optional<PipelineParityEvidence> pipeline_evidence; ///< Completed original phase/step union, without model values.
     };
 
     /**
@@ -3851,30 +3853,32 @@ namespace llaminar2::test::parity
         }
 
         /**
-         * @brief Capture production parity at the authenticated prompt geometry.
+         * @brief Declare the public production cap when the typed cell owns an exact retained family.
+         * @return Explicit native-pipeline cap, or absence for historical fixture geometry.
+         */
+        virtual std::optional<int> productionParityRetainedPrefillCap() const { return std::nullopt; }
+
+        /**
+         * @brief Bind production parity startup bucket inputs before snapshot admission.
          *
-         * The serving default pads small prompts to a 256-row graph bucket for
-         * throughput reuse. Stage-by-stage parity materializes every published
-         * row, so comparing the oracle's nine real rows plus 247 known padding
-         * rows multiplies diagnostic transfer and CSV work without adding a
-         * mathematical input. Production campaigns instead declare one exact
-         * graph bucket from authenticated `token_ids`. The mandatory
-         * prompt-plus-token partial-prefix suffix reuses this same retained
-         * executable with production padding, so one logical suffix cannot
-         * manufacture a second full-model graph. Geometry remains part of
-         * cache identity; this method never permits eager execution or
-         * recapture.
+         * Ordinary parity uses one prompt-sized bucket. Frozen standalone
+         * replay uses its declared serving ladder. A typed native exact
+         * pipeline uses the public serving candidates for both snapshot BOM
+         * and production admission. The actual admitted cap then determines
+         * the retained exact widths and the request's live chunk schedule.
          */
         void configureExactProductionParityPrefillGraphBucket()
         {
             if (!productionParityCampaignEnabled())
                 return;
-            if (frozen_history_replay_)
+            const auto native_cap = productionParityRetainedPrefillCap();
+            if (native_cap || frozen_history_replay_)
             {
-                // An explicit history diagnosis must retain the production
-                // physical family; logical-row snapshot projection remains in
-                // the original executor. Ordinary matrix cells stay exact-N.
-                const auto capture = frozen_history_replay_->servingPrefillCapture();
+                const auto capture = native_cap
+                    ? FrozenParityHistoryReplay::ServingPrefillCapture{
+                        prefillGraphBucketSizes(*native_cap),
+                        std::min(*native_cap, kDefaultPrefillGraphMinBucketSize), 0}
+                    : frozen_history_replay_->servingPrefillCapture();
                 std::string buckets;
                 for (const int rows : capture.bucket_rows)
                 {
@@ -11809,6 +11813,14 @@ namespace llaminar2::test::parity
                 }
             }
 
+            if(usesDistributedPipelineEvidence() &&
+               (!originalPipelineParityOwnership().first ||
+                config_.collective_evidence_source!=ParityCollectiveEvidenceSource::PostCollectiveSnapshot ||
+                !config_.allreduce_stages.empty()))
+            {
+                ADD_FAILURE()<<"Split pipeline parity requires original admitted owners and completed local-collective snapshots";
+                return false;
+            }
             if (policy.require_snapshot_publication)
             {
                 const auto keys = activeSnapshotKeys();
@@ -11821,6 +11833,7 @@ namespace llaminar2::test::parity
 
                 for (const auto &key : policy.requiredSnapshotKeys(phase))
                 {
+                    if(usesDistributedPipelineEvidence() && !ownsPipelineParityKey(key))continue;
                     if (std::find(keys.begin(), keys.end(), key) == keys.end())
                     {
                         const auto source=GraphSnapshotSourceOutput::fromQwenSparseSemanticKey(key);
@@ -12469,6 +12482,314 @@ namespace llaminar2::test::parity
             return acceptsRequiredRawParityStages(layers, config.graph_snapshot_policy.requiredSnapshotKeys(phase),phase);
         }
 
+        /** @return Whether strict evidence belongs to genuine split pipeline owners. */
+        bool usesDistributedPipelineEvidence() const noexcept
+        { return config_.uses_cross_rank_pipeline && config_.final_logit_mean_kl.has_value(); }
+
+        /** @brief Passive projection of the actual initialized original admission, not a rank heuristic.
+         * @return Local original scopes; empty/invalid metadata stays invalid for collective rejection. */
+        std::pair<bool,std::vector<PipelineParityStageOwnership>> originalPipelineParityOwnership() const
+        {
+            std::vector<PipelineParityStageOwnership> result;
+            const auto* original=dynamic_cast<const OrchestrationRunner*>(orch_runner_.get());
+            const auto* prepared=original ? original->pipelinePreparedPlanForDiagnostics() : nullptr;
+            const auto admission=prepared ? prepared->admission() : nullptr;
+            if(!admission || !admission->globalPipeline() || !mpi_ctx_ ||
+               admission->globalPipeline()->total_layers!=config_.early_layers_count ||
+               admission->globalPipeline()->world_size!=mpiWorldSize() ||
+               admission->rankPlan().rank!=mpiRank())return {false,{}};
+            std::set<int> stages;
+            for(const auto& stage:admission->stages())
+            {
+                const auto& scope=stage.topology().scope();
+                const auto& plan=stage.rankPlan();
+                if(stage.topology().stageId()<0 || !stages.insert(stage.topology().stageId()).second || plan.rank!=mpiRank() ||
+                   scope.first_layer<0 || scope.last_layer<=scope.first_layer ||
+                   scope.last_layer>config_.early_layers_count ||
+                   plan.first_layer!=scope.first_layer || plan.last_layer!=scope.last_layer-1 ||
+                   (scope.has_embedding && scope.first_layer!=0) ||
+                   (scope.has_lm_head && scope.last_layer!=config_.early_layers_count) ||
+                   plan.global_tp_domain_size>1)return {false,{}};
+                result.push_back({stage.topology().stageId(),mpiRank(),scope.first_layer,scope.last_layer,
+                    scope.has_embedding,scope.has_lm_head});
+            }
+            return {true,std::move(result)};
+        }
+
+        /** @brief Resolve one original diagnostic key against passive admitted stage ownership.
+         * @param key Canonical snapshot key already selected by the original framework.
+         * @return Whether this actual rank owns its comparison/publication obligation. */
+        bool ownsPipelineParityKey(const std::string& key) const
+        {
+            if(!usesDistributedPipelineEvidence())return true;
+            const auto [valid,stages]=originalPipelineParityOwnership();
+            if(!valid)return false;
+            for(const auto& stage:stages)
+            {
+                if(key=="EMBEDDING" && stage.embedding)return true;
+                if((key=="LM_HEAD" || key=="FINAL_NORM") && stage.logits)return true;
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)
+                    if(key.starts_with("layer"+std::to_string(layer)+"_"))return true;
+            }
+            return false;
+        }
+
+        /** @brief Validate this original owner's raw finite/exact records before metadata exchange.
+         * @param layers Actual local records, retaining original global decoder indices.
+         * @param stages Original admitted local scopes, retaining global decoder indices.
+         * @param config Unchanged canonical required-stage and threshold declaration.
+         * @param phase Actual comparison phase; query provenance is never waived.
+         * @param actual_rank Original current MPI rank, independent of NUMA or stage order.
+         * @return Original required-stage/evidence verdict scoped only to authenticated owned layers. */
+        template<class Layers>
+        static ::testing::AssertionResult acceptsOwnedPipelineRawEvidence(const Layers& layers,
+            std::span<const PipelineParityStageOwnership> stages,const ParityConfig& config,ParityForwardPhase phase,int actual_rank)
+        {
+            std::vector<int> owned;
+            for(const auto& stage:stages)
+            {
+                if(stage.rank!=actual_rank || stage.stage<0 || stage.first_layer<0 ||
+                   stage.last_layer<=stage.first_layer || stage.last_layer>config.early_layers_count)
+                    return ::testing::AssertionFailure()<<"Pipeline raw evidence contains a foreign original scope";
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)owned.push_back(layer);
+            }
+            if(layers.size()!=owned.size())return ::testing::AssertionFailure()<<"Pipeline local decoder cardinality disagrees";
+            for(int index:owned)
+                if(std::count_if(layers.begin(),layers.end(),[index](const auto& value){return value.layer_idx==index;})!=1)
+                    return ::testing::AssertionFailure()<<"Pipeline missing/duplicate owned decoder "<<index;
+            for(const auto& layer:layers)
+            {
+                if(layer.stages_compared<=0 || layer.stage_results.empty())
+                    return ::testing::AssertionFailure()<<"Pipeline owned decoder has no original stages";
+                for(const auto& record:layer.stage_results)
+                {
+                    if(!validParityCheckpointEvidence(record,phase==ParityForwardPhase::Decode) ||
+                       (phase==ParityForwardPhase::Prefill && record.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery) ||
+                       (record.integer_mismatch_count && *record.integer_mismatch_count!=0))
+                        return ::testing::AssertionFailure()<<"Pipeline invalid original raw checkpoint "<<record.stage_name;
+                }
+            }
+            std::vector<std::string> required;
+            for(const auto& key:config.graph_snapshot_policy.requiredSnapshotKeys(phase))
+            {
+                if(key=="EMBEDDING" || key=="LM_HEAD")required.push_back(key);
+                else for(int layer:owned)
+                    if(key.starts_with("layer"+std::to_string(layer)+"_")){required.push_back(key);break;}
+            }
+            // An idle owner has no raw obligation. It still participates in the
+            // complete original-world certificate and cannot claim a decoder.
+            if(owned.empty() && required.empty())return ::testing::AssertionSuccess();
+            return acceptsRequiredRawParityStages(layers,required,phase);
+        }
+
+        /** @brief Project exact original local records into fixed diagnostic cardinalities.
+         * @param layers Actual completed local comparator records.
+         * @param stages Original admitted exclusive stage scopes.
+         * @param count Authenticated global main decoder count.
+         * @param raw Actual original finite/exact required-checkpoint verdict.
+         * @param actual_rank Original current MPI rank whose observation is projected.
+         * @return One cell per original decoder; foreign/duplicate records remain invalid.
+         */
+        static std::vector<PipelineParityLayerObservation> pipelineParityLayerObservations(
+            const std::vector<LayerStats>& layers,std::span<const PipelineParityStageOwnership> stages,
+            int count,bool raw,int actual_rank)
+        {
+            if(count<=0)throw std::invalid_argument("Pipeline evidence requires its original main boundary");
+            std::vector<PipelineParityLayerObservation> result(static_cast<std::size_t>(count));
+            for(const auto& stage:stages)
+            {
+                if(stage.rank!=actual_rank || stage.stage<0 || stage.first_layer<0 || stage.last_layer<=stage.first_layer || stage.last_layer>count)
+                    throw std::invalid_argument("Pipeline evidence stage escapes its original main boundary");
+                for(int layer=stage.first_layer;layer<stage.last_layer;++layer)++result[layer].claims;
+            }
+            for(const auto& layer:layers)
+            {
+                if(layer.layer_idx<0 || layer.layer_idx>=count)
+                    throw std::invalid_argument("Pipeline evidence contains a foreign decoder");
+                ++result[layer.layer_idx].records;
+                if(raw)++result[layer.layer_idx].valid_records;
+            }
+            return result;
+        }
+
+        /** @brief Exchange only completed comparison metadata through the original MPI owner.
+         * @param local Exact original scalar comparison header.
+         * @param layers Actual local global-indexed raw diagnostics.
+         * @param phase Original phase; no tensor/snapshot or controller state is exchanged.
+         * @param step Exact original decode index; prefill uses minus one.
+         * @return Complete immutable diagnostic certificate, or a collective metadata rejection. */
+        PipelineParityEvidence collectPipelineParityEvidence(PipelineParityObservation local,
+            const std::vector<LayerStats>& layers,ParityForwardPhase phase,int step)
+        {
+            // Exact original literal identities prevent same-geometry evidence
+            // from another case/reference/request entering this diagnostic union.
+            const auto* test=::testing::UnitTest::GetInstance()->current_test_info();
+            if(!test)throw std::logic_error("Pipeline comparison has no original canonical test identity");
+            std::string identity;
+            // Length framing keeps literal path/prompt fields unambiguous;
+            // frozen-history identity includes its exact teacher trajectory.
+            const auto append=[&](const std::string& value) {
+                identity+=std::to_string(value.size())+":"+value;
+            };
+            append(test->test_suite_name());append(test->name());append(cfg().name);append(getBackendName());
+            // Frame every original reference-pack field independently. The
+            // local cache key uses separators and is not a wire identity parser.
+            append(config_.snapshot_dir);append(config_.model_path);
+            append(parityPredictorIdentity(config_.shared_predictor));append(config_.prompt);
+            append(std::to_string(config_.decode_steps));
+            append(frozen_history_replay_ ? frozen_history_replay_->identity() : std::string{});
+            append(std::to_string(config_.token_ids.size()));
+            for(const auto token:config_.token_ids)append(std::to_string(token));
+            if(identity.size()>std::size_t(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("Pipeline comparison identity exceeds original MPI extent");
+            const int bytes=static_cast<int>(identity.size());
+            std::vector<int> sizes(static_cast<std::size_t>(mpiWorldSize())),offsets(sizes.size());
+            parityCoordinationMPIContext()->allgather_bytes(&bytes,sizes.data(),sizeof(bytes));
+            int total=0;
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+            {
+                if(sizes[rank]<=0 || sizes[rank]>std::numeric_limits<int>::max()-total)
+                    throw std::invalid_argument("Pipeline comparison identity metadata extent is invalid");
+                offsets[rank]=total;total+=sizes[rank];
+            }
+            std::string joined(static_cast<std::size_t>(total),'\0');
+            parityCoordinationMPIContext()->allgatherv_bytes(identity.data(),bytes,joined.data(),sizes.data(),offsets.data());
+            std::vector<std::string> identities;
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+                identities.emplace_back(joined.data()+offsets[rank],static_cast<std::size_t>(sizes[rank]));
+            requirePipelineParityIdentities(identities);
+            // A split owner compares its production-completed local TP
+            // snapshot. Summing tensor values across PP owners would both
+            // invent evidence and mismatch their different layer scopes.
+            if(config_.collective_evidence_source!=ParityCollectiveEvidenceSource::PostCollectiveSnapshot ||
+               !config_.allreduce_stages.empty())
+                throw std::invalid_argument("Split pipeline parity requires original completed local-collective snapshots");
+            const int count=config_.early_layers_count;
+            const auto [valid,stages]=originalPipelineParityOwnership();
+            local.rank=mpiRank();local.world=mpiWorldSize();local.layers=count;
+            local.phase=static_cast<int>(phase);local.step=step;local.scope_valid=valid;
+            const auto raw=valid ? acceptsOwnedPipelineRawEvidence(layers,stages,config_,phase,mpiRank())
+                : ::testing::AssertionFailure()<<"Pipeline parity lost its original admitted stage authority";
+            EXPECT_TRUE(raw)<<raw.message();
+            local.local_raw_valid=bool(raw);
+            std::vector<PipelineParityLayerObservation> owned(count>0 ? std::size_t(count) : 0);
+            for(const auto& stage:stages)
+            {
+                local.embedding_claims+=stage.embedding;local.logits_claims+=stage.logits;
+            }
+            try { owned=pipelineParityLayerObservations(layers,stages,count,bool(raw),mpiRank()); }
+            catch(const std::invalid_argument&) { local.local_raw_valid=0; }
+            std::vector<PipelineParityObservation> headers(static_cast<std::size_t>(mpiWorldSize()));
+            parityCoordinationMPIContext()->allgather_bytes(&local,headers.data(),sizeof(local));
+            if(count<=0 || std::any_of(headers.begin(),headers.end(),[&](const auto& header){
+                    return header.layers!=count || header.world!=mpiWorldSize();}) ||
+               std::size_t(count)>std::size_t(std::numeric_limits<int>::max())/sizeof(PipelineParityLayerRecord)/headers.size())
+                throw std::invalid_argument("Pipeline comparison metadata geometry disagrees before exchange");
+            const auto compact=compactPipelineParityLayers(owned);
+            const int local_bytes=static_cast<int>(compact.size()*sizeof(PipelineParityLayerRecord));
+            parityCoordinationMPIContext()->allgather_bytes(&local_bytes,sizes.data(),sizeof(local_bytes));
+            total=0;
+            std::vector<std::size_t> rank_counts(sizes.size());
+            for(std::size_t rank=0;rank<sizes.size();++rank)
+            {
+                if(sizes[rank]<0 || sizes[rank]%sizeof(PipelineParityLayerRecord) ||
+                   std::size_t(sizes[rank])/sizeof(PipelineParityLayerRecord)>std::size_t(count) ||
+                   sizes[rank]>std::numeric_limits<int>::max()-total)
+                    throw std::invalid_argument("Pipeline comparison compact metadata extent is invalid");
+                offsets[rank]=total;total+=sizes[rank];
+                rank_counts[rank]=std::size_t(sizes[rank])/sizeof(PipelineParityLayerRecord);
+            }
+            std::vector<PipelineParityLayerRecord> received(std::size_t(total)/sizeof(PipelineParityLayerRecord));
+            parityCoordinationMPIContext()->allgatherv_bytes(compact.data(),local_bytes,received.data(),sizes.data(),offsets.data());
+            const auto all=expandPipelineParityLayers(received,rank_counts,count);
+            return mergePipelineParityEvidence(headers,all,count,phase,step);
+        }
+
+        /** @brief Collect actual prefill evidence and copy only original head/tail scalar metrics.
+         * @param summary Actual local comparator output; local layer/stage CSV diagnostics are retained. */
+        void completePipelinePrefillEvidence(ParityTestSummary& summary)
+        {
+            PipelineParityObservation local;
+            summary.pipeline_local_embedding_passed=summary.embedding_passed;
+            local.embedding_valid=summary.embedding_evidence_valid;
+            local.embedding_cosine=summary.embedding_cosine;local.embedding_passed=summary.embedding_passed;
+            local.has_logits=summary.lm_head_evidence_valid;local.logits_valid=summary.lm_head_evidence_valid;
+            local.cosine=summary.lm_head_cosine;local.kl=summary.lm_head_kl;
+            local.top1=summary.lm_head_top1;local.top5=summary.lm_head_top5;
+            local.logit_passed=summary.lm_head_passed;local.reference_in_top3=summary.lm_head_pytorch_top1_in_top3;
+            local.actual_token=summary.lm_head_llaminar_token;local.reference_token=summary.lm_head_pytorch_token;
+            summary.pipeline_evidence=collectPipelineParityEvidence(local,summary.layer_stats,ParityForwardPhase::Prefill,-1);
+            const auto& head=summary.pipeline_evidence->head();const auto& tail=summary.pipeline_evidence->tail();
+            summary.embedding_evidence_valid=head.embedding_valid;summary.embedding_cosine=head.embedding_cosine;
+            summary.embedding_passed=head.embedding_passed;
+            summary.lm_head_evidence_valid=tail.logits_valid;summary.lm_head_cosine=tail.cosine;summary.lm_head_kl=tail.kl;
+            summary.lm_head_top1=tail.top1;summary.lm_head_top5=tail.top5;summary.lm_head_passed=tail.logit_passed;
+            summary.lm_head_pytorch_top1_in_top3=tail.reference_in_top3;
+            summary.lm_head_llaminar_token=tail.actual_token;summary.lm_head_pytorch_token=tail.reference_token;
+        }
+
+        /** @brief Combine every original decode step before unchanged final numerical acceptance.
+         * @param summary Actual local diagnostic trajectory.
+         * @param sum_cosine Original tail's ordered sum, copied unchanged to other participants.
+         * @param sum_kl Original tail's ordered sum, never averaged/reduced across ranks. */
+        void completePipelineDecodeEvidence(DecodeParitySummary& summary,float& sum_cosine,float& sum_kl)
+        {
+            struct Totals{float cosine,kl;int steps,top1,top3,top5;std::uint64_t records;};
+            const Totals local{sum_cosine,sum_kl,summary.steps_total,summary.top1_matches,summary.top3_matches,
+                summary.top5_matches,summary.step_stats.size()};
+            std::vector<Totals> totals(static_cast<std::size_t>(mpiWorldSize()));
+            parityCoordinationMPIContext()->allgather_bytes(&local,totals.data(),sizeof(local));
+            // Agree every participant's complete cardinality before any
+            // step exchange: a truncated local bank must fail collectively.
+            if(std::any_of(totals.begin(),totals.end(),[&](const auto& value){
+                    return value.steps!=config_.decode_steps || value.records!=std::uint64_t(config_.decode_steps);}))
+                throw std::invalid_argument("Pipeline parity lost its complete original decode trajectory");
+            summary.steps_passed=0;
+            int tail_rank=-1;
+            for(auto& step:summary.step_stats)
+            {
+                PipelineParityObservation observed;
+                observed.has_logits=step.has_logit_data;observed.logits_valid=step.logit_evidence_valid;
+                observed.cosine=step.cosine_similarity;observed.kl=step.kl_divergence;
+                observed.top1=step.top1_overlap;observed.top5=step.top5_overlap;
+                observed.actual_token=step.llaminar_token;observed.reference_token=step.pytorch_token;
+                observed.token_match=step.token_match;observed.top3_match=step.top3_match;observed.top5_match=step.top5_match;
+                step.pipeline_evidence=collectPipelineParityEvidence(observed,step.layer_stats,ParityForwardPhase::Decode,step.step_idx);
+                const auto& tail=step.pipeline_evidence->tail();
+                if(tail_rank>=0 && tail_rank!=step.pipeline_evidence->tailRank())
+                    throw std::invalid_argument("Pipeline final-logit owner changed within original trajectory");
+                tail_rank=step.pipeline_evidence->tailRank();
+                step.has_logit_data=tail.has_logits;step.logit_evidence_valid=tail.logits_valid;
+                step.cosine_similarity=tail.cosine;step.kl_divergence=tail.kl;step.top1_overlap=tail.top1;step.top5_overlap=tail.top5;
+                step.llaminar_token=tail.actual_token;step.pytorch_token=tail.reference_token;
+                step.token_match=tail.token_match;step.top3_match=tail.top3_match;step.top5_match=tail.top5_match;
+                step.passed=step.logit_evidence_valid && config_.final_logit_mean_kl->accepts(step.kl_divergence,false);
+                summary.steps_passed+=step.passed;
+            }
+            if(tail_rank<0)throw std::invalid_argument("Pipeline decode has no original final-logit owner");
+            sum_cosine=totals[tail_rank].cosine;sum_kl=totals[tail_rank].kl;
+            summary.top1_matches=totals[tail_rank].top1;summary.top3_matches=totals[tail_rank].top3;summary.top5_matches=totals[tail_rank].top5;
+        }
+
+        /** @brief Consume only complete original distributed evidence or the unchanged local law.
+         * @param summary Actual original diagnostic bank, ordinary or TP.
+         * @param config Original thresholds/required stage declaration.
+         * @param phase Actual compared phase. @param step Actual original decode index, or minus one.
+         * @return Exact complete evidence verdict; missing pipeline proof is failure. */
+        template<class Summary>
+        static ::testing::AssertionResult acceptsFinalLogitSummaryRawEvidence(const Summary& summary,
+            const ParityConfig& config,ParityForwardPhase phase,int step=-1)
+        {
+            if(config.uses_cross_rank_pipeline)
+            {
+                if constexpr(requires{summary.pipeline_evidence;})
+                    if(summary.pipeline_evidence && summary.pipeline_evidence->matches(phase,step,config.early_layers_count))
+                        return ::testing::AssertionSuccess();
+                return ::testing::AssertionFailure()<<"Missing/mismatched complete original pipeline comparison evidence";
+            }
+            return acceptsFinalLogitRawEvidence(summary.layer_stats,config,phase);
+        }
+
         /** @return Additional original decoder evidence; legacy families retain their policy. */
         virtual ::testing::AssertionResult acceptsAdditionalDecodeEvidence(const DecodeParitySummary &) const
         {
@@ -12522,7 +12843,7 @@ namespace llaminar2::test::parity
                     structural_accepted;
                 for (const auto &step : summary.step_stats)
                     summary.overall_passed = summary.overall_passed &&
-                        acceptsFinalLogitRawEvidence(step.layer_stats, config, ParityForwardPhase::Decode);
+                        acceptsFinalLogitSummaryRawEvidence(step, config, ParityForwardPhase::Decode, step.step_idx);
             }
         }
 
@@ -12565,14 +12886,17 @@ namespace llaminar2::test::parity
             Summary &summary, const ParityConfig &config,
             bool embedding_passed, bool additional_accepted = true)
         {
-            summary.early_layers_passed = embedding_passed ? 1 : 0;
+            bool local_embedding_passed=embedding_passed;
+            if constexpr(requires{summary.pipeline_evidence;summary.pipeline_local_embedding_passed;})
+                if(summary.pipeline_evidence)local_embedding_passed=summary.pipeline_local_embedding_passed;
+            summary.early_layers_passed = local_embedding_passed ? 1 : 0;
             for (int index = 0; index < std::min(config.early_layers_count,
                      static_cast<int>(summary.layer_stats.size())); ++index)
             {
                 if (summary.layer_stats[index].passed)
                     ++summary.early_layers_passed;
             }
-            summary.total_layers_passed = embedding_passed ? 1 : 0;
+            summary.total_layers_passed = local_embedding_passed ? 1 : 0;
             for (const auto &layer : summary.layer_stats)
             {
                 if (layer.passed)
@@ -12582,7 +12906,7 @@ namespace llaminar2::test::parity
                 ? config.final_logit_mean_kl->valid() && summary.embedding_evidence_valid &&
                     summary.lm_head_evidence_valid && summary.lm_head_passed &&
                     config.final_logit_mean_kl->accepts(summary.lm_head_kl, true) && additional_accepted &&
-                    acceptsFinalLogitRawEvidence(summary.layer_stats, config, ParityForwardPhase::Prefill)
+                    acceptsFinalLogitSummaryRawEvidence(summary, config, ParityForwardPhase::Prefill)
                 : summary.early_layers_passed >= config.min_early_layers_passed &&
                     summary.lm_head_passed && additional_accepted;
         }
@@ -12637,7 +12961,7 @@ namespace llaminar2::test::parity
             const bool require_complete_segmented_prefill_snapshots =
                 prefill_probe.prefill_chunk_successful_schedules > 0;
 
-            int n_layers = parityLayerCount();
+            int n_layers = usesDistributedPipelineEvidence() ? config_.early_layers_count : parityLayerCount();
 
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
@@ -12731,6 +13055,8 @@ namespace llaminar2::test::parity
             // Compare each layer
             for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
             {
+                if(usesDistributedPipelineEvidence() &&
+                   !ownsPipelineParityKey("layer"+std::to_string(layer_idx)+"_"))continue;
                 LayerStats stats;
                 std::optional<StageComparisonResult> aligned_route_diagnostic;
                 stats.layer_idx = layer_idx;
@@ -13099,6 +13425,7 @@ namespace llaminar2::test::parity
                                      ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
                                      (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
 
+            if(usesDistributedPipelineEvidence())completePipelinePrefillEvidence(summary);
             const auto additional_accepted = acceptsAdditionalPrefillEvidence(summary);
             EXPECT_TRUE(additional_accepted)
                 << "Model-specific complete prefill evidence failed: embedding/logits or original decoder identities";
@@ -13809,7 +14136,7 @@ namespace llaminar2::test::parity
             if (config_.final_logit_mean_kl)
             {
                 exportTPPrefillCSV(summary);
-                const auto raw = acceptsFinalLogitRawEvidence(summary.layer_stats, config_, ParityForwardPhase::Prefill);
+                const auto raw = acceptsFinalLogitSummaryRawEvidence(summary, config_, ParityForwardPhase::Prefill);
                 EXPECT_TRUE(raw) << raw.message();
                 if (!summary.embedding_evidence_valid || !summary.lm_head_evidence_valid)
                 {
@@ -14018,7 +14345,7 @@ namespace llaminar2::test::parity
 
             if (config_.final_logit_mean_kl)
             {
-                const auto raw = acceptsFinalLogitRawEvidence(summary.layer_stats, config_, ParityForwardPhase::Prefill);
+                const auto raw = acceptsFinalLogitSummaryRawEvidence(summary, config_, ParityForwardPhase::Prefill);
                 EXPECT_TRUE(raw) << raw.message();
                 if (!summary.embedding_evidence_valid || !summary.lm_head_evidence_valid)
                 {
@@ -14375,7 +14702,7 @@ namespace llaminar2::test::parity
                 // ---------------------------------------------------------------
                 {
                     auto scope = profileParityScope("decode_parity.step.layer_compare");
-                    int n_layers = parityLayerCount();
+                    int n_layers = usesDistributedPipelineEvidence() ? config_.early_layers_count : parityLayerCount();
                     auto snapshot_keys = activeSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
                     const auto gdn_cfg_decode = getGDNHeadConfig();
@@ -14383,6 +14710,8 @@ namespace llaminar2::test::parity
 
                     for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
                     {
+                        if(usesDistributedPipelineEvidence() &&
+                           !ownsPipelineParityKey("layer"+std::to_string(layer_idx)+"_"))continue;
                         LayerStats stats;
                         std::optional<StageComparisonResult> aligned_route_diagnostic;
                         stats.layer_idx = layer_idx;
@@ -14746,6 +15075,7 @@ namespace llaminar2::test::parity
                 summary.step_stats.push_back(step_stats);
             }
 
+            if(usesDistributedPipelineEvidence())completePipelineDecodeEvidence(summary,sum_cosine,sum_kl);
             // Compute aggregate statistics
             if (summary.steps_total > 0)
             {
@@ -15063,7 +15393,7 @@ namespace llaminar2::test::parity
                 EXPECT_TRUE(structural) << structural.message();
                 for (const auto &step : summary.step_stats)
                 {
-                    const auto raw = acceptsFinalLogitRawEvidence(step.layer_stats, config_, ParityForwardPhase::Decode);
+                    const auto raw = acceptsFinalLogitSummaryRawEvidence(step, config_, ParityForwardPhase::Decode, step.step_idx);
                     EXPECT_TRUE(raw) << "step " << step.step_idx << ": " << raw.message();
                 }
                 EXPECT_TRUE(summary.overall_passed) << "Final-logit decode failed independent per-step or structural evidence";
@@ -15210,6 +15540,24 @@ namespace llaminar2::test::parity
                 return;
             }
 
+            std::optional<ParityTestSummary> original_fragment;
+            if(summary.pipeline_evidence)
+            {
+                original_fragment=summary;
+                if(summary.pipeline_evidence->headRank()!=mpiRank())
+                {
+                    original_fragment->embedding_cosine=0;original_fragment->embedding_passed=false;
+                    original_fragment->embedding_evidence_valid=false;
+                }
+                if(summary.pipeline_evidence->tailRank()!=mpiRank())
+                {
+                    original_fragment->lm_head_cosine=original_fragment->lm_head_kl=0;
+                    original_fragment->lm_head_top1=original_fragment->lm_head_top5=0;
+                    original_fragment->lm_head_passed=false;original_fragment->lm_head_evidence_valid=false;
+                    original_fragment->lm_head_pytorch_top1_in_top3=false;
+                }
+            }
+            const auto& local_summary=original_fragment ? *original_fragment : summary;
             ASSERT_NE(mpi_ctx_, nullptr);
             ASSERT_GT(mpiWorldSize(), 1);
 
@@ -15230,27 +15578,26 @@ namespace llaminar2::test::parity
             };
 
             RankPrefillSummary local{};
-            local.embedding_cosine = summary.embedding_cosine;
-            local.embedding_passed = summary.embedding_passed ? 1 : 0;
-            local.has_embedding_data =
-                (summary.embedding_passed || summary.embedding_cosine != 0.0f)
-                    ? 1
-                    : 0;
-            local.lm_head_cosine = summary.lm_head_cosine;
-            local.lm_head_kl = summary.lm_head_kl;
-            local.lm_head_top1 = summary.lm_head_top1;
-            local.lm_head_top5 = summary.lm_head_top5;
+            local.embedding_cosine = local_summary.embedding_cosine;
+            local.embedding_passed = local_summary.embedding_passed ? 1 : 0;
+            local.has_embedding_data = summary.pipeline_evidence
+                ? int(local_summary.embedding_evidence_valid)
+                : int(local_summary.embedding_passed || local_summary.embedding_cosine != 0.0f);
+            local.lm_head_cosine = local_summary.lm_head_cosine;
+            local.lm_head_kl = local_summary.lm_head_kl;
+            local.lm_head_top1 = local_summary.lm_head_top1;
+            local.lm_head_top5 = local_summary.lm_head_top5;
             local.lm_head_top1_in_topk =
-                summary.lm_head_pytorch_top1_in_top3 ? 1 : 0;
-            local.lm_head_passed = summary.lm_head_passed ? 1 : 0;
+                local_summary.lm_head_pytorch_top1_in_top3 ? 1 : 0;
+            local.lm_head_passed = local_summary.lm_head_passed ? 1 : 0;
             local.has_lm_head_data =
-                (summary.lm_head_passed || summary.lm_head_cosine != 0.0f ||
-                 summary.lm_head_kl != 0.0f || summary.lm_head_top1 != 0.0f ||
-                 summary.lm_head_top5 != 0.0f)
+                (local_summary.lm_head_passed || local_summary.lm_head_cosine != 0.0f ||
+                 local_summary.lm_head_kl != 0.0f || local_summary.lm_head_top1 != 0.0f ||
+                 local_summary.lm_head_top5 != 0.0f)
                     ? 1
                     : 0;
-            local.early_layers_passed = summary.early_layers_passed;
-            local.total_layers_passed = summary.total_layers_passed;
+            local.early_layers_passed = local_summary.early_layers_passed;
+            local.total_layers_passed = local_summary.total_layers_passed;
 
             std::vector<RankPrefillSummary> rank_summaries(
                 static_cast<size_t>(mpiWorldSize()));
@@ -15264,7 +15611,7 @@ namespace llaminar2::test::parity
                 dir / (".pipeline_prefill_rank_" + std::to_string(mpiRank()));
             const int32_t local_write_ok =
                 ParityCSVArtifactWriter::writePrefill(
-                    fragment_dir, getBackendName(), summary)
+                    fragment_dir, getBackendName(), local_summary)
                     ? 1
                     : 0;
             std::vector<int32_t> write_status(
@@ -15279,8 +15626,8 @@ namespace llaminar2::test::parity
             if (isRank0())
             {
                 ParityTestSummary aggregate;
-                const auto &head = rank_summaries.front();
-                const auto &tail = rank_summaries.back();
+                const auto &head = rank_summaries[summary.pipeline_evidence ? summary.pipeline_evidence->headRank() : 0];
+                const auto &tail = rank_summaries[summary.pipeline_evidence ? summary.pipeline_evidence->tailRank() : rank_summaries.size()-1];
                 EXPECT_EQ(head.has_embedding_data, 1)
                     << "Pipeline head published no embedding comparison";
                 EXPECT_EQ(tail.has_lm_head_data, 1)
@@ -15307,6 +15654,12 @@ namespace llaminar2::test::parity
                         config_.min_early_layers_passed &&
                     aggregate.lm_head_passed;
 
+                if(summary.pipeline_evidence)
+                {
+                    aggregate.overall_passed=summary.overall_passed;
+                    aggregate.embedding_evidence_valid=summary.embedding_evidence_valid;
+                    aggregate.lm_head_evidence_valid=summary.lm_head_evidence_valid;
+                }
                 std::vector<std::filesystem::path> rank_dirs;
                 rank_dirs.reserve(static_cast<size_t>(mpiWorldSize()));
                 for (int rank = 0; rank < mpiWorldSize(); ++rank)
@@ -15364,6 +15717,10 @@ namespace llaminar2::test::parity
                 return;
             }
 
+            auto original_fragment=summary;
+            for(auto& step:original_fragment.step_stats)
+                if(step.pipeline_evidence && step.pipeline_evidence->tailRank()!=mpiRank())
+                    step.has_logit_data=false;
             ASSERT_NE(mpi_ctx_, nullptr);
             ASSERT_GT(mpiWorldSize(), 1);
             const auto dir = ensureResultsDir();
@@ -15371,7 +15728,7 @@ namespace llaminar2::test::parity
                 dir / (".pipeline_decode_rank_" + std::to_string(mpiRank()));
             const int32_t local_write_ok =
                 ParityCSVArtifactWriter::writeDecode(
-                    fragment_dir, getBackendName(), summary)
+                    fragment_dir, getBackendName(), original_fragment)
                     ? 1
                     : 0;
             std::vector<int32_t> write_status(

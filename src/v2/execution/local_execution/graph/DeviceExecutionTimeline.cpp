@@ -78,6 +78,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::DeviceGenerationController,
                     .consumers = roles({
                         DeviceTimelineRole::DeviceGenerationController,
+                        DeviceTimelineRole::MoERebalanceMaintenance,
                         DeviceTimelineRole::AllPositionVerifier,
                         DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::RequestStateReset,
@@ -228,6 +229,7 @@ namespace llaminar2
                     .producer = DeviceTimelineRole::MoERebalanceMaintenance,
                     .consumers = roles({
                         DeviceTimelineRole::MainForwardGraph,
+                        DeviceTimelineRole::DeviceGenerationController,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::Diagnostics,
                     }),

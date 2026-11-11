@@ -2990,6 +2990,21 @@ namespace llaminar2
                 "[DeviceGraphExecutor] Retained parent policy and topology composer must be supplied together");
             return false;
         }
+        const auto &prior_input_authority = retained_parent_composer.inputAuthority();
+        if (prior_input_authority)
+        {
+            if (!retained_parent_requested || !ctx)
+                throw std::logic_error("Prior-child arena producer requires its exact retained parent policy");
+            prior_input_authority->require(graph, ctx->deviceId(), gpu_stream);
+            if (segment_cache.initialized && !segment_cache.prior_child_input_authority)
+                throw std::logic_error("An already recorded parent cannot adopt a new prior-child arena producer");
+            if (segment_cache.prior_child_input_authority &&
+                !segment_cache.prior_child_input_authority->sameBinding(*prior_input_authority))
+                throw std::logic_error("Retained parent changed its original prior-child arena producer");
+        }
+        else if (segment_cache.prior_child_input_authority)
+            throw std::logic_error("Retained parent lost its original prior-child arena producer");
+
         if (retained_parent_requested &&
             (!ctx || !defer_final_sync || retained_full_graph_requested))
         {
@@ -3754,6 +3769,10 @@ namespace llaminar2
             segment_cache.capture_variant_signature = current_variant_signature;
         }
 
+        // Identity resets above retire the old parent before its source proof.
+        // Rebind the validated same original wire owner before planning reads.
+        segment_cache.prior_child_input_authority = prior_input_authority;
+
         // Monotonic step counter + phase transition selection for segmented mode.
         const auto phase_transition = DeviceGraphCaptureController::beginStep(
             segment_cache.initialized,
@@ -3767,7 +3786,15 @@ namespace llaminar2
          * retained graph on each sparse endpoint. Keep the producer-side gate
          * outside argument evaluation so ordinary replay allocates nothing.
          */
-        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
+        // Setup records/instantiates an executable but performs no model
+        // traversal. Its existing materialization metrics remain truthful;
+        // only a real submission can contribute executed decode work. This
+        // executor also submits prefill through the same native cache; its
+        // signature-owned workload, never the row count or a diagnostic name,
+        // identifies the phase. Prefill's caller already publishes its exact
+        // lifecycle, so adding a decode counter here would double-count it.
+        if (!materialize_without_launch && segment_cache.replay_workload.valid() &&
+            segment_cache.replay_workload.decode && PerfStatsCollector::isDomainEnabled("forward_graph"))
         {
             PerfStatsCollector::addCounter(
                 "forward_graph",

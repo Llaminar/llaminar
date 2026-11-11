@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "kernels/common/SamplingMath.h"
 #include <span>
 
 #include "../IComputeStage.h"
@@ -94,6 +95,19 @@ namespace llaminar2
             bool operator==(const MainKVBinding &) const = default;
         };
 
+        /** @brief Exact original compact fields needed by downstream stage cadence consumers.
+         * Only health/output-count/leading-count travel; the retained compact ABI
+         * bank remains original device storage, never a follower outcome owner. */
+        struct PipelineMoECommitEvidence final
+        {
+            int32_t *meta_device = nullptr;
+            int meta_stride = 0;
+            /** @return Whether the existing compact ABI bank can name all three exact fields. */
+            bool valid() const noexcept { return meta_device && reinterpret_cast<std::uintptr_t>(meta_device) % alignof(int32_t) == 0 &&
+                meta_stride >= sampling_math::kSpeculativeBatchMetaCount; }
+            bool operator==(const PipelineMoECommitEvidence &) const = default;
+        };
+
         /**
          * @brief One complete Dynamic ExpertOverlay cadence boundary on device.
          *
@@ -101,8 +115,10 @@ namespace llaminar2
          * optional controls. A greedy grouped MTP transaction advances the
          * boundary only after every accepted-state mutation has been queued on
          * the publication stream. The binding is absent for Static placement,
-         * stochastic reducers (which already own this transition), and
-         * non-controller publication authorities.
+         * stochastic reducers (which already own this transition). A pipeline
+         * follower may bind only its own cadence controller and the exact
+         * transported committed-round evidence; it acquires no response or
+         * sampling authority.
          */
         struct DynamicMoECommitBoundaryBinding
         {
@@ -186,6 +202,8 @@ namespace llaminar2
              */
             std::optional<DynamicMoECommitBoundaryBinding>
                 dynamic_moe_commit_boundary;
+            /** Tail-authored exact round evidence, relayed through the original publication topology. */
+            std::optional<PipelineMoECommitEvidence> pipeline_moe_commit_evidence;
 
             int request_count = 0;
             int verifier_rows_per_request = 0;

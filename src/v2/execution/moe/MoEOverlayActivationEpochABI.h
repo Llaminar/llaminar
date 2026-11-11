@@ -48,6 +48,10 @@ namespace llaminar2
         MainDecode = 2, ///< Main-model one-row decode per logical request.
         MTPDraft = 3, ///< One NextN/MTP sidecar depth per logical request.
         MTPGroupedVerifier = 4, ///< Main-model grouped verifier transaction.
+        MTPConditionSpeculativeContinuation = 5, ///< Accepted-state publication owns this scalar condition's cadence.
+        GenerationAdmission = 8, ///< Immutable request-policy envelope; no device computation.
+        OrdinaryForwardOnly = 7, ///< Sampler-free one-row condition commit; never a response-loop step.
+        MTPConditionCommittedSerialToken = 6, ///< This scalar condition owns one new serial commit.
     };
 
     /** Number of alternating payload banks in one activation transaction slot. */
@@ -78,7 +82,7 @@ namespace llaminar2
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
     /** Current binary layout and semantic-contract version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 9u;
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 10u;
     /** Original host-ordered identities have no native roster index. */
     inline constexpr std::uint32_t kMoEOverlayActivationOriginalNoSlot = 0xffffffffu;
 

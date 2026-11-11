@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "../../../utils/NativeQuantisedTestPartialStorage.h"
 #include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include <gtest/gtest.h>
@@ -1529,8 +1530,7 @@ namespace llaminar2::test
                                    1u,
                                    device)
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      device,
                                      "grouped_cpu_promotion_" +

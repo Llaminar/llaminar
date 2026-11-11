@@ -606,6 +606,7 @@ def validate_parity(report: dict, cells: list[dict]) -> None:
     for field in ("correctness_passed", "performance_requirements_met", "artifact_contract_passed"):
         if report.get(field) is not True:
             raise ValueError(f"production parity gate is red: {field}")
+    validate_prerequisites(report)
     prerequisites = report.get("preflight_tests", [])
     if (report.get("preflight_return_code") != 0 or report.get("preflight_test_count") != len(prerequisites)
             or not any(name.startswith("V2_Unit_") for name in prerequisites)

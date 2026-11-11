@@ -9,6 +9,7 @@
  * state crosses to a second authority while constructing or running the graph.
  */
 #include "Qwen4ExpPLEBuilder.h"
+#include "execution/local_execution/orchestrators/Qwen4ExpFixedHeadPipelinePort.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderGraph.h"
@@ -410,7 +411,7 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         keyNorm=c.prefix+"key_norm",queryNorm=c.prefix+"query_norm",gate=c.prefix+"gate",
         convNorm=c.prefix+"conv_norm",convolution=c.prefix+"convolution";
     std::vector<Pending> nodes;
-    std::optional<ComputeGraph> pooledGraph;
+    std::optional<ComputeGraph> lookupGraph;
     std::string lookupTerminal=gather;
     auto hashStage=std::make_unique<Stage>(Stage::Params{
         .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
@@ -444,7 +445,14 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
             ?Qwen4ExpPooledLookupDeclaration{std::get<Qwen4ExpPooledLookupStorage>(storage)}
             :Qwen4ExpPooledLookupDeclaration{std::get<Qwen4ExpPooledReaderLookupStorage>(storage)};
         if(pooledEarly)lookupTerminal=pooledEarly->consume(graph,c,b,original,hashIdentity,dependencies);
-        else {pooledGraph.emplace();lookupTerminal=appendOriginalPooledLookup(*pooledGraph,c,b,original,gather).last;}
+        else {lookupGraph.emplace();lookupTerminal=appendOriginalPooledLookup(*lookupGraph,c,b,original,gather).last;}
+    }
+    else if (const auto *pipeline = std::get_if<FixedPipelineLookupStorage>(&storage))
+    {
+        require(pipeline->port && !early && !residentEarly && !pooledEarly,
+            "Fixed PLE pipeline requires its original captured participant port");
+        lookupGraph.emplace();
+        pipeline->port->appendConsumer(*lookupGraph, c.prefix, gather, pipeline->query, pipeline->count, b.ids, b.embedding);
     }
     else if(auto *fixed=std::get_if<Qwen4ExpFixedHeadLookupStorage>(&storage))
     {
@@ -516,14 +524,14 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         require(!graph.getNode(nodes[i].name),"PLE node name collides with an existing producer");
         for(const auto &edge:nodes[i].dependencies)
         {
-            bool exists=graph.getNode(edge)!=nullptr || (pooledGraph && pooledGraph->getNode(edge));
+            bool exists=graph.getNode(edge)!=nullptr || (lookupGraph && lookupGraph->getNode(edge));
             for(std::size_t j=0;j<i;++j) exists=exists || nodes[j].name==edge;
             require(exists,"PLE graph dependency is absent or points to a later node");
         }
     }
-    if(pooledGraph)
-        for(const auto& name:pooledGraph->getExecutionOrder())
-            require(!graph.getNode(name),"PLE pooled node name collides with an existing producer");
+    if(lookupGraph)
+        for(const auto& name:lookupGraph->getExecutionOrder())
+            require(!graph.getNode(name),"PLE lookup node name collides with an existing producer");
     // merge() carries a source fragment's optional lane. A shared reader has
     // only its original participant relation and must never invent that lane.
     if(auto *whole=std::get_if<ImmutableLookupStage::Storage>(&storage))
@@ -533,7 +541,7 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
     {
         graph.addNode(node.name,std::move(node.stage),c.device);
         for(const auto &edge:node.dependencies) graph.addDependency(node.name,edge);
-        if(pooledGraph && node.name==hash){graph.merge(std::move(*pooledGraph),hash);pooledGraph.reset();}
+        if(lookupGraph && node.name==hash){graph.merge(std::move(*lookupGraph),hash);lookupGraph.reset();}
     }
     if(residentEarly)residentEarly->sealBranch(graph,key);
     return convolution;

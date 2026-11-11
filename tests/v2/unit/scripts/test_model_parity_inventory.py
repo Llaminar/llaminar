@@ -487,7 +487,7 @@ class LosslessRuntimeDocumentTests(unittest.TestCase):
                       "maximum_cache_rows": 64, "cache_physical_byte_limit": 4096}]
         return {"model": "/original/main.gguf", "shared_predictor": "/original/mtp.gguf",
                 "runtime": {"configuration_policy": "lossless_declared_document_v1",
-                    "configuration_document": {"kind": "llaminar.orchestration-config", "schema_version": 12,
+                    "configuration_document": {"kind": "llaminar.orchestration-config", "schema_version": 13,
                         "configuration": {"model_path": "/original/main.gguf", "shared_predictor": "/original/mtp.gguf",
                             "ngram_table_policy": {"gpu_adaptive": {"local_hot_cache": {
                                 "maximum_cache_rows": 0, "cache_physical_byte_limit": 0,
@@ -540,6 +540,159 @@ class LosslessRuntimeDocumentTests(unittest.TestCase):
                 lambda r:r['diagnostic_benchmark']['configuration_document'].update(kind='foreign')):
             bad=copy.deepcopy(original);mutate(bad)
             with self.assertRaises(ValueError):inventory.map_predictor_source(bad,str)
+
+
+class ObservedFixedPipelineInventoryTests(unittest.TestCase):
+    """Replay declaration binding, original rank retirement and native measured evidence."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.exact = "ObservedFixture.ProductionParity/Exact"
+        self.participants = [
+            dict(stage=stage, backend="rocm", ordinal=ordinal, uuid=f"gpu-{ordinal}",
+                 native_isa="gfx906", numa_node=1, pcie_upstream_bdfs=[f"0000:{stage+8:02x}:00.0"])
+            for stage, ordinal in ((0, 2), (0, 4), (1, 6))]
+        self.declaration = dict(model_parity_schema=1, id="Exact", model="/model.gguf",
+            inventory_role="numerical_diagnostic", e2e=None, cross_host_e2e=[], benchmark=None,
+            runtime=dict(generation=dict(mtp_policy="off"), movement_evidence="forbidden",
+                         configuration_policy="observed_pipeline_binding_required_v1",
+                         observed_pipeline_request=dict(backend="rocm", native_isa="gfx906", mpi_ranks=2,
+                                                        stage_sizes=[2, 1])))
+        domains = [dict(name=f"stage-{stage}", owner_rank=0, scope="RANK_LOCAL", devices=[
+            dict(hostname="observed", numa_node=1, device_type="ROCm", device_ordinal=p["ordinal"])
+            for p in self.participants if p["stage"] == stage]) for stage in range(2)]
+        self.config = dict(kind="llaminar.orchestration-config", schema_version=1, configuration=dict(
+            planning_mode="Apply", mpi_procs=2, execution_rank_selection=[1], domain_definitions=domains,
+            pp_stage_definitions=[dict(stage_id=stage, domain_name=f"stage-{stage}") for stage in range(2)]))
+        self.exported = dict(schema=1, exact_cell=self.exact, declaration=self.declaration,
+            configuration={**self.declaration, "runtime": dict(
+                generation=dict(mtp_policy="off"), movement_evidence="forbidden",
+                configuration_policy="lossless_declared_document_v1", configuration_document=self.config),
+                "diagnostic_benchmark": dict(configuration_policy="lossless_declared_document_v1",
+                                             configuration_document=self.config)})
+        self.receipts = []
+        for rank in range(2):
+            path = self.directory / "observed-pipeline" / f"rank-{rank}"
+            path.mkdir(parents=True)
+            self.receipts.append(path / "observed-pipeline-binding.json")
+            self.receipts[-1].write_text(json.dumps(dict(schema=1, cell="Exact", discovery_rank=rank,
+                discovery_size=2, active=rank == 1, execution_rank=0 if rank == 1 else None,
+                selected_discovery_ranks=[1], original_owner=1, original_hostname="observed",
+                original_numa_node=1, requested_native_isa="gfx906", stage_sizes=[2,1],
+                participants=self.participants, terminal_join_completed=True, parity_work_succeeded=True)))
+        self.config_path = self.receipts[1].parent / "observed-pipeline-config.json"
+        self.config_path.write_text(json.dumps(self.exported))
+
+    def bound(self):
+        return inventory.bind_observed_pipeline_artifacts(self.exact, self.declaration, self.directory)
+
+    def test_original_binding_rejects_changed_placement_and_inactive_work(self):
+        record = self.bound()
+        self.assertEqual(record["diagnostic_benchmark"]["configuration_document"], self.config)
+        self.assertTrue(inventory.InventoryScope.LOCAL_DIAGNOSTIC.accepts(record))
+        self.assertFalse(inventory.InventoryScope.ALL.accepts(record))
+        false_selection = copy.deepcopy(self.exported)
+        false_selection["configuration"]["runtime"]["configuration_document"]["configuration"]["execution_rank_selection"] = [0]
+        self.config_path.write_text(json.dumps(false_selection))
+        with self.assertRaisesRegex(ValueError, "rank selection"):
+            self.bound()
+        self.config_path.write_text(json.dumps(self.exported))
+        (self.receipts[0].parent / "observed-pipeline-config.json").write_text("{}")
+        with self.assertRaisesRegex(ValueError, "inactive original"):
+            self.bound()
+
+    def test_runtime_and_terminal_keep_actual_native_owner_roster(self):
+        record = self.bound()
+        runtime = {key: record["observed_pipeline_binding"][key] for key in (
+            "discovery_size", "selected_discovery_ranks", "original_owner", "original_hostname",
+            "original_numa_node", "execution_rank", "stage_sizes", "participants")}
+        runtime = copy.deepcopy(runtime)
+        runtime.update(ple_stage=0, ple_consumers=["ROCm:2", "ROCm:4"],
+            fixed_owners=[dict(device=f"ROCm:{ordinal}", stage=stage, participant=member,
+                               consumer=consumer, first_head=index*2, heads=2, native_bytes=180)
+                for index,(ordinal,stage,member,consumer) in enumerate(((2,0,0,0),(6,1,0,0),(4,0,1,1)))])
+        inventory.require_observed_pipeline_runtime(record,runtime)
+        report = dict(schema="llaminar.fixed-native-pipeline-terminal.v1", owners={
+            owner["device"]: {name: 0 if name.endswith("failures") else 1
+                for name in inventory.FIXED_NATIVE_PIPELINE_METRICS} for owner in runtime["fixed_owners"]})
+        records = [dict(domain="immutable_lookup", device=device, name=name, phase="request_terminal",
+                        kind="counter", count=1, sequence_word_count=1, value=value,
+                        tags={"authority":"pipeline_generation_terminal","request":"0"})
+                   for device, fields in report["owners"].items() for name,value in fields.items()]
+        document = dict(observed_pipeline_binding=runtime, fixed_native_pipeline_terminal=report)
+        self.assertEqual(inventory.require_observed_pipeline_terminal(document,records),report)
+        with self.assertRaisesRegex(ValueError, "repeats"):
+            inventory.require_observed_pipeline_terminal(document,[*records,records[0]])
+        wrong_count = copy.deepcopy(records)
+        wrong_count[-1]["sequence_word_count"] = 0
+        with self.assertRaisesRegex(ValueError, "foreign device, phase or count"):
+            inventory.require_observed_pipeline_terminal(document,wrong_count)
+        for name in ("adaptive_lookup_calls", "fixed_head_lookup_calls"):
+            legacy = dict(records[0], name=name, phase="generation_terminal",
+                          tags={"authority":"terminal_device_generation_control","request":"0"})
+            with self.assertRaisesRegex(ValueError, "legacy immutable lookup"):
+                inventory.require_observed_pipeline_terminal(document,[*records,legacy])
+        with self.assertRaisesRegex(ValueError, "totals differ"):
+            inventory.require_observed_pipeline_terminal(document,records[:-1])
+        runtime["participants"][0]["uuid"] = "other"
+        with self.assertRaisesRegex(ValueError, "substituted original"):
+            inventory.require_observed_pipeline_runtime(record,runtime)
+
+    def test_release_guardian_owns_one_original_rankfile_session(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from run_model_kld_canaries import original_local_launch
+        from run_model_parity_benchmarks import run_declared_guardian
+        binary = self.directory / "llaminar"
+        launcher = self.directory / "llaminar_mpi_session"
+        mpi = self.directory / "mpirun"
+        for path in (binary, launcher, mpi):
+            path.touch()
+            path.chmod(0o700)
+        rankfile = self.directory / "original-ranks"
+        rankfile.write_text("original observer placement")
+        args = SimpleNamespace(binary=binary,mpi_rankfile=rankfile)
+        adapter = SimpleNamespace(topology=dict(expected_config=self.config))
+        numerical, release = self.directory / "numerical", self.directory / "release"
+        numerical.mkdir()
+        release.mkdir()
+        env = dict(PATH=str(self.directory))
+        _, pins, proof = original_local_launch(args,adapter,None,numerical,[str(binary)],env)
+        command, release_pins, release_proof = original_local_launch(
+            args,adapter,None,release,[str(binary),"benchmark"],env,prepare_session=False)
+        self.assertTrue((numerical / "mpi-session").is_dir())
+        self.assertFalse((release / "mpi-session").exists())
+        self.assertEqual(pins,release_pins)
+        self.assertEqual(proof,release_proof)
+        self.assertIn("--rankfile",command)
+        with patch("run_model_parity_benchmarks.subprocess.Popen") as process, \
+             patch("mpi_session_retirement.require_retired") as retire:
+            process.return_value.wait.return_value = 0
+            process.return_value.poll.return_value = 0
+            run_declared_guardian(command,env,release)
+        process.assert_called_once()
+        retire.assert_called_once()
+        self.assertTrue((release / "mpi-session").is_dir())
+
+    def test_original_inactive_observer_rank_is_terminal_only(self):
+        from model_kld_corpus_v2 import metadata_digest, validate_distributed_rank_reports
+        manifest = dict(schema=2)
+        topology = dict(expected_config=self.config, runtime_config_digest="selected")
+        document = dict(observed_pipeline_binding=dict(selected_discovery_ranks=[1], discovery_size=2,
+                                                       original_owner=1, execution_rank=0))
+        files = [self.directory / f"rank-{rank}.json" for rank in range(2)]
+        for rank, path in enumerate(files):
+            path.write_text(json.dumps(dict(schema="llaminar.qfn-observed-pipeline-rank.v1", discovery_rank=rank,
+                discovery_size=2, execution_rank=0 if rank == 1 else None, active=rank == 1,
+                native_retired=True, runtime_config_digest="selected", corpus_manifest_digest=metadata_digest(manifest))))
+        self.assertEqual(len(validate_distributed_rank_reports(manifest,topology,document,self.directory/"logits.json")),2)
+        wrong = json.loads(files[0].read_text())
+        wrong["active"] = True
+        files[0].write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError,"terminal role"):
+            validate_distributed_rank_reports(manifest,topology,document,self.directory/"logits.json")
 
 
 if __name__ == "__main__":

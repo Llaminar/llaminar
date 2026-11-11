@@ -82,13 +82,17 @@ struct PooledImmutableFactoryReplayAccess final {
         return qwen4exp::ImmutableLookupExecutionBoundary::createPooledImpl(std::move(service),std::move(geometry),std::move(owners),
             std::move(coordinator),std::move(memory),stream,std::move(source),std::move(terminal));
     }
-    /** @brief Retire only generations in the isolated fixture's declared two-backend/eight-ordinal mock population.
+    /** @brief Validate the recorded physical reset for one exact isolated fixture generation. */
+    static void retireFixtureGeneration(DeviceId original){
+        auto reset=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(original);
+        if(reset.receipt().retiredLiveContext())NativeOrderingEventGroupReplayAccess::validatedReset(reset);
+    }
+    /** @brief Retire the legacy fixtures' isolated two-backend/eight-ordinal mock population.
+     * Larger original source rosters must retire their actual declared devices.
      * All graph/storage/backend aliases must already have drained before this last-owner scope runs. */
     static void retireFixtureGenerations(){
-        for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(int ordinal=0;ordinal<8;++ordinal){
-            auto reset=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement({type,ordinal});
-            if(reset.receipt().retiredLiveContext())NativeOrderingEventGroupReplayAccess::validatedReset(reset);
-        }
+        for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(int ordinal=0;ordinal<8;++ordinal)
+            retireFixtureGeneration({type,ordinal});
     }
 };
 }

@@ -5,7 +5,8 @@
  * Physical groups, process ownership and locality come from discovery. Actual
  * captured NCCL/RCCL observations and completed host-MPI exchanges keep separate
  * typed identities: neither substitutes for GPU DMA or mapped kernel access.
- * The GPU/host primitives have separate mechanism/direction/first-touch identity;
+ * The GPU/host primitives bind distinct native-executor and host-first-touch ranks
+ * plus mechanism/direction identity;
  * they are not complete activation-packet timings. No model warmup or per-candidate probe occurs.
  */
 #pragma once

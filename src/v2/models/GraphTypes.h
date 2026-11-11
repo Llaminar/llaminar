@@ -23,6 +23,7 @@
 
 #pragma once
 #include "../execution/mtp/MTPShiftedCacheOrigin.h"
+#include "../execution/mtp/MTPSidecarCaptureLayout.h"
 #include "../execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -83,6 +84,7 @@ namespace llaminar2
     class MoEExpertOverlayRuntimePlan;
     class MoEOverlayNodeLocalRouteExchange;
     class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayActivationBatchInventory;
     class MoEOverlayNodeLocalDeviceControllerFabric;
     struct PipelineConfig;
 
@@ -909,6 +911,8 @@ namespace llaminar2
              */
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
                 rank_batch_transport_registry = nullptr;
+            /** Same original source/row declaration retained by the admitted channel registry. */
+            std::shared_ptr<const MoEOverlayActivationBatchInventory> activation_batch_inventory;
 
             /**
              * Node-local mapped control pages for a heterogeneous or
@@ -1213,6 +1217,8 @@ namespace llaminar2
 
     struct MTPForwardInput
     {
+        /** Original Full/Chained cache role selected by the retained sidecar owner. */
+        MTPSidecarCaptureRole capture_role = MTPSidecarCaptureRole::Full;
         const int *draft_token_ids = nullptr;
         /**
          * @brief Optional device-resident draft token IDs.

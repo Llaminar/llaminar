@@ -12,6 +12,7 @@
  */
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "backends/NativeContextPreparation.h"
 #include "MoEOverlayPhysicalProjectionPieces.h"
 #include "MoEOverlayPhysicalLaneDemand.h"
 #include "MoEOverlayPhysicalRemotePieceOrdinals.h"
@@ -3976,12 +3977,61 @@ namespace llaminar2
             };
         }
 
+        /** @return Existing immutable cached directed fact; this never probes a native backend. */
+        std::optional<bool> observedGpuPeerAccess(DeviceId destination,DeviceId source)
+        {
+            return DeviceManager::instance().peerAccessAvailable(destination,source);
+        }
+
+        /**
+         * @brief Authenticate the complete original source/choice declaration before pool creators.
+         * @param config Original source/PMA setup, with no live ownership or byte decisions.
+         * @param impl Retains the exact validated declaration for all later creators.
+         * @throws std::exception For missing/foreign source geometry or changed directed evidence.
+         */
+        void authenticatePhysicalLaneDemand(const MoEOverlayPhysicalResidencyFabric::Config& config,
+            MoEOverlayPhysicalResidencyFabric::Impl& impl)
+        {
+            if(!config.initial_snapshot->placement_plan)
+                throw std::logic_error("Physical lane setup lost the original declared topology");
+            const int world_rank=config.memory_authority->worldRank();
+            const auto lane_scope=config.remote_projection_transport
+                ?MoEOverlayPhysicalLaneScope::communicator(config.remote_projection_transport->worldSize())
+                :MoEOverlayPhysicalLaneScope::rankLocal(world_rank);
+            impl.lane_demand_plan=configuredMoEOverlayLaneDemand(*config.initial_snapshot->placement_plan,
+                impl.original_layer_manifests,originalFabricGeometry(config).expertCount(),lane_scope,
+                config.maximum_concurrent_cycles,config.maximum_cycles_per_layer);
+            const auto local_ids=config.registry->localParticipantIds();
+            std::map<DeviceId,size_t> actual_gpu_streams;
+            for(const auto id:local_ids) {
+                const auto endpoint=config.registry->endpoint(id);
+                if(!endpoint)throw std::logic_error("Physical stream owner is missing its original local endpoint");
+                if(endpoint->device().is_gpu()) {
+                    auto& count=actual_gpu_streams[endpoint->device()];
+                    count=checkedMoEOverlayLaneAdd(count,config.maximum_execution_streams);
+                }
+            }
+            const auto declared_streams=MoEOverlayCapacityAdmission::executionStreamCounts(
+                *config.initial_snapshot->placement_plan,world_rank,config.maximum_execution_streams);
+            if(actual_gpu_streams!=declared_streams)
+                throw std::invalid_argument("Physical movement GPU cohort differs from its original bound participant roster");
+            impl.lane_demand_plan.original_execution_streams=declared_streams;
+            const bool local_gpu=!actual_gpu_streams.empty();
+            if(local_gpu) {
+                if(declared_streams.empty())throw std::invalid_argument("Physical GPU stream owners are not bound to their original PMA rank");
+                requireOriginalMoEOverlayGpuDemand(config.physical_gpu_lane_demand.get(),impl.lane_demand_plan,
+                    world_rank,observedGpuPeerAccess);
+                impl.lane_demand_plan=*config.physical_gpu_lane_demand;
+            }
+        }
+
         /** @brief Materialize every local endpoint/layer from one model manifest. */
         void materializeEndpointPools(
             const MoEOverlayPhysicalResidencyFabric::Config &config,
             MoEOverlayPhysicalResidencyFabric::Impl &impl)
         {
-            const auto local_ids = config.registry->localParticipantIds();
+
+            const auto local_ids=config.registry->localParticipantIds();
             std::map<int, LayerProjectionSignatures> model_signatures;
             std::map<
                 int,
@@ -4125,6 +4175,10 @@ namespace llaminar2
                 }
                 impl.original_layer_manifests.push_back(std::move(source));
             }
+
+            // The preceding pass is declarative source authentication only.
+            // Reject changed GPU incidence before any shadow/event/stream creator.
+            authenticatePhysicalLaneDemand(config,impl);
 
             /*
              * From this point onward the device path resolves sources through
@@ -4377,50 +4431,18 @@ namespace llaminar2
                    projectionName(key.projection);
         }
 
-        /**
-         * @brief Decide whether one exact GPU edge may use direct device access.
-         *
-         * Same-device copies are ordinary D2D operations.  A different-device
-         * edge is direct only when the destination (which owns the transfer
-         * stream) can address the source allocation.  Missing topology is a
-         * setup error rather than permission to discover an implicit runtime
-         * fallback while inference is live.
-         */
-        bool gpuEdgeUsesDirectPeer(DeviceId source, DeviceId destination)
-        {
-            if (!source.is_gpu() || !destination.is_gpu() ||
-                source.type != destination.type)
-            {
-                return false;
-            }
-            if (source == destination)
-                return true;
-            const auto access = DeviceManager::instance().peerAccessAvailable(
-                destination,
-                source);
-            if (!access.has_value())
-            {
-                throw std::runtime_error(
-                    "ExpertOverlay could not resolve directed peer access for " +
-                    destination.to_string() + " -> " + source.to_string());
-            }
-            return *access;
-        }
+
 
         /** @brief Materialize every independently runnable local/remote GPU lane. */
         void materializeTransferLanes(
             const MoEOverlayPhysicalResidencyFabric::Config &config,
             MoEOverlayPhysicalResidencyFabric::Impl &impl)
         {
-            if(!config.initial_snapshot->placement_plan)
-                throw std::logic_error("Physical lane setup lost the original declared topology");
             const int world_rank=config.memory_authority->worldRank();
-            const auto lane_scope=config.remote_projection_transport
-                ?MoEOverlayPhysicalLaneScope::communicator(config.remote_projection_transport->worldSize())
-                :MoEOverlayPhysicalLaneScope::rankLocal(world_rank);
-            impl.lane_demand_plan=configuredMoEOverlayLaneDemand(*config.initial_snapshot->placement_plan,
-                impl.original_layer_manifests,originalFabricGeometry(config).expertCount(),lane_scope,
-                config.maximum_concurrent_cycles,config.maximum_cycles_per_layer);
+            const auto gpuEdgeUsesDirectPeer=[&](DeviceId source,DeviceId destination){
+                if(!source.is_gpu() || !destination.is_gpu())return false;
+                return admittedMoEOverlayDirectGpuPeer(impl.lane_demand_plan,source,destination);
+            };
             const auto lane_counts=impl.lane_demand_plan.materializedCounts();
             const auto count=[&](MoEOverlayPhysicalLaneKey key){const auto found=lane_counts.find(key);
                 return found==lane_counts.end()?size_t{0}:found->second;};
@@ -4465,19 +4487,7 @@ namespace llaminar2
                 return multiplicity * config.maximum_concurrent_cycles;
             };
 
-            const auto physicalStreamCount = [&](std::size_t multiplicity)
-            {
-                if (multiplicity == 0u ||
-                    config.maximum_execution_streams == 0u ||
-                    multiplicity >
-                        std::numeric_limits<std::size_t>::max() /
-                            config.maximum_execution_streams)
-                {
-                    throw std::overflow_error(
-                        "ExpertOverlay physical stream-pool geometry overflowed");
-                }
-                return multiplicity * config.maximum_execution_streams;
-            };
+            const auto& execution_stream_counts=impl.lane_demand_plan.original_execution_streams;
 
             /*
              * A complete placement target can take part once in a canonical
@@ -4499,9 +4509,10 @@ namespace llaminar2
                     device,
                     TransferEngine::instance()
                         .allocatePersistentTransferExecutionLanes(
-                            physicalStreamCount(multiplicity),
+                            execution_stream_counts.at(device),
                             device,
-                            "moe_overlay_physical_fabric"));
+                            "moe_overlay_physical_fabric",
+                            GPUDeviceContextPool::instance().retainExistingPreparedContext(device,config.memory_authority)));
             }
             const auto executionLane = [&execution_lanes](
                                            DeviceId device,
@@ -4551,6 +4562,7 @@ namespace llaminar2
                                   destination_multiplicity] :
                      participant_multiplicity)
                 {
+                    if(!local_total(source_device,destination_device))continue;
                     if (!source_device.is_gpu() ||
                         !destination_device.is_gpu() ||
                         (source_device == destination_device &&
@@ -5174,6 +5186,12 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric requires complete matching initial banks");
+        }
+        for(const auto id:config.registry->localParticipantIds()) {
+            const auto endpoint=config.registry->endpoint(id);
+            if(endpoint && endpoint->device().is_gpu() &&
+                (!config.physical_gpu_lane_demand || config.physical_gpu_lane_demand->original_rank!=config.memory_authority->worldRank()))
+                throw std::invalid_argument("Physical GPU fabric requires its original rank-bound admitted lane declaration");
         }
         if (config.shadow_slots_per_endpoint_layer == 0 ||
             config.staging_capacity_bytes == 0 ||

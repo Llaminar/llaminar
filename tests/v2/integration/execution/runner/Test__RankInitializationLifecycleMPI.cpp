@@ -255,7 +255,15 @@ namespace llaminar2::test
         ClusterInventory inventory;
         inventory.world_size = 2;
         inventory.ranks.resize(2);
-        for (int index = 0; index < 2; ++index) inventory.ranks[index].rank = index;
+        // Both authored MPI participants inhabit the same physical host. Rank
+        // identity is unique; its known node identity may be shared. Leaving
+        // node_id unknown would fail activation admission before the intended
+        // asymmetric prefill-cache exception and its peer consensus.
+        for (int index = 0; index < 2; ++index)
+        {
+            inventory.ranks[index].rank = index;
+            inventory.ranks[index].node_id = 0;
+        }
         const auto execution = resolveMoEExpertOverlayExecutionPlan(overlay,
             {.current_world_rank = rank, .world_size = 2});
         const auto policy = resolveMoEOverlayCapacityAdmissionPolicy(*overlay, config, 2, 2, 8);

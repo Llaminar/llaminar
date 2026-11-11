@@ -6,7 +6,8 @@
  * The explicitly selected payload slot has two GPU-private cursors. Cold setup observes each exact
  * original initialization stream before publication, creating no extra events. Captured bindings retain those owners, exact tensor/buffer storage,
  * and message geometry; neither binding nor channel exposes live protocol state
- * to the host. This is a same-process/node transport, not an MPI address space.
+ * to the host. Split original-rank endpoints share authenticated node-local pages;
+ * peer virtual addresses and GPU contexts never cross that process boundary.
  */
 #pragma once
 
@@ -23,12 +24,132 @@
 
 namespace llaminar2
 {
+    struct ClusterInventory;
+    class IMPIContext;
+
+    /** @brief Exact GPU in its original MPI rank namespace; ordinal alone is not identity. */
+    struct CapturedTransferRankGPU final
+    {
+        int rank;
+        DeviceId device;
+        bool operator==(const CapturedTransferRankGPU &) const = default;
+    };
+    /** @brief Positive original channel-allocation scope and semantic boundary key, never a request clock. */
+    struct CapturedTransferRankChannelId final
+    {
+        std::uint64_t generation;
+        std::uint64_t boundary;
+        bool operator==(const CapturedTransferRankChannelId &) const = default;
+    };
+    /**
+     * @brief Sealed original-rank roles and exact physical quote for one node-local channel.
+     *
+     * The declared host endpoint owns shared backing. Each rank owns only its
+     * local GPU cursor. This value contains immutable topology, not another
+     * reservation ledger or a process-local alias to the peer GPU.
+     */
+    class CapturedTransferRankPlan final
+    {
+    public:
+        /** @brief Resolve distinct same-node original GPU owners without touching a backend.
+         * @param inventory Existing complete discovery publication.
+         * @param id Original enclosing session allocation scope and semantic boundary identity.
+         * @param producer Original producer rank and its local GPU.
+         * @param consumer Original consumer rank and its local GPU.
+         * @param capacity Positive admitted maximum payload bytes.
+         * @param host_endpoint Original physical host owner; Producer for forward, Consumer for reverse when EarlierDomain owns both.
+         * @return An immutable role/UUID/node binding shared by quote and materialization.
+         * @throws std::invalid_argument For unknown, remote-node or foreign GPU ownership.
+         * @throws std::overflow_error For an unrepresentable channel allocation. */
+        static CapturedTransferRankPlan fromInventory(const ClusterInventory &inventory,
+            CapturedTransferRankChannelId id, CapturedTransferRankGPU producer,
+            CapturedTransferRankGPU consumer, size_t capacity,
+            CapturedTransferEndpoint host_endpoint = CapturedTransferEndpoint::Producer);
+        /** @return Original role metadata; never acquires a foreign GPU context. */
+        CapturedTransferRankGPU endpoint(CapturedTransferEndpoint role) const;
+        /** @return This rank's sole endpoint, or no endpoint on an uninvolved original rank. */
+        std::optional<CapturedTransferEndpoint> localRole(int rank) const noexcept;
+        /** @return Endpoint that owns the one physical host allocation/first touch. */
+        CapturedTransferEndpoint hostEndpoint() const noexcept { return host_endpoint_; }
+        /** @return Original host allocation rank; reverse metadata may retain EarlierDomain ownership. */
+        int hostRank() const { return endpoint(host_endpoint_).rank; }
+        /** @return Original physical node, authenticated independently of MPI ordering. */
+        int physicalNode() const noexcept { return node_; }
+        /** @return Existing immutable model/boundary identity. */
+        CapturedTransferRankChannelId originalId() const noexcept { return id_; }
+        /** @return Maximum payload extent, not the bytes sent by a replay. */
+        size_t capacityBytes() const noexcept { return capacity_; }
+        /** @return Exact original metadata for collective setup agreement, without pointer serialization. */
+        std::vector<std::uint8_t> serialize() const;
+        /** @brief Quote only this endpoint's physical allocations through the original PMA builder.
+         * @param role Actual original local role.
+         * @param gpu Original local GPU resource matching that role.
+         * @param host Original CPU resource iff role is hostEndpoint(); absent on the other role.
+         * @param builder Canonical admission builder, not a second live ledger. */
+        void contributeMemory(CapturedTransferEndpoint role, PhysicalMemoryResource gpu,
+            std::optional<PhysicalMemoryResource> host, PhysicalMemoryPlanBuilder &builder) const;
+        bool operator==(const CapturedTransferRankPlan &) const = default;
+    private:
+        CapturedTransferRankPlan(CapturedTransferRankChannelId id, CapturedTransferRankGPU producer,
+            CapturedTransferRankGPU consumer, int node, size_t capacity, std::array<std::string, 2> uuids, CapturedTransferEndpoint host_endpoint)
+            : id_(id), endpoints_{producer, consumer}, node_(node), capacity_(capacity), uuids_(std::move(uuids)), host_endpoint_(host_endpoint) {}
+        CapturedTransferRankChannelId id_;
+        std::array<CapturedTransferRankGPU, 2> endpoints_;
+        int node_;
+        size_t capacity_;
+        std::array<std::string, 2> uuids_;
+        CapturedTransferEndpoint host_endpoint_;
+    };
+
+    /**
+     * @brief Original enclosing model cohort retaining actual distributed backing until explicit retirement.
+     *
+     * Channels own only their local GPU aliases/cursor. This session owns the
+     * original pages/file and host-owner PMA lease across those channel borrows.
+     * It performs no GPU work on creation and creates no communicator/ledger.
+     */
+    class CapturedTransferRankSession final
+    {
+    public:
+        /** @brief Retain the original existing discovery context for one model cohort.
+         * @param original Existing shared owner, never a reconstructed MPI wrapper.
+         * @return A setup/retirement owner containing no physical allocation yet. */
+        static std::shared_ptr<CapturedTransferRankSession> create(std::shared_ptr<IMPIContext> original);
+        /** @brief Fatal if physical owners were abandoned; never performs MPI from destruction. */
+        ~CapturedTransferRankSession();
+        /**
+         * @brief Retire after the enclosing model has destroyed ALL original local graph/alias owners.
+         *
+         * The existing global consensus first rejects live channel borrows,
+         * then proves all original mappings/file descriptors closed before the
+         * original allocator releases its one PMA charge. Call from original explicit model
+         * shutdown, including failed setup; never a per-request hot operation.
+         */
+        void retireAfterOriginalGraphRelease();
+        /** @brief Reject a reconstructed/foreign MPI ownership control block before cold composition.
+         * @param original Same shared original context used to create this session.
+         * @throws std::invalid_argument For a foreign, replaced or retired original owner. */
+        void requireOriginalContext(const std::shared_ptr<IMPIContext> &original) const;
+        /** @return Whether explicit original all-rank retirement has completed. */
+        bool retired() const noexcept { return retired_; }
+        /** @return Original setup scope minted by the existing allocation-identity authority, never a request clock. */
+        std::uint64_t originalGeneration() const noexcept { return generation_; }
+    private:
+        friend class TransferEngine;
+        struct Entry;
+        CapturedTransferRankSession(std::shared_ptr<IMPIContext> original, std::uint64_t generation)
+            : original_(std::move(original)), generation_(generation) {}
+        std::shared_ptr<IMPIContext> original_;
+        std::uint64_t generation_;
+        std::vector<std::shared_ptr<Entry>> entries_; ///< Actual RAII allocations, never another byte total.
+        bool retired_ = false;
+    };
+
     /** @brief Pure allocation geometry contributed to the canonical memory plan. */
     struct CapturedTransferChannelMemory
     {
-        size_t mapped_host_bytes = 0; ///< Page-rounded control plus payload only in MappedHost mode.
+        size_t mapped_host_bytes = 0; ///< Page-rounded original mapped control and payload.
         size_t cursor_bytes_per_device = 0; ///< Exact private cursor, on each GPU.
-        size_t producer_payload_bytes = 0; ///< Native peer slab, absent for mapped-host payload.
     };
 
     /**
@@ -49,6 +170,8 @@ namespace llaminar2
 
         /** @return Immutable capacity available to one message, not its live length. */
         [[nodiscard]] size_t capacityBytes() const noexcept { return identity_.capacity; }
+        /** @return Original remote-role declaration, or null for the original same-process pair. */
+        const CapturedTransferRankPlan *rankPlan() const noexcept { return rank_plan_ ? &*rank_plan_ : nullptr; }
         /** @return Exact allocation identity required in the enclosing graph-cache key. */
         [[nodiscard]] CapturedTransferChannelIdentity identity() const noexcept { return identity_; }
         /** @return Frozen physical endpoint identity; never queries live device state.
@@ -56,19 +179,11 @@ namespace llaminar2
         [[nodiscard]] DeviceId endpointDevice(CapturedTransferEndpoint role) const;
         /** @return Exact physical geometry used both in planning and materialization. */
         [[nodiscard]] static CapturedTransferChannelMemory memoryFor(size_t capacity);
-        /** @brief Quote the exact explicitly selected allocation route; never inspect residual capacity.
-         * @param capacity Positive maximum message bytes. @param storage Exact physical payload route.
-         * @return One mapped control bank, native cursors, and the selected payload allocation.
-         * @throws std::exception For invalid route, zero capacity or arithmetic overflow.
-         */
-        [[nodiscard]] static CapturedTransferChannelMemory memoryFor(size_t capacity, CapturedTransferPayloadStorage storage);
-        /** @return Immutable physical route retained in every endpoint capture identity. */
-        CapturedTransferPayloadStorage payloadStorage() const noexcept { return payload_storage_; }
-
 
     private:
         friend class TransferEngine;
         friend class CapturedTransferBinding;
+        friend class PipelineActivationFanout; ///< Closed cold projection of the original local consumer publication only.
         friend struct CapturedTransferChannelReplayProbe; ///< Test-only payload canary access after both endpoints' terminal joins; no production observation API.
         /** @brief Bind the existing original parent's immutable identity before native submissions.
          * @param original Nonzero original admission; never a channel-owned request counter.
@@ -111,15 +226,15 @@ namespace llaminar2
         void requireOriginalEndpoint(CapturedTransferEndpoint role)const;
         static constexpr size_t payload_offset = sizeof(CapturedTransferChannelControl);
         CapturedTransferChannelIdentity identity_;
-        std::array<Endpoint, 2> endpoints_; ///< Original workers outlive mapped registration teardown.
+        std::array<Endpoint, 2> endpoints_; ///< Only declared local workers own contexts/cursors.
+        std::optional<CapturedTransferRankPlan> rank_plan_; ///< Original remote roles; no peer process addresses.
+        std::optional<CapturedTransferEndpoint> rank_role_; ///< Sole local role; absent only for the original local pair.
+        std::array<std::uint64_t, 3> backing_identity_{}; ///< Actual shared file device/inode/uid; no peer virtual address.
         PhysicalMemoryAllocationLease mapped_lease_; ///< Outlives mapped storage.
         std::shared_ptr<MappedHostTransferRegion> mapped_;
         std::mutex invocation_mutex_; ///< Serializes CPU admission/cancellation only; never native progress.
         CapturedTransferInvocation original_invocation_{};
         bool invocation_active_ = false, terminal_cancelled_ = false;
-        PhysicalMemoryAllocationLease peer_payload_lease_; ///< Released after native peer payload storage.
-        std::shared_ptr<DeviceTransferBuffer> peer_payload_; ///< Producer-owned slab retained through both endpoint bindings.
-        CapturedTransferPayloadStorage payload_storage_ = CapturedTransferPayloadStorage::MappedHost;
 
     };
 

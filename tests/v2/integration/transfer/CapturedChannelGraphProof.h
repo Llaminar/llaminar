@@ -23,14 +23,6 @@
 namespace llaminar2::counted_channel_test
 {
     /**
-     * @brief Reuse the actual captured peer count/slice/reset oracle from native admission preflight.
-     * @param first Original peer-payload producer.
-     * @param second Original peer consumer; cached Complete coverage is required by its channel factory.
-     * @note No alternative transport, workload or host-selected count is introduced.
-     */
-    void verifyPeerPayloadReplay(DeviceId first,DeviceId second);
-
-    /**
      * @brief Reject omitted phases, duplicate legacy nodes or a lost fusion.
      * @param graph Complete recorded participant graph, not a synthetic node list.
      * @param maximum_bytes Positive immutable message capacity used at capture.

@@ -203,9 +203,11 @@ namespace llaminar2
 
         /** @brief Freeze native transport through the participant's ordinary executor. */
         static bool capturePublicationTransport(DeviceGraphOrchestrator &runner, PipelineForwardGraphEdges &edges,
-            PipelineForwardGraphEdges::PublicationBanks banks, IDeviceContext &context, IWorkerGPUContext &gpu)
+            PipelineForwardGraphEdges::PublicationBanks banks, IDeviceContext &context, IWorkerGPUContext &gpu,
+            void *original_setup_stream)
         {
-            runner.pipeline_publication_transport_ = edges.materializePublicationTransport(banks, runner.executor_, context, gpu);
+            runner.pipeline_publication_transport_ = edges.materializePublicationTransport(
+                banks, runner.executor_, context, gpu, original_setup_stream);
             return static_cast<bool>(runner.pipeline_publication_transport_);
         }
 

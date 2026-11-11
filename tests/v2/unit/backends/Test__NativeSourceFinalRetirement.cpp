@@ -47,9 +47,14 @@ public:
   const auto cpu=resource(DeviceId::cpu());
   observed.cpu.memory_bytes=cpu.total_bytes;observed.cpu.free_memory_bytes=cpu.admission_available_bytes;
   observed.cpu_memory_bytes=cpu.total_bytes;
+  // Explicit sparse physical locality belongs to this authored observation;
+  // neither the MPI rank nor the GPU ordinal supplies NUMA ownership.
+  constexpr int observedNUMANode=5;
+  observed.cpu.numa_node=observedNUMANode;
   for(const auto device:{DeviceId::cuda(231),DeviceId::rocm(231)}){
    const auto original=resource(device);DeviceInfo gpu;
    gpu.type=device.type;gpu.local_device_id=device.ordinal;gpu.memory_bytes=original.total_bytes;
+   gpu.numa_node=observedNUMANode;
    gpu.free_memory_bytes=original.admission_available_bytes;observed.gpus.push_back(std::move(gpu));
   }
  }
@@ -486,7 +491,8 @@ TEST(NativeSourceFinalRetirement, SelectedSourceMembershipAndRankRemainExactAcro
   EXPECT_TRUE(Access::prepareContexts(runner,{devices[0]}))<<runner.lastError();}
  {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
   EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(232)}));
-  EXPECT_NE(runner.lastError().find("did not declare"),std::string::npos);}
+  EXPECT_NE(runner.lastError().find("selected GPU is absent from the original rank inventory"),std::string::npos)
+      << runner.lastError();}
  {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM},1);
   EXPECT_FALSE(Access::prepareContexts(runner,{devices[0]}));
   EXPECT_NE(runner.lastError().find("crossed original physical ranks"),std::string::npos);}

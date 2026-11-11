@@ -2815,6 +2815,7 @@ namespace llaminar2
             auto transport = createMoEOverlayRankBatchTransport(
                     MoEOverlayRankBatchTransportConfig{
                         .mpi_ctx = config_.mpi_context,
+                        .physical_memory_authority = config_.model_context->concreteWeightManager()->physicalMemoryAuthority(),
                         .source_world_rank = source_world_rank,
                         .target_world_rank = local_world_rank,
                         .workspace = std::move(wire_workspace),
@@ -5698,10 +5699,12 @@ namespace llaminar2
                     input.key.histogram_source =
                         ExpertHistogramSource::GroupedVerifier;
                     break;
+                case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+                case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
                 case MoEOverlayInferenceGraphRole::None:
                     abort_armed();
                     return reject(
-                        "Mapped ExpertOverlay CPU follower received a terminal graph role");
+                        "Mapped ExpertOverlay CPU follower received a terminal or pipeline-only graph role");
                 }
                 input.residency_epoch = descriptor->placement_epoch;
                 input.source_participant =
@@ -6644,6 +6647,8 @@ namespace llaminar2
             case MoEOverlayInferenceGraphRole::MainPrefill:
                 return "prefill";
             case MoEOverlayInferenceGraphRole::MainDecode:
+            case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+            case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
                 return "decode";
             case MoEOverlayInferenceGraphRole::MTPDraft:
             case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
@@ -7310,6 +7315,9 @@ namespace llaminar2
             mtp_graph_depth = cached ? cached->mtp_graph_depth : -1;
             role_name = "mtp_draft";
             break;
+        case MoEOverlayInferenceGraphRole::MTPConditionSpeculativeContinuation:
+        case MoEOverlayInferenceGraphRole::MTPConditionCommittedSerialToken:
+            return fail("Pipeline condition tickets require their original stage-cohort executor");
         case MoEOverlayInferenceGraphRole::None:
             return fail("terminal graph role reached the execution authority");
         }

@@ -2,8 +2,10 @@
  * @file PlanningHostDeviceMeasurement.h
  * @brief Bounded captured GPU/host link observations, distinct from MPI and native collectives.
  *
- * One rank's setup thread first-touches its own mapped pages before GPU work is
- * submitted. Exact streams then measure both directions through the production
+ * The declared host rank first-touches its shared pages before the NUMA-local
+ * GPU executor registers them. Original all-rank agreement fences preparation
+ * and retirement; neither role may substitute another rank's scope. Exact
+ * streams then measure both directions through the production
  * DMA and mapped-copy-kernel mechanisms. These are byte-service primitives, not
  * complete activation-packet protocol timings or measured model throughput.
  */
@@ -13,43 +15,65 @@
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "transfer/MappedTransferProgressABI.h"
 #include <vector>
+#include <optional>
+#include <memory>
 
 namespace llaminar2
 {
+    class IMPIContext;
     /** @brief Mechanisms with separate observations; no failed-operation substitution. */
     enum class PlanningHostTransferMechanism { DMA, MappedKernel };
 
-    /** @brief Immutable GPU visibility, host first-touch scope and two bounded payload sizes. */
+    /** @brief Native executor role; visibility alone cannot authorize this GPU. */
+    struct PlanningHostDeviceGPUExecutor final
+    {
+        int rank;
+        DeviceId device;
+        bool operator==(const PlanningHostDeviceGPUExecutor &) const = default;
+    };
+    /** @brief Setup caller that owns physical host first touch, never GPU execution. */
+    struct PlanningHostDeviceFirstTouch final
+    {
+        int rank;
+        bool operator==(const PlanningHostDeviceFirstTouch &) const = default;
+    };
+    /** @brief Immutable distinct GPU-executor and same-machine host-placement roles. */
     class PlanningHostDeviceRequest final
     {
     public:
-        /**
-         * @brief Resolve one rank-visible GPU and its rank-local host allocator.
-         * @param rank Canonical process/physical-node/NUMA publication.
-         * @param device Exact CUDA/ROCm ordinal in that process.
-         * @param bulk_bytes Positive larger sample, greater than the one-byte control sample.
-         * @throws std::invalid_argument for missing identities or unrepresentable payloads.
-         */
-        static PlanningHostDeviceRequest fromInventory(const RankInventory &rank, DeviceId device, size_t bulk_bytes);
-        /** @return Process whose setup thread owns host first touch. */
-        int rank() const noexcept { return rank_; }
-        /** @return Physical machine from inventory, not inferred from link timing. */
+        /** @brief Resolve both roles from one original inventory namespace.
+         * @param inventory Original complete discovery publication.
+         * @param gpu NUMA-local native executor and its original device ordinal.
+         * @param host Original first-touch rank, with a known NUMA on the same physical machine.
+         * @param bulk_bytes Existing positive larger byte sample, bounded by INT_MAX.
+         * @return Sealed GPU UUID and observed host NUMA without another query.
+         * @throws std::invalid_argument For foreign/unknown ownership or geometry. */
+        static PlanningHostDeviceRequest fromInventory(const ClusterInventory &inventory,
+            PlanningHostDeviceGPUExecutor gpu, PlanningHostDeviceFirstTouch host, size_t bulk_bytes);
+        /** @return Rank permitted to own the native context/stream/measurement. */
+        int gpuRank() const noexcept { return gpu_.rank; }
+        /** @return Original setup caller that creates/first-touches the host pages. */
+        int hostRank() const noexcept { return host_.rank; }
+        /** @return Original physical machine shared by both roles. */
         int physicalNode() const noexcept { return node_; }
-        /** @return Declared rank host scope; -1 remains explicitly unqualified, not GPU-local. */
+        /** @return Original known host NUMA; no unknown or rank-derived surrogate. */
         int hostNumaNode() const noexcept { return host_numa_; }
-        /** @return GPU ordinal visible to the observing process. */
-        DeviceId device() const noexcept { return device_; }
-        /** @return Physical GPU identity within this node and backend. */
+        /** @return Original GPU ordinal in its executor's visible namespace. */
+        DeviceId device() const noexcept { return gpu_.device; }
+        /** @return Original physical GPU identity, scoped to machine/backend. */
         const std::string &uuid() const noexcept { return uuid_; }
-        /** @return Larger exact payload; allocation padding is never timed as traffic. */
+        /** @return Live larger sample extent, not page-rounded allocation bytes. */
         size_t bulkBytes() const noexcept { return bulk_bytes_; }
+        /** @return Exact metadata identity used by existing planning agreement/receipts. */
+        std::vector<uint8_t> serialize() const;
         bool operator==(const PlanningHostDeviceRequest &) const = default;
     private:
-        /** @brief Only validated inventory projection may establish first-touch/endpoint identity. */
-        PlanningHostDeviceRequest(int rank, int node, int host_numa, DeviceId device, std::string uuid, size_t bulk)
-            : rank_(rank), node_(node), host_numa_(host_numa), device_(device), uuid_(std::move(uuid)), bulk_bytes_(bulk) {}
-        int rank_, node_, host_numa_;
-        DeviceId device_;
+        PlanningHostDeviceRequest(PlanningHostDeviceGPUExecutor gpu, PlanningHostDeviceFirstTouch host,
+            int node, int numa, std::string uuid, size_t bulk)
+            : gpu_(gpu), host_(host), node_(node), host_numa_(numa), uuid_(std::move(uuid)), bulk_bytes_(bulk) {}
+        PlanningHostDeviceGPUExecutor gpu_;
+        PlanningHostDeviceFirstTouch host_;
+        int node_, host_numa_;
         std::string uuid_;
         size_t bulk_bytes_;
     };
@@ -74,28 +98,34 @@ namespace llaminar2
     class PlanningHostDeviceMeasurement final
     {
     public:
-        /**
-         * @brief Add exact two mapped host buffers, one device buffer and two retained graphs to PMA.
-         * @param request Same sealed geometry passed to measure.
-         * @param host Rank-local CPU allocator; never charged to the GPU's RAM.
-         * @param execution Exact rank-visible GPU resource.
-         * @param builder Canonical BOM owner; no parallel admission arithmetic.
-         */
-        static void contributeMemory(const PlanningHostDeviceRequest &request, PhysicalMemoryResource host,
+        /** @brief Quote the two shared host buffers on their first-touch owner.
+         * @param request Same sealed identity used by collect.
+         * @param host Original CPU resource on request.hostRank().
+         * @param builder Canonical PMA BOM, never another rank's ledger. */
+        static void contributeHostMemory(const PlanningHostDeviceRequest &request,
+            PhysicalMemoryResource host, PhysicalMemoryPlanBuilder &builder);
+        /** @brief Quote GPU buffer and two graphs on the native executor.
+         * @param request Same sealed identity used by collect.
+         * @param execution Original GPU resource on request.gpuRank().
+         * @param builder Canonical PMA BOM; no duplicate host-page charge. */
+        static void contributeExecutionMemory(const PlanningHostDeviceRequest &request,
             PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder);
-        /**
-         * @brief Measure from the affined rank setup caller, never a GPU worker or MPI progress callback.
-         * @param request Immutable inventory/first-touch/payload identity.
-         * @param memory Rank-bound authority admitting the complete declared family.
-         * @return Eight positive native-event observations after graph/storage retirement.
+        /** @return Exact page-rounded pair extent shared by admission and mmap. */
+        static size_t hostAllocationBytes(const PlanningHostDeviceRequest &request);
+        /** @brief Collect one original sample with both roles and all-rank retirement.
+         * @param request Immutable executor/first-touch/byte identity, agreed by every rank.
+         * @param mpi Existing discovery communicator; null means its one-rank local form.
+         * @param memory This caller's rank-bound physical admission.
+         * @return Eight native observations only on the GPU owner; no result on other roles.
          *
-         * Host publication changes the source before each H2D invocation,
-         * outside timing. Final byte verification and diagnostic readback are
-         * also untimed. The normal GPU worker records/replays exact-stream
-         * graphs; all copies go through TransferEngine, with no stream sync.
+         * Host first touch precedes registration through existing all-rank
+         * agreement. Native clocks retain the original warmup/three-invocation
+         * mechanism; source publication and byte checks remain outside timing.
+         * The final agreement proves GPU graphs/registrations have retired
+         * before the host owner releases any shared page or PMA claim.
          */
-        static PlanningHostDeviceObservations measure(const PlanningHostDeviceRequest &request,
-            const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+        static std::optional<PlanningHostDeviceObservations> collect(const PlanningHostDeviceRequest &request,
+            const std::shared_ptr<IMPIContext> &mpi, const std::shared_ptr<PhysicalMemoryAuthority> &memory);
         /** @brief Reject incomplete/duplicate coordinates, foreign units, empty graphs or wrong completed work. */
         static void validate(const PlanningHostDeviceObservations &observation);
     };

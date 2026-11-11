@@ -12,6 +12,7 @@
  * source identity remains4 and symmetric arithmetic is unchanged.
  */
 
+#include "../../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "utils/ExpertTierWeightWireTestOracle.h"
 
@@ -983,8 +984,7 @@ namespace llaminar2
             const std::string pool_name =
                 "rocm_expert_tier_execution_pool_contract";
 
-            const auto first = TransferEngine::instance()
-                                   .allocatePersistentTransferExecutionLanes(
+            const auto first = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                        lane_count,
                                        device,
                                        pool_name);
@@ -1003,8 +1003,7 @@ namespace llaminar2
                 }
             }
 
-            const auto reused = TransferEngine::instance()
-                                    .allocatePersistentTransferExecutionLanes(
+            const auto reused = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                         lane_count,
                                         device,
                                         pool_name);
@@ -1040,8 +1039,7 @@ namespace llaminar2
                                          staging_bytes,
                                          2u,
                                          device);
-            const auto execution = TransferEngine::instance()
-                                       .allocatePersistentTransferExecutionLanes(
+            const auto execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                            1u,
                                            device,
                                            "rocm_shared_execution_race_contract")
@@ -1485,8 +1483,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::rocm(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::rocm(0),
                                      "rocm_tier_round_trip")
@@ -1820,8 +1817,7 @@ namespace llaminar2
                                        DeviceId::rocm(device_ordinal),
                                        HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::rocm(device_ordinal),
                                          "rocm_secondary_device_remote_projection")
@@ -1932,8 +1928,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::rocm(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::rocm(0),
                                      "rocm_floating_tier_round_trip")
@@ -2180,8 +2175,7 @@ namespace llaminar2
                                        DeviceId::rocm(0),
                                        HostTransferAccess::CrossProcessReadable)
                                    .front(),
-                    .execution = TransferEngine::instance()
-                                     .allocatePersistentTransferExecutionLanes(
+                    .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                          1u,
                                          DeviceId::rocm(0),
                                          "rocm_remote_q51_roundtrip")
@@ -2487,8 +2481,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::rocm(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::rocm(0),
                                      "rocm_asymmetric_promotion_execution")
@@ -2915,8 +2908,7 @@ namespace llaminar2
                                    1u,
                                    DeviceId::rocm(0))
                                .front(),
-                .execution = TransferEngine::instance()
-                                 .allocatePersistentTransferExecutionLanes(
+                .execution = ::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                                      1u,
                                      DeviceId::rocm(0),
                                      "rocm_inference_overlap")
@@ -3379,7 +3371,7 @@ namespace llaminar2
                 .payload=payload.data(),.scales=scales.data(),.mins=coefficients.data(),
                 .payload_bytes=payload.bytes(),.scales_bytes=scales.bytes(),.mins_bytes=coefficients.bytes()};
             ASSERT_TRUE(destination.validFor(layout));
-            const auto execution=TransferEngine::instance().allocatePersistentTransferExecutionLanes(
+            const auto execution=::llaminar2::test::ComponentTransferExecutionPoolFixtureAccess::allocate(TransferEngine::instance(),
                 1u,DeviceId::rocm(0),"rocm_iq3_source_cold_promotion").front();
             ExpertTierWeightTransferLane lane({
                 .device=DeviceId::rocm(0),

@@ -623,8 +623,36 @@ def validate_distributed_rank_reports(manifest, topology, document, report_path)
     Historical one-rank reports keep their existing shape and validation.
     """
     import json
-    world = topology['expected_config'].get('configuration', {}).get('mpi_procs', 1)
+    config = topology['expected_config'].get('configuration', {})
+    world = config.get('mpi_procs', 1)
     require(type(world) is int and world >= 0, 'Malformed original MPI membership')
+    selected = config.get('execution_rank_selection')
+    if selected is not None and world > 1:
+        binding = document.get('observed_pipeline_binding')
+        require(type(selected) is list and len(selected) == 1 and type(selected[0]) is int and
+                0 <= selected[0] < world and type(binding) is dict and
+                binding.get('selected_discovery_ranks') == selected and binding.get('discovery_size') == world and
+                binding.get('original_owner') == selected[0] and binding.get('execution_rank') == 0 and
+                'distributed_observer' not in document, 'Missing original selected observer membership')
+        root = Path(report_path).parent.resolve(strict=True)
+        pins = {}
+        rank_inodes = set()
+        for rank in range(world):
+            path = root / f'rank-{rank}.json'
+            require(path.is_file() and not path.is_symlink(), 'Missing original selected rank terminal receipt')
+            pin = identity(path)
+            require((pin[1], pin[2]) not in rank_inodes, 'Aliased original selected rank terminal receipt')
+            rank_inodes.add((pin[1], pin[2]))
+            active = rank == selected[0]
+            receipt = json.loads(path.read_text())
+            expected = dict(schema='llaminar.qfn-observed-pipeline-rank.v1', discovery_rank=rank,
+                discovery_size=world, execution_rank=0 if active else None, active=active, native_retired=True,
+                runtime_config_digest=topology['runtime_config_digest'], corpus_manifest_digest=metadata_digest(manifest))
+            require(type(receipt) is dict and receipt == expected and
+                all(type(receipt[key]) is type(value) for key, value in expected.items()),
+                'Original selected rank terminal role or ownership changed')
+            pins[str(path)] = pin
+        return pins
     if world <= 1:
         require('distributed_observer' not in document, 'Unexpected distributed observer identity')
         return {}

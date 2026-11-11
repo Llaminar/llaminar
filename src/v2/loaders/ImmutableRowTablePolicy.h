@@ -45,7 +45,9 @@ ImmutableRowLookupExecution immutableRowLookupExecution(ImmutableRowStorage stor
 /** @brief Explicit lookup distribution; no automatic entry into distributed storage. */
 enum class ImmutableRowTableDistribution : std::uint8_t { Replicated, FixedHeadSharded };
 /** @brief Planner provenance of the actual declaration, not a selectable topology. */
-enum class ImmutableRowTableTPTopology : std::uint8_t { None, HomogeneousFullMainRankLocal };
+enum class ImmutableRowTableTPTopology : std::uint8_t {
+    None, HomogeneousFullMainRankLocal, HomogeneousPipelineRankLocal
+};
 
 /** @brief Requested setup preference; Automatic is never a runtime/kernel storage kind. */
 enum class ImmutableRowStoragePreference : std::uint8_t { Automatic, VRAM, RAM, MemoryMapped, HostAdaptiveRAMSSD, AdaptiveVRAMRAMSSD };

@@ -47,6 +47,7 @@ const std::vector<Qwen4ExpBufferDeclaration> declarations{
     {BufferId::QFN_NGRAM_SHARD_TRANSPORT_ROWS, {"qfn_ngram_shard_transport_rows", {"1"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLEFixedHeadStorage},
     {BufferId::QFN_NGRAM_SHARD_LOCAL_NATIVE, {"qfn_ngram_shard_local_native", {"qfn_fixed_local_words"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLEFixedHeadStorage},
     {BufferId::QFN_NGRAM_SHARD_GATHERED_NATIVE, {"qfn_ngram_shard_gathered_native", {"qfn_fixed_gathered_words"}, "int32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLEFixedHeadStorage},
+    {BufferId::QFN_NGRAM_SHARD_PIPELINE_NATIVE, {"qfn_ngram_shard_pipeline_native", {"qfn_fixed_pipeline_wire_words"}, "int32", BufferSemantic::InOut}, Qwen4ExpBufferPlacement::FixedHeadPipelineWire},
     {BufferId::QFN_PLE_EMBEDDING, {"qfn_ple_embedding", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLE},
     {BufferId::QFN_PLE_KEY, {"qfn_ple_key", {"seq_len", "qfn_trunk"}, "fp32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLE},
     {BufferId::QFN_PLE_VALUE, {"qfn_ple_value", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch}, Qwen4ExpBufferPlacement::PLE},
@@ -116,8 +117,16 @@ void validatePlacement(const Qwen4ExpMemoryGeometry &geometry, const Qwen4ExpBuf
         }
     }
     const bool fixed=dimensions.ngram_lookup==ImmutableRowLookupExecution::FixedHeadShardGPU;
-    if(fixed ? (dimensions.ngram_fixed_head_participants!=2 && dimensions.ngram_fixed_head_participants!=4 && dimensions.ngram_fixed_head_participants!=8)
-             : dimensions.ngram_fixed_head_participants!=0)
+    const auto degree = dimensions.ngram_fixed_head_participants;
+    const auto pipeline_heads = dimensions.ngram_fixed_pipeline_local_heads;
+    const bool old_degree = degree == 2 || degree == 4 || degree == 8;
+    if ((fixed ? (pipeline_heads ? degree <= 0 || degree > 16 : !old_degree) : degree != 0 || pipeline_heads != 0) ||
+        pipeline_heads < 0 || pipeline_heads > 16 || dimensions.ngram_fixed_pipeline_gathered_heads < 0 ||
+        dimensions.ngram_fixed_pipeline_gathered_heads > 16 ||
+        (pipeline_heads ? (degree == 1 ? dimensions.ngram_fixed_pipeline_gathered_heads != 0 :
+            dimensions.ngram_fixed_pipeline_gathered_heads != 16 && dimensions.ngram_fixed_pipeline_gathered_heads != 16 - pipeline_heads) :
+            dimensions.ngram_fixed_pipeline_gathered_heads != 0) ||
+        (dimensions.ngram_fixed_pipeline_scratch_words && !dimensions.device.is_gpu()))
         throw std::invalid_argument("Flash Next fixed-head execution requires its exact native cohort degree");
 }
 
@@ -137,12 +146,30 @@ Qwen4ExpBufferDimensions dimensionsFor(const GraphConfig &model, int flattened_r
     const int ple = static_cast<int>(model.flash_next->ngrams().decoder_layer);
     const bool owns_ple = model.pp_layer_offset <= ple && ple < model.pp_layer_offset + model.n_layers;
     std::optional<ImmutableRowLookupExecution> storage;
+    int pipeline_heads = 0;
+    int pipeline_gathered_heads = 0;
+    std::size_t pipeline_words = 0;
     if (owns_ple)
     {
         if (!model.ngram_table_placement)
             throw std::invalid_argument("Flash Next graph allocation requires resolved ngram placement");
         storage = model.ngram_table_placement->lookupForConsumer(
             {model.ngram_table_placement->worldRank(), model.default_device});
+    }
+    if (model.ngram_table_placement) {
+        const auto &placement = *model.ngram_table_placement;
+        const PhysicalMemoryAllocatorIdentity id{placement.worldRank(), model.default_device};
+        if (const auto *pipeline = placement.fixedHeadPipeline(); pipeline && placement.containsAllocator(id)) {
+            const auto &owner = pipeline->owner(id);
+            if ((owner.stage_index == pipeline->consumerStage()) != owns_ple)
+                throw std::logic_error("Flash Next arena changed its original fixed-head pipeline PLE interval");
+            if (owns_ple) {
+                pipeline_heads = pipeline->assembledHeadCount(owner.consumer_index);
+                pipeline_gathered_heads = pipeline->gatheredHeadCount(owner.consumer_index);
+            }
+            pipeline_words = pipeline->scratchBytes(id, pipeline->maximumRows(), model.flash_next->ngrams().row_bytes) /
+                sizeof(std::int32_t);
+        }
     }
     return {.main_layers = static_cast<int>(model.flash_next->mainLayers()),
         .first_layer = model.pp_layer_offset, .layer_count = model.n_layers, .compute_width = model.d_model,
@@ -152,7 +179,10 @@ Qwen4ExpBufferDimensions dimensionsFor(const GraphConfig &model, int flattened_r
             ? resolveMTPRetainedTargetQueryRows(model.mtp) : 0,
         .device = model.default_device, .attention_phase_schedule=model.attention_phase_schedule, .ngram_lookup = storage,
         .ngram_fixed_head_participants = storage==ImmutableRowLookupExecution::FixedHeadShardGPU
-            ? static_cast<int>(model.ngram_table_placement->consumers().size()) : 0};
+            ? static_cast<int>(model.ngram_table_placement->consumers().size()) : 0,
+        .ngram_fixed_pipeline_local_heads = pipeline_heads,
+        .ngram_fixed_pipeline_gathered_heads = pipeline_gathered_heads,
+        .ngram_fixed_pipeline_scratch_words = pipeline_words};
 }
 
 /**
@@ -205,7 +235,9 @@ void applyQwen4ExpBufferLayout(GraphSchema &schema, const Qwen4ExpMemoryGeometry
     const bool gpu = dimensions.device.is_gpu();
     const bool host_storage = dimensions.ngram_lookup && *dimensions.ngram_lookup == ImmutableRowLookupExecution::HostProvider;
     const bool fixed_storage = dimensions.ngram_lookup==ImmutableRowLookupExecution::FixedHeadShardGPU;
-    const auto selected = [owns_ple, owns_sparse, gpu, host_storage, fixed_storage, retained_rows = dimensions.retained_mtp_candidate_rows](Qwen4ExpBufferPlacement placement)
+    const auto selected = [owns_ple, owns_sparse, gpu, host_storage, fixed_storage,
+        pipeline_wire = dimensions.ngram_fixed_pipeline_scratch_words != 0,
+        retained_rows = dimensions.retained_mtp_candidate_rows](Qwen4ExpBufferPlacement placement)
     {
         switch (placement)
         {
@@ -214,6 +246,7 @@ void applyQwen4ExpBufferLayout(GraphSchema &schema, const Qwen4ExpMemoryGeometry
         case Qwen4ExpBufferPlacement::PLEHostStorage: return owns_ple && host_storage;
         case Qwen4ExpBufferPlacement::PLEGPUHostStorage: return owns_ple && gpu && host_storage;
         case Qwen4ExpBufferPlacement::PLEFixedHeadStorage: return owns_ple && gpu && fixed_storage;
+        case Qwen4ExpBufferPlacement::FixedHeadPipelineWire: return pipeline_wire;
         case Qwen4ExpBufferPlacement::Sparse: return owns_sparse;
         case Qwen4ExpBufferPlacement::SparseGPU: return owns_sparse && gpu;
         case Qwen4ExpBufferPlacement::SparseMTP: return owns_sparse && retained_rows > 0;
@@ -233,6 +266,8 @@ void applyQwen4ExpBufferLayout(GraphSchema &schema, const Qwen4ExpMemoryGeometry
     for (const auto &entry : declarations)
     {
         if (!selected(entry.placement)) continue;
+        if (dimensions.ngram_fixed_pipeline_local_heads && dimensions.ngram_fixed_head_participants == 1 &&
+            (entry.id == BufferId::QFN_NGRAM_SHARD_HEADERS || entry.id == BufferId::QFN_NGRAM_SHARD_GATHERED_NATIVE)) continue;
         const auto duplicate = [&entry](const BufferSpec &spec) { return spec.name == entry.spec.name; };
         if (std::any_of(schema.layer_buffers.begin(), schema.layer_buffers.end(), duplicate) ||
             std::any_of(schema.model_buffers.begin(), schema.model_buffers.end(), duplicate))
@@ -271,11 +306,18 @@ void applyQwen4ExpBufferGeometry(GraphResolverConfig &resolver, const Qwen4ExpMe
     resolver.custom_formulas["qfn_native_words"] = (row_bytes + sizeof(std::int32_t) - 1) / sizeof(std::int32_t);
     const auto degree=static_cast<std::size_t>(dimensions.ngram_fixed_head_participants);
     resolver.custom_formulas["qfn_fixed_head_participants"]=degree;
+    resolver.custom_formulas["qfn_fixed_pipeline_wire_words"] = dimensions.ngram_fixed_pipeline_scratch_words;
     if(degree) {
-        const auto selected=product(static_cast<std::size_t>(dimensions.flattened_rows),row_bytes);
+        const auto gathered_heads = dimensions.ngram_fixed_pipeline_local_heads
+            ? static_cast<std::size_t>(dimensions.ngram_fixed_pipeline_gathered_heads) : geometry.ple_heads;
+        const auto selected=product(static_cast<std::size_t>(dimensions.flattened_rows),
+            product(gathered_heads,geometry.ple_table_row_bytes));
+        const auto local_heads = dimensions.ngram_fixed_pipeline_local_heads
+            ? static_cast<std::size_t>(dimensions.ngram_fixed_pipeline_local_heads) : geometry.ple_heads / degree;
         const auto local=product(static_cast<std::size_t>(dimensions.flattened_rows),
-            product(geometry.ple_heads/degree,geometry.ple_table_row_bytes));
-        if(geometry.ple_heads!=16 || geometry.ple_heads%degree || selected>std::numeric_limits<std::size_t>::max()-3 ||
+            product(local_heads,geometry.ple_table_row_bytes));
+        if(geometry.ple_heads!=16 || (!dimensions.ngram_fixed_pipeline_local_heads && geometry.ple_heads%degree) ||
+            selected>std::numeric_limits<std::size_t>::max()-3 ||
             local>std::numeric_limits<std::size_t>::max()-3)
             throw std::overflow_error("Flash Next fixed-head native packet extent overflows or loses original heads");
         // Only allocation is rounded to INT32. Wire stride is exactly M*H*B;

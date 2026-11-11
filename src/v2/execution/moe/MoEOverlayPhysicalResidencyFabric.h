@@ -27,6 +27,7 @@
 
 namespace llaminar2
 {
+    struct MoEOverlayPhysicalLaneDemandPlan;
     struct GGUFModel;
     class ModelLoader;
     class MoEOverlayMPIRemoteProjectionTransport;
@@ -282,6 +283,8 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry;
             /** Exact epoch and owner map installed in @ref registry. */
             std::shared_ptr<const MoEOverlayResidencySnapshot> initial_snapshot;
+            /** Same immutable original capacity declaration; mandatory for local GPU creators, unnecessary for CPU-only pools. */
+            std::shared_ptr<const MoEOverlayPhysicalLaneDemandPlan> physical_gpu_lane_demand;
             /** Typed source of the terminal durable physical inventory. */
             MoEOverlayPhysicalInventoryAuthority inventory_authority =
                 MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry;

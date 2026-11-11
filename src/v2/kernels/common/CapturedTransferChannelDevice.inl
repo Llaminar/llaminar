@@ -82,7 +82,7 @@ __device__ __forceinline__ void capturedTransferFail(
     mappedSystemRelease64(&publication->epoch, kCapturedTransferAbortEpoch);
     if (drain)
     {
-        if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication)
+        if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication && binding.device_extent)
             *binding.device_extent = 0;
         return;
     }
@@ -131,8 +131,19 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
     // producer waiting for the previous acknowledgement must not change the
     // extent of the transaction it is trying to publish.
     const auto source_slice = binding.source_slice ? *binding.source_slice : CapturedTransferSourceSlice{};
+    // The original materializer precedes acquire. Snapshot the local signed
+    // rows once; the producer's published uint64 extent remains wire authority.
+    const auto rows = binding.device_rows
+        ? capturedTransferRowBytes(*binding.device_rows, binding.row_bytes, binding.message.bytes)
+        : CapturedTransferRowBytes{true, 0};
+    if (!rows.valid)
+    {
+        capturedTransferFail(binding, CapturedTransferStatus::InvalidBinding);
+        return;
+    }
     const std::uint64_t producer_bytes = binding.source_slice ? source_slice.live_bytes :
-        binding.extent_source == CapturedTransferExtentSource::ProducerDevice ? *binding.device_extent : 0;
+        binding.extent_source == CapturedTransferExtentSource::ProducerDevice
+            ? (binding.device_rows ? rows.bytes : *binding.device_extent) : 0;
     const auto started = capturedTransferWallClock();
     for (;;)
     {
@@ -150,13 +161,19 @@ __device__ __forceinline__ void capturedTransferAcquire(CapturedTransferChannelD
             mappedSystemAcquire64(&binding.control->cancelled_nonce));
         if (decision.ready())
         {
+            if (binding.device_rows && binding.role == CapturedTransferEndpoint::Consumer &&
+                cursor.acquired_message.bytes != rows.bytes)
+            {
+                capturedTransferFail(binding, CapturedTransferStatus::MessageMismatch);
+                return;
+            }
             binding.cursor->acquired_message = cursor.acquired_message;
             binding.cursor->acquired_source_offset = cursor.acquired_source_offset;
             // Only this acquired invocation can initialize the completion
             // cohort. All copy blocks follow this write through the stream
             // dependency or the single-block barrier.
             binding.cursor->completed_payload_blocks = 0;
-            if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication)
+            if (binding.extent_source == CapturedTransferExtentSource::ProducerPublication && binding.device_extent)
                 *binding.device_extent = cursor.acquired_message.bytes;
             return;
         }
@@ -355,4 +372,46 @@ __global__ __launch_bounds__(256) void capturedTransferBatchCopyPublishKernel(Ca
         capturedTransferCopyAndPublish<true>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
     else
         capturedTransferCopyAndPublish<false>(entry.binding, entry.destination, entry.source, blockIdx.x, entry.copy_blocks);
+}
+
+/** @brief Reject incomplete/mismatched native activation receipt before model roots.
+ * @param binding Immutable original geometry and participant-local native evidence.
+ * This node follows the whole completed-prefix launch, never a single channel
+ * or an enclosing timer. Failure stays sticky and traps through original GPU
+ * fatal execution; no partial payload can advance model/KV state.
+ */
+__global__ void pipelineActivationFanoutValidationKernel(PipelineActivationFanoutValidation binding)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    // Native system-scope loads exist only in the device compilation pass.
+    // The host pass emits this kernel's launch stub, not a validation path.
+    if (threadIdx.x != 0) return;
+    const auto &state = *binding.state;
+#if defined(__CUDA_ARCH__)
+    ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_system> original_abort(
+        *const_cast<std::uint32_t *>(binding.completion.abortAddress()));
+    const auto abort = original_abort.load(::cuda::memory_order_acquire);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    const auto abort = __hip_atomic_load(binding.completion.abortAddress(), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
+    const auto error = atomicAdd(&binding.state->first_error, 0);
+    const bool original_ready = !binding.original_receive.valid() ||
+        binding.original_receive.status(state.header.message.bytes,
+            mappedSystemAcquire64(binding.original_receive.cancellationAddress()),
+            state.header.epoch, state.header.message) == CapturedTransferStatus::Ready;
+    if (original_ready && pipelineActivationFanoutHeaderMatches(*binding.rows, binding.row_bytes, binding.capacity,
+            binding.expected_key, state.header) &&
+        binding.completion.matches(binding.allocation, binding.scope, state.header.epoch,
+            state.header.message.bytes, binding.native_message, abort, error)) return;
+    atomicCAS(&binding.state->first_error, 0, 1);
+    printf("pipeline_activation_fanout_failure key=%llu epoch=%llu bytes=%llu error=%d\n",
+        static_cast<unsigned long long>(state.header.message.key),
+        static_cast<unsigned long long>(state.header.epoch),
+        static_cast<unsigned long long>(state.header.message.bytes), error);
+#if defined(__CUDA_ARCH__)
+    asm volatile("trap;");
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
+#endif
 }

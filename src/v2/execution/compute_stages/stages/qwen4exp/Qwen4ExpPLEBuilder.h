@@ -221,7 +221,13 @@ class Qwen4ExpPLEBuilder final
 {
 public:
     /** @brief Explicit whole-storage versus fixed-range composition; no automatic substitution. */
-    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage,Qwen4ExpPooledLookupStorage,Qwen4ExpPooledReaderLookupStorage>;
+    /** @brief Actual fixed-range native pipeline consumer and DGO-authenticated source query. */
+    struct FixedPipelineLookupStorage {
+        std::shared_ptr<const Qwen4ExpFixedHeadPipelinePort> port;
+        Qwen4ExpReplicatedPLEQuery query;
+        std::optional<Qwen4ExpIntBinding> count; ///< Original materializer, request or verifier count root.
+    };
+    using LookupStorage=std::variant<ImmutableLookupStage::Storage,Qwen4ExpFixedHeadLookupStorage,FixedPipelineLookupStorage,Qwen4ExpPooledLookupStorage,Qwen4ExpPooledReaderLookupStorage>;
     /**
      * @brief Append lexical computation using its explicitly admitted whole-table or fixed-head storage.
      * @param graph Existing participant-local declarative graph.

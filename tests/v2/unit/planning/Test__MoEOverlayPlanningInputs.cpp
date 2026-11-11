@@ -13,6 +13,7 @@
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationChannelPlan.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "config/OrchestrationConfig.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -738,7 +739,17 @@ namespace llaminar2
                         observed.cpu.memory_bytes=observed.cpu.free_memory_bytes=observed.cpu_memory_bytes=256ull<<30;
                         if(backend!=DeviceType::CPU) observed.gpus.push_back({.type=backend,.local_device_id=0,
                             .memory_bytes=256ull<<30,.free_memory_bytes=256ull<<30,.compute_units=60});
+                        // The admitted lane BOM consumes the same original main and
+                        // retained predictor tensor directories as this full-source fixture.
+                        auto manifest = buildMoEOverlayLayerWeightManifestFromGGUF(source.main,
+                            f.family.main_layer_count, profile.expert_count, interval.first);
+                        if (f.rank.has_lm_head) {
+                            auto predictor = buildMoEOverlayLayerWeightManifestFromGGUF(
+                                source.predictor, 1, profile.expert_count, 48);
+                            manifest.insert(manifest.end(), predictor.begin(), predictor.end());
+                        }
                         auto request=f.request();
+                        request.original_expert_manifest = manifest;
                         request.native_source_placement=loader.nativeWeightSourcePlacement();
                         request.gpu_weight_load={.policy=GPUWeightLoadMemoryPolicy{},
                             .maximum_source_bytes=maximumGGUFTensorPayloadBytes(source.main)};
@@ -750,6 +761,11 @@ namespace llaminar2
                                 .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{}};
                         auto inputs=buildMoEOverlayMemoryPlanInputs(request,512);
                         inputs.local_capacity.native_ordering_events=test::recordedNgramOrdering(f.rank.primary_device.toLocalDeviceId());
+                        if (backend != DeviceType::CPU && mode == MoERebalanceRuntimeMode::Dynamic) {
+                            auto missing = inputs.local_capacity;
+                            missing.original_expert_manifest = {};
+                            EXPECT_THROW((void)test::planWithRecordedHostServices(missing), std::invalid_argument);
+                        }
                         const auto fixed=test::planWithRecordedHostServices(inputs.local_capacity);
                         ASSERT_NE(fixed.physical_memory_admission,nullptr);
                         const auto exact=MemoryPlanner::plan(profile,fixed.device_inputs);

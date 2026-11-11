@@ -6,6 +6,8 @@
  */
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
+#include "backends/NativeAuxiliaryStreamOwnership.h"
+#include "transfer/TransferEngine.h"
 #include "backends/ReadAheadNativeParentTerminal.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "mocks/MockWorkerGPUContext.h"
@@ -17,7 +19,26 @@
 #include <cstdio>
 #include <type_traits>
 #include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
-namespace llaminar2::test { namespace {
+namespace llaminar2::test {
+/** @brief Replay actual source/retirement code; fake handles never certify native runtime bounds. */
+struct NativeAuxiliaryStreamOwnershipReplayAccess {
+    static auto claim(const PreparedGPUContextUsePermit& p,const std::string& name){return NativeAuxiliaryStreamOwnership::claim(p,name);}
+    static auto claim(const PreparedGPUContextUsePermit& p,const std::string& name,GPUAuxiliaryStreamSchedulingClass scheduling)
+    {return NativeAuxiliaryStreamOwnership::claim(p,name,scheduling);}
+    static void require(const NativeAuxiliaryStreamOwnership& p,const PreparedGPUContextUsePermit& original,
+        const std::string& name,GPUAuxiliaryStreamSchedulingClass scheduling)
+    {p.requireOriginal(original,original.worker().get(),name,scheduling);}
+    static void requirePublicReset(const NativeAuxiliaryStreamOwnership& p)
+    {p.requireRetirement(NativeAuxiliaryStreamOwnership::RetirementScope::PublicReset);}
+    static void requireOriginalShutdown(const NativeAuxiliaryStreamOwnership& p)
+    {p.requireRetirement(NativeAuxiliaryStreamOwnership::RetirementScope::OriginalContextShutdown);}
+    static void begin(NativeAuxiliaryStreamOwnership& p){p.beginNativeAttempt();}
+    static void delegate(NativeAuxiliaryStreamOwnership& p){p.delegateToContext();}
+    static void complete(NativeAuxiliaryStreamOwnership& p){p.completeNativeHandles();}
+    static void require(const NativeAuxiliaryStreamOwnership& p,const PreparedGPUContextUsePermit& original,
+                        const std::string& name){p.requireOriginal(original,original.worker().get(),name);}
+};
+namespace {
 static_assert(!std::is_copy_constructible_v<PreparedFollowerCaptureTerminalPopulation>);
 static_assert(!std::is_move_constructible_v<PreparedFollowerCaptureTerminalPopulation>);
 static_assert(!std::is_copy_assignable_v<PreparedFollowerCaptureTerminalPopulation>);
@@ -31,7 +52,14 @@ static_assert(!std::is_move_assignable_v<PreparedFollowerCaptureTerminalOwner>);
 class SourceBoundWorker final:public testing::MockWorkerGPUContext {
 public:
     SourceBoundWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(ordinal){thread_.start(std::move(root),[](void*){},nullptr);}
-    ~SourceBoundWorker()override{thread_.join();}
+    ~SourceBoundWorker()override{
+        thread_.join();
+        // Mirror the actual backend record's destruction order, with no SDK
+        // object: destroy the fake stream before completing its real PMA slot.
+        for(auto& stream:namedStreams){++streamDestructions;NativeAuxiliaryStreamOwnershipReplayAccess::complete(*stream);stream.reset();}
+    }
+    std::vector<std::unique_ptr<NativeAuxiliaryStreamOwnership>> namedStreams;
+    static inline unsigned streamDestructions=0;
     /** @brief Replay a precise native creator failure after earlier handles were accepted. */
     void* createEvent(GPUEventPurpose purpose=GPUEventPurpose::Ordering)override{
         ++eventAttempts;
@@ -410,6 +438,74 @@ TEST(NativeOrderingOriginalSource, PreparedFollowerPartialCreatorFailureCannotAl
     for(const auto device:devices){auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);Access::physicalReset(scope);}
 
         }
+        _exit(::testing::Test::HasFailure()?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Context-owned streams survive graph release but retire before original physical reset. */
+TEST(NativeOrderingOriginalSource, AuxiliaryStreamOwnershipRequiresOriginalPermitAndExactContextRetirement){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT(([]{
+        using Access=NativeContextPreparationReplayAccess;
+        const std::array devices{DeviceId::cuda(56),DeviceId::rocm(56)};
+        const PhysicalMemoryResource cpu{0,DeviceId::cpu(),256u<<20,256u<<20};
+        const std::array resources{cpu,PhysicalMemoryResource{0,devices[0],128u<<20,128u<<20},
+                                      PhysicalMemoryResource{0,devices[1],128u<<20,128u<<20}};
+        testing::installHardwareFreeGPUContextFactories();
+        for(const auto device:devices)Access::seed(device,[device](std::shared_ptr<PreparedGPUWorkerStack> stack){
+            return Access::construct<SourceBoundWorker>(std::move(stack),device.gpu_ordinal());});
+        auto source=Access::source<SourceBoundWorker>(std::span<const DeviceId>{devices},resources);
+        auto memory=source->memory();
+        {
+            std::array permits{source->acquire(devices[0]),source->acquire(devices[1])};
+            for(std::size_t i=0;i<devices.size();++i)
+                EXPECT_THROW(TransferEngine{}.allocatePersistentTransferExecutionLanes(1,devices[i],"before_admission",permits[i]),std::logic_error);
+            PhysicalMemoryPlanBuilder extras;
+            for(std::size_t i=0;i<devices.size();++i){
+                const auto declaration=TransferEngine::persistentTransferExecutionLanesBOM(3,cpu,resources[i+1]);
+                for(const auto& row:declaration.resources())extras.add(row);
+            }
+            source->freezeForPlanning();PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
+            const auto declared=extras.build();for(const auto& row:declared.resources())plan.add(row);
+            source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
+            for(std::size_t i=0;i<devices.size();++i){
+                auto& worker=dynamic_cast<SourceBoundWorker&>(*permits[i].worker());
+                TransferEngine transfers;
+                EXPECT_THROW(transfers.allocatePersistentTransferExecutionLanes(0,devices[i],"invalid",permits[i]),std::invalid_argument);
+                EXPECT_THROW(transfers.allocatePersistentTransferExecutionLanes(1,DeviceId::cpu(),"invalid",permits[i]),std::invalid_argument);
+                EXPECT_THROW(transfers.allocatePersistentTransferExecutionLanes(1,devices[i],"",permits[i]),std::invalid_argument);
+                EXPECT_THROW(transfers.allocatePersistentTransferExecutionLanes(1,devices[1-i],"foreign",permits[i]),std::invalid_argument);
+                {
+                    GraphCaptureGuard capture;
+                    EXPECT_THROW(transfers.allocatePersistentTransferExecutionLanes(1,devices[i],"capture",permits[i]),std::logic_error);
+                }
+                const auto before=memory->reservedBytes(devices[i],PhysicalMemoryOwner::NativeAuxiliaryStream);
+                EXPECT_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::claim(permits[i],"invalid",static_cast<GPUAuxiliaryStreamSchedulingClass>(99)),std::invalid_argument);
+                EXPECT_EQ(memory->reservedBytes(devices[i],PhysicalMemoryOwner::NativeAuxiliaryStream),before);
+                for(const auto scheduling:{GPUAuxiliaryStreamSchedulingClass::Normal,GPUAuxiliaryStreamSchedulingClass::LatencyCritical,
+                    GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance}) {
+                    const auto name="activation_lane:"+std::to_string(static_cast<unsigned>(scheduling));
+                    auto token=NativeAuxiliaryStreamOwnershipReplayAccess::claim(permits[i],name,scheduling);
+                    EXPECT_GT(memory->reservedBytes(devices[i],PhysicalMemoryOwner::NativeAuxiliaryStream),0u);
+                    NativeAuxiliaryStreamOwnershipReplayAccess::begin(*token);
+                    NativeAuxiliaryStreamOwnershipReplayAccess::delegate(*token);
+                    for(int replay=0;replay<20;++replay){
+                        EXPECT_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::requirePublicReset(*token),std::logic_error);
+                        EXPECT_NO_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::requireOriginalShutdown(*token));
+                        EXPECT_NO_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::require(*token,permits[i],name,scheduling));
+                        EXPECT_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::require(*token,permits[i],name+"foreign",scheduling),std::logic_error);
+                        EXPECT_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::require(*token,permits[1-i],name,scheduling),std::logic_error);
+                        EXPECT_THROW(NativeAuxiliaryStreamOwnershipReplayAccess::require(*token,permits[i],name,
+                            scheduling==GPUAuxiliaryStreamSchedulingClass::Normal?GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance:
+                                GPUAuxiliaryStreamSchedulingClass::Normal),std::logic_error);
+                    }
+                    worker.namedStreams.push_back(std::move(token));
+                }
+            }
+        }
+        const auto before=SourceBoundWorker::streamDestructions;
+        for(const auto device:devices){auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);Access::physicalReset(scope);}
+        EXPECT_EQ(SourceBoundWorker::streamDestructions,before+3*devices.size());
         _exit(::testing::Test::HasFailure()?1:0);
     }()),::testing::ExitedWithCode(0),"");
 }

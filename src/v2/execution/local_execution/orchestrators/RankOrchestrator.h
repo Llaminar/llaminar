@@ -46,6 +46,10 @@
  * @author David Sanftenberg
  * @date January 2026
  * CPU serial storage declarations survive admission and runtime projection.
+ *
+ * Local and global pipeline stages share the original rank-owned prepared
+ * source and PMA handoff. Global topology remains immutable metadata; remote
+ * execution, activation transport and model-context reuse are not impersonated.
  */
 
 #pragma once
@@ -371,6 +375,8 @@ namespace llaminar2
 
             /// Optional MPI context used by MoE overlay domain-worker commands.
             std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+            /** Exact admitted parent MPI owner for local pipeline membership; never WORLD/self reconstructed. */
+            std::shared_ptr<IMPIContext> original_pipeline_mpi_ctx;
 
             /** Pre-rendezvoused node-local activation channels for child graphs. */
             std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
@@ -506,6 +512,12 @@ namespace llaminar2
              * stage's owner epoch, histogram or prepared-bank registry.
              */
             [[nodiscard]] Config forPipelineStage(std::size_t stage_index) const;
+            /**
+             * @brief Install one original local/global stage's sealed expert runtime.
+             * @param binding Exact stage whose scope and devices this child already declares.
+             * @throws std::invalid_argument Before mutation for foreign scope or existing owners.
+             */
+            void installPipelineStageRuntime(const MoEOverlayPipelineStageBinding &binding);
         };
 
         // =====================================================================

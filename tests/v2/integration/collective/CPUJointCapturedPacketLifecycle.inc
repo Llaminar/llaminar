@@ -3,8 +3,8 @@
  * @brief Genuine two-socket prepared fragments behind retained GPU dispatch and
  * return.
  *
- * Rank0 is both the GPU continuation and the original CPU root. Rank1 is the
- * other original CPU member. The source-local edge uses its real mapped ticket;
+ * The discovered original GPU-owning rank is also the CPU cohort root; the
+ * other original socket remains its real CPU member. The source-local edge uses its real mapped ticket;
  * only the remote member has a mapped activation channel. No extra rank, local
  * CPU packet channel, synthetic completion or terminal cancellation substitutes
  * for an ordinary successful invocation/reset. Explicit decode/verifier traces
@@ -16,6 +16,14 @@
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/ServingGGUFFixturePayload.h"
 #include "backends/BackendManager.h"
+#include "../../fixtures/backends/PreparedNativeLookupFixture.h"
+#include "planning/RankHardwareOwnership.h"
+#include "execution/moe/MoEOverlayActivationBatchResources.h"
+#include "backends/NativeOrderingEventGroup.h"
+#include "backends/GPUGraphMemoryContract.h"
+#include "backends/GPUFlatGraphStructure.h"
+#include "memory/CPUStorageRoot.h"
+#include "execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
@@ -46,6 +54,8 @@
 #include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
 #include <array>
+#include <bit>
+#include <limits>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -58,7 +68,7 @@
 namespace rooted_packet_lifecycle
 {
 using namespace llaminar2;
-constexpr int rows = 64, hidden = 256, intermediate = 16, experts = 8, top_k = 2;
+constexpr int rows = 65, hidden = 256, intermediate = 16, experts = 8, top_k = 2;
 constexpr size_t slots = size_t(rows) * top_k;
 constexpr uint64_t workspace_generation = 17;
 constexpr uint64_t invocation_count = 20;
@@ -70,7 +80,7 @@ struct RecordedLayerWork
 };
 constexpr std::array<RecordedLayerWork, 4> live_row_trace{{{9, 9}, {9, 0}, {1, 1}, {9, 9}}};
 /** @brief Explicit packet phase; source weights/native domain remain identical. */
-enum class PacketPhaseScenario { Prefill, Decode, GroupedVerifier };
+enum class PacketPhaseScenario { Prefill, Decode, GroupedVerifier, OriginalFanout, ZeroWeightCompaction };
 /** @brief Terminal-only numerical witness, never an execution implementation. */
 enum class PacketRowOracle { None, Grouped, Serial };
 /** @brief Authored input/phase trace; no field is inferred from route capacity. */
@@ -85,6 +95,7 @@ struct RecordedPhaseInvocation
     int draft_depth = -1;
     int original_first_row = 0;
     PacketRowOracle oracle = PacketRowOracle::None;
+    int zero_pattern = 0;
 };
 /** @param scenario Explicit registered native phase.
  * @return Immutable input trace, retaining real positive admission for empty CPU participants. */
@@ -100,11 +111,21 @@ inline std::vector<RecordedPhaseInvocation> phaseInvocations(PacketPhaseScenario
                               ExpertHistogramSource::PrefillChunk, rows, rows});
         return result;
     }
+    if (scenario == PacketPhaseScenario::OriginalFanout)
+        return {{{rows,rows},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,rows,rows},
+                {{9,9},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,9,rows},
+                {{9,0},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,9,rows},
+                {{1,1},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,1,1},
+                {{rows,rows},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,rows,rows}};
+    if (scenario == PacketPhaseScenario::ZeroWeightCompaction)
+        return {{{9,6},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,9,rows,-1,0,PacketRowOracle::None,1},
+                {{1,0},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,1,1,-1,0,PacketRowOracle::None,2},
+                {{1,1},Role::MainPrefill,Semantics::Prefill,ExpertHistogramSource::PrefillChunk,1,1,-1,0,PacketRowOracle::None,3}};
     if (scenario == PacketPhaseScenario::Decode)
         return {{{1,1}, Role::MainDecode, Semantics::Decode, ExpertHistogramSource::DecodeToken,1,1},
                 {{1,0}, Role::MainDecode, Semantics::Decode, ExpertHistogramSource::DecodeToken,1,1},
                 {{1,1}, Role::MainDecode, Semantics::Decode, ExpertHistogramSource::DecodeToken,1,1}};
-    // A verifier's exact execution extent is M+1, independent of capacity64.
+    // A verifier's exact execution extent is M+1, independent of capacity65.
     // Physical2/depth1 and physical4/depth3 are both real dispatch families;
     // CPU2-of-physical3 below is separate partial-work coverage.
     // Serial requests are diagnostic oracles through the SAME production path,
@@ -234,6 +255,23 @@ inline void requireOriginal(bool accepted, const char *operation)
  */
 class Source final
 {
+    /** @brief Exact original operand; native free precedes its sole allocation lease on every unwind. */
+    struct NativeOperand final {
+        IBackend* backend; DeviceId device; void* address; PhysicalMemoryAllocationLease claim;
+        /** @brief Bind only a successfully allocated original native root.
+         * @param issuer Existing backend, retained by original source.
+         * @param endpoint Exact original GPU.
+         * @param pointer Original allocation, never adopted from another owner.
+         * @param lease Same-PMA pre-allocation claim. */
+        NativeOperand(IBackend* issuer,DeviceId endpoint,void* pointer,PhysicalMemoryAllocationLease lease)
+            :backend(issuer),device(endpoint),address(pointer),claim(std::move(lease)){}
+        NativeOperand(const NativeOperand&)=delete;
+        /** @brief Transfer physical release authority while vector storage grows cold. */
+        NativeOperand(NativeOperand&& other) noexcept:backend(other.backend),device(other.device),
+            address(std::exchange(other.address,nullptr)),claim(std::move(other.claim)){}
+        /** @brief Release the native root before member claim destruction. */
+        ~NativeOperand(){if(address)backend->free(address,device.ordinal);}
+    };
     /** @brief One cold-built exact physical-row executable; all payload/source owners stay shared. */
     struct CaptureFamily
     {
@@ -246,28 +284,101 @@ class Source final
         size_t node_count = 0;
     };
   public:
+    /** @brief Exact original source-local ticket requests; allocator geometry remains infrastructure-owned.
+     * @param device Actual original continuation GPU.
+     * @return Immutable dispatch payload and publication-word sequence.
+     * @throws std::exception For invalid source geometry/device declaration. */
+    static std::vector<MappedHostTransferArena::AllocationRequest> dispatchRequests(DeviceId device)
+    {
+        MoEOverlayDispatchTicketStorage declaration;
+        declaration.bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+            0, rows, top_k, hidden, device, workspace_generation);
+        return {{declaration.allocationBytes(), 64u}, {sizeof(std::uint64_t), 64u}};
+    }
+    /** @brief Quote every retained exact-row source on the original allocator observations.
+     * @param host Same source host resource.
+     * @param gpu Same original GPU resource.
+     * @param widths Actual declared retained physical widths.
+     * @param channels Original native/host lane declaration.
+     * @return Complete source payload, General graph and event bill.
+     * @throws std::exception For invalid original geometry, resources or overflow. */
+    static PhysicalMemoryPlan bom(PhysicalMemoryResource host, PhysicalMemoryResource gpu,
+        std::span<const int> widths, std::span<const MoEOverlayNodeLocalActivationChannelPlan> channels)
+    {
+        PhysicalMemoryPlanBuilder plan;
+        for (const auto count : {size_t(rows)*hidden, size_t(rows)*top_k, size_t(rows)*top_k, slots*hidden}) {
+            const CPUStorageRoot<float> root(count, PhysicalMemoryOwner::ActivationArena, DeviceId::cpu());
+            plan.add(host, PhysicalMemoryOwner::ActivationArena, root.physicalBytes());
+            plan.add(gpu, PhysicalMemoryOwner::ActivationArena, count*sizeof(float));
+        }
+        plan.add(gpu, PhysicalMemoryOwner::ExecutionWorkspace, 2*sizeof(DeviceMoEPlacementBank)+
+            sizeof(DeviceMoEOverlayEpochControl)+sizeof(DeviceMoEOverlayEpochTicket)+sizeof(DeviceMoEOverlayEpochStatus)+sizeof(int32_t));
+        const auto requests = dispatchRequests(gpu.device);
+        plan.add(host,PhysicalMemoryOwner::ActivationTransportStaging,MappedHostTransferArena::backingBytes(requests));
+        for(size_t cache=0;cache<widths.size();++cache) {
+            plan.add(host,PhysicalMemoryOwner::NativeGraphExecutable,
+                GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(gpu.device));
+            plan.add(host,PhysicalMemoryOwner::NativeGraphExecutable,nativeGraphCaptureObjectBytes(gpu.device));
+            plan.add(gpu,PhysicalMemoryOwner::NativeGraphExecutable,
+                GPUGraphMemoryContract::reservationBytesPerExecutable(gpu.device,GPUGraphExecutableClass::General));
+        }
+        const auto event = NativeOrderingEventGroup::bom(NativeOrderingEventProgram::captureSubmissionRetirement(),host,gpu);
+        // One actual prepared terminal per retained cache, plus the source's
+        // setup/terminal cache. Teardown publishes that event before reset,
+        // so reset never creates an unpriced generic stream-fence event.
+        for(size_t cache=0;cache<widths.size()+1u;++cache)
+            for(const auto& resource:event.resources())plan.add(resource);
+        bool asynchronous=false;
+        for(const auto width:widths) {
+            const auto batch=MoEOverlayActivationBatchResources::bom(channels,width,0u,host,gpu);
+            for(const auto& resource:batch.resources())plan.add(resource);
+            asynchronous |= width>1;
+        }
+        const auto ordering=asynchronous?MoEOverlayActivationBatchResources::sharedLaneStreamsBOM(channels,host,gpu):
+            MoEOverlayActivationBatchResources::coldPublicationBOM(host,gpu);
+        for(const auto& resource:ordering.resources())plan.add(resource);
+        return plan.build();
+    }
     /** @brief Capture the original source endpoint without dispatching it.
      * @param device Actual continuation backend.
-     * @param transport Original remote contributor channel owned on rank0.
+     * @param transport Original remote contributor channel owned on the discovered source rank.
      * @param owners Same original source map used by both CPU members.
      * @param canonical Actual CPU root publication; no test payload publisher is
      * provided.
      * @param capture_rows Exact physical row families authored by the immutable request trace.
      * All families are materialized before the first admission; runtime selection never captures.
+     * @param original Actual source-issued GPU worker/PMA permit, retained through every capture.
+     * @param remote_rank Actual other original CPU socket rank, never a logical coordinate.
+     * @throws std::exception For failed original admission, allocation, capture or identity proof.
      */
     Source(DeviceId device, MoEOverlayNodeLocalRankBatchTransport &transport,
            const MoEExpertOwnerMap &owners,
            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> canonical,
-           std::span<const int> capture_rows)
+           std::span<const int> capture_rows, const PreparedGPUContextUsePermit& original,
+           int remote_rank)
         : device_(device), transport_(transport), canonical_(std::move(canonical)),
-          hidden_({rows, hidden}), indices_({rows, top_k}), weights_({rows, top_k}),
-          output_({slots, size_t(hidden)}), output_poison_(slots * hidden, -991.f)
+          memory_(original.memory()), original_worker_(original.worker()), remote_rank_(remote_rank),
+          hidden_({rows,hidden},hidden_root_.allocate(original.memory()),DeviceId::cpu()),
+          indices_({rows,top_k},indices_root_.allocate(original.memory()),DeviceId::cpu()),
+          weights_({rows,top_k},weights_root_.allocate(original.memory()),DeviceId::cpu()),
+          output_({slots,size_t(hidden)},output_root_.allocate(original.memory()),DeviceId::cpu()),
+          output_poison_(slots * hidden, -991.f)
     {
         backend_ = getBackendFor(device_);
         requireOriginal(backend_ != nullptr, "original source backend");
-        stream_ = backend_->createStream(device_.ordinal);
-        terminal_ = backend_->createEvent(device_.ordinal);
-        requireOriginal(stream_ && terminal_, "original source stream/event");
+        worker_=original_worker_.get();
+        stream_=original_worker_->defaultStream();
+        requireOriginal(stream_ && original.device()==device_, "original admitted source stream/worker");
+        graph_reservation_.emplace(memory_->reserveNewAllocations(device_,PhysicalMemoryOwner::NativeGraphExecutable,
+            memory_->plannedBytes(device_,PhysicalMemoryOwner::NativeGraphExecutable)));
+        host_graph_reservation_.emplace(memory_->reserveNewAllocations(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable,
+            memory_->plannedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable)));
+        original_worker_->submitAndWait([&] {
+        try {
+        requireOriginal(terminal_cache_.bindBorrowedCaptureStream(worker_,stream_,device_,true) &&
+            terminal_cache_.prepareCaptureStreamTerminal(worker_,memory_),"original admitted terminal event");
+        for(const auto count:{size_t(rows)*hidden,size_t(rows)*top_k,size_t(rows)*top_k,slots*hidden})
+            tensor_claims_.push_back(memory_->claimNewAllocation(device_,PhysicalMemoryOwner::ActivationArena,count*sizeof(float)));
         if (device_.is_cuda())
         {
 #ifdef HAVE_CUDA
@@ -322,10 +433,12 @@ class Source final
                                                         epoch_ticket_, epoch_status_),
                         "actual source epoch acquire");
         observeEpoch(DeviceMoEOverlayEpochOperation::Acquire);
-        auto metadata = TransferEngine::instance().createMappedHostArena(std::array{device_});
+        const auto requests=dispatchRequests(device_);
+        auto metadata = TransferEngine::instance().createMappedHostArena(std::array{device_},memory_,requests);
         dispatch_ticket_ = std::make_shared<MoEOverlayDispatchTicketStorage>();
         dispatch_ticket_->bindFixedCapacity(0, rows, top_k, hidden, device_, workspace_generation,
                                             metadata, epoch_ticket_);
+        metadata->requireDeclarationConsumed();
         initializeInputs();
         arena_ = std::make_unique<BufferArena>();
         requireOriginal(
@@ -336,7 +449,7 @@ class Source final
                                                &output_),
             "source arena bindings");
         context_ = IDeviceContext::create(device_);
-        worker_ = &GPUDeviceContextPool::instance().getContext(device_);
+
         GraphExecutorConfig config;
         config.default_device = device_;
         config.worker_gpu_context_resolver = [this](DeviceId requested)
@@ -367,7 +480,7 @@ class Source final
             if (physical_rows > 1)
             {
                 transaction = std::make_shared<MoEOverlayActivationLaneBatchState>(
-                    device_, std::vector{lane}, physical_rows, 0, 0);
+                    device_, std::vector{lane}, physical_rows, 0, 0, memory_);
                 family.transaction = transaction;
             }
             MoEOverlayTicketPublishStage::Params publication;
@@ -472,8 +585,8 @@ class Source final
             graph_->addDependency("root_return", "contributor_return");
             cache_->steady_replay_host_policy =
                 DeviceGraphExecutor::GraphSegmentCache::SteadyReplayHostPolicy::RetainedFullGraph;
-            requireOriginal(cache_->bindBorrowedCaptureStream(worker_, stream_, device_, false),
-                            "source capture stream");
+            requireOriginal(cache_->bindBorrowedCaptureStream(worker_, stream_, device_, false) &&
+                cache_->prepareCaptureStreamTerminal(worker_,memory_),"source original admitted capture terminal");
             graph_->reset();
             requireOriginal(
                 submit(DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch),
@@ -489,12 +602,25 @@ class Source final
             captured_node_count_ = captured_->nodeCount();
             family.captured = captured_;
             family.node_count = captured_node_count_;
+            std::vector<GPUGraphKernelNodeInfo> kernels;
+            std::string inspection_error;
+            requireOriginal(captured_->inspectKernelNodes(kernels,&inspection_error),inspection_error.c_str());
+            const auto writers=std::count_if(kernels.begin(),kernels.end(),[](const auto& node){
+                return node.name.find("packSharedDispatchUnionKernel")!=std::string::npos;});
+            const auto single_writers=std::count_if(kernels.begin(),kernels.end(),[](const auto& node){
+                return node.name.find("packSingleRowDispatchKernel")!=std::string::npos;});
+            requireOriginal(physical_rows>1?writers==1:single_writers==1,
+                "Original source must retain exactly one physical dispatch writer");
         }
+        } catch(const std::exception& failure) { abortUnexpected(failure.what()); }
+          catch(...) { abortUnexpected("unknown original GPU source construction failure"); }
+        });
     }
     /** @brief Abort only failure cleanup, drain accepted work before releasing
      * any mapped/root owner. */
     ~Source()
     {
+        try {
         if (pending_)
         {
             (void)canonical_->publishAbort();
@@ -507,12 +633,17 @@ class Source final
         // Reset uploads can exist before any graph is submitted. Retain their
         // immutable staging owner until this exact stream is drained as well.
         if (backend_ && stream_)
-            backend_->synchronizeStream(stream_, device_.ordinal);
+            requireOriginal(backend_->synchronizeStream(stream_, device_.ordinal),
+                "Original source exact-stream retirement drain failed");
+        if(terminal_pending_)await();
         for (auto &[physical_rows, family] : captures_)
         {
             (void)physical_rows;
-            family->cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
-            family->graph.reset();
+            original_worker_->submitAndWait([&]{
+                (void)family->cache.publishCaptureStreamTerminal();
+                family->cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+                family->graph.reset();
+            });
         }
         captures_.clear();
         graph_ = nullptr;
@@ -520,19 +651,20 @@ class Source final
         executor_.reset();
         context_.reset();
         arena_.reset();
-        for (void *address : allocations_)
-            backend_->free(address, device_.ordinal);
-        if (terminal_)
-            backend_->destroyEvent(terminal_, device_.ordinal);
-        if (stream_)
-            backend_->destroyStream(stream_, device_.ordinal);
+        allocations_.clear();
+        original_worker_->submitAndWait([&]{
+            (void)terminal_cache_.publishCaptureStreamTerminal();
+            terminal_cache_.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+        });
+        } catch(const std::exception& failure) { abortUnexpected(failure.what()); }
+          catch(...) { abortUnexpected("unknown original GPU source retirement failure"); }
     }
     /** @return Actual source-local publication consumed by the production host
      * dispatcher. */
     const auto &dispatchTicket() const noexcept { return dispatch_ticket_; }
     /** @brief Select an already materialized exact-row executable after original admission.
      * @param ticket Authored original request; its physical extent must match the captured batch state.
-     * @note Storage capacity64 never substitutes for the authenticated execution extent.
+     * @note Storage capacity65 never substitutes for the authenticated execution extent.
      */
     void launch(const MoEOverlayInferenceTransactionTicket &ticket)
     {
@@ -561,30 +693,22 @@ class Source final
         // Own failure cleanup before submission: an exception may follow a
         // native enqueue, which still needs its original abort/drain boundary.
         pending_ = true;
-        requireOriginal(
+        original_worker_->submitAndWait([&]{requireOriginal(
             submit(DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch),
-            "source retained launch");
+            "source retained launch");});
         requireOriginal(addresses() == bound_addresses_, "launch preserves original GPU operand bindings");
         requireOriginal(cache_->segments.size() == 1 &&
                             cache_->segments.front().capture.get() == captured_ &&
                             captured_->hasExecutable() && captured_->nodeCount() == captured_node_count_,
                         "same cold-built executable for the selected exact-row family");
-        requireOriginal(backend_->recordEvent(terminal_, device_.ordinal, stream_),
-                        "source terminal event");
+        publishTerminal();
     }
     /** @brief Observe only terminal completion; never use a host live-count
      * shadow. */
     void await()
     {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        bool ready = false;
-        while (!ready && std::chrono::steady_clock::now() < deadline)
-        {
-            requireOriginal(backend_->queryEvent(terminal_, device_.ordinal, &ready),
-                            "source terminal query");
-            std::this_thread::yield();
-        }
-        requireOriginal(ready, "source actual round trip deadline");
+        terminal_cache_.waitForPublishedCaptureStreamTerminal(terminal_ticket_,DeviceGraphExecutor::GraphSegmentCache::HostFenceWaitPolicy::ActiveProgress);
+        terminal_pending_=false;
         pending_ = false;
     }
     /**
@@ -600,10 +724,8 @@ class Source final
         requireOriginal(!pending_ && captured_,
                         "replay reset requires a quiescent retained capture");
         requireOriginal(addresses() == bound_addresses_, "original GPU replay buffer addresses");
-        const auto recorded = std::find_if(live_row_trace.begin(), live_row_trace.end(),
-            [live](const auto& work) { return work.cohort_rows == live; });
-        requireOriginal(recorded != live_row_trace.end(),
-                        "cohort work missing from recorded trace");
+        requireOriginal(live>=0 && live<=rows,"Recorded cohort work exceeds its admitted source");
+        recorded_active_=live?live:live_row_trace.front().logical_rows;
         // Empty participants still belong to a nonempty model request. Route
         // that recorded request to the original GPU-owned experts instead of
         // inventing a zero-row dispatch ticket.
@@ -613,17 +735,35 @@ class Source final
                                                device_.ordinal, stream_),
                         "ordered recorded expert-route publication");
         TransferEngine::publishDeviceWrite(&indices_, device_, stream_);
+        zero_pattern_=0;
+        for(size_t slot=0;slot<recorded_weights_.size();++slot)recorded_weights_[slot]=slot%top_k?0.75f:0.25f;
+        requireOriginal(backend_->hostToDevice(weights_.gpu_data_ptr(),recorded_weights_.data(),
+            sizeof(recorded_weights_),device_.ordinal,stream_),"original route-weight reset");
+        TransferEngine::publishDeviceWrite(&weights_,device_,stream_);
         requireOriginal(backend_->hostToDevice(output_.gpu_data_ptr(), output_poison_.data(),
                                                output_poison_.size() * sizeof(float),
                                                device_.ordinal, stream_),
                         "ordered overwrite of original GPU output storage");
         TransferEngine::publishDeviceWrite(&output_, device_, stream_);
         requireOriginal(
-            backend_->hostToDevice(active_, &recorded->logical_rows, sizeof(int32_t),
+            backend_->hostToDevice(active_, &recorded_active_, sizeof(int32_t),
                                    device_.ordinal, stream_),
             "ordered recorded active-count publication");
         requireOriginal(addresses() == bound_addresses_,
                         "replay reset must not rebind GPU storage");
+    }
+    /** @brief Replay original zero holes including all-zero and smallest positive FP32 weights.
+     * @param recorded Exact authored request and zero-hole pattern, never downloaded execution state. */
+    void prepareZeroWeights(const RecordedPhaseInvocation& recorded)
+    {
+        prepareInputs(recorded.work.logical_rows);
+        zero_pattern_=recorded.zero_pattern;
+        for(size_t slot=0;slot<recorded_weights_.size();++slot)
+            recorded_weights_[slot]=zero_pattern_==2 || (zero_pattern_==1 && slot%3!=1)?0.f:
+                zero_pattern_==3?std::bit_cast<float>(std::uint32_t{1}):(slot%top_k?0.75f:0.25f);
+        requireOriginal(backend_->hostToDevice(weights_.gpu_data_ptr(),recorded_weights_.data(),
+            sizeof(recorded_weights_),device_.ordinal,stream_),"original zero-hole route weights");
+        TransferEngine::publishDeviceWrite(&weights_,device_,stream_);
     }
     /**
      * @brief Publish one immutable recorded input slice before the next native admission.
@@ -678,17 +818,17 @@ class Source final
      * @param live Recorded original logical prefix; no device state is inferred
      * from it.
      */
-    void verifyOutput(int live, const RecordedPhaseInvocation *recorded = nullptr)
+    void verifyOutput(int live, const RecordedPhaseInvocation *recorded = nullptr, size_t live_entries = std::numeric_limits<size_t>::max())
     {
         std::vector<float> actual(slots * hidden), expected(slots * hidden, -991.f);
         requireOriginal(backend_->deviceToHost(actual.data(), output_.gpu_data_ptr(),
                                                actual.size() * sizeof(float), device_.ordinal,
                                                stream_),
                         "terminal route observation");
-        requireOriginal(backend_->recordEvent(terminal_, device_.ordinal, stream_),
-                        "terminal observation event");
+        requireOriginal(publishTerminal(), "terminal observation event");
         await();
-        for (size_t entry = 0; entry < size_t(live * top_k); ++entry)
+        if(live_entries==std::numeric_limits<size_t>::max())live_entries=size_t(live*top_k);
+        for (size_t entry = 0; entry < live_entries; ++entry)
         {
             const auto original = canonical_->originalRouteSlotsHost()[entry];
             const auto compact = canonical_->compactRouteSlotsHost()[entry];
@@ -702,7 +842,7 @@ class Source final
             std::copy_n(canonical_->contributionRowsHost() + size_t(compact) * hidden, hidden,
                         expected.data() + size_t(original) * hidden);
         }
-        if (live > 0)
+        if (live > 0 && zero_pattern_!=3)
             EXPECT_TRUE(std::any_of(actual.begin(), actual.begin() + live * top_k * hidden,
                                     [](float value)
                                     { return std::isfinite(value) && value > 0.f; }));
@@ -733,7 +873,7 @@ class Source final
                             ++serial_comparisons_;
                         }
         }
-        if (live == live_row_trace.front().cohort_rows)
+        if (live == live_row_trace.front().cohort_rows && zero_pattern_==0)
         {
             if (!first_nonempty_output_)
                 first_nonempty_output_ = actual;
@@ -755,7 +895,7 @@ class Source final
         DeviceMoEOverlayEpochControl retired{};
         requireOriginal(backend_->deviceToHost(&retired, epoch_control_, sizeof(retired),
                                                device_.ordinal, stream_) &&
-                            backend_->recordEvent(terminal_, device_.ordinal, stream_),
+                            publishTerminal(),
                         "retired source reader observation");
         await();
         EXPECT_EQ(retired.bank_readers[0], 0u);
@@ -778,10 +918,10 @@ class Source final
             }
         }
         std::fill_n(output_.mutable_data(), output_.numel(), -991.f);
-        requireOriginal(hidden_.ensureOnDevice(device_, stream_) &&
-                            indices_.ensureOnDevice(device_, stream_) &&
-                            weights_.ensureOnDevice(device_, stream_) &&
-                            output_.ensureOnDevice(device_, stream_) &&
+        requireOriginal((TransferEngine::prepareDeviceInput(&hidden_,device_,stream_), true) &&
+                            (TransferEngine::prepareDeviceInput(&indices_,device_,stream_), true) &&
+                            (TransferEngine::prepareDeviceInput(&weights_,device_,stream_), true) &&
+                            (TransferEngine::prepareDeviceInput(&output_,device_,stream_), true) &&
                             backend_->hostToDevice(active_, &live_row_trace.front().logical_rows, sizeof(int32_t),
                                                    device_.ordinal, stream_),
                         "recorded source inputs");
@@ -805,7 +945,7 @@ class Source final
         DeviceMoEOverlayEpochStatus observed{};
         requireOriginal(backend_->deviceToHost(&observed, epoch_status_, sizeof(observed),
                                                device_.ordinal, stream_) &&
-                            backend_->recordEvent(terminal_, device_.ordinal, stream_),
+                            publishTerminal(),
                         "native source epoch receipt");
         await();
         requireOriginal(observed.succeeded() && observed.operation == uint32_t(operation) &&
@@ -814,11 +954,11 @@ class Source final
     }
     /** @brief Resolve only the actual remote original member.
      * @param owners Same authoritative original source map.
-     * @return Actual rank1 CPU member, never a fabricated source-local channel. */
+     * @return Actual other original CPU member, never a fabricated source-local channel. */
     int remoteParticipant(const MoEExpertOwnerMap &owners)
     {
         for (const auto &p : owners.participants())
-            if (p.device.is_cpu() && p.world_rank == 1)
+            if (p.device.is_cpu() && p.world_rank == remote_rank_)
                 return remote_ = p.participant_id;
         throw std::logic_error("Original source map has no remote CPU member");
     }
@@ -837,9 +977,13 @@ class Source final
      * @return Backend-owned address retained until actual stream retirement. */
     void *allocate(size_t bytes)
     {
+        allocations_.reserve(allocations_.size()+1u);
+        auto claim=memory_->claimNewAllocation(device_,PhysicalMemoryOwner::ExecutionWorkspace,bytes);
         auto *address = backend_->allocate(bytes, device_.ordinal);
         requireOriginal(address != nullptr, "source input allocation");
-        allocations_.push_back(address);
+        // Vector capacity is acquired before the creator so bookkeeping
+        // failure cannot orphan a successful allocation outside its lease.
+        allocations_.emplace_back(backend_,device_,address,std::move(claim));
         return address;
     }
     /** @brief Submit the retained original source graph through its actual executor.
@@ -851,6 +995,14 @@ class Source final
             *graph_, context_.get(), *cache_, stream_, worker_, nullptr, false, false, true, {},
             DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph, {}, {}, {}, initial);
     }
+    /** @brief Publish one already-admitted exact terminal on its original worker.
+     * @return True after the real event record; failure remains fatal in the cache. */
+    bool publishTerminal() {
+        if(worker_->ownsCurrentThread())terminal_ticket_=terminal_cache_.publishCaptureStreamTerminal();
+        else original_worker_->submitAndWait([&]{terminal_ticket_=terminal_cache_.publishCaptureStreamTerminal();});
+        terminal_pending_=true;
+        return true;
+    }
     DeviceId device_;
     MoEOverlayNodeLocalRankBatchTransport &transport_;
     std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> canonical_;
@@ -859,8 +1011,19 @@ class Source final
     IWorkerGPUContext *worker_ = nullptr;
     std::unique_ptr<IMoEKernel> kernel_;
     void *stream_ = nullptr;
-    void *terminal_ = nullptr;
-    std::vector<void *> allocations_;
+    std::shared_ptr<PhysicalMemoryAuthority> memory_;
+    std::shared_ptr<IWorkerGPUContext> original_worker_;
+    int remote_rank_;
+    bool terminal_pending_=false; ///< Host receipt ownership only; never a device execution-state shadow.
+    std::optional<PhysicalMemoryOwnerReservation> graph_reservation_,host_graph_reservation_;
+    std::vector<PhysicalMemoryAllocationLease> tensor_claims_;
+    DeviceGraphExecutor::GraphSegmentCache terminal_cache_;
+    DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket terminal_ticket_;
+    CPUStorageRoot<float> hidden_root_{size_t(rows)*hidden,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()};
+    CPUStorageRoot<float> indices_root_{size_t(rows)*top_k,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()};
+    CPUStorageRoot<float> weights_root_{size_t(rows)*top_k,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()};
+    CPUStorageRoot<float> output_root_{slots*hidden,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()};
+    std::vector<NativeOperand> allocations_;
     DeviceMoEPlacementBank *banks_ = nullptr;
     std::unique_ptr<DeviceMoEPlacementBank[]> initial_banks_;
     DeviceMoEOverlayEpochControl initial_control_{};
@@ -882,6 +1045,9 @@ class Source final
     const IGPUGraphCapture *captured_ = nullptr;
     size_t captured_node_count_ = 0;
     std::array<float, rows * hidden> recorded_hidden_{}; ///< Authored input, stable until terminal event.
+    int32_t recorded_active_=0;
+    int zero_pattern_=0;
+    std::array<float, rows * top_k> recorded_weights_{};
     std::array<float, rows * top_k> recorded_routes_{}; ///< Authored route input, never device state.
     std::array<std::optional<std::vector<float>>, 5> grouped_observations_; ///< Terminal diagnostics only.
     std::array<std::optional<std::vector<float>>, 4> serial_observations_; ///< Same-input serial terminal diagnostics.
@@ -891,7 +1057,7 @@ class Source final
 };
 
 /** @brief Replay prepared two-socket work through declared exact-row executables and original resets.
- * @param device Original rank0 continuation; the other rank never requests a
+ * @param device Original continuation backend family; only its discovered owner requests a
  * GPU backend.
  */
 inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
@@ -947,6 +1113,21 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                             inventory->ranks[member].cpu.numa_node == nodes[member],
                         "original inventory/observed NUMA identity");
     }
+    int source_rank=-1;
+    DeviceId original_device=DeviceId::invalid();
+    for(const auto& original_rank:inventory->ranks) {
+        for(const auto& gpu:original_rank.gpus)
+            if(gpu.type==device.type && rankOwnsGPUDevice(original_rank,gpu)) {
+                source_rank=original_rank.rank; original_device=DeviceId(gpu.type,gpu.local_device_id); break;
+            }
+        if(source_rank>=0)break;
+    }
+    requireOriginal(source_rank>=0 && original_device.is_gpu(),"Original CPU cohort has no NUMA-owned continuation GPU");
+    device=original_device;
+    const int remote_rank=source_rank==members[0].world_rank?members[1].world_rank:members[0].world_rank;
+    if(members.front().world_rank!=source_rank)std::reverse(members.begin(),members.end());
+    std::unique_ptr<llaminar2::test::PreparedNativeLookupFixture> original;
+    if(rank==source_rank)original=llaminar2::test::PreparedNativeLookupFixture::prepare(std::array{device},rank);
     initCPUBackend(nodes[rank]);
     llaminar2::test::PlanningGGUFFixture file(
         true, false, GGUFTensorType::F32, intermediate, std::nullopt, experts,
@@ -963,7 +1144,10 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     plan.domains.front().backend =
         device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
     plan.domains.back().participants = {members[0].address, members[1].address};
-    plan.domains.back().world_ranks = {0, 1};
+    plan.domains.front().owner_rank=source_rank;
+    // RANK_LOCAL authenticates its sole original owner through owner_rank.
+    plan.domains.front().world_ranks.clear();
+    plan.domains.back().world_ranks = {members[0].world_rank,members[1].world_rank};
     plan.routed_tiers[0].max_experts_per_layer = 2;
     plan.routed_tiers[1].max_experts_per_layer = 6;
     plan.placements = {{.layer = 0, .routed_expert_tier = {0, 0, 1, 1, 1, 1, 1, 1}}};
@@ -992,7 +1176,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     const auto local_id = selected->participant().participant_id;
     int remote_id = -1;
     for (const auto &p : owners->participants())
-        if (p.world_rank == 1 && p.device.is_cpu())
+        if (p.world_rank == remote_rank && p.device.is_cpu())
             remote_id = p.participant_id;
     requireOriginal(remote_id >= 0, "actual remote cohort participant");
     const auto manifest = selected->cohort()->localManifest(selected->participantIndex());
@@ -1001,7 +1185,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     CPUJointExpertRouteStorageLayout joint(selected->cohort(), selected->participantIndex(), rows,
                                            top_k);
     const bool is_root = joint.isRoot();
-    requireOriginal(is_root == (rank == 0), "original CPU root/continuation topology");
+    requireOriginal(is_root == (rank == source_rank), "original CPU root/continuation topology");
     const auto consumer = is_root ? std::optional<DeviceId>{device} : std::nullopt;
     const auto layout = std::make_shared<const CPUSerialExpertStorageLayout>(
         DeviceId::cpu(), rows, hidden, top_k, std::vector<size_t>{rows}, is_root, intermediate / 2,
@@ -1034,8 +1218,12 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     const auto program = NativeCPUCollectiveProgram::expertShardRoutePartials(
         1, CollectiveBackendType::UPI, members);
     const auto capacity = observeSystemMemoryCapacity();
-    const PhysicalMemoryResource host{rank, DeviceId::cpu(), capacity.total_bytes,
-                                      capacity.admission_available_bytes};
+    const PhysicalMemoryResource host=original?original->resource(DeviceId::cpu()):
+        PhysicalMemoryResource{rank,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
+    const auto channel_plan=MoEOverlayActivationChannelPlanner::plan({.placement_plan=&plan,
+        .cluster_inventory=inventory.get(),.row_capacity=rows,.d_model=hidden,.top_k=top_k,.graph_family_count=1});
+    requireOriginal(channel_plan.channels.size()==1,"Original joint cohort must retain its one real remote CPU lane");
+    const auto& channel=channel_plan.channels.front();
     PhysicalMemoryPlanBuilder bill;
     program.contributeDomainBOM(bill, host, rank);
     NativeCPUCollectiveProgram::contributeProcessPoolBOM(bill, host);
@@ -1046,8 +1234,22 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         .add(host, PhysicalMemoryOwner::ActivationArena, layout->physicalBytes())
         .add(host, PhysicalMemoryOwner::ExecutionWorkspace, layout->workspaceBytes())
         .add(host, PhysicalMemoryOwner::ExecutionWorkspace, named_workspace_bytes);
-    const auto memory = std::make_shared<PhysicalMemoryAuthority>(
-        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bill.build()), rank);
+    for(const auto& charge:channel_plan.staging_charges)
+        if(charge.world_rank==rank) {
+            const auto resource=charge.device.is_cpu()?host:original->resource(charge.device);
+            bill.add(resource,PhysicalMemoryOwner::ActivationTransportStaging,charge.bytes);
+        }
+    if(original) {
+        const auto gpu=original->resource(device);
+        const auto source_bill=Source::bom(host,gpu,capture_rows,std::span(&channel,1));
+        for(const auto& resource:source_bill.resources())bill.add(resource);
+        const std::array canonical_requests{MappedHostTransferArena::AllocationRequest{
+            MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(slots).bytes,64u}};
+        bill.add(host,PhysicalMemoryOwner::ActivationTransportStaging,MappedHostTransferArena::backingBytes(canonical_requests));
+        original->admit(bill.build());
+    }
+    const auto memory=original?original->memory():std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bill.build()),rank);
     WeightManager manager(loader, world);
     manager.installPhysicalMemoryAuthority(memory);
     const ModelContextId model{47367};
@@ -1108,13 +1310,16 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> canonical;
     if (is_root)
     {
-        auto metadata = TransferEngine::instance().createMappedHostArena(std::array{device});
+        const std::array requests{MappedHostTransferArena::AllocationRequest{
+            MoEOverlayCanonicalRouteReturnTicketStorage::metadataLayout(slots).bytes,64u}};
+        auto metadata = TransferEngine::instance().createMappedHostArena(std::array{device},memory,requests);
         canonical = std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();
         canonical->bindFixedCapacity(0, slots, hidden, device, workspace_generation,
                                      arena->mappedCPUCanonicalRoutes(device), metadata);
+        metadata->requireDeclarationConsumed();
     }
-    int channel_pid = rank == 0 ? int(::getpid()) : 0;
-    requireOriginal(MPI_Bcast(&channel_pid, 1, MPI_INT, 0, MPI_COMM_WORLD) == MPI_SUCCESS,
+    int channel_pid = is_root ? int(::getpid()) : 0;
+    requireOriginal(MPI_Bcast(&channel_pid, 1, MPI_INT, source_rank, MPI_COMM_WORLD) == MPI_SUCCESS,
                     "original channel identity publication");
     auto wire = std::make_shared<MoEOverlayRankBatchWireWorkspace>(
         MoEOverlayRankBatchWireWorkspace::Config{.participant_ids = {remote_id},
@@ -1124,8 +1329,9 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                                                  .top_k = top_k});
     MoEOverlayRankBatchTransportConfig config{
         .mpi_ctx = world,
-        .source_world_rank = 0,
-        .target_world_rank = 1,
+        .physical_memory_authority = memory,
+        .source_world_rank = source_rank,
+        .target_world_rank = remote_rank,
         .workspace = wire,
         .max_rows_per_participant = rows,
         .max_entries_per_participant = slots,
@@ -1138,9 +1344,9 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         .transaction_topology = {.workspace_generation = workspace_generation,
                                  .topology_fingerprint_low = 367,
                                  .topology_fingerprint_high = 736,
-                                 .source_world_rank = 0,
-                                 .target_world_rank = 1},
-        .source_endpoint = {.world_rank = 0,
+                                 .source_world_rank = source_rank,
+                                 .target_world_rank = remote_rank},
+        .source_endpoint = {.world_rank = source_rank,
                             .participant_id = 0,
                             .tier_priority = 0,
                             .domain_ordinal = 0},
@@ -1155,15 +1361,15 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                                                      .d_model = hidden,
                                                      .activation_graph_family_count = 1}),
         .local_lanes = {{.participant_id = remote_id,
-                         .device = rank == 0 ? device : DeviceId::cpu()}},
+                         .device = is_root ? device : DeviceId::cpu()}},
         .original_cpu_joint_owners = owners};
     MoEOverlayNodeLocalRankBatchTransport transport(config);
     auto &control = transport.activationEpochControl(remote_id, 0);
     const auto protocol_config = transport.activationEpochConfig(remote_id, 0);
     MoEOverlayActivationEpochProtocol protocol(control, protocol_config);
     std::unique_ptr<Source> source;
-    if (rank == 0)
-        source = std::make_unique<Source>(device, transport, *owners, canonical, capture_rows);
+    if (is_root)
+        source = std::make_unique<Source>(device, transport, *owners, canonical, capture_rows, original->permit(device),remote_rank);
     MoEOverlayCollectiveWorkspace packets(
         {.max_rows = rows,
          .max_entries = slots,
@@ -1171,11 +1377,11 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
          .top_k = top_k,
          .device = DeviceId::cpu(),
          .return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes});
-    auto input = rank == 0 ? packets.localExpertInput(0, 1)
+    auto input = is_root ? packets.localExpertInput(0, 1)
                            : transport.activationDeviceLane(remote_id, 0, DeviceId::cpu())
                                  .hostDispatchPayload(rows);
     auto output =
-        rank == 0 ? packets.localExpertOutput(0, 1) : transport.sharedReturnRows(remote_id);
+        is_root ? packets.localExpertOutput(0, 1) : transport.sharedReturnRows(remote_id);
     auto local_context = IDeviceContext::create(DeviceId::cpu());
     auto local_collective = std::make_shared<MoEOverlayRankLocalSparseCollectiveContext>(
         MoEOverlayRankLocalSparseCollectiveContext::Config{8});
@@ -1194,7 +1400,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     auto dispatched = std::make_shared<MoEExpertDispatchOutput>();
     std::unique_ptr<MoEExpertDispatchStage> host_dispatch;
     std::unique_ptr<MoESparseDispatchStage> local_dispatch;
-    if (rank == 0)
+    if (is_root)
     {
         MoEExpertDispatchStage::Params p;
         p.device_id = DeviceId::cpu();
@@ -1295,7 +1501,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     auto reduce = std::make_unique<MoECPUExpertShardRouteStage>(reduction);
     std::unique_ptr<MoESparseReturnReduceStage> local_return;
     auto inbound_return = packets.returnReceive(0, 1);
-    if (rank == 0)
+    if (is_root)
     {
         MoESparseReturnReduceStage::Params returned;
         returned.device_id = DeviceId::cpu();
@@ -1344,12 +1550,16 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     {
         const auto& recorded = trace[(generation - 1) % trace.size()];
         const int live = recorded.work.cohort_rows;
+        const size_t live_entries=recorded.zero_pattern==2?0u:recorded.zero_pattern==1?
+            size_t(recorded.work.logical_rows*top_k/3):size_t(live*top_k);
         SCOPED_TRACE("generation=" + std::to_string(generation) + " live=" + std::to_string(live));
-        if (rank == 0)
+        if (is_root)
         {
             // Replay recorded cohort work inside the same valid request/capture
             // envelope. Empty CPU participants retain positive logical rows.
-            if (scenario == PacketPhaseScenario::Prefill)
+            if (scenario == PacketPhaseScenario::ZeroWeightCompaction)
+                source->prepareZeroWeights(recorded);
+            else if (scenario == PacketPhaseScenario::Prefill || scenario == PacketPhaseScenario::OriginalFanout)
                 source->prepareInputs(live);
             else
                 source->prepareInvocation(recorded);
@@ -1366,7 +1576,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         }
         requireOriginal(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS, "original invocation boundary");
         const auto identity = protocol.activeIdentity();
-        if (rank != 0)
+        if (!is_root)
         {
             requireOriginal(identity.request_count == 1 && identity.physical_rows_per_request > 0,
                             "follower payload requires original positive one-request geometry");
@@ -1377,7 +1587,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         EXPECT_EQ(identity.logical_rows_per_request, uint32_t(recorded.ticket_logical_rows));
         EXPECT_EQ(identity.physical_rows_per_request, uint32_t(recorded.ticket_physical_rows));
         EXPECT_EQ(identity.draft_depth, recorded.draft_depth);
-        if (rank == 0)
+        if (is_root)
         {
             requireOriginal(host_dispatch->execute(local_context.get()),
                             "actual captured source-local dispatch ticket");
@@ -1426,24 +1636,40 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
             input.key.histogram_source = recorded.histogram_source;
         }
         EXPECT_EQ(input.live_row_count, size_t(live));
-        EXPECT_EQ(input.live_entry_count, size_t(live * top_k));
+        EXPECT_EQ(input.live_entry_count, live_entries);
+        if(scenario==PacketPhaseScenario::OriginalFanout || scenario==PacketPhaseScenario::ZeroWeightCompaction) {
+            size_t entry=0;
+            for(int row=0;row<recorded.work.logical_rows;++row)for(int slot=0;slot<top_k;++slot) {
+                const auto original=size_t(row*top_k+slot);
+                const bool selected=recorded.work.cohort_rows>0 && recorded.zero_pattern!=2 &&
+                    (recorded.zero_pattern!=1 || original%3==1);
+                if(!selected)continue;
+                requireOriginal(entry<input.live_entry_count,"Original compact entry was omitted");
+                EXPECT_EQ(input.original_route_slots_host[entry],int32_t(original));
+                EXPECT_EQ(input.expert_ids_host[entry],2+slot);
+                const float weight=recorded.zero_pattern==3?std::bit_cast<float>(std::uint32_t{1}):(slot?0.75f:0.25f);
+                EXPECT_EQ(std::bit_cast<std::uint32_t>(input.route_weights_host[entry]),std::bit_cast<std::uint32_t>(weight));
+                ++entry;
+            }
+            EXPECT_EQ(entry,live_entries);
+        }
         auto& packed = *arena->cpuJointPackedRecords();
         const float unused_record = -1000.0f - static_cast<float>(generation);
         std::fill_n(packed.mutable_data(), packed.numel(), unused_record);
         requireOriginal(compute.execute(local_context.get()), "actual prepared CPU shard compute");
-        EXPECT_TRUE(std::all_of(packed.data() + size_t(live * top_k) * (hidden + 1),
+        EXPECT_TRUE(std::all_of(packed.data() + live_entries * (hidden + 1),
                                packed.data() + packed.numel() - 1,
                                [unused_record](float value) { return value == unused_record; }))
             << "CPU producer touched inactive packed capacity";
         EXPECT_EQ(
             canonical_moe_route_record::readRecordCount(arena->cpuJointPackedRecords()->data(),
                                                         arena->cpuJointPackedRecords()->numel()),
-            size_t(live * top_k));
+            live_entries);
         const double gathered_bytes_before = evidence.value("cpu_packed_route_gather_local_bytes", recorded.histogram_source);
         const double gathered_calls_before = evidence.value("cpu_packed_route_gather_calls", recorded.histogram_source);
         auto root_timing=reduce->observeRootTiming(true);
         EXPECT_FALSE(root_timing.completed());
-        if (rank == 0)
+        if (is_root)
             requireOriginal(reduce->execute(local_context.get()),
                             "actual source-local rooted reduction/publication");
         else
@@ -1468,15 +1694,15 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
             EXPECT_FALSE(root_sample->combine_ns);
             EXPECT_FALSE(root_sample->preweight_publication_ns);
         }
-        const size_t gathered_prefix = size_t(live * top_k) * (is_root ? members.size() : 1);
+        const size_t gathered_prefix = live_entries * (is_root ? members.size() : 1);
         EXPECT_TRUE(std::all_of(packed.data() + gathered_prefix * (hidden + 1),
                                packed.data() + packed.numel() - 1,
                                [unused_record](float value) { return value == unused_record; }))
             << "Native gather touched inactive packed capacity";
         EXPECT_EQ(evidence.value("cpu_packed_route_gather_calls", recorded.histogram_source) - gathered_calls_before, 1.0);
         EXPECT_EQ(evidence.value("cpu_packed_route_gather_local_bytes", recorded.histogram_source) - gathered_bytes_before,
-                  double(size_t(live * top_k) * (hidden + 1) * sizeof(float)));
-        if (rank == 0)
+                  double(live_entries * (hidden + 1) * sizeof(float)));
+        if (is_root)
         {
             local_return->updateMoEOverlayCollectiveRuntimeParams(
                 {.generation_id = generation,
@@ -1487,21 +1713,21 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                             "actual original final source-local return edge");
             EXPECT_FALSE(bool(dispatched->residency_lease));
             const auto ranges = arena->cpuJointSourceRanges();
-            requireOriginal(validRootedFloatRecordRanges(ranges, size_t(2 * live * top_k)),
+            requireOriginal(validRootedFloatRecordRanges(ranges, 2u*live_entries),
                             "actual native root source range extents");
-            EXPECT_EQ(ranges[0].record_count, size_t(live * top_k));
-            EXPECT_EQ(ranges[1].record_count, size_t(live * top_k));
+            EXPECT_EQ(ranges[0].record_count, live_entries);
+            EXPECT_EQ(ranges[1].record_count, live_entries);
             EXPECT_EQ(ranges[0].first_record, 0u);
-            EXPECT_EQ(ranges[1].first_record, size_t(live * top_k));
-            EXPECT_EQ(ranges[0].record_count + ranges[1].record_count, size_t(2 * live * top_k));
+            EXPECT_EQ(ranges[1].first_record, live_entries);
+            EXPECT_EQ(ranges[0].record_count + ranges[1].record_count, 2u*live_entries);
             source->await();
-            source->verifyOutput(live, scenario == PacketPhaseScenario::GroupedVerifier ? &recorded : nullptr);
+            source->verifyOutput(live, scenario == PacketPhaseScenario::GroupedVerifier ? &recorded : nullptr,live_entries);
             const auto traffic = protocol.completedTraffic(identity, &error);
             requireOriginal(bool(traffic), error.c_str());
             EXPECT_EQ(traffic->dispatch_live_rows, uint64_t(live));
-            EXPECT_EQ(traffic->dispatch_live_entries, uint64_t(live * top_k));
+            EXPECT_EQ(traffic->dispatch_live_entries, uint64_t(live_entries));
             EXPECT_EQ(traffic->dispatch_payload_bytes,
-                      moeOverlayDispatchPayloadBytes(live, live * top_k, hidden));
+                      moeOverlayDispatchPayloadBytes(live, live_entries, hidden));
             const auto payload_layout = MoEOverlayActivationPayloadSelection::forPhysicalRows(
                 recorded.ticket_physical_rows);
             EXPECT_EQ(traffic->dispatch_shared_hidden_bytes,
@@ -1514,7 +1740,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
             EXPECT_EQ(traffic->return_stage_count, 1u);
         }
         requireOriginal(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS, "all actual returns complete");
-        if (rank == 0)
+        if (is_root)
             requireOriginal(protocol.reset(identity, &error), error.c_str());
         requireOriginal(MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS,
                         "original success reset visible");
@@ -1545,9 +1771,6 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                     "actual native domain retirement after all stage borrowers");
     EXPECT_EQ(
         memory->reservedBytes(DeviceId::cpu(), PhysicalMemoryOwner::NativeCPUCollectiveDomain), 0u);
-    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ActivationTransportStaging,
-                                   PhysicalMemoryMaterializationKind::NewAllocation),
-              0u);
     ::testing::Test::RecordProperty("actual_distinct_physical_sockets", 2);
     ::testing::Test::RecordProperty("actual_complete_packet_invocations", invocation_count);
     std::string cohort_trace, logical_trace, physical_trace;
@@ -1574,6 +1797,11 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     {
         abortUnexpected("unknown failure with an admitted native domain");
     }
+    // All channel and canonical-ticket owners from the successful try scope
+    // are gone. Test exact physical release here rather than inspecting a
+    // legitimately live admitted mapped page during the transaction scope.
+    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
 }
 /**
  * @brief Fail the original two-rank job before GTest can swallow one actor's exception.

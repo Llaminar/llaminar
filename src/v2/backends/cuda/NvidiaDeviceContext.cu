@@ -15,6 +15,9 @@
  */
 
 #include "NvidiaDeviceContext.h"
+#include "backends/NativeContextPreparation.h"
+#include "backends/GPUCaptureDependencyRoster.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "CUDAHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/GPUWorkerInitialization.h"
@@ -531,8 +534,10 @@ namespace llaminar2
 
         std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
         auto it = auxiliary_streams_.find(name);
-        if (it != auxiliary_streams_.end() && it->second)
+        if (it != auxiliary_streams_.end() && it->second.stream)
         {
+            if(it->second.ownership)
+                throw std::logic_error("Raw auxiliary stream lookup cannot borrow an original-admitted stream without its permit");
             const auto class_it =
                 auxiliary_stream_scheduling_classes_.find(name);
             if (class_it == auxiliary_stream_scheduling_classes_.end() ||
@@ -542,7 +547,7 @@ namespace llaminar2
                           << name);
                 return nullptr;
             }
-            return static_cast<void *>(it->second);
+            return static_cast<void *>(it->second.stream);
         }
 
         cudaStream_t stream = nullptr;
@@ -582,7 +587,7 @@ namespace llaminar2
         }
         if (!stream)
             return nullptr;
-        auxiliary_streams_[name] = stream;
+        auxiliary_streams_[name] = AuxiliaryStreamRecord{stream,{}};
         auxiliary_stream_scheduling_classes_[name] = scheduling_class;
         if (created)
             *created = true;
@@ -698,11 +703,103 @@ namespace llaminar2
         return true;
     }
 
+    /** @copydoc IWorkerGPUContext::prepareBatchCaptureDependencies */
+    std::shared_ptr<GPUCaptureDependencyRoster> NvidiaDeviceContext::prepareBatchCaptureDependencies(
+        std::size_t lanes,std::size_t groups,const PreparedGPUContextUsePermit& original)
+    {
+        if(original.worker().get()!=this)throw std::logic_error("Batch dependency roster substituted original worker");
+        std::shared_ptr<GPUCaptureDependencyRoster> result;
+        projection_resources_.withIdleOperation([&]{
+            std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            if(!batch_capture_dependencies_)batch_capture_dependencies_=GPUCaptureDependencyRoster::create(original,lanes,groups);
+            else batch_capture_dependencies_->grow(original,lanes,groups);
+            result=batch_capture_dependencies_;
+        });
+        return result;
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *NvidiaDeviceContext::getOrCreateAdmittedAuxiliaryStream(
+        const std::string &name,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        return getOrCreateAdmittedAuxiliaryStream(name,GPUAuxiliaryStreamSchedulingClass::Normal,original,created);
+    }
+
+    /** @copydoc IWorkerGPUContext::getOrCreateAdmittedAuxiliaryStream */
+    void *NvidiaDeviceContext::getOrCreateAdmittedAuxiliaryStream(const std::string &name,
+        GPUAuxiliaryStreamSchedulingClass scheduling_class,const PreparedGPUContextUsePermit &original,bool *created)
+    {
+        if(created)*created=false;
+        if(name.empty() || original.worker().get()!=this || isGraphCaptureActive())
+            throw std::invalid_argument("Admitted auxiliary stream requires its exact original cold worker/name");
+        if(scheduling_class!=GPUAuxiliaryStreamSchedulingClass::Normal &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::LatencyCritical &&
+           scheduling_class!=GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance)
+            throw std::invalid_argument("Admitted auxiliary stream has unknown scheduling class");
+        void* result=nullptr;
+        projection_resources_.withIdleOperation([&]{
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        if(auto it=auxiliary_streams_.find(name);it!=auxiliary_streams_.end()){
+            if(!it->second.stream || !it->second.ownership)
+                throw std::logic_error("Admitted auxiliary stream cannot adopt an unadmitted existing handle");
+            const auto priority=auxiliary_stream_scheduling_classes_.find(name);
+            if(priority==auxiliary_stream_scheduling_classes_.end() || priority->second!=scheduling_class)
+                throw std::logic_error("Admitted auxiliary stream scheduling class changed");
+            it->second.ownership->requireOriginal(original,this,name,scheduling_class);
+            result=static_cast<void*>(it->second.stream);return;
+        }
+        auto ownership=NativeAuxiliaryStreamOwnership::claim(original,name,scheduling_class);
+        auto [entry,inserted]=auxiliary_streams_.try_emplace(name);
+        if(!inserted)throw std::logic_error("Auxiliary stream owner record already exists");
+        cudaStream_t stream=nullptr;
+        try{
+            auxiliary_stream_scheduling_classes_.emplace(name,scheduling_class);
+            ownership->beginNativeAttempt();
+            if(scheduling_class==GPUAuxiliaryStreamSchedulingClass::Normal)
+                stream=static_cast<cudaStream_t>(createStream());
+            else {
+                auto error=cudaSetDevice(device_ordinal_);int least=0,greatest=0;
+                if(error==cudaSuccess)error=cudaDeviceGetStreamPriorityRange(&least,&greatest);
+                if(error==cudaSuccess)error=cudaStreamCreateWithPriority(&stream,cudaStreamNonBlocking,
+                    scheduling_class==GPUAuxiliaryStreamSchedulingClass::LatencyCritical?greatest:least);
+                if(error!=cudaSuccess)throw std::runtime_error("Original prioritized auxiliary stream creation failed");
+            }
+            if(!stream)throw std::runtime_error("Original auxiliary stream creator returned null");
+            entry->second.stream=stream;
+            entry->second.ownership=std::move(ownership);
+            entry->second.ownership->delegateToContext();
+        }catch(...){
+            if(stream){
+                // Native destruction precedes commitment completion, including
+                // partial creation; never replace the creator's first failure.
+                if(cudaSetDevice(device_ordinal_)!=cudaSuccess || cudaStreamDestroy(stream)!=cudaSuccess)
+                    std::terminate();
+            }
+            if(ownership)ownership->completeNativeHandles();
+            auxiliary_streams_.erase(entry);
+            auxiliary_stream_scheduling_classes_.erase(name);
+            throw;
+        }
+        if(created)*created=true;
+        result=static_cast<void*>(stream);
+        });
+        return result;
+    }
+
     void NvidiaDeviceContext::resetAuxiliaryStreams()
     {
         // Public named-stream reset preserves the fixed context-lifetime set.
         projection_resources_.withIdleOperation([&] {
             std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+            for(const auto& [name,record]:auxiliary_streams_) {
+                (void)name;
+                if(record.ownership)record.ownership->requireRetirement(shutdown_requested_.load()
+                    ?NativeAuxiliaryStreamOwnership::RetirementScope::OriginalContextShutdown
+                    :NativeAuxiliaryStreamOwnership::RetirementScope::PublicReset);
+            }
+            if(batch_capture_dependencies_ && batch_capture_dependencies_.use_count()!=1)
+                throw std::logic_error("Cannot destroy Batch capture events while original graph owners retain them");
+            batch_capture_dependencies_.reset();
             if (auxiliary_streams_.empty()) return;
             cudaError_t set_err = cudaSetDevice(device_ordinal_);
             if (set_err != cudaSuccess)
@@ -712,8 +809,9 @@ namespace llaminar2
                                                                  << cudaGetErrorString(set_err));
                 std::terminate();
             }
-            for (auto &[name, stream] : auxiliary_streams_)
+            for (auto &[name, record] : auxiliary_streams_)
             {
+                const auto stream=record.stream;
                 (void)name;
                 if (stream && stream != default_stream_)
                 {
@@ -724,6 +822,10 @@ namespace llaminar2
                                   << cudaGetErrorString(err));
                         std::terminate();
                     }
+                }
+                if(record.ownership) {
+                    record.ownership->completeNativeHandles();
+                    record.ownership.reset();
                 }
             }
             auxiliary_streams_.clear();

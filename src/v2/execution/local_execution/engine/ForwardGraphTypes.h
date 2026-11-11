@@ -578,6 +578,13 @@ namespace llaminar2
         {
             reuse_class = ReuseClass::MTPConditionAlternative;
         }
+        else if (signature.state_transaction == ForwardStateTransaction::ForwardOnlyCondition)
+        {
+            // The sampler-free one-shot retires before generation resumes and
+            // cannot overlap prefill or verification. Reuse their admitted
+            // wide diagnostic bank rather than retaining another scalar bank.
+            reuse_class = ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
         else if (!signature.decode &&
                  signature.execution_role ==
                      ForwardExecutionRole::MainInference)
