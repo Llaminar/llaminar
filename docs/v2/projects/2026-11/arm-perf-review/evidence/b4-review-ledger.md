@@ -81,3 +81,16 @@ fence wording (contradicting the corrected header + Main's §9 point) —
 restored to the reviewed §9 (diagnostic AUTHORIZED; production-path +
 N-sweep + economy fenced). Blob f26fd8ba01af0533bed7073383ee3deabd66acfa
 = the re-verification target. d7 HOLD (D1-D6) separate.
+
+## DIAGNOSTIC REPAIR TIP (~22:58Z): a42ac312b — routed for D1-D6 re-review
+
+codex/arm-b4-vocab-budget @ a42ac312b (parent d7eb73708, base 12675c956;
+3 files +861/-646; arch-boundary split per D6). Key dispositions: D2
+Mode P now replays the PRODUCTION rejection sampler with an independent
+residual threshold (dyadic-bin enumeration of the EXECUTED sampler); D3
+byte proof on the ACTUAL BackendNative LM-head policy (single ordered
+chain = that policy's production tree; 16×4 fold belongs to
+GPUAlignedExpert MoE) with BITWISE comparisons + counted traffic; D4
+verified receipts w/ strict stale/duplicate rejection; D5 production
+couplings (sampleMTPSerialEquivalentTargetRow; G tie-break = lowest ID);
+D6 portable/NEON TU split. Station W3 re-queues after the re-review.
