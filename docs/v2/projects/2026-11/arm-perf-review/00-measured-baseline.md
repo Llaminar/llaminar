@@ -148,3 +148,44 @@ greedy, single stream, graph-captured bucket pipeline, 102 GB resident:
 - GPU-side reference only — used as the GB10 ceiling context for idea 17's
   CPU bandwidth comparison and the llama.cpp cross-engine check (CPU baseline
   still open).
+
+## Progress ledger (periodic perf checkpoints — operator directive 2026-11-11)
+
+Cadence: after each Main SETTLED/collection merge AND on a ~3-day recurring
+check, re-run the canonical benchmark set on GB10 (35B-A3B UD-IQ3_S MTP
+off + dynamic, 20T, greedy seed 42; 27B Q4_K_S MTP off/dynamic) and append
+a dated entry here: measured tok/s, delta vs last entry, and the remaining
+opportunity ranking. Hosts booked through arm-sparks; M1 = low priority.
+
+### Entry 0 — checkpoint baseline (2026-11-11)
+
+Landed/measured so far:
+- **35B MTP dynamic 14.34 → 18.5-18.7 tok/s (+30%)** — spin policy
+  (GOMP_SPINCOUNT=3000000, idea 13) + workshare pooling `408ff90e5`
+  (fused bundle M=1: 190-230 us vs 770-1900 us member-by-member, Mac VM).
+- **I8MM engine +1.3-1.7%** (kernel 1.01-1.19x, idea 6, tip cd55f6b27).
+- **Single-rank binding A725-first → fastest-first** (idea 26; residual
+  measurement rides idea-16 Phase A).
+- **CUDA sm_121 spill elimination in-tip** (idea 21 arc: 176-commit SETTLED
+  e8866ec04; 10 native cells 11/11, CB kernels zero spills) — unblocks GB10
+  GPU + UMA validation work.
+- **Bundle-1 (ideas 7+25: hot-path alloc cleanup + prefill bucket
+  overhead)** proven on 28ddbe253 (BOUND), awaiting combined FF.
+- Idea 12 (cache tiling) RETIRED — in-model A/B regression (methodology:
+  idea 20). Idea 18 (GDN grouped verifier) CONFIRMED harmful (<1.0) — keep
+  serial.
+
+Remaining opportunity ranking (by expected impact):
+1. **Idea 16** — MoE routed experts 43% + router bundle 35% + GDN 18% +
+   LM head of decode time; Phase A (measurement) queued next window.
+2. **Idea 17/24** — GB10 decode bandwidth gap (llama.cpp CUDA 28.8 vs
+   Llaminar CUDA 22.8 tok/s; CPU 14.34) + GPU prefill 3.3x gap (~80%
+   bucket-pipeline overhead; blocked on nsys tooling).
+3. **Idea 8** — prepared-weight layout (dead-byte elimination 10.0%/5.56%,
+   compact encodings IQ3_S 9.5→3.44 bpw); Phase A GO.
+4. **Idea 14 B wave** — dense MTP verifier economics on the new base
+   (MTP 5.45-5.55 vs 5.28 no-MTP: wins now; depth tuning open).
+5. **Half-perf cell (FMLAL)** — admission-held, focused review queued.
+6. Smaller: idea 3 (metadata hoist), 4 (column panel reuse), 11
+   (validation hoist), 22 (FA2 tournament tail p95 8.9%), 23 (HC auto-plan),
+   28 (IQ4_XS M=1 regression).
