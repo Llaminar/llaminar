@@ -159,9 +159,12 @@ g. **Economy**: counted rows/bytes (build-S cost, selected-row gather,
   implements; honestly named and versioned): the candidate set is the
   recency set of COMMITTED target tokens — every token whose target
   emission has been committed at a verified position enters the ledger at
-  rank 0 of its commit; the shortlist orders by freshest commit
-  (generation descending), then lowest global token ID. Concrete
-  lifecycle (normative):
+  rank 0 of its commit; the shortlist orders by freshest commit position
+  (observation sequence DESCENDING — every commit within one request
+  carries the same request generation, so the generation serves
+  identity/staleness only, never ordering), then lowest global token ID;
+  repeated IDs deduplicate to their freshest observation before the
+  budget is applied. Concrete lifecycle (normative):
   * State: an append-only observation ledger of (global token ID, commit
     position, request generation), request-scoped, no cross-request
     carryover.
@@ -178,15 +181,19 @@ g. **Economy**: counted rows/bytes (build-S cost, selected-row gather,
     snapshot, or a prefix bucket is STALE and rejected by the builder
     (see §7); the ledger's own older entries are policy-valid history,
     ordered by freshness.
-  * Shortlist construction: the freshest committed tokens first
-    (generation descending, then lowest global token ID), backfilled by
-    the admitted cold-start order up to N; |S| = min(N, distinct live
-    committed tokens + backfill), reported per position.
-  * Count/sweep limits (honest): |S| collapses to 1 after the first
-    commit and grows only with DISTINCT committed tokens — in a
-    256-token request most N >= 256 arms cannot explore distinct
-    supports; every sweep arm reports its realized distinct-support
-    count, and N is not claimed to explore supports it cannot reach.
+  * Shortlist construction: deduplicate the ledger to each token's
+    freshest observation, order by commit position descending (then
+    lowest global token ID), take the first N distinct IDs, and
+    backfill the remaining budget with unranked live IDs in ascending
+    global-ID order; |S| = min(N, live vocabulary), reported per
+    position.
+  * |S| semantics (honest, with backfill): the ranked prefix carries
+    the DISTINCT committed tokens in freshness order; unranked live
+    IDs backfill in ascending global-ID order up to N, so |S| =
+    min(N, live vocabulary) and different N values DO produce
+    different supports through the backfill. Every sweep arm reports
+    its realized distinct-support count and how many of its entries
+    are ranked versus backfilled.
   * No hidden full-head rescue: the selector's only inputs are the
     committed-token ledger and the vocabulary bound; no current-logit or
     full-head input exists in its interface.
@@ -198,8 +205,10 @@ g. **Economy**: counted rows/bytes (build-S cost, selected-row gather,
   each verified position with its causal row identity (generation,
   position) as the receipt, the same admitted cold start, the same
   no-hidden-rescue interface, and the same stale-receipt rules. Because
-  the ranking is a per-position target row, every N up to V is
-  explorable in principle — the sweep-limit caveat above does not apply.
+  the ranking is a per-position target row, every N in 1 <= N < V is
+  explorable in principle (the same budget bounds as v1, consistent with
+  the no-N=V-aliasing rule) — the sweep-limit caveat above does not
+  apply.
   Staging v2 is a separate versioned decision.
 
 - The proposal draw law q must be TRUTHFUL w.r.t. the actual current
