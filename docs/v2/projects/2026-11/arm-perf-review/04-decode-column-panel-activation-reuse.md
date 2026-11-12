@@ -276,3 +276,13 @@ is staged. Seal K14-I04M1-0AD09600-20261112. The implementation gate
 is decided by the window's signal per the integrator's rule.
 
 ### MAIN'S CONDITIONS ADOPTED (~06:09Z): one job on the host; record identities; NO profiler on the timing run; prune the build tree afterwards; results = diagnostic evidence NOT an economy admission; any kernel change follows the normal implement → validate → handback path. Seal K14-I04M1-0AD09600-20261112. .80 queue: W3 → B1ATTR2 → idea-04 M=1 → 27B rider.
+
+### .80 SEQUENCE EVENT (~07:01Z): the M=1 window launched ahead of the B4 canonical (guard held)
+
+Main's launch guard saw youthful_brattain (the idea-04 M=1 build +
+timing runs at 0ad09600b, tree tip-i04, created 06:58:47Z) and did NOT
+start main-b4c — no overlap. **Accepted sequencing: M=1 (a timing
+window runs alone) → main-b4c (the B4 pre-application canonical) → 27B
+rider.** Main polls for the M=1 exit; the coordinator relays the seal
+(K14-I04M1-0AD09600-20261112) + the interpretation table when sparks
+reports.
