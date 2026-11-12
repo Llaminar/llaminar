@@ -885,3 +885,19 @@ missing — the positive-capacity all-inactive span control at the
 primitive (P5, fixture-only). Both native runs (station I8MM, .80 NEON)
 held for the P5 tip. Sequence: P5 fix → push → both runs pin → runtime
 handoff → reviewer #209 → landing cycle.
+
+### FMLAL GATE TIP RELEASED (~04:27Z): e8c5bd505 — both native runs pin to it
+
+P5 landed (fixture-only: the positive-capacity all-inactive-span
+control runs AT the primitive via a real ProjectionRowWorkScope with a
+zero-count device range; selection spans empty; live-span scan finds
+nothing; count 0; output sentinel-pinned). Gate tip = e8c5bd505de86bc
+710e2839a3e9a82cb5017fe64 (13 commits on 74797687f). RELEASED:
+- Station: I8MM build + the v2_test_cpu_half_operands binary (the
+  three-run script re-run at the new tip = the ACTUAL gate).
+- .80: NEON-envelope build (-DLLAMINAR_CPU_ISA=NEON, Integration
+  GCC14) + the same binary (Main/sparks).
+Raw gtest XML/logs + exact tree + build exit + binary exit to Main +
+addon + the reviewer. Green both → Main's #8 (full I8MM canonical) +
+the reviewer verdict → application → PR commits. Idea-04 M=1 queues
+behind the landing.
