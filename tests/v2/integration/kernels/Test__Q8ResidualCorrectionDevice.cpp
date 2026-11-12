@@ -11,6 +11,8 @@
  * complete prepared HC chains before fusion, with exact bank/guard histories.
  * A separate authored HC-up/read composition preserves a nonzero signal lost
  * by SingleQ8, with independent FP64 source arithmetic and live-prefix replay.
+ * M512 HC-down tile comparisons retain a forced baseline, all native Q8 source
+ * aliases and dirty M512/M64 histories independently of installed Auto policy.
  */
 #include <gtest/gtest.h>
 #include "qwen4exp/HC103OriginalGPU.h"
@@ -48,7 +50,9 @@
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -1289,5 +1293,30 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K2560RowTileEvents)
 /** @test One original source/M with balanced isolated MT32/MT16 graph event pairs. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M448K10240RowTileEvents) {
  proveNativeQ8SmallNTiles(DeviceId::rocm(0),10240,448,NativeQ8TileComparison::Rows);
+}
+
+/** @test Actual M512 HC-down bytes, dirty partial/reset histories and guards for Q8_0. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320M512K10240TileByteResetQ8_0) {
+ proveNativeQ8PrefillTiles("Q8_0",0);
+}
+/** @test Actual M512 HC-down bytes retain the independent Q8_1 source descriptor. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320M512K10240TileByteResetQ8_1) {
+ proveNativeQ8PrefillTiles("Q8_1",0);
+}
+/** @test Actual M512 HC-down bytes retain the original Q8_K superblock source. */
+TEST(Q8ResidualCorrectionDevice,ROCmNativeQ8N320M512K10240TileByteResetQ8_K) {
+ proveNativeQ8PrefillTiles("Q8_K",0);
+}
+/** @test Opt-in forced NT128/MT32 versus NT64/MT16 and NT64/MT32 event pairs, Q8_0. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_0) {
+ proveNativeQ8PrefillTiles("Q8_0",512);
+}
+/** @test Opt-in identical physical comparisons through the original Q8_1 source. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_1) {
+ proveNativeQ8PrefillTiles("Q8_1",512);
+}
+/** @test Opt-in identical physical comparisons through the original Q8_K source. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_K) {
+ proveNativeQ8PrefillTiles("Q8_K",512);
 }
 #endif

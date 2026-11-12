@@ -40445,6 +40445,29 @@ if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
     endforeach()
 endif()
 
+# Actual M512 HC-down retains a forced baseline after Auto policy promotion.
+if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
+    foreach(V2_NATIVE_Q8_PREFILL_SOURCE Q8_0 Q8_1 Q8_K)
+        set(V2_NATIVE_Q8_PREFILL_ALIAS V2_Integration_ROCmNativeQ8N320M512K10240TileByteReset${V2_NATIVE_Q8_PREFILL_SOURCE})
+        add_v2_test(${V2_NATIVE_Q8_PREFILL_ALIAS}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmNativeQ8N320M512K10240TileByteReset${V2_NATIVE_Q8_PREFILL_SOURCE}
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeQuantised;Prefill;Capture;Replay;ByteExact;Lifecycle;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        if(TEST ${V2_NATIVE_Q8_PREFILL_ALIAS})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_Q8_PREFILL_ALIAS})
+        endif()
+        add_v2_test(V2_Perf_ROCmNativeQ8N320M512K10240TileEvents${V2_NATIVE_Q8_PREFILL_SOURCE}
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_also_run_disabled_tests
+                --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmNativeQ8N320M512K10240TileEvents${V2_NATIVE_Q8_PREFILL_SOURCE}
+            LABELS "V2;Performance;ROCm;NativeQuantised;Prefill;ComponentTiming"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
+    endforeach()
+endif()
+
 # Native inventory may temporarily retarget its caller, never its CPU ownership.
 if(TARGET v2_test_numa_topology_sysfs)
     add_v2_test(V2_Integration_HardwareDiscoveryCallerAffinityReplay

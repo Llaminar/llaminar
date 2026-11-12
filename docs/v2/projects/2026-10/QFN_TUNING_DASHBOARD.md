@@ -21,12 +21,12 @@ numerical limits. Quantisation spikes are accepted; formal canary status remains
 and generation retire cleanly.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
-**Prefill pass:** **734.87→789.43 P tok/s (+7.42%)**, matched 512/1 requests,
-M512, Static, MTP/prefix off. Removed AMD private zero-vector traffic; captured
-bytes pass on MI50/7900XTX/3090. [Result](../2026-11/QFN_EP4_EP4_PREFILL_PUBLICATION_TUNING_20261112.md).
-Next: M512 HC-down tile selection. Retained 512/256 baseline: **732.92P/37.26D**;
-new decode is unmeasured. [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md):
-concurrent submission and HC fusion remain unpromoted.
+**Prefill:** **734.87→793.72 P tok/s (+8.01%)**, matched512/1, M512,
+Static, MTP/prefix off. [Publication](../2026-11/QFN_EP4_EP4_PREFILL_PUBLICATION_TUNING_20261112.md)
+and [HC-down tiles by architecture](../2026-11/QFN_EP4_EP4_PREFILL_HC_DOWN_TILES_20261112.md);
+captured byte/reset gates pass. Next: HC two-term up projection.
+Prior512/256 **732.92P/37.26D**; new decode unmeasured.
+[Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md): submission/HC fusion unpromoted.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
 [fixed VRAM ngram plan](QFN_FIXED_VRAM_PIPELINE_PLAN_2026-11-10.md).
 
@@ -103,7 +103,7 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
-| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 789.43† | — | — | 37.26‡ | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 793.72† | — | — | 37.26‡ | — | — |
 
 † Latest 512/1 prefill-only run. ‡ Prior 512/256 decode; not remeasured.
 

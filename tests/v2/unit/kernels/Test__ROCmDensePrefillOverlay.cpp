@@ -5,6 +5,8 @@
  * These tests inspect immutable policy and construction-thread state only. No
  * HIP dependency or accelerator is linked. Captured execution and all source
  * formats are proved separately by the explicit backend integration gate.
+ * Installed M512 HC-down observations retain architecture-specific physical
+ * tiles; authored-only neighbor rows keep later measured additions admissible.
  */
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
@@ -187,6 +189,43 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8MeasuredM448SelectionAndActualRowIsolati
             EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(measured,
                 19, 448, 320, k, DensePrefillWeightFamily::NativeQuantised));
         }
+    }
+}
+/** @brief Installed HC-down M512 tiles preserve actual card facts and exact row identity. */
+TEST_F(ROCmDensePrefillOverlay, NativeQ8MeasuredM512SelectionAndActualRowIsolation)
+{
+    using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
+    using Entry = generated::ROCmDensePrefillOverlayEntry;
+    const std::array measured{
+        Entry{19, 512, 320, 10240, DensePrefillWeightFamily::NativeQuantised,
+            {64, 16, 1, 2, false, VNNIPrefillProducer::NativeCooperative}, Arch::rocm(9, 0, 6)},
+        Entry{19, 512, 320, 10240, DensePrefillWeightFamily::NativeQuantised,
+            {64, 32, 1, 2, false, VNNIPrefillProducer::NativeCooperative}, Arch::rocm(11, 0, 0)}};
+    const std::array hardware{actualQ8Hardware(Arch::rocm(9, 0, 6)),
+                              actualQ8Hardware(Arch::rocm(11, 0, 0), 32)};
+    for (std::size_t index = 0; index < hardware.size(); ++index)
+    {
+        auto actual = hardware[index];
+        const auto before = actual;
+        const auto &expected = measured[index].config;
+        for (const auto &selected : {
+                 selectDensePrefillExactConfig(19, 512, 320, 10240,
+                     DensePrefillWeightFamily::NativeQuantised, &actual),
+                 selectDensePrefillExactConfigFromEntries(measured, 19, 512, 320, 10240,
+                     DensePrefillWeightFamily::NativeQuantised, &actual)})
+        {
+            ASSERT_TRUE(selected);
+            EXPECT_EQ(std::tuple(selected->n_tile, selected->m_tile, selected->min_blocks,
+                                 selected->unroll, selected->full_tiles, selected->producer),
+                      std::tuple(expected.n_tile, expected.m_tile, expected.min_blocks,
+                                 expected.unroll, expected.full_tiles, expected.producer));
+        }
+        // Only this authored M512 span owns absence. Independent future
+        // installed M511/M513 observations must not invalidate this regression.
+        for (int rows : {511, 513})
+            EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(measured,
+                19, rows, 320, 10240, DensePrefillWeightFamily::NativeQuantised, &actual)) << rows;
+        EXPECT_EQ(actual, before);
     }
 }
 /** @brief Actual architecture outranks nearby clocks, including native-wave32 devices. */
