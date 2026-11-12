@@ -2350,3 +2350,25 @@ both lanes); restoration requested per the operator's explicit max
 requirement. Station download ~105GB/111.3GB. CB NUMA exchange closed
 read-only (their investigation continues; our no-change statement +
 confined-path evidence delivered).
+
+### T2 CONTROL SEALED (~15:58Z) — MTP finding fully sealed; census enumerator GO
+
+**K14-I16RIDER-T2-880429059-20261112**: no-MTP greedy 25.31 tok/s (temp0/
+seed42 resolved, digest 0a4c0002a4a6de72) vs MTP-dyn 18.39 (same anchor,
+same day) = **−27.4% at FULLY GREEDY, token digest IDENTICAL between
+arms** — the MTP path preserves the exact token stream (verifier byte-
+equivalence contract HOLDS); the regression is purely draft/verify
+ECONOMICS (acceptance 38.89% @ depth 10, stochastic_accepts=0). The
+99%@depth-7 tracker record = separate protocol epoch. POST-MERGE: the
+model-class/topology-aware MTP default policy = top quick-win (~27%
+recovery, zero output change); acceptance-collapse root-cause
+investigation opens; verifier LM-head routing = the kernel-side fix.
+M=1 run-1 discard confirmed deliberate (re-anchor kill; no exited
+record — closed, no fault). Census correctly OPEN; enumerator GO'd:
+read-only production-loader/packer diagnostic on the W2 lane branch
+(per-tensor {encoding, source/prepared bytes} CSV, observed not derived,
+non-installed namespace, .79) — completes the idea-08 input.
+Lane thinking restored to max on both new lanes (root cause:
+coordinator-shell PI_REASONING_LEVEL=high leaked into the herdr spawn
+and overrode :max at first message injection; fixed via herdr
+agent send-keys shift+tab; spawn-env hygiene lesson memorized).
