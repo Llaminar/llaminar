@@ -1205,3 +1205,21 @@ fork" — the BackendNative alpha+beta pooling, 4→3 forks/execution per
 the corrected analysis). .80 was idle (the M=1 re-run not yet launched;
 it queues behind main-b1). **A paired Release A/B timing window follows
 as a separate booking per the gates — lands only if same-or-better.**
+
+### B1 CORRECTNESS GREEN (~11:08Z): d5e04fdce canonical 3569/0-new; the A/B window main-b1ab RUNNING
+
+Main-b1 on .80 (Integration NEON_I8MM GCC14): **GREEN at d5e04fdce** —
+focused (the new FusedSkinnyFP32Pooling cell, FusedProjectionParity,
+FusedQKV/GateUp, GDNKernels, GDNProjection grouping/arithmetic/route
+evidence, CPUHalfOperands) all pass; canonical **3569 tests (3568+1
+new), 0 skipped, the same 6 inherited, 0 new**. The one extra selected
+cell = a CUDA-only registration (not built with HAVE_CUDA=OFF) — a
+regex-selection artifact, out of the canonical gate, unrelated.
+build-b1 pruned (the disk-hygiene rule).
+**The Release A/B window main-b1ab is RUNNING on .80 (~75 min)**: two
+Release NEON_I8MM builds, A=ae51ce3f0 vs B=d5e04fdce; saved plans
+built by A; 27B ABBA + 35B ABBAABBA, nomtp+mtp, -n 256, unprofiled;
+then one PerfStats omp fork-evidence run per binary (which directly
+verifies the corrected 4→3-forks prediction). **Landing gate: B ≥ A
+with generated tokens identical** — the operator's same-or-better bar.
+The M=1 window queues behind main-b1ab.
