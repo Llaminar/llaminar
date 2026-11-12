@@ -62,3 +62,15 @@ structural fix is fewer barriers.
   and 27B dense, MTP off and dynamic, before and after.
 - `Perf__CPUFusedVerifier ManyNarrowMembersBundleVersusStandalone` for
   bundle-shaped work.
+
+### IDEA-26 DELETION VERIFIED CLEAN (~10:09Z): the exemptions cleanup IS in the collected lineage
+
+Addon3's verification + the coordinator's cross-check: a4f2da4d4 IS an
+ancestor of bb893cd79 (merge-base = a4f2da4d4 itself); the chain
+880429059..bb893cd79 = 13 commits with a4f2da4d4 as commit 12/13
+(immediately before the comment checkpoint); the diff a4f2da4d4→bb893
+cd79 over the changed files is EMPTY. The rebased PR lineage carries
+the same content by subject (021624d67 + the restoration-probe commits
+— new SHAs from the rebase). **The codex/arm-idea26-openmp-wakeup
+deletion was CLEAN: nothing local-only, nothing lost. The addon3
+retirement is confirmed; /tmp/idea26-wt + build dirs free to remove.**
