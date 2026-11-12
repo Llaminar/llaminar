@@ -2641,3 +2641,19 @@ Inputs sealed: corrected census CONFIRMS 1.73x expansion, carrier =
 CompactMultiScale gate/up (2.34x) + NibbleLUTSourceScale down; repaired
 tournament bench (ACK @ 3b109793c) = the validation methodology
 template; .79 re-run in flight separately.
+
+### SILENT LAUNCH FAILURE (Main-observed 21:11Z): .79 tournament relaunch #1 failed; relaunch #2 dispatched
+
+sparks' 21:00Z relaunch: tourney2-run.log = `bash: /w/tourney2.sh: No
+such file or directory` — scp never produced the file on .79 (path
+mismatch); no container, no build-tr-* dirs; launcher sleeping 1500s.
+Tree /w/tip-repair correctly @ 3b109793c (only prep verified true).
+The 13:08 w2-tourney output = pre-repair tip, 9/9 RC=1 Oracle-1 quad-0
+(expected at that tip) — NO valid tournament result exists yet.
+Relaunch procedure dispatched (interrupt sleeper; ssh-heredoc the
+script at /home/factory/idea25/tourney2.sh; verify file + build dirs +
+first output; report evidence). OPERATOR CONTEXT: the tournament result
+is requested for the PR #43 description — the sealed table (ISA x M,
+prepared vs compact time + ratio) is now blocking; Main receives it on
+seal. Lane-defect classification: launch mechanics (silent scp
+failure), first-run-RED of the launch, not of the bench itself.
