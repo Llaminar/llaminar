@@ -2135,3 +2135,38 @@ NOT ARM'S (left untouched): feat/opencode-hybrid-decode (the base
 owner's harness), feat/qwen38-w4a4, feat/qwen-flash-next, feat/clover-
 moe, feat/continuous-batching-c1-ownership, claude/deepseek-*,
 feat/qfn-ngram-continuation (the base branch), master.
+
+### ARM BRANCH SURFACE — FINAL STATE (~10:45Z, operator rule: "we don't need artifacts — part of the arm branch if important, otherwise delete")
+
+SIX MORE DELETED per the artifact rule (closed/descoped topics whose
+content will never join the arm branch; the topics' records live in the
+TRACKER, not in dead branches):
+- codex/arm-b9-strengthening (B9 benched/closed),
+- codex/arm-witness-post-index (the B9 composition — the range-diff
+  reference; the topic is closed),
+- codex/arm-s4-nibble-witness (the register-gate arc's artifact —
+  descoped),
+- feat/neon-s4-nibble-lifetimes (the register-gate sibling),
+- codex/arm-panel-tournament-policy (idea-22's experimental branch —
+  held, not started; the tracker preserves the p95-regret finding),
+- codex/arm-b1-fused-fork-pooling (addon3's WIP — superseded by Main's
+  corrected-target implementation d5e04fdce on the PR candidate).
+
+**THE REMAINING ARM SURFACE (6 branches):**
+- feat/arm64-native-kernels @ ae51ce3f0 — THE PR (MERGEABLE/CLEAN).
+- codex/arm-perf-review @ 8e7b95dd6 — the tracker (permanent).
+- codex/arm-idea16-moe-decode @ 5c2cef47a — the ACTIVE W2 payload
+  branch (the B1 seal re-run + tournament + census execute from it;
+  deletable after the idea-08 inputs complete — the benches land via
+  Main or go per this rule).
+- codex/arm-idea23-hc-planning @ 640d625cb — pending-decision (the
+  model-level run decides land-or-delete post-merge).
+- codex/bundle1-perf-harness @ 5d606a108 — the parked Bundle-1 hop's
+  subject (the hop decision determines land-or-delete).
+- feat/mxfp4-arm64 @ 6c6993dae + feat/mxfp4-weights @ e29a3d7f — the
+  OPEN MXFP4 lane (post-#43-merge work, operator-kept open).
+
+NOT ARM'S (untouched): feat/qfn-ngram-continuation (the base branch),
+feat/opencode-hybrid-decode (the base owner's harness), feat/qwen38-
+w4a4, feat/qwen-flash-next, feat/clover-moe, feat/continuous-batching-
+c1-ownership, claude/deepseek-*, master — other programs'/owners'.
