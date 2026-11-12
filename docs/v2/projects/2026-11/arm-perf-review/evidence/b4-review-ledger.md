@@ -552,3 +552,68 @@ Lanes rebase onto 7a4790c77. .80 free → the corrected I8MM M=1 window
 (Release, not Integration, for timing). **The pace directive's
 compounding effect is visible: two collections landed on the PR within
 hours (FMLAL + the B4 diagnostic).**
+
+---
+
+# B4 seal record corrections (K14-B4-E09903875 / K14-B4-ADDF3DB78 / the handoff package)
+
+Status: CORRECTIONS NOTE per reviewer-272 and Main's directive. The raw
+seals and the handoff package are preserved as-is; this note supplies the
+corrected descriptions. Nothing here changes any test result, any source
+SHA, or any fence.
+
+## 1. The portable XML test count vs the "2/2" figure
+
+The portable JUnit XML (v2_test_draft_vocab_budget.xml) records SIX test
+cases (PolicyValidatorsRejectSpecNegatives,
+SelectorLifetimeIsEnforcedWithReceipts,
+GreedyCouplingPreservesTargetStreamAtEveryN,
+SeededCouplingPreservesTargetTokensAtEveryN,
+ProbabilityRejectionExecutedLawEnumeration,
+SweepMechanicsUseRuntimeDescriptors) — all PASS. The "2/2 PASSED" figure
+in the ctest summaries is the CTEST TARGET count (the two test
+executables: the portable target and the head target), not the test-case
+count. Total executed test cases across both targets: 8 (6 portable + 2
+head), all PASS.
+
+## 2. The durations
+
+Main's canonical run on addf3db78 (.80): the portable target 0.17 s, the
+head target 0.07 s.
+
+## 3. The e099 (failed-run) SUMMARY corrections
+
+The sealed SUMMARY.md's implied byte-mismatch diagnosis is SUPERSEDED:
+the actual failure is the ADMISSION gap — GroupedTargetRowsMatchSerialM1
+failed at :439 because `workspace.allocate(...)` returned false ("No
+backend available for device CPU" — the two-argument
+DeviceWorkspaceManager requires BackendManager::initCPUBackend
+registration; the fixture lacked it). No numerical comparison ran in
+that test. The SUMMARY also mistypes the tip: the actual failed tip is
+e09903875325906d7bba6a190046c68d94252d4f (…5325906d7bba…), not
+"e099038758". The raw SUMMARY is preserved as-is; this note is the
+corrected record.
+
+## 4. Build-context clarification
+
+Both .80 runs (the failed e09903875 run and the fixed addf3db78 run) are
+INTEGRATION builds (NEON_I8MM SHARED_CORE=ON, g++-14) — the handoff
+package §4's Release/Integration mix is corrected to Integration for
+both. The local Mac verification is SYNTAX-ONLY (clang++-18 + g++-14
+-fsyntax-only) — not a full build.
+
+## 5. Evidence-class clarification (the B4 TUs vs the unrelated perf TUs)
+
+The B4 TUs' (Test__CPUDraftVocabularyBudget{,Head}.cpp) executed evidence
+is the ACTUAL Linux GCC build/run in the two seals. The g++-14/clang
+-fsyntax-only checks named for the unrelated performance TUs
+(Perf__CPUCompactIQ3SDecode.cpp — the idea-08 tournament bench;
+Perf__CPUMoESingleTokenTransaction.cpp — the B1 bench) are separate
+diagnostics and must not be conflated as B4 execution evidence.
+
+## 6. Abridged-excerpt disclosure
+
+The pasted XML excerpts in the handoff package were ABRIDGED (the e099
+head-XML failure CDATA; the addf portable testcase elements). The FULL
+verbatim XMLs live in the two seals; the reviewer used the actual local
+XMLs. The abridgment is disclosed, not a fidelity claim.
