@@ -3240,8 +3240,9 @@ add_v2_test(V2_Integration_ClusterInventoryBootstrap
     TIMEOUT 60
 )
 
-# Check actual rank-worker admission with no initial partition mutation. The
-# original master pin must not become inherited affinity for native children.
+# Check actual rank-worker admission with no initial partition mutation. An
+# unbound runtime owns no native core admission and is rejected before binding,
+# so no master pin can become inherited affinity for native children.
 # Disable the KMP policy too: LLVM OpenMP gives it precedence over OMP_PROC_BIND.
 add_v2_test(V2_Integration_MPIBootstrapCallerAffinity
     COMMAND ${CMAKE_COMMAND} -E env "OMP_PROC_BIND=false" "OMP_DYNAMIC=false"
