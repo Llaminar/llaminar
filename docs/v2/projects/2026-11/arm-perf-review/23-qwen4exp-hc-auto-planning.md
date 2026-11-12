@@ -34,3 +34,19 @@ one second (blocks automatic placement of models like Qwen3.8-Flash-Next).
   on GB10 with the joint-pool observation in idea 2.
 - Device-free planning tests for the HC kinds, plus the Qwen4Exp parity/
   admission cells that already cover these tensors.
+
+### OPERATOR DECISION (~09:05Z): idea-23 PATH (b) — fix + model in parallel; the model homes on the DGX station
+
+- **Stage 1 dispatched to addon3**: classify the HC roles (HyperConnection-
+  Projection, HyperConnectionNorm, output_hc_down.weight, etc.) in
+  PlanningForwardWeightWork::planningOrdinaryWeightKind, priced as
+  projections; add the HC tensors to the WeightIdentity/Qwen4Exp
+  coverage; device-free planning tests + the Qwen4Exp parity/admission
+  cells. Normal implement → validate → handback from the PR tip.
+- **Stage 2 dispatched to the station session**: download
+  Qwen3.8-Flash-Next-UD-Q4_K_XL (4-split, ~111 GB) to the STATION host
+  storage (256G free; the operator designated the station as the model
+  home), SHA/size-verified; report paths + disk state.
+- The model-level validation (plan -m ... auto without the
+  unclassified-work error, matching the --expert-tier workaround)
+  waits for both.
