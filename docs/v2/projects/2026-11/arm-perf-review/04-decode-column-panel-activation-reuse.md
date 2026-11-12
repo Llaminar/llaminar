@@ -295,3 +295,16 @@ interpretation table). Pressed for the M=1 state + the .79/W2 counter
 re-run status (also overdue since ~04:45). Main's B4 combined-tip
 canonical at 7a4790c77 (the A4-restore tip) is staged behind the
 confirmations — WAIT issued.
+
+### M=1 WINDOW FAILED EMPTY (~07:20Z): the perf binary was never built — hard-fail guard ordered
+
+Main's direct observation: the Release build didn't produce
+v2_perf_cpu_native_quantised_thread_scaling (wrong target or build
+failure); every cell failed instantly ("No such file or directory");
+8 header-only CSVs (124 B each) = the entire output. Nothing live;
+.80 idle → Main starts the B4 canonical at 7a4790c77 NOW (correctness
+first; the M=1 window redone after). **RUN-SHEET FIX (routed to
+addon): build the perf target EXPLICITLY + `test -x` hard-fail BEFORE
+the timing loop (a missing binary = an abort, not silent per-cell
+failures) + report the build-failure context.** The re-booking follows
+the B4 canonical; the interpretation kit stands.
