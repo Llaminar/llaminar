@@ -2258,3 +2258,33 @@ Re-run gate = .79 tournament (rebuild build-cd-* from adf8efc32; 3 ISA
 × M=1/4/15) after the idea-08 BOM census (independent, running next).
 First-run-RED = never-green diagnostic bench, NOT a PR defect (file
 exists only on the lane; non-installed diagnostic namespace).
+
+### IDEA-08 TOURNAMENT: SOURCE HOLD — my fix incomplete; numbers void (12:30Z)
+
+Reviewer one-pass verdict + Main's routing: **SOURCE HOLD at adf8efc32**.
+The two sign corrections (adf8efc32) = confirmed RIGHT, but the bench has
+FOUR more source defects (reviewer line numbers, verified by me against
+the production authorities):
+1. Oracle1 reference (line 128): ExpandedSource::weights16 uses
+   group*256+quad*4; production column offset = group*256+column*4
+   (CPUNativeQuantisedWeightPacker.h:595-609: destination+group*256+
+   zmm*64+lane*kValuesPerGroup = group*256+column*4) ⇒ must be quad*16;
+   at quad1 it compares expanded columns 1..4 vs compact 4..7.
+2. Lines 270-273/328-331: BOTH walkers advance half-scale and raw-
+   coefficient pointers by quad*4; admittedScales/admittedMins are
+   per-column uint16 (CPUNativeNEONPreparedProjection.h:596-614: +
+   column) ⇒ a quad's four columns = quad*8 bytes. Both arms share the
+   mistake ⇒ Oracle2 is a shared-walker/metamorphic check, cannot prove
+   production equality. (Per-quad single-scale aggregation is also not
+   the production per-column program.)
+3. Lines 604-647: SMMLA pairs only when M even ⇒ M=15 runs 15 SDOT
+   rows, no SMMLA+tail; M=1 single-row OK.
+4. Timed outputs overwritten, never consumed/validated (682-698 recheck
+   decoded WEIGHTS only) — no retention proof of the timed FP32 work.
+**CONSEQUENCE**: any tournament/census numbers from 5c2cef47a or
+adf8efc32 = NOT idea-08 decision inputs. Repair = post-merge
+(implementation-fenced, outside PR #43); re-run only after a fixed tip
+gets a reviewer ACK. Sparks instructed: census ONLY (independent pure
+model-load input, keep + pin script/artifact paths); tournament re-run
+CANCELLED. adf8efc32 kept as stage-1 (reviewer-confirmed sign fix);
+remaining findings queued for post-merge.
