@@ -1919,3 +1919,27 @@ d1fd0a077). Campaign attempt 3 = container main-campaign-ebd (started
 00:48:23Z); attempts 1-2 preserved. **LANES: rebase onto ebd66f0cb (not
 dd8) only after Main announces the push.** Relayed to addon (FMLAL had
 rebased locally onto dd8 — redo onto the announced SHA).
+
+### CAMPAIGN #2 RESULT (~01:38Z, ebd66f0cb): exit 8, 3535 tests, 17 failed / 0 skipped
+
+- **20 inherited failures FIXED by the base** (the base absorbed most of
+  the qualified-relative inherited set).
+- 12 NEW failures, classified by Main:
+  (a) Rebase interaction — FIXED in **74797687f**: 3 new base GTest
+  bodies price GPU-native objects and fail CPU-only (5 aliases +
+  MemoryPlanner + PhysicalMemoryAuthority) → guarded HAVE_CUDA||HAVE_ROCM
+  + REQUIRES_BACKEND GPU; base routes --mpi-procs ranks into cluster
+  thread config needing original-entry native admission (MPIBootstrap ×2)
+  → applied only when admission exists; duplicated kwarg from auto-merge
+  (GroupedSealedPlan).
+  (b) Base topology (inherited, not fixed): **ShmemSpinAbsorbingAbortReplay**
+  — the base now rejects two CPU-expert ranks on one NUMA node (.80 has
+  one) = same class as CPURootedGatherParallelCopyReplay. WATCH: semantic
+  interaction with the branch's merged ShmemSpin shared-partition fix —
+  if #3 still shows it, route the analysis.
+  (c) Suspected flake: KVStateLifecyclePolicySelfTest (exit 255; same
+  files passed at 1267) — recheck in #3.
+- Unchanged inherited: 4 ROCm trainer fixtures + the 2-socket cell.
+- **Campaign #3** on the final tip 74797687f (tree 9879e16dc), container
+  main-campaign-747, started 01:37:54Z — fix-forward continuation within
+  Main's window; push only if no branch-introduced failures.
