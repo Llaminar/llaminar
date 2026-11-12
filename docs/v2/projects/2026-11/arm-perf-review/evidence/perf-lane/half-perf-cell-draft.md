@@ -981,3 +981,15 @@ proceeds with the NEON gate once the host is clean; the no-other-
 containers-on-my-worktree request is granted while gate receipts are
 produced. Escalation to Main/operator if it reappears after removal.
 No evidence impact (worktree clean; scratch untracked; self-terminated).
+
+### FOREIGN CONTAINER RECONCILIATION (~04:36Z): CB lead disowns; c527 queried; forensic ask
+
+CB lead: their session did NOT launch it (recent station work = read-only
+SSH/SCP in CB c1; no automation retained); CB authorization explicitly
+excludes ARM/FMLAL worktrees; they cannot attest for the DGX worker
+without checking (check in flight). c527 queried directly (read-only).
+The station asked to PRESERVE docker inspect output (ID, times, command,
+mounts, labels) if the container record still exists — the forensic
+record for the origin question. If no CB origin: escalates to Main/the
+operator as a station-integrity question. No evidence damage; the NEON
+gate proceeds.
