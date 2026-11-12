@@ -34,6 +34,32 @@ namespace llaminar2::test {
 namespace {
 using Engine=gemm::FloatingPointGemmKernel;
 using Mode=FloatingActivationOperandPrecision;
+/** @brief Whether the RESOLVED route is the FMLAL leaf: the compiled
+ *        envelope must declare FP16FML and the process ISA resolution must
+ *        have selected a native NEON level (an explicit Scalar route in an
+ *        I8MM binary legitimately executes none). */
+bool fmlalRouteResolved()
+{
+    if (!fmlalLeafCompiledInEnvelope()) return false;
+#if defined(__aarch64__)
+    const auto level = activeISALevel();
+    return level == ISALevel::NEON || level == ISALevel::NEONDotProd;
+#else
+    return false;
+#endif
+}
+/** @brief Enable the FMLAL route probe for one contract, then restore off.
+ *        A no-op in envelopes without the leaf: the probe does not exist
+ *        there and the resolved-route expectations are zero. */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+class FmlalProbe final {
+public:
+    FmlalProbe() { fmlalLeafProbeEnabled().store(true, std::memory_order_relaxed); }
+    ~FmlalProbe() { fmlalLeafProbeEnabled().store(false, std::memory_order_relaxed); }
+};
+#else
+class FmlalProbe final { public: };
+#endif
 /** @brief Restore physical worker selection and dynamic-team policy. */
 class Workers final {
     int count_=omp_get_max_threads(),dynamic_=omp_get_dynamic();
@@ -274,13 +300,17 @@ TEST(CPUHalfOperands, NativeBF16RouterSerialRowsAndRetainedBank){
 }
 /** @test K tails of 0..255 around the 256-lane stripe and non-multiple widths. */
 TEST(CPUHalfOperands, KTailBoundariesAllRowsMatchSerial){
+    FmlalProbe probe;
+    const long long expect_per_prove=fmlalRouteResolved()?4:0;
     for(int workers:{1,3})for(int m:{1,2,3,4})
         for(int k:{255,256,257,300,511,512,513,767}){
             const long long before=fmlalLeafInvocations();
             proveLinear(m,k,workers);
-            // Four execution lanes over nine columns, one row tile at M<=4:
-            // the FMLAL envelope increments 36 times, the scalar envelope 0.
-            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?4:0)<<"k="<<k<<" m="<<m;
+            // Four execution lanes over nine columns: four admitted live
+            // FMLAL dispatches per proveLinear on the resolved route, zero
+            // otherwise (an explicit Scalar route in an I8MM binary runs the
+            // scalar schedule and counts nothing).
+            EXPECT_EQ(fmlalLeafInvocations()-before,expect_per_prove)<<"k="<<k<<" m="<<m;
         }
     // Repeated runs of one boundary geometry stay byte-identical.
     proveLinear(2,257,3);
@@ -328,6 +358,7 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
     const std::array<uint16_t,12> special_words{{
         0x0000,0x8000,0x0001,0x03FF,0x7C00,0xFC00,0x7E00,0x7C01,0x7BFF,0x0400,0x8001,0x3C00}};
     constexpr int K=256;
+    FmlalProbe probe;
     for(int repetition:{1,2}){
         // Weight-side specials: A is exact 1.0 in both storage forms.
         for(uint16_t special:special_words){
@@ -344,7 +375,7 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
             const long long before=fmlalLeafInvocations();
             std::fill_n(output.mutable_data(),1,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,K))<<"W="<<special;
-            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?1:0)<<"W="<<special;
+            EXPECT_EQ(fmlalLeafInvocations()-before,fmlalRouteResolved()?1:0)<<"W="<<special;
             EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"fp32A W="<<special;
             std::fill_n(output.mutable_data(),1,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,1,1,K))<<"W="<<special;
@@ -366,6 +397,26 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
             std::fill_n(output.mutable_data(),1,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,1,1,K))<<"A="<<special;
             EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"halfA A="<<special;
+        }
+        // The smallest subnormal, certified independently of the finite
+        // background: every product is exactly zero except one lane carrying
+        // 1.0 * 2^-24, so the tree returns that contribution alone — a case
+        // the 255-ones background cannot round away.
+        {
+            std::vector<uint16_t> words(size_t(K),0x0000),half(size_t(K),0x3C00);
+            words[size_t(repetition-1)]=0x0001;
+            std::vector<float> minsub_source(size_t(K),1.f);
+            FP16Tensor weight({size_t(1),size_t(K)},words);
+            Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+            FP32Tensor input({size_t(1),size_t(K)}),output({size_t(1),size_t(1)});
+            std::copy(minsub_source.begin(),minsub_source.end(),input.mutable_data());
+            FP16Tensor half_input({size_t(1),size_t(K)},half);
+            std::vector<uint16_t> a_words(size_t(K),0x3C00),w_words=words;
+            const float expected=canonicalHalfTree(a_words,w_words);
+            EXPECT_EQ(std::bit_cast<uint32_t>(expected),0x33800000u);
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,K));
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"minsub W";
         }
         // FP32-A conversion discriminators: RNE ties and the overflow-to-Inf
         // boundary, isolated per run (the hand table is the one
@@ -441,7 +492,7 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
         std::fill_n(probe_a.mutable_data(),65,1.f);
         const long long before=fmlalLeafInvocations();
         ASSERT_TRUE(probe_engine.multiply_tensor(&probe_a,&probe_c,1,2,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,fmlalLeafCompiledInEnvelope()?1:0);
+        EXPECT_EQ(fmlalLeafInvocations()-before,fmlalRouteResolved()?1:0);
     }
     // Device-free admission semantics: an envelope declaring FP16 without the
     // FML extension admits on an FHM-less machine; the FMLAL envelope does
