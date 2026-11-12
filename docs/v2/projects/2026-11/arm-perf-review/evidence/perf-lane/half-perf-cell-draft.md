@@ -735,3 +735,41 @@ Main on .80 (main-fmlal5, exited; host handed back → B1 export can go):
   the D6 arch-split class); (2) **wrong FZ16 bit — bit 26 is AHP; FZ16
   is bit 19** (the FPCR-profile admission tests the wrong bit).
 - Sent to addon (not applied); #6 after the fix tip on 74797687f.
+
+### FMLAL LANDING REVIEW (~02:49Z): SOURCE HOLD at b5e928e40 — L1-L5
+
+Fresh full-range static verdict (74797687f..b5e928e40, six files
++628/-11; no execution by the reviewer):
+- L1: x86 compilation regression — Test__CPUHalfOperands.cpp:15
+  unconditionally includes ARMCPUFeatures.h (#error on non-AArch64);
+  ARM-only types unguarded at :411-445; the target registers on x86
+  (:30367). Guard include/body; retain portable half correctness.
+- L2: the F1 regression cannot reach the repaired route — :402-403
+  constructs FP16 weights + Mode::FP32 (rejected at base :5208-5210);
+  the real (F,F) route = GPUAlignedExpert + Mode::Native; descriptor
+  [N,K]={1,16} not {16,1}; don't weaken the storage validator.
+  (= Main's #5 throw finding, confirmed at source.)
+- L3: kFZ16=1ULL<<26 is WRONG — FPCR.FZ16 is bit 19; bit 26 = AHP; an
+  actual FZ16-only word (0x80000) passes the FZ16-off admission. Fix
+  the bit; preserve AHP rejection under its correct name; focused
+  profile controls with this contract.
+- L4: F4 process admission incomplete — CPUFeatures.h:208-245 admits
+  only DotProd/I8MM before overrides; native()/observe() only require
+  ASIMD; requireCompiledEnvelope() not wired into the ordinary ISA
+  resolver; FHM checked only at the FMLAL dispatch :1836 → not complete
+  startup admission for a globally-enabled feature that may execute
+  outside this leaf. Bind the envelope authority into ordinary
+  admission incl. explicit scalar selection.
+- L5: F5 partial — the counter still increments before pointer/
+  publication validation (:1459-1469) and live-span checks (:1483-1487);
+  unconditional relaxed atomic in every eligible call; tests derive
+  expectations from the COMPILED envelope (resolved-Scalar legitimately
+  executes 0). Separate capability/attempt/admitted-execution; resolved-
+  route expectations; evidence out of clean timing; stale comments.
+ACKNOWLEDGED: F1 guard, F2 oracle+ties+specials, 256-lane chains, '+w'
+constraint, FHM observations, I8MM-global scope + mask — source
+acknowledgments, NOT a blanket byte/runtime certificate (the finite-255
+background rounds away the smallest-subnormal contribution in some
+special cases).
+DISPOSITION: implementation authorization intact; economy NOT ADMITTED;
+focused controls = lane obligations; broader checks = Main's campaign.
