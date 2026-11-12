@@ -1081,3 +1081,17 @@ rider (K14-I16RIDER27). W3 never started (the earlier attempts were
 the disk-full one; the tree is seeded, no build began). .79/W2: the
 1-failed counter assertion consistent across all 4 placements —
 awaiting addon2's resolution.
+
+### B1ATTR2 SEALED (~06:59Z): K14-B1ATTR2-12675C956-20261112 — the corrected export complete
+
+16 files + full-record JSONs at .80 /home/factory/llaminar-i8mm/
+b1attr2-runs/; all 4 configs RC=0 (35B/27B × MTP/no-MTP) with
+omp,kernel + SUMMARY + **CPU_STAGE_TIMING=1** + full JSONs — the omp
+fork stage names + the gdn_projection_route identity data are IN this
+export (the missing pin fixed). Addon3's deliverables: (1) the
+per-stage named analysis (the 35B verifier 5-fork group, the draft
+1-fork stages, the 27B 4-fork stage identity); (2) the
+gdn_projection_route cross-check (2 fused subgroups predicted from
+code); (3) the B1 ranking paired with measured per-fork overhead
+(timings usable — uncontended). .80 → idea-04 M=1 (0ad09600b) → the
+27B rider.
