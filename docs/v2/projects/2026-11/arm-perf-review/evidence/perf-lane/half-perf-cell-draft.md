@@ -1011,3 +1011,18 @@ conversation. The addon disowned the request. This is a
 messaging-layer routing/attribution failure, not a worker-discipline
 failure — flagged to Main + the operator.** The station's NEON gate
 proceeds (worktree clean).
+
+### NEON GATE LAUNCHED (~04:38Z): host cleaned, watcher audit rules out the station orchestrator
+
+strange_euclid self-terminated; its scratch removed; tree verified
+clean at 0ad09600b; the station's watcher state audited ("No watchers"
+→ their own orchestrator ruled out as the foreign actor). New
+integrity observation: `thirsty_benz` in Created state (random name,
+never started, origin unknown) — possibly the same actor's failed
+first attempt; logged for the CB-lead/Main reconciliation (the CB
+worker's session log would confirm or refute). NEON-envelope gate
+expectations: FP16FML=0 → the leaf-less control — probe-enabled-but-
+route-not-FMLAL counts of 0 = PASS (the no-FMLAL control the reviewer
+demanded). A separate OneDNN build-neon identity via the canonical
+helper (flags-bound, disclosed). Three-run receipts + exit + tree SHAs
+to coordinator + Main + addon when it lands.
