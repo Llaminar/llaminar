@@ -901,3 +901,18 @@ Raw gtest XML/logs + exact tree + build exit + binary exit to Main +
 addon + the reviewer. Green both → Main's #8 (full I8MM canonical) +
 the reviewer verdict → application → PR commits. Idea-04 M=1 queues
 behind the landing.
+
+### FMLAL GATE-TIP PRELIMINARY FINDING (~04:28Z): P1-P5 still bypass the FMLAL counter — two fixture bypasses
+
+Reviewer static source at exact e8c5bd505: all five P-calls instantiate
+run_gpu_aligned_expert_fp32_matmul<FP16> with DEFAULT HalfRNE=false/
+HalfStorage=false (production correctly excludes (F,F) from FMLAL) AND
+the prior public-controls FmlalProbe has destructed (no probe in the
+primitive block despite its comment). **Two independent bypasses: the
+intended <FP16,true> domain is not instantiated, and no enable scope
+spans P1-P5.** P4 predicts 0 vs expected 1 on native I8MM/FMLAL; plain
+NEON can pass while the negatives stay nondiscriminating. P5 reaches
+the row selection but not the FMLAL evidence scan. FIX = fixture-only;
+DO NOT relax the production domain guard. The in-flight native runs may
+confirm empirically (P4 failing on I8MM); the reviewer's final verdict
+waits for the fixed fixture + runtime handoffs.
