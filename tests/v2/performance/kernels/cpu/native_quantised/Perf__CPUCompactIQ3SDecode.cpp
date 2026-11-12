@@ -31,10 +31,15 @@
  *
  * Byte oracles, before and after timing: (1) the compact decode of every
  * unit reproduces the prepared data plane byte for byte (memcmp against
- * the production-expanded engine's own data plane); (2) the full-matrix
- * FP32 outputs of the compact arm and the expanded arm are bit-identical
- * for every timed row shape and compiled family. Both arms share one
- * microkernel template and differ only in their weight-vector source, so
+ * the production-expanded engine's own data plane, read at the packer's
+ * group*256 + column*4 byte offsets); (2) the full-matrix FP32 outputs
+ * of the compact arm and the expanded arm are bit-identical for every
+ * timed row shape and compiled family, and the timed passes write
+ * retained per-row outputs that are compared after timing. Both arms
+ * consume the per-column scale/min planes through the production
+ * admitted-planes program (admittedScales/admittedMins advanced by
+ * column) and share one microkernel template, differing only in their
+ * weight-vector source, so
  * the comparison isolates the decode cost. The production dot leaves
  * (`NEONMultiScaleOps::dot`, `pairDot`) and the production
  * `accumulateSingleScaleBlockNEON` program are used unchanged, with the
@@ -45,8 +50,10 @@
  * capabilities, mirroring the ISA-cell build convention (the window runs
  * the bench under the NEON / NEON_DOTPROD / NEON_I8MM build cells; the
  * I8MM cell also exercises the SMMLA row-pair walk). Row shapes M=1, M=4
- * and M=15; I8MM walks row pairs (an odd trailing row uses the family's
- * SDOT leaf, exactly as production row pairs do). Timing is unprofiled,
+ * and M=15; I8MM walks floor(M/2) row pairs for every M, and an odd
+ * trailing row runs the single-row SDOT leaf — exactly the production
+ * Pair-tile grid dispatch, where a one-row span compiles the DotProd
+ * instantiation (leafInstruction). Timing is unprofiled,
  * alternating paired samples per arm.
  *
  * This bench grants no production change: it is a diagnostic bound for the
@@ -118,6 +125,10 @@ namespace
 
         /// Sixteen decoded bytes for (block, group, column quad), in the
         /// production interleaved order: four columns x four K values.
+        /// Production packs column c at group*256 + (c/16)*64 + (c%16)*4
+        /// bytes (CPUNativeQuantisedWeightPacker), which collapses to
+        /// group*256 + c*4; a quad's columns quad*4..quad*4+3 therefore
+        /// start at group*256 + quad*16 bytes.
         inline int8x16_t weights16(int block, int group, int quad) const
         {
             const auto *unit = packed->interleavedBase() +
@@ -125,7 +136,7 @@ namespace
                     static_cast<size_t>(packed->interleaved_block_stride);
             return vld1q_s8(reinterpret_cast<const int8_t *>(
                 unit + static_cast<size_t>(group) * 256u +
-                static_cast<size_t>(quad) * 4u));
+                static_cast<size_t>(quad) * 16u));
         }
 
         /// One 64-column chunk: the scale plane after data + compensation.
@@ -267,10 +278,16 @@ namespace
                     dots = Ops::dot(dots, std::bit_cast<I>(weights),
                         I{} + word);
                 }
-                const F scale0 = Ops::half(reinterpret_cast<const uint16_t *>(
-                    source.scalesHalf(block) + static_cast<size_t>(quad) * 4u));
-                const I metadata = Ops::words(reinterpret_cast<const uint16_t *>(
-                    source.nibbleWords(block) + static_cast<size_t>(quad) * 4u));
+                // Production consumes the per-column uint16 planes:
+                // admittedScales/admittedMins(chunk, block) + column
+                // (CPUNativeNEONPreparedProjection). A quad's first column
+                // is quad*4, so the advance is quad*4 uint16 words.
+                const F scale0 = Ops::half(
+                    reinterpret_cast<const uint16_t *>(source.scalesHalf(block)) +
+                    static_cast<size_t>(quad) * 4u);
+                const I metadata = Ops::words(
+                    reinterpret_cast<const uint16_t *>(source.nibbleWords(block)) +
+                    static_cast<size_t>(quad) * 4u);
                 const I coefficient = metadata * 2 + 1;
                 const F scale = scale0 * __builtin_convertvector(coefficient, F);
                 const float activation_scale =
@@ -325,10 +342,16 @@ namespace
                 // ops struct actually declares.
                 I dots[2];
                 Ops::splitPair(columns01, columns23, dots[0], dots[1]);
-                const F scale0 = Ops::half(reinterpret_cast<const uint16_t *>(
-                    source.scalesHalf(block) + static_cast<size_t>(quad) * 4u));
-                const I metadata = Ops::words(reinterpret_cast<const uint16_t *>(
-                    source.nibbleWords(block) + static_cast<size_t>(quad) * 4u));
+                // Production consumes the per-column uint16 planes:
+                // admittedScales/admittedMins(chunk, block) + column
+                // (CPUNativeNEONPreparedProjection). A quad's first column
+                // is quad*4, so the advance is quad*4 uint16 words.
+                const F scale0 = Ops::half(
+                    reinterpret_cast<const uint16_t *>(source.scalesHalf(block)) +
+                    static_cast<size_t>(quad) * 4u);
+                const I metadata = Ops::words(
+                    reinterpret_cast<const uint16_t *>(source.nibbleWords(block)) +
+                    static_cast<size_t>(quad) * 4u);
                 const I coefficient = metadata * 2 + 1;
                 const F scale = scale0 * __builtin_convertvector(coefficient, F);
                 const float activation_scale0 =
@@ -562,7 +585,8 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
     // ------------------------------------------------------------------
     // Timing: alternating paired samples per arm, per row shape, on the
     // compiled family. The ASIMD/DotProd cells walk rows one by one; the
-    // I8MM cell walks row pairs plus one SDOT row for an odd count.
+    // I8MM cell walks floor(M/2) row pairs plus one SDOT tail row for an
+    // odd count, for every M — the production Pair-tile dispatch.
     // ------------------------------------------------------------------
 #if defined(__ARM_FEATURE_DOTPROD)
     cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::DotProd);
@@ -584,10 +608,12 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
 #endif
 
 
-    float pair_expanded0[64];
-    float pair_compact0[64];
-    float pair_expanded1[64];
-    float pair_compact1[64];
+    // Retained per-row FP32 outputs of the timed passes: every timed row
+    // writes its own slot (production rows own distinct output spans), so
+    // no timed result is overwritten and the timed work stays consumable
+    // by the post-timing retention oracle below.
+    alignas(16) float retained_expanded[kMaxRows][64];
+    alignas(16) float retained_compact[kMaxRows][64];
 
     struct RowShape
     {
@@ -602,26 +628,45 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
         std::vector<double> compact_samples;
         auto one_pass = [&](bool expanded_arm) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-            if (shape.rows % 2 == 0)
+            // Production Pair-tile dispatch for every row shape:
+            // floor(M/2) SMMLA row-pair tiles plus, for an odd M, one
+            // single-row tile whose admitted leaf is the SDOT program —
+            // leafInstruction compiles I8MM with Rows==1 to the DotProd
+            // instantiation (the NEON_I8MM cell's armv8-a+simd+dotprod+i8mm
+            // envelope defines both feature macros). M=1 is that lone SDOT
+            // row; M=15 is seven SMMLA pairs plus the SDOT tail.
+            for (int pair = 0; pair < shape.rows / 2; ++pair)
             {
-                for (int pair = 0; pair < shape.rows / 2; ++pair)
-                {
-                    const auto *act0 =
-                        &activations[static_cast<size_t>(pair * 2) *
-                                     static_cast<size_t>(kBlocksPerRow)];
-                    const auto *act1 =
-                        &activations[static_cast<size_t>(pair * 2 + 1) *
-                                     static_cast<size_t>(kBlocksPerRow)];
-                    if (expanded_arm)
-                        walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(expanded, act0, act1,
-                            pair_expanded0, pair_expanded1);
-                    else
-                        walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(compact, act0, act1,
-                            pair_compact0, pair_compact1);
-                }
-                return;
+                const auto *act0 =
+                    &activations[static_cast<size_t>(pair * 2) *
+                                 static_cast<size_t>(kBlocksPerRow)];
+                const auto *act1 =
+                    &activations[static_cast<size_t>(pair * 2 + 1) *
+                                 static_cast<size_t>(kBlocksPerRow)];
+                if (expanded_arm)
+                    walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(expanded, act0, act1,
+                        retained_expanded[pair * 2],
+                        retained_expanded[pair * 2 + 1]);
+                else
+                    walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(compact, act0, act1,
+                        retained_compact[pair * 2],
+                        retained_compact[pair * 2 + 1]);
             }
-#endif
+            if (shape.rows % 2 != 0)
+            {
+                const int tail_row = shape.rows - 1;
+                const auto *act =
+                    &activations[static_cast<size_t>(tail_row) *
+                                 static_cast<size_t>(kBlocksPerRow)];
+                if (expanded_arm)
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::DotProd>>(
+                        expanded, act, retained_expanded[tail_row]);
+                else
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::DotProd>>(
+                        compact, act, retained_compact[tail_row]);
+            }
+            return;
+#else
             for (int row = 0; row < shape.rows; ++row)
             {
                 const auto *act =
@@ -632,19 +677,20 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                     walkUnitRows<cpu::native_quantised::multi_scale::
                             NEONMultiScaleOps<cpu::native_quantised::
                                 multi_scale::NEONByteDot::DotProd>>(
-                        expanded, act, row_expanded);
+                        expanded, act, retained_expanded[row]);
                 else
                     walkUnitRows<cpu::native_quantised::multi_scale::
                             NEONMultiScaleOps<cpu::native_quantised::
                                 multi_scale::NEONByteDot::DotProd>>(
-                        compact, act, row_compact);
+                        compact, act, retained_compact[row]);
 #else
                 if (expanded_arm)
-                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(expanded, act, row_expanded);
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(expanded, act, retained_expanded[row]);
                 else
-                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(compact, act, row_compact);
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(compact, act, retained_compact[row]);
 #endif
             }
+#endif // !__ARM_FEATURE_MATMUL_INT8
         };
         for (int pair = 0; pair < warmup; ++pair)
         {
@@ -677,6 +723,20 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                   << ",compact_median_us=" << compact_median
                   << ",ratio=" << (compact_median / expanded_median)
                   << ",prepared_bpw=9.5,compact_bpw=4.25,unprofiled=1\n";
+
+        // Retention oracle (untimed): the last timed pass left every row
+        // of this shape in its own retained slot. The two arms' timed FP32
+        // work — including the SMMLA pairs and the SDOT tail under I8MM —
+        // must agree byte for byte, proving the timed programs produced
+        // equal outputs, not merely equal decoded weights.
+        for (int row = 0; row < shape.rows; ++row)
+            compareOutputs(retained_expanded[row], retained_compact[row],
+                64, "timed FP32 retention (family=" +
+                    std::string(family_label) + ", rows=" +
+                    std::string(shape.label) + ", row " +
+                    std::to_string(row) + ")");
+        if (::testing::Test::HasFailure())
+            return;
     }
 
     // Post-timing oracle: the compact decode still matches byte for byte.
