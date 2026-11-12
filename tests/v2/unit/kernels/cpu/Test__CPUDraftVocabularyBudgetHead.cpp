@@ -49,6 +49,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cpu/gemm/CPUNativeNEONContributionContract.h"
 #include "kernels/cpu/gemm/CPUNativeNEONMultiScaleOps.h"
@@ -435,6 +436,11 @@ TEST(CPUDraftVocabularyBudgetHead, GroupedTargetRowsMatchSerialM1)
     FP32Tensor grouped_logits(
         std::vector<size_t>{static_cast<size_t>(kVerifierRows),
             static_cast<size_t>(kTailVocab)});
+    // The two-argument workspace manager allocates through the device
+    // backend, so the CPU backend must be initialized first (the same
+    // fixture pattern the STT bench uses; the W3 seal caught this gap).
+    if (!llaminar2::hasCPUBackend())
+        llaminar2::initCPUBackend(-1);
     DeviceWorkspaceManager workspace(DeviceId::cpu(), 1u << 22);
     ASSERT_TRUE(workspace.allocate(
         cpuProjectionQ8WorkspaceRequirements(
