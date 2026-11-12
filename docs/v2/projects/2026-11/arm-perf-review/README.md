@@ -2448,3 +2448,21 @@ standalone proofs uncommitted per the sign-fix pattern; syntax-only
 clean in all 3 cell envelopes. Focused-pass request dispatched to
 arm-reviewer (01a1a8d9) with the 4 verification points; the .79
 tournament re-run fires only on ACK. Lane stands by for fix-forwards.
+
+### REVIEWER VERDICT on e0f6506c9 (~18:56Z): SOURCE HOLD — findings 1-3 closed, finding-4 fix-forward
+
+Confirmed by the reviewer: byte units (quad*16 BYTES), walker word
+identity (IQ3_STensor.cpp:483-504 → WeightPacker:527-536/:639-655, no
+float round-trip), and the row/leaf tile split (M1 DotProd; M4 2 SMMLA
+pairs; M15 7 pairs + DotProd row14; scalar loop #else-excluded) — all
+SOURCE-CLOSED. **Open**: the retention oracle validates only the FINAL
+sample; earlier timed iterations are overwritten (concrete negative:
+omit one_pass at :708 in every timed iteration — warmup outputs still
+pass). Required: per-invocation live-output observability at the timing
+boundary + untimed dirty-output/check-before-reuse controls; comparison
+outside the timed interval. Fix-forward dispatched to arm-i08repair
+(acceptance test = the reviewer's negative must FAIL the oracle).
+Also noted by the reviewer: Oracle2 remains shared-walker/metamorphic
+(not independent full-engine proof) — accepted framing for a diagnostic
+bench; uncommitted proofs = lane reports, not reviewer-authenticated
+evidence.
