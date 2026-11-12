@@ -627,3 +627,19 @@ bundle assertion failed). Pushed 79967de27; sparks rebuilds + re-runs
 the 4 placements → the B1 seal completes on a passing counter contract.
 Timing evidence stands: production 217.2 vs transaction 206.3 µs
 mixed-20T (B ≤ A non-regression territory).
+
+### W2 MYSTERY SOLVED (~07:55Z): the re-run binary predated the counter-name fix
+
+Addon2's line-number fingerprint: the reported failure at :836 = the
+fresh_bundle EXPECT_EQ line in 3cb9f79b4 (verified via git show); in
+79967de27 the assertion moved to :841 (a +5-line comment block). The
+timeline closes the case: 79967de27 committed 05:43:23; sparks' binary
+mtime 05:35; the re-run ~05:36 — both BEFORE the fix. The "post-fix
+rebuild" was post-3cb9f79b4 (the ADMISSION fix), not post-79967de27
+(the counter-NAME fix — a separate commit an hour later). The observed
+zero is EXPECTED at 3cb9f79b4 (the STAGE-level counter); the kernel-
+level counter DOES advance on arm-A (the down/transaction counters,
+same domain/gate/TU, not in the failure list). RESOLUTION: sparks
+fetches 79967de27, rebuilds, re-runs — the assertion lands at :841
+(the fingerprint) and should PASS → the B1 seal completes. Timing
+unaffected.
