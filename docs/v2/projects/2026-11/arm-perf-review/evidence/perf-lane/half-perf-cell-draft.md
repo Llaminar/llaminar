@@ -951,3 +951,9 @@ authenticated); the STATION runs the NEON-envelope build + binary at
 the previous station-I8MM plan. W3 (B4) yields .80: not-started →
 holds; mid-build → finishes then #8. Green both → the reviewer's #209
 + application → PR commits.
+
+### FMLAL #8 RUNNING (~04:34Z): main-fmlal8 at 0ad09600b (tree ffa6a156a), started 04:33:26Z
+
+.80 was empty → #8 running (I8MM focused + canonical, ~45 min); .80
+held by Main; W3 held until handback. Station NEON gate at 0ad09600b
+in parallel. Post-#8 .80 queue: W3 → 27B rider → B1ATTR2 state check.
