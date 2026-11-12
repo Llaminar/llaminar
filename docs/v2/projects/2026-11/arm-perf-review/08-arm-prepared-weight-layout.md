@@ -154,3 +154,15 @@ concrete fixes (explicit vreinterpretq before vtst; the template
 qualifier) + the process requirement: **g++-14 must join their local
 check matrix for this TU.** Campaign attempt 3 on .80 = FINISHED/EXITED
 (dockerps empty; Main owns the result report).
+
+### W2 FIX-BACK #2 LANDED (~01:27Z): 8a5fa75a8 — g++-14-clean, check matrix upgraded
+
+Both NEON errors fixed: the :222 vtstq_u8 sign-mask uses portable
+vreinterpretq_u8_u32 for BOTH vectors (the hidden second conversion was
+the bit-position vector; std::bit_cast gone from the expression); all
+FOUR MultiScale:: template sites fully qualified (:607/:611/:636/:639 —
+the regex fix missed line-wrapped template argument lists). Check
+matrix: clang++ AND g++-14 -fsyntax-only both clean; g++-14
+corroborates the STT TU's prior pass. Sparks resumes the W2 build at
+8a5fa75a8 → link → B1 4 placements + tournament + BOM census → the
+idea-08 GO/NO-GO inputs.
