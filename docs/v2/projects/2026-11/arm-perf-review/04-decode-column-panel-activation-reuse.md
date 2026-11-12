@@ -286,3 +286,12 @@ window runs alone) → main-b4c (the B4 pre-application canonical) → 27B
 rider.** Main polls for the M=1 exit; the coordinator relays the seal
 (K14-I04M1-0AD09600-20261112) + the interpretation table when sparks
 reports.
+
+### M=1 WINDOW COMPLETION UNCONFIRMED (~07:19Z): the container is gone, no seal reported
+
+Main reports youthful_brattain gone + build-i04 exists, but sparks has
+NOT reported the window's completion (no seal K14-I04M1, no
+interpretation table). Pressed for the M=1 state + the .79/W2 counter
+re-run status (also overdue since ~04:45). Main's B4 combined-tip
+canonical at 7a4790c77 (the A4-restore tip) is staged behind the
+confirmations — WAIT issued.
