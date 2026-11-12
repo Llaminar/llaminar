@@ -669,3 +669,18 @@ with data. Candidate flagged: a PerfStats policy `enabled` collector
 switch consulted beyond isDomainEnabled would make the filter-only
 proof scope explain the asymmetry. The B1 seal gates on the
 resolution; timing (B≤A) unaffected.
+
+### W2 DISCRIMINATOR RESULT (~09:31Z): recording NEVER happened — the collector's overall enabled switch is off
+
+CPU_STT_KERNEL_DOMAIN: records=0 at EVERY point (after_production/
+after_transaction/after_transaction_arm) → the kernel-domain collector
+held nothing = **recording never happened in the proof scope** (not
+visibility). Confirms the PerfStats policy.enabled hypothesis: the
+proof's filter-only enablement isn't enough — the collector's OVERALL
+enabled switch is off. Reframe: B-path fresh_transaction passed because
+its expected snapshot was also empty/absent, not because B recorded.
+**FIX: enable the collector in the proof scope with the SAME trigger
+the production path uses (the exact env/API from the production
+recording path) → counters advance → the fresh_ asserts pass on real
+recorded data.** Routed to addon2; the B1 seal gates on the collector-
+enabled re-run; timing unaffected.
