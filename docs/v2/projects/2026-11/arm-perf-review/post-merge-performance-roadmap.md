@@ -32,19 +32,23 @@ without in-model validation (methodology rule, idea 20).
    design + phased plan + non-attached PerfStats measurement design (NCU/NSYS
    on safety HOLD) + x86 A/B gate. Shared engine code → x86 same-or-better
    is a hard gate, measured not assumed.
-2. **Idea 8 — compact ARM prepared-weight layout.** The 35B decode reads
-   ~2.7× more weight bytes than its quantization needs. Phase A plan approved
-   + GO. Inputs: (a) census = estimator-based SIZING input in flight on .79
-   (per-tensor predicted/estimator columns + observed aggregate BOM, strictly
-   labeled — authorized because estimator byte-equality is a tested production
-   invariant; the OBSERVED per-tensor enumeration needs a debug-namespace
-   seam (StageDumper-pattern reader over the prepared store's per-tensor
-   publication) = post-merge, normal review path, added as an idea-08
-   dependency); (b) tournament bench on SOURCE HOLD — repair lane in flight
-   (arm-i08repair) for the four reviewer findings, then reviewer ACK, then
-   sparks re-run. ABI-bearing (packer → view → footprint → cache keys →
-   wire/movement); per-ISA layout identity keeps x86 untouched by
-   construction.
+2. **Idea 8 — compact ARM prepared-weight layout.** CONFIRMED by the
+   corrected census (K14-I08A-CENSUS re-seal): the 35B's prepared
+   quantised weights = 26.62GB vs 15.34GB source = **1.73× expansion**,
+   carried by **CompactMultiScale gate/up experts (6.88→16.11GB, 2.34×)**
+   + NibbleLUTSourceScale down experts (+1.55GB); Q6 = native (1.06×);
+   the original IQ3SExpanded suspect (blk.39) is negligible. Compaction
+   target REASSIGNED to CMS + NibbleLUT families; potential ~42%
+   prepared-byte reduction = the decode-bandwidth prize. Inputs state:
+   estimator-based per-tensor census SEALED (labeled; same-estimator
+   agreement with the plan BOM — not independent validation; normative
+   anchor = preflight estimator-byte-equality); OBSERVED per-tensor
+   enumeration = post-merge debug seam (StageDumper pattern, normal
+   review). Tournament bench on SOURCE HOLD — fix-forward #2 in flight
+   (arm-i08repair: end-clock ordering boundary + per-sample byte
+   comparison), then reviewer ACK, then sparks re-run. ABI-bearing
+   (packer → view → footprint → cache keys → wire/movement); per-ISA
+   layout identity keeps x86 untouched by construction.
 
 ## Tier 2 — MTP economics (cheap-to-medium, high certainty)
 
