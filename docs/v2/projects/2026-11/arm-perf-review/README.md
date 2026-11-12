@@ -1906,3 +1906,16 @@ class, same as the station's solved blocker); preserved in
 preserve-dd8-attempt1/; external/onednn + external/cnpy copied from
 campaign-src-shared2 (tree still clean); attempt 2 = container
 main-campaign-dd8b started 00:21:32Z.
+
+### REBASE CANDIDATE SUPERSEDED (Main, ~00:49Z): dd8f2bd96 → ebd66f0cb
+
+Main's attempt-2 configure exposed a resolution defect in the dd8
+replay: a tests/v2/CMakeLists.txt conflict shared a trailing endif()
+between the base's new block and ours → one if() unclosed across 63
+commits. Fixed with an autosquashed fixup into the originating commit
+(every commit's CMakeLists balances; tip diff vs dd8 = +endif() only).
+NEW CANDIDATE: **ebd66f0cb** (tree 735712de3, still 207 commits on
+d1fd0a077). Campaign attempt 3 = container main-campaign-ebd (started
+00:48:23Z); attempts 1-2 preserved. **LANES: rebase onto ebd66f0cb (not
+dd8) only after Main announces the push.** Relayed to addon (FMLAL had
+rebased locally onto dd8 — redo onto the announced SHA).
