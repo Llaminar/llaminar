@@ -1265,3 +1265,16 @@ b1ab/followup. PR #43 stays at ae51ce3f0. Main back on call for
 merge-attributed fix-forwards only. **Open question for post-merge:
 is the 27B fork cut worth anything at all?** .80 handed back to sparks
 (unconditional) — M=1 next.
+
+### OPERATOR OVERRIDE (~13:12Z, verbatim): "B1 pooling looks good, why post merge? it should be part of arm"
+
+The operator, having seen the full main-b1ab/ab2 evidence (35B +0.7–0.9%
+= layout artifact in unchanged code; 27B mechanism confirmed 4→3 forks,
+timing in-noise; tokens identical; correctness canonical 3569/0-new),
+OVERRIDES the deferral: **B1 pooling LANDS on PR #43 pre-merge.**
+Recorded BEFORE dispatch (literal-quote rule). Landing = FF the PR
+branch ae51ce3f0 → d5e04fdce (a direct child, already validated green
+by main-b1). The 35B layout delta ships with it as an accepted,
+operator-weighed cost (the mechanism benefit + fork reduction were the
+deciding factors). Post-merge follow-up if warranted: layout mitigation
+or re-measure on the merged base.
