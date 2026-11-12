@@ -198,3 +198,18 @@ MATRIX now the pre-push standard: both TUs clang++ AND g++-14 clean
 (4/4). STT binary superseded (rebuilt from the new tree). Sparks
 resumes at 27b37f0a8 → link → B1 placements + tournament + census →
 the idea-08 GO/NO-GO inputs.
+
+### B1 ADMISSION FIX LANDED (~04:08Z): 3cb9f79b4 — fixture init gap, bare-binary runs enabled
+
+Root cause (addon2, answering sparks' ctest-vs-env question): the STT
+bench fixture skipped the one-line hasCPUBackend()/initCPUBackend(-1)
+init every other device-free CPU test performs (Test__MoERoutingStage
+.cpp:183 pattern; the guarded helper in
+tests/v2/utils/CPUProjectionTestWorkspace.h:58) — the two-arg
+DeviceWorkspaceManager allocates through the device backend, which
+requires the registered CPU backend. FIXED at 3cb9f79b4 (pushed;
+dual-compiler clean): the fixture initializes the backend before
+workspace admission → the bare binary runs the 4-placement matrix
+without any wrapper (the right shape for the taskset matrix). Sparks
+resumes: fetch → incremental rebuild → B1 4 placements → tournament →
+census → the idea-08 GO/NO-GO inputs.
