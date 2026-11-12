@@ -2596,3 +2596,23 @@ FloatingPointGemmKernel.h which the IQ3_S bench never exercises →
 identical measured production path; re-pin to merged develop tip happens
 at idea-08 implementation time). Sparks GO dispatched (K14-I08A-
 TOURNEY-3B109793C, 3 ISA binaries, M=1/4/15, GCC-14).
+
+### STATE AUDIT 2026-11-12T20:53Z (exceptions-only — 2 exceptions, flagged)
+
+Verified from direct probes: .79 worktree tip-repair @ correct ACK-pinned
+3b109793cc (pre-claimed prep verified: mirror + checkout + external
+seeded ✓); .80 idle (docker: only Main's exited campaign containers
+9-17h old — consistent). **EXCEPTION 1**: tournament GO dispatched
+~20:32Z but .79 shows zero build processes / no build-cd dirs at
+20:56Z — launch not yet materialized; sparks (session busy on bash)
+pinged for immediate launch confirmation per the silent-failure rule.
+No launch CLAIM made, so not yet claim-vs-reality drift — watching.
+**EXCEPTION 2**: the station trycloudflare hostname
+(continent-wit-intervention-elder) no longer resolves — tunnel rotated
+or down; station unreachable for both programs. Station session is
+operator-managed; CB lead informed via this record. No ARM action was
+pending on the station (idea-23 is post-merge), so no program impact;
+tunnel identity needs refreshing from the station side when next
+needed. All other sessions match last verified state (reviewer
+compacted+idle 60% ctx; i08repair idle 80% post-fix; Main idle
+on-call; CB lead thinking — their own program).
