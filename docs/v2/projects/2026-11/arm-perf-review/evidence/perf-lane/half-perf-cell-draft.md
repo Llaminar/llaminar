@@ -1162,3 +1162,25 @@ window. Every lesson from this arc is institutionalized: the dual-
 compiler matrix, the scope-check in dispatch, run-sheet diffing,
 direct-iteration grants for fixture rounds, and the reviewer's
 source-prediction discipline.
+
+### #209 COMPLETE (~06:19Z): the raw-handoff review closed — FMLAL's evidence chain is DONE
+
+The reviewer read all three JUnits/logs + result/exit + environment +
+corrected flags + transport/receipt lists directly (station-attributed
+station evidence): NEON 11/11 filtered, 4/4 focused, 12/12 unfiltered,
+zero failures/errors/skips, exit 0; aarch64/GCC14.2.0, exact 0ad,
+-march=armv8-a+simd (the leaf-less envelope, complementary to Main's
+I8MM 12/12 + 19/19). Correct zero probe expectations in NEON ≠ native
+FMLAL execution evidence.
+RECORD CORRECTIONS: (1) the LINKED list = 26 entries (not 27); (2)
+EveryPositiveWorkerBudget on CPU70/one-CPU ≠ a whole-machine scaling
+certificate; JUnit durations ≠ economy evidence; (3) reading the
+records did NOT authenticate origin/Git tree/binary/dependency
+closure/hashes — owner assertions retained; (4) the full canonical
+remains 3532/6/0/CANONICAL=8; inherited/topology equivalence = Main's
+assessment.
+**FINAL: #209 COMPLETE as a bounded static-source + reported-
+functional-handoff review — SOURCE ACK at exact 0ad09600b; K1/K2
+closed; no remaining blocking source finding. Economy NOT ADMITTED;
+application Main-owned. The FMLAL arc is CLOSED on the evidence side;
+the leaf is ON PR #43.**
