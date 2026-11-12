@@ -9,6 +9,7 @@
  */
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningForwardWeightWork.h"
+#include "loaders/WeightIdentity.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
@@ -148,6 +149,57 @@ TEST(PlanningForwardWeightWork, FlashNextSourceRolesHaveExplicitWorkKinds)
         EXPECT_EQ(planningOrdinaryWeightKind(role), expected);
     }
     EXPECT_EQ(planningOrdinaryWeightKind(WeightRole::Other), PlanningOrdinaryWeightKind::Unclassified);
+}
+
+/** @test Every HC tensor name maps through the full identity→kind chain. */
+TEST(PlanningForwardWeightWork, HyperConnectionTensorNamesClassifyThroughTheFullChain)
+{
+    using Kind = PlanningOrdinaryWeightKind;
+    // Every HC tensor name from the Qwen4Exp schema walks inferWeightRole →
+    // planningOrdinaryWeightKind and lands in the projected/non-projected kind
+    // its role declares. The 27B dense model's planning failure ("unclassified
+    // request work") is rejected here at the tensor-name level.
+    const std::vector<std::pair<const char *, WeightRole>> hc_projection_names{
+        {"hc_attn_down.weight", WeightRole::HyperConnectionProjection},
+        {"hc_attn_up.weight", WeightRole::HyperConnectionProjection},
+        {"hc_attn_inject.weight", WeightRole::HyperConnectionProjection},
+        {"hc_ffn_down.weight", WeightRole::HyperConnectionProjection},
+        {"hc_ffn_up.weight", WeightRole::HyperConnectionProjection},
+        {"hc_ffn_inject.weight", WeightRole::HyperConnectionProjection},
+        {"output_hc_down.weight", WeightRole::HyperConnectionProjection},
+        {"output_hc_up.weight", WeightRole::HyperConnectionProjection},
+        {"nextn.hc_head_down.weight", WeightRole::HyperConnectionProjection},
+        {"nextn.hc_head_up.weight", WeightRole::HyperConnectionProjection}};
+    for (const auto &[name, expected_role] : hc_projection_names)
+    {
+        SCOPED_TRACE(name);
+        EXPECT_EQ(inferWeightRole(name), expected_role);
+        EXPECT_EQ(planningOrdinaryWeightKind(inferWeightRole(name)),
+                  PlanningOrdinaryWeightKind::Projection);
+    }
+    const std::vector<std::pair<const char *, WeightRole>> hc_norm_names{
+        {"hc_attn_norm.weight", WeightRole::HyperConnectionNorm},
+        {"hc_ffn_norm.weight", WeightRole::HyperConnectionNorm},
+        {"output_hc_norm.weight", WeightRole::HyperConnectionNorm},
+        {"nextn.hc_head_norm.weight", WeightRole::HyperConnectionNorm},
+        {"nextn.hnorm.weight", WeightRole::HyperConnectionNorm}};
+    for (const auto &[name, expected_role] : hc_norm_names)
+    {
+        SCOPED_TRACE(name);
+        EXPECT_EQ(inferWeightRole(name), expected_role);
+        EXPECT_EQ(planningOrdinaryWeightKind(inferWeightRole(name)),
+                  PlanningOrdinaryWeightKind::NonProjection);
+    }
+    // Block-prefixed variants resolve identically (the identity strips the
+    // leading blk.N prefix before matching).
+    for (const auto &block : std::array{0, 1, 47})
+    {
+        SCOPED_TRACE("blk." + std::to_string(block));
+        const auto name = "blk." + std::to_string(block) + ".hc_attn_up.weight";
+        EXPECT_EQ(inferWeightRole(name), WeightRole::HyperConnectionProjection);
+        EXPECT_EQ(planningOrdinaryWeightKind(inferWeightRole(name)),
+                  PlanningOrdinaryWeightKind::Projection);
+    }
 }
 
 /** @test Terminal normalization keeps prefill rows while only the following vocabulary head compacts. */
