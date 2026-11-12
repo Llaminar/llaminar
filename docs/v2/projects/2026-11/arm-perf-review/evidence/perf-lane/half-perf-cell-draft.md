@@ -1026,3 +1026,18 @@ route-not-FMLAL counts of 0 = PASS (the no-FMLAL control the reviewer
 demanded). A separate OneDNN build-neon identity via the canonical
 helper (flags-bound, disclosed). Three-run receipts + exit + tree SHAs
 to coordinator + Main + addon when it lands.
+
+### INTEGRITY FORENSICS + GATE CORRECTION (~04:38Z)
+
+(1) c527's branch reset to edccdec00 landed 04:29:30Z DURING the
+aborted r3 build; the 67→edcc diff is test-file-only (production
+sources identical → core objects not contaminated), but r3's
+incremental state = UNTRUSTED (any future I8MM run there
+reconfigures/rebuilds). **c527's stash preserved as incident evidence
+(NOT dropped) for the operator's review.** Forensics:
+station-integrity/strange_euclid-forensics.txt (SHA 816d725f…) with
+inspect/top/network-none facts + the thirsty_benz observation.
+(2) First NEON launch failed instantly on a wrapper path slip
+(exit 127; archived attempt15-wrapper-path); the NEON gate NOW RUNNING
+as watcher fmlal-neon-gate-r2 (22ea42db0): reconfigure → NEON build
+(separate OneDNN build-neon identity) → three JUnit runs at 0ad09600b.
