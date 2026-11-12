@@ -2233,3 +2233,28 @@ all PASSED = K14-I16B1-5C2CEF47-20261112 seal evidence — the audit's
 (build-cd-*); census next; then tournament. (3) Discipline note:
 silent-failed launch attempts report to coordinator IMMEDIATELY (the
 90m audit = verification path, NOT a reporting path).
+
+### W2 TOURNAMENT RED → ROOT-CAUSED + FIXED (12:25Z): IQ3_S compact sign-plane double transposition
+
+Sparks reported the W2 tournament RED (9/9 uniform byte-exact failure at
+Perf__CPUCompactIQ3SDecode.cpp:491 — "compact decode differs from the
+prepared plane at block=0 group=0 quad=0", all ISA cells × M=1/4/15, 6
+ms, no timing lines). **Diagnosis (coordinator, contract-backed)**: the
+diagnostic bench's IQ3_S sign plane has a double transposition vs the
+production contract (CPUNativeQuantisedDecode.h case 11: sign bit =
+payload[9+g/2] bit ((g%2)*4+lane)):
+1. **Fixture**: source nibble at 4*(column%2) — must be 4*(group%2)
+   (even columns read odd-group signs → fails at the first vector).
+2. **Compact decoder**: sign_word from plane[quad/2]+plane[quad/2+1]<<8
+   + (quad%2)*8 shift — the plane is one nibble per column (byte
+   column/2, nibble column%2) → quad's 4 columns = bytes quad*2/quad*2+1
+   with NO shift (odd quads read wrong bytes; shifted reads zero-fill
+   upper lanes). Index/ninth-bit/scale/min paths were already correct.
+**FIX LANDED**: origin/codex/arm-idea16-moe-decode @ **adf8efc32** (on
+5c2cef47a; 2-line arithmetic corrections + contract comments).
+Pre-validated: standalone fixture+decoder vs the production sign
+contract passes 8×16×4. Reviewer focused pass dispatched (01a1a8d9).
+Re-run gate = .79 tournament (rebuild build-cd-* from adf8efc32; 3 ISA
+× M=1/4/15) after the idea-08 BOM census (independent, running next).
+First-run-RED = never-green diagnostic bench, NOT a PR defect (file
+exists only on the lane; non-installed diagnostic namespace).
