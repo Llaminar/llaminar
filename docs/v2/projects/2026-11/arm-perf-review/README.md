@@ -1893,3 +1893,16 @@ export's exit was UNCONFIRMED at grant time — sparks overdue on the
 audit answer; the export re-queues post-campaign if it didn't
 complete). Force-push of dd8f2bd96 = the rebase-anchoring base for
 FMLAL/B4/idea16 at handover; verdicts re-pin.
+
+### CORRECTION (Main, ~00:22Z): dd8f2bd96 NOT pushed — rebase only on the force-push announcement
+
+dd8f2bd96 exists only as Main's local replay; Main pushes after the
+campaign validates it. Lanes must NOT rebase onto it until the
+force-push announcement. FMLAL sequencing revised: hold tip 67e8856c9 →
+on the announcement, rebase → push → validation #5 → verdict (one
+cycle). Campaign attempt 1 failed at configure: the fresh clone lacked
+the ignored external/onednn + network-none → clone failure (environment
+class, same as the station's solved blocker); preserved in
+preserve-dd8-attempt1/; external/onednn + external/cnpy copied from
+campaign-src-shared2 (tree still clean); attempt 2 = container
+main-campaign-dd8b started 00:21:32Z.
