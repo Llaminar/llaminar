@@ -31,7 +31,9 @@
  *   supplies a different correction distribution to the production
  *   helper — the executed law deviates and is DETECTED; the
  *   invalid-PMF/under-coverage negative is rejected by the draw-side
- *   PMF validation; the threshold-endpoint fixture is restored.
+ *   PMF validation; the threshold-endpoint and strict-acceptance-tie /
+ *   residual-CDF-tie controls are RESTORED from the round-4 lineage
+ *   (the round-5 rewrite accidentally dropped them).
  * - D5/A5 boundaries (explicit): Mode C replays the production helper
  *   with SUPPLIED thresholds (no seed-to-threshold addressing, no
  *   connected multi-N selector/head path — production wiring, out of
@@ -925,6 +927,58 @@ TEST(CPUDraftVocabularyBudget, ProbabilityRejectionExecutedLawEnumeration)
         EXPECT_TRUE(differs)
             << "the omitted-residual bug pattern must deviate from the "
             << "target law (the checker catches it)";
+    }
+
+    // Threshold endpoints (restored from the round-4 lineage; the round-5
+    // rewrite accidentally dropped this block): with q = delta on token 0
+    // and p(0) = 0.5, the accept probability is 0.5 - a threshold
+    // strictly below 0.5 accepts; at or above 0.5 the helper rejects and
+    // the residual is NORMALIZED over tokens 1/2/3 to (.5, .25, .25) with
+    // the production selection rule r <= cumulative, so
+    // residual_threshold 0.5 selects TOKEN 1. The clamp contract:
+    // threshold 0 stays 0; threshold 1 clamps to 0.99999994f (largest
+    // float below 1) - neither endpoint is passed un-clamped by this
+    // fixture, and both extremes are asserted.
+    // Threshold endpoints (restored fixture, production boundary
+    // convention): with q = delta on token 0 and p(0) = 0.5, the accept
+    // probability is 0.5 — a threshold strictly below 0.5 accepts; at or
+    // above 0.5 the helper rejects and the residual is NORMALIZED over
+    // tokens 1/2/3 to (.5, .25, .25) with the production selection rule
+    // r <= cumulative, so residual_threshold 0.5 selects TOKEN 1. The
+    // clamp contract: threshold 0 stays 0; threshold 1 clamps to
+    // 0.99999994f (largest float below 1) — neither endpoint is passed
+    // un-clamped by this fixture, and both extremes are asserted.
+    {
+        const std::vector<llaminar2::SamplingDistributionEntry> target{
+            {0, 0.5f}, {1, 0.25f}, {2, 0.125f}, {3, 0.125f}};
+        const std::vector<llaminar2::SamplingDistributionEntry> draft{
+            {0, 1.0f}, {1, 0.0f}, {2, 0.0f}, {3, 0.0f}};
+        const auto below = llaminar2::sampleMTPRejectionRowFromDistributions(
+            target, draft, 0, 0.25f, 0.5f);
+        EXPECT_TRUE(below.ok);
+        // accept_threshold 0.25 < accept_probability 0.5 -> accepted draft.
+        EXPECT_TRUE(below.accepted);
+        EXPECT_EQ(0, below.token);
+        const auto above = llaminar2::sampleMTPRejectionRowFromDistributions(
+            target, draft, 0, 0.5f, 0.5f);
+        EXPECT_TRUE(above.ok);
+        // accept_threshold 0.5 is NOT below 0.5 -> rejected; the residual
+        // normalized (.5, .25, .25) with r <= cumulative selects TOKEN 1.
+        EXPECT_FALSE(above.accepted);
+        EXPECT_EQ(1, above.token);
+        // Endpoint: threshold 0 accepts any positive accept probability.
+        const auto zero_threshold =
+            llaminar2::sampleMTPRejectionRowFromDistributions(target, draft,
+                0, 0.0f, 0.5f);
+        EXPECT_TRUE(zero_threshold.ok);
+        EXPECT_TRUE(zero_threshold.accepted);
+        // Endpoint: threshold 1 clamps below certainty -> rejected into
+        // the residual.
+        const auto one_threshold =
+            llaminar2::sampleMTPRejectionRowFromDistributions(target, draft,
+                0, 1.0f, 0.5f);
+        EXPECT_TRUE(one_threshold.ok);
+        EXPECT_FALSE(one_threshold.accepted);
     }
 }
 
