@@ -2013,3 +2013,23 @@ build-rb2 pruned. **ALL LANES rebase onto ae51ce3f0, incl. the B1 WIP
 (codex/arm-b1-fused-fork-pooling; the "B1 authorize" quote accepted;
 Main takes the runner-placement pass on a rebased copy).** .80 free →
 the M=1 window (re-anchored to ae51ce3f0).
+
+### OPERATOR DIRECTIVE (~10:00Z): the base-branch owner will merge to develop — stabilize + complete-open only
+
+The base-branch owner: "I will finish running the Opencode harness tests
+on the topologies and then merge to develop." **Program priority:
+(1) COMPLETE what is open; (2) address ONLY critical items needed to
+stabilize the ARM branch; (3) DON'T START new work.**
+CLASSIFIED:
+- CRITICAL: main-rb2 (the upstream-rebase validation — running) → the
+  new-tip announcement → the lane-rebase wave.
+- OPEN (complete, don't escalate): the W2 collector-fix re-run → the B1
+  seal → the idea-08 inputs (the tournament + census = the booked W2
+  payload); the M=1 window re-run (re-anchored to ae51ce3f0); the B1
+  pooling cycle (authorized; Main's structural pass + validation);
+  idea-23 stage-1 fix (dispatched, small); the model download
+  (passive); B1ATTR2's analysis.
+- HOLD (don't start): the 27B rider; the Bundle-1 final hop (parked —
+  not stabilization-critical); the idea-04 implementation decision
+  (diagnostic evidence only until post-merge); any new windows/ideas;
+  MXFP4 (gated on the merge — post-merge phase).
