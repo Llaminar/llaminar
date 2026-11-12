@@ -520,9 +520,15 @@ namespace llaminar2
         // If already in MPI context or bootstrap disabled, continue to runtime init
         if (mpi_env.is_mpi_process || config.mpi_no_bootstrap)
         {
+            // An explicit --mpi-procs rank sizes its team from the admitted
+            // rank partition only when original entry admitted native core
+            // places; worker places are never minted after entry. Without that
+            // admission the rank keeps its native OpenMP environment unchanged.
+            const bool explicit_rank_count =
+                config.mpi_procs > 0 && NativeCPUPlacement::hasCoreAdmission();
             if (mpi_env.is_mpi_process &&
                 (!config.hostfile.empty() || config.execution_rank_selection ||
-                 automatic_multi_rank_discovery || config.mpi_procs > 0))
+                 automatic_multi_rank_discovery || explicit_rank_count))
             {
                 const auto &places=NativeCPUPlacement::admission();
                 configureClusterRankThreads(config,places);
