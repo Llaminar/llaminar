@@ -2213,3 +2213,23 @@ re-verification).
   b1attr2-runs/ (b1-27b-mtp-full.json, b1-27b-mtp.out, b1-27b-nomtp*,
   b1-35b-mtp-full.json @ 07:42–07:45Z local).
 - No session claiming progress without artifact paths beyond the above.
+
+### AUDIT RECONCILIATION (12:05Z): path confusion resolved — no overlap confirmed
+
+Sparks' seq-155 correction + my artifact checks: (1) i04-run2.log
+DOES exist — at `/home/factory/llaminar-i8mm/build/i04-run2.log` (NOT
+`/work/` — no /work on .80; BOTH sides had the path wrong, incl. my
+first check using the stated path); stamp 11:07:32Z, **empty**;
+i04-cfg.log 11:07:32Z (a cmake-cfg ran, produced nothing); i04-build
+logs 08:04 +0100 (morning). So a script touched .80 at 11:07:32Z with
+NO container + empty log — supports sparks' corrected account (heredoc
+broke), but the timestamp = 11:07:32Z ≠ their ~10:25Z record — one-line
+clock reconciliation asked. **Lease question ANSWERED: no container,
+no overlap; main-b1 (10:34–11:08Z) + main-b1ab (11:08:45Z+) = sole
+containers throughout.** (2) .79 = the W2 host: idea25/w2-b1/*.log @
+11:01–11:09 local (+0100) = the 4-placement B1 re-run at 5c2cef47a,
+all PASSED = K14-I16B1-5C2CEF47-20261112 seal evidence — the audit's
+"re-run?" = ANSWERED by artifacts. Tournament 3 ISA binaries built
+(build-cd-*); census next; then tournament. (3) Discipline note:
+silent-failed launch attempts report to coordinator IMMEDIATELY (the
+90m audit = verification path, NOT a reporting path).
