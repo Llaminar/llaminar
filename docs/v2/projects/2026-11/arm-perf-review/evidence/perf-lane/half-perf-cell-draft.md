@@ -957,3 +957,15 @@ holds; mid-build → finishes then #8. Green both → the reviewer's #209
 .80 was empty → #8 running (I8MM focused + canonical, ~45 min); .80
 held by Main; W3 held until handback. Station NEON gate at 0ad09600b
 in parallel. Post-#8 .80 queue: W3 → 27B rider → B1ATTR2 state check.
+
+### STATION INTEGRITY EVENT (~04:35Z): foreign container strange_euclid on the FMLAL worktree
+
+A container (llaminar-dev, network-none, RW-bound to the FMLAL
+worktree) appeared running an src/v2-direct diagnostic configure with
+an Error-grep — matching the addon's direct-iteration grant pattern.
+The station did NOT interfere (correct): let it self-terminate (stuck
+in the pcre2 network-none retry loop, dies in minutes), verify the
+scratch dir gone, then launch the NEON gate (one-CPU sequencing).
+Addon ownership query dispatched. PROCESS NOTE: the addon's
+direct-iteration grant was .80-scoped — station usage must be
+coordinated with the station's one-CPU slot discipline explicitly.
