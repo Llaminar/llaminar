@@ -2197,3 +2197,19 @@ valid (idle).** Sparks asked to reconcile what actually ran at 10:25Z
 assigned — honest-reconciliation culture; the queue discipline stands
 (no launch until Main's explicit handback + arm-perf GO + docker-ps
 re-verification).
+
+### STATE AUDIT # (11:54Z, 90m cadence)
+
+- **.80**: main-b1ab Up 44m (lease holder = Main, running) — MATCHES
+  last verified; main-b1 Exited 0 45m ago; no lane container.
+- **.79**: NO container (idle); evidence: idea25/w2-b1/ b1-{1T,fast-
+  10T,mixed-20T,slow-10T}.log @ 11:01–11:09Z — fresh. Query sent to
+  sparks re: W2 seal re-run/tournament/census state (complete/running/
+  queued). Possible drift candidate pending reply.
+- **Station**: SSH reachable (host 5f6041930e9d) but the `gpu` user's
+  shell has NO docker CLI — cb-c1-canonical unverifiable via this
+  path; CB-lead-owned (01a1ad51) — not re-probed deeper.
+- **A2/B1ATTR2 exports**: LANDED — /home/factory/llaminar-i8mm/
+  b1attr2-runs/ (b1-27b-mtp-full.json, b1-27b-mtp.out, b1-27b-nomtp*,
+  b1-35b-mtp-full.json @ 07:42–07:45Z local).
+- No session claiming progress without artifact paths beyond the above.
