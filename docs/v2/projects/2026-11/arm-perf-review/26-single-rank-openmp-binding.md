@@ -1095,3 +1095,24 @@ gdn_projection_route cross-check (2 fused subgroups predicted from
 code); (3) the B1 ranking paired with measured per-fork overhead
 (timings usable — uncontended). .80 → idea-04 M=1 (0ad09600b) → the
 27B rider.
+
+### B1 ROOT CAUSE COMPLETE (~07:00Z): layerN_gdn_proj = the 4-fork stage — per-member forking in the floating fused path
+
+The named-attribution export identified the stage: **layerN_gdn_proj,
+4.00 forks/execution × 48 GDN stages × 765 steps = 147,600 forks (25.6%
+of ALL decode forks).** Mechanism (code-level): FloatingPointGemmKernel
+::multiply_fused_tensor loops per MEMBER and runs each member's matmul
+with its own OMP_WORKSHARE_REGION — one fork per MEMBER, not one pooled
+fork per group (2 calls × 2 members = 4 forks ✓ exact match with the
+histogram). Contrast: the 35B native path pools into one workshare
+(1 fork/call); the FLOATING path was never pooled. Route records
+confirm: 2 fused 2-projection subgroup calls per execution (qkv+z,
+alpha+beta — floating engines, codebooks none+none).
+**FIX SHAPE: pool the floating fused path like the native path
+(independent output tiles, byte-neutral, the same discipline) — affects
+all floating fused-projection users; 4→2 forks/execution halves the GDN
+fork share.** Production pooling waits for explicit operator
+authorization per the lane's rule; the mini-plan routes for the
+operator decision package. THE B1 ATTRIBUTION ARC IS CLOSED: unknown
+structure → named, root-caused, mechanistically-explained pooling
+target with a quantified expected gain.
