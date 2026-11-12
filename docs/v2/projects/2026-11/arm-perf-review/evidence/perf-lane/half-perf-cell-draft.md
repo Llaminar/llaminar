@@ -1142,3 +1142,23 @@ certificate, no economy/merge/execution grant; Main owns application.
 #2, already in Main's hands with SHA verification) to the reviewer —
 pasted text is readable; station paths are not. That closes the raw-
 handoff review → #209 complete → FF-apply → PR commits.**
+
+---
+
+## **FMLAL LANDED (~06:08Z): PR #43 fast-forwarded 74797687f → 0ad09600b**
+
+The FMLAL half-product leaf is ON the PR branch: FF-apply after the
+#209 source ACK + the reviewer's raw-record pointer (Main's message
+had crossed their 259). PR body updated. **The arc: "FMLAL leaf never
+existed" (artifact bundle) → operator implementation grant → 8
+validation rounds (macro → GCC14 → specials → K=16 witness → witness
+construction → FZ16 bit → H1-H4 → J1-J3) → 5 review rounds (F1-F5 →
+A1-A5 → source-predicted failures → H → J) → one contract decision
+(FP16RNE narrowing-by-contract accepted) → one rebase onto the new PR
+lineage → cross-envelope native gates on two hosts (I8MM Main-
+authenticated + NEON station) → source ACK → FF-apply.** Lanes rebase
+onto 0ad09600b. Queue: W3 (B4) → addon's idea-04 M=1 diagnostic
+window. Every lesson from this arc is institutionalized: the dual-
+compiler matrix, the scope-check in dispatch, run-sheet diffing,
+direct-iteration grants for fixture rounds, and the reviewer's
+source-prediction discipline.
