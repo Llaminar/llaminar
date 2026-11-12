@@ -1128,3 +1128,16 @@ lane's conditions (branch from 0ad09600b, one workshare over all
 members' row tiles, unchanged per-member arithmetic, byte-identity
 proof matrix, fork-count assertion). Implementation waits for the
 operator's explicit authorization.
+
+### B1 POOLING AUTHORIZED (~09:10Z): operator "B1 authorize" — implementation starts
+
+The pooled-workshare fix is AUTHORIZED: one workshare over all members'
+row tiles in multiply_fused_tensor's floating path (the native path's
+pooling pattern), unchanged per-member arithmetic, the byte-identity
+proof matrix, the fork-count assertion (4→2 forks/execution as the
+testable claim). Branch: from the CURRENT PR tip 7a4790c77 (addon3's
+prep note said bb893cd79 — outdated; the re-verification ran at
+0ad09600b and 7a4790c77 adds only B4 diagnostic test files). Normal
+implement → validate → handback. Expected gain (diagnostic arithmetic
+until measured): 147,600 → ~73,800 forks on the 27B decode path
+(25.6% → ~12.8% of all decode forks).
