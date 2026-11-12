@@ -64,3 +64,22 @@ exactly 4 splits (shard1 10.9MB metadata 44481862…; shard2 49.86GB
 Authenticated hf CLI (Fankserver), resumable; sha256-expected.txt
 written BEFORE verification; 249G free → ~145G after. 6h monitor
 window, resume-capable.
+
+### IDEA-23 STAGE-1 RESULT (~10:01Z): the classification is ALREADY CORRECT at ae51ce3f0 — the test is the deliverable
+
+Branch codex/arm-idea23-hc-planning @ 640d625cb (base ae51ce3f0, 1 file
++52): **every HC role from the Qwen4Exp schema already classifies
+correctly through the full inferWeightRole → planningOrdinaryWeightKind
+chain at this tip** (HyperConnectionProjection via isFlashNext-
+ProjectionRole; HyperConnectionNorm via isImmutableFP32WeightRole;
+output_hc_down.weight via the HyperConnectionProjection mapping). The
+original finding was observed at the OLDER base bef53edb6 (2026-11-08)
+— fixed upstream since, or the UD repack carries tensors outside the
+WeightIdentity list (the open hypothesis, resolved by the model-level
+run). **THE DELIVERABLE: the device-free regression guard walks every
+HC tensor name × the full chain — a future repack with a renamed/
+missing HC tensor fails the test before the planning cost model sees
+it.** DISPOSITION: the branch stays parked on its lane (NOT routed for
+PR application under the no-new-work directive — nice-to-have, not
+stabilization-critical); applies post-merge if the model-level run
+confirms a real gap. The model download continues.
