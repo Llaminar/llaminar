@@ -4,6 +4,8 @@
 Exercise ring rotation, missing records, late teardown warnings, process
 retirement, journal corruption and the actual CLI/shell closure protocol.
 Kernel reads are simulated; no model, GPU or elevated privilege is used.
+Real informational KFD clock/memory-map hung-task frames reproduce diagnostics
+that the original severity-and-fault-word classifier incorrectly marked clean.
 """
 from dataclasses import asdict
 import json
@@ -56,6 +58,17 @@ def clean_evidence(directory: Path):
             'findings': [], 'finding_count': 0, 'error': None}
 
 
+# Exact frame spellings/offsets retained from the q90 Linux blocked-task report.
+# The heading/fence frames alone deliberately carry no GPU attribution.
+Q90_GPU_WAIT_STACK = (
+    "INFO: task llaminar_model_:1606685 blocked for more than 122 seconds.",
+    "Call Trace:",
+    "  dma_fence_default_wait+0xed/0x250",
+    "  kfd_ioctl_get_clock_counters+0x20/0x80 [amdgpu]",
+    "  amdgpu_amdkfd_gpuvm_sync_memory+0x6e/0xb0 [amdgpu]",
+    "  kfd_ioctl_map_memory_to_gpu+0x238/0x400 [amdgpu]",
+)
+
 class GPUDriverDiagnosticsTests(unittest.TestCase):
     """Existing warning, scope and public-harness obligations stay mandatory."""
     def setUp(self):
@@ -100,6 +113,29 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertFalse(driver.driver_diagnostic(record(message, priority)))
         self.assertFalse(driver.driver_diagnostic(record("amdgpu error mentioned by userspace", "err", facility="user")))
+
+    def test_informational_kfd_hung_task_frames_reject_original_false_clean_rule(self):
+        """Restore q90's actual wait frames and authenticate the original rule's miss."""
+        for message in Q90_GPU_WAIT_STACK[-3:]:
+            with self.subTest(message=message):
+                row = record(message, "info")
+                legacy = bool(driver._DRIVER.search(row.msg) and
+                    (row.pri in driver._BAD_PRIORITIES or driver._PROBLEM.search(row.msg)))
+                self.assertFalse(legacy, "Negative control must reproduce the original missed finding")
+                self.assertTrue(driver.driver_diagnostic(row))
+                self.assertTrue(driver.driver_diagnostic(record(" ? __pfx_" + message.strip(), "info")))
+                self.assertFalse(driver.driver_diagnostic(record(message, "info", facility="user")))
+        self.assertTrue(driver.driver_diagnostic(record("\n".join(Q90_GPU_WAIT_STACK), "info")))
+        for message in (
+            *Q90_GPU_WAIT_STACK[:3],
+            "amdgpu: kfd initialized clock counters and GPU memory mappings",
+            "amdgpu: registered kfd_ioctl_map_memory_to_gpu",
+            "amdgpu: kfd_ioctl_map_memory_to_gpu+0x238/0x400 [amdgpu] initialized",
+            " kfd_ioctl_map_memory_to_gpu+0x238/0x400 [unrelated]",
+            "Modules linked in: amdgpu kfd_ioctl_map_memory_to_gpu",
+        ):
+            with self.subTest(benign=message):
+                self.assertFalse(driver.driver_diagnostic(record(message, "info")))
 
     def test_old_warnings_are_excluded_but_new_equal_time_records_are_checked(self):
         """Ordering, not time-of-day or a coarse seconds filter, defines a cell."""
@@ -232,6 +268,23 @@ class GPUDriverWindowTests(unittest.TestCase):
             self.assertEqual(evidence['snapshot_count'], 128)
             driver.publish(root / 'cell.driver-diagnostics.json', evidence)
             driver.validate_evidence(root)
+
+    def test_informational_kfd_hung_task_journal_cannot_close_clean(self):
+        """The actual collector and posthoc reader both reject q90's old zero-finding summary."""
+        original=record("amdgpu: normal startup", timestamp=10)
+        stack=tuple(record(message, "info", timestamp=11+index) for index,message in enumerate(Q90_GPU_WAIT_STACK))
+        before=snapshot(original)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            _,evidence,passed=self.run_collector(root,before,[before,snapshot(original,*stack)])
+            self.assertFalse(passed);self.assertTrue(evidence['complete'])
+            self.assertFalse(evidence['passed']);self.assertEqual(evidence['finding_count'],3)
+            self.assertEqual([row['msg'] for row in evidence['findings']],list(Q90_GPU_WAIT_STACK[-3:]))
+            # A retained old summary can never certify the same journal after
+            # the corrected parser discovers these actual driver stack frames.
+            old={**evidence,'passed':True,'findings':[],'finding_count':0}
+            with self.assertRaises(ValueError):driver.inspect_journal(root,old)
+            with self.assertRaises(ValueError):driver.inspect_journal(root,evidence)
 
     def test_loss_between_observations_and_reboots_still_fail(self):
         """A short polling interval never excuses missing kernel history."""

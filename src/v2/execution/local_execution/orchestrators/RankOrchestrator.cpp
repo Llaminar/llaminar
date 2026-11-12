@@ -2467,6 +2467,13 @@ namespace llaminar2
         initializePPGraphExecutionPlan();
     }
 
+    const PipelineGraphExecutionPlan& RankOrchestrator::pipelineGraphExecutionPlan() const
+    {
+        if(!pp_graph_execution_plan_)
+            throw std::logic_error("Rank has no declared pipeline graph execution plan");
+        return *pp_graph_execution_plan_;
+    }
+
     void RankOrchestrator::initializePPGraphExecutionPlan()
     {
         if (pp_stage_runners_.empty())

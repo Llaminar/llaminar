@@ -14,8 +14,10 @@ memory-bandwidth limits; no throughput target is substituted for profiling.
 backend and the full 32-case EP4/EP4 preparation/lifecycle matrix. Parent
 interruption prevented a whole-run receipt; user requested checkpointing the
 passing slice and skipping the redundant repeat. Numerical/model gates next.
-**Implementation:** checkpoint `d1fd0a077` pushed. Native prefill passes:
+**Implementation:** checkpoint `9b970ad61` pushed. Native prefill passes:
 KL **0.0129**, top-1/top-5 **100%**. Scalar-prefill GDN handoff is repaired; Decode mean KL **0.198** remains red under diagnosis.
+Public PP router ownership is repaired in focused tests; full-corpus collection
+exceeds its startup budget before logits. No corpus pass is claimed.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
 **Performance:** the exact eight-GPU model cell has no qualified baseline yet.
@@ -68,7 +70,7 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission / SDK10.1 | **Passing CTest slice checkpointed; redundant full rerun waived by user.** Focused post-checkpoint repairs pass. Next: original eight-GPU numerical replay, paired panel and matched Release measurement; no complete whole-run receipt is claimed. [Current inference work](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
+| Admission / SDK10.1 | **Passing CTest slice checkpointed; full rerun waived by user.** Focused router/diagnostics repairs pass. Resolve slow RCCL startup, then collect the unchanged panel before Release measurement. No complete whole-run receipt. [Evidence](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
 | Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
 | Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 | Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |

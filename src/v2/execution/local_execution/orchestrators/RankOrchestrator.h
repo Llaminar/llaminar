@@ -219,6 +219,13 @@ namespace llaminar2
         };
 
         /**
+         * @brief Borrow the actual runner-resolved immutable PP execution declaration.
+         * @return Original plan, after child graph owner construction and before forwards.
+         * @throws std::logic_error If this rank has no declared PP graph ownership.
+         */
+        const PipelineGraphExecutionPlan& pipelineGraphExecutionPlan() const;
+
+        /**
          * @brief Configuration for multi-device orchestration
          *
          * Specifies devices, weights, backend, and inference parameters.

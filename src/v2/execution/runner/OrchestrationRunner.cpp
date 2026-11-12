@@ -24845,12 +24845,15 @@ namespace llaminar2
             return setError("Invalid LOCAL PP configuration");
         }
 
-        // Ensure GlobalBackendRouter is initialized for inter-stage transfers.
-        // LOCAL PP uses TensorBase::transferTo() which routes through the backend router.
-        GlobalBackendRouter::initForTests();
-
+        // The original active MPI context already owns the canonical discovery
+        // membership projection. Captured PP edges own their native transports;
+        // a router must not create copy communicators from host-wide visibility.
+        std::vector<std::vector<GlobalDeviceAddress>> router_stages;
+        for(const auto& stage:mdo_config.pp_stages)router_stages.push_back(stage.stage_devices);
         std::unique_ptr<RankOrchestrator> orch;
         orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
+        GlobalBackendRouter::initForPipeline(PipelineRouterAdmission::admit(
+            mpi_ctx_,router_stages,orch->pipelineGraphExecutionPlan()));
         runner_ = std::move(orch);
 
         LOG_DEBUG("Local PP compute graph built successfully");

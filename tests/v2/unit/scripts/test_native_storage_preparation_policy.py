@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Adversarial policy replay for typed native preparation and exact root permits."""
+"""Adversarial native authority replay, including test-only router bootstrap isolation.
+
+Negative controls restore the actual production PP bootstrap defect and exercise
+aliases, owner-local calls and comment/string masking without a compiler or GPU.
+"""
 import unittest
 from check_native_storage_preparation_policy import scan_source
 class NativePreparationPolicy(unittest.TestCase):
@@ -85,4 +89,41 @@ class NativePreparationPolicy(unittest.TestCase):
                 for body in (f"struct {name} {{ void construct(); }};", f"test::{name}::program(role);", f"using Access=test::{name};"):
                     self.assertTrue(scan_source(path,body))
             self.assertTrue(scan_source("src/v2/execution/Other.cpp",f"friend struct test::{name};"))
+    def test_production_router_bootstrap_rejects_original_pipeline_call(self):
+        """Restore the original PP body: no production runner may synthesize inventory."""
+        original = """void OrchestrationRunner::buildLocalPPComputeGraph() {
+            GlobalBackendRouter::initForTests();
+            backend_router_ = GlobalBackendRouter::get();
+        }"""
+        failures = scan_source("src/v2/execution/runner/OrchestrationRunner.cpp", original)
+        self.assertEqual(len(failures), 1)
+        self.assertIn(":2:", failures[0])
+        self.assertIn("test-only router initialization", failures[0])
+        self.assertEqual(scan_source("src/v2/execution/runner/OrchestrationRunner.cpp",
+            original.replace("GlobalBackendRouter::initForTests();", "GlobalBackendRouter::initForPipeline(std::move(admission));")), [])
+
+    def test_test_router_infrastructure_signatures_allow_no_callsite(self):
+        """Declaration/definition allowances do not exempt calls in either owner file."""
+        declarations = {
+            "src/v2/collective/BackendRouter.h": "class GlobalBackendRouter { static bool initForTests(); };",
+            "src/v2/collective/BackendRouter.cpp": "bool GlobalBackendRouter::initForTests() { return true; }",
+        }
+        for path, signature in declarations.items():
+            with self.subTest(path=path):
+                self.assertEqual(scan_source(path, signature), [])
+                for call in ("GlobalBackendRouter::initForTests();", "GlobalBackendRouter :: initForTests ();",
+                             "using Router=GlobalBackendRouter; Router::initForTests();",
+                             "auto bootstrap=&GlobalBackendRouter::initForTests; bootstrap();",
+                             "using GlobalBackendRouter::initForTests; initForTests();"):
+                    self.assertTrue(scan_source(path, signature + call))
+        self.assertTrue(scan_source("src/v2/collective/ForeignRouter.cpp", declarations["src/v2/collective/BackendRouter.cpp"]))
+        self.assertTrue(scan_source("src/v2/collective/ForeignRouter.h", declarations["src/v2/collective/BackendRouter.h"]))
+        self.assertTrue(scan_source("src/v2/collective/BackendRouter.cpp",
+                                   "bool GlobalBackendRouter::initForTests() { return initForTests(); }"))
+
+    def test_test_router_comments_and_literals_are_not_production_calls(self):
+        """Source diagnostics may describe the banned spelling without invoking it."""
+        source = '// GlobalBackendRouter::initForTests();\n/* initForTests */ const char* why=R"tag(GlobalBackendRouter::initForTests())tag";'
+        self.assertEqual(scan_source("src/v2/execution/runner/OrchestrationRunner.cpp", source), [])
+
 if __name__=="__main__":unittest.main()

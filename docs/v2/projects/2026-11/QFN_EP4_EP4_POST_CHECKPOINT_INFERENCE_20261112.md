@@ -168,6 +168,75 @@ MTP is off; prefix caching remains enabled by the frozen configuration.
     device-free regression exercises both backend descriptions, both PLE-stage
     placements, and missing/duplicate/foreign/reordered negative cases.
 
+15. **The HTTP/canary observer rejected the effective default prefill cap.**
+    The unpaired full-corpus collector supplies the normal omitted cap, which
+    the canonical configuration resolves to M512. The observer compared the
+    optional authored value directly with 512 and rejected that valid intent
+    before admission. It now consumes the existing canonical normalization;
+    other caps still fail, and the independently authored ExpertOverlay segment
+    geometry is preserved. The new default-cap regression runs through the
+    existing explicit preflight contract. Build `q88` and all five focused
+    checks in `q89` pass. This repair is published as `9b970ad61`.
+
+16. **The public local-PP frontend initialized a test-only global router.**
+    Unlike the detailed fixture's direct RankOrchestrator construction, the
+    public OrchestrationRunner called `GlobalBackendRouter::initForTests()`.
+    That helper fabricates a no-MPI rank-zero inventory from every visible
+    device. The `q90` observation consequently initialized unrelated CUDA and
+    ROCm groups before the actual selected eight-MI50 pipeline. A typed PP
+    admission now authenticates the original active communicator, immutable
+    inventory, ordered physical participants, and actual graph execution plan.
+    Captured pipeline edges keep their own transport authority and create no
+    additional router communicator. Generic boundaries admit only their actual
+    directed initial copy endpoints; destination TP publication remains separate.
+    Admission and runtime share allocation-free endpoint selection, preserving
+    source-TP priority. Device-free tests exercise original rank projection,
+    spare and foreign GPUs, unequal/mixed-vendor boundaries, snapshot identity,
+    and forbidden lazy group creation. A source-policy negative control restores
+    the original production test-helper call and proves its rejection.
+
+17. **Driver diagnostics overlooked informational AMD/KFD wait-stack frames.**
+    The old severity/word filter accepted `q90` despite kernel frames showing
+    GPUVM mapping and clock-counter waits. Exact symbol/module/frame matching
+    now catches those records without flagging ordinary startup prose or
+    unrelated waits. All 21 direct Python tests pass, including original-code
+    failure controls and supplied stale-summary rejection. Reanalysis finds
+    20 findings in the preserved `q90` journal; its original clean summary is
+    not accepted. No original evidence was overwritten. The existing explicit
+    HTTP driver-diagnostics preflight entry covers this classifier.
+
+## Public-frontend startup observation
+
+Build `q94` passes. After correcting the new fixture's original one-host
+rank metadata, `q95` passes all three repaired router/source aliases; the four
+unchanged RankOrchestrator, source-negative-control and driver aliases passed
+in `q93`. These are focused checks, not a full preflight rerun.
+
+The unpaired `q96` collector uses the unchanged 16-history corpus, original MPI
+rankfile, SingleQ8 arithmetic and selected eight-MI50 layout. Its observer
+contract intentionally has MTP and prefix caching off, unlike the prefix-enabled
+short detailed fixture above. It remains explicitly **UNCALIBRATED**, unscored
+and ineligible for certification. No failed detailed receipt was rewritten.
+
+The unrelated CUDA communicator is absent after the frontend repair. RCCL setup
+is nevertheless very slow: loading at 03:54:06 UTC, the first intended group
+7/6/8/9 finishes setup at 04:00:41, and group 1/3/4/2 at 04:04:12. Read-only host
+GDB observations confirm the first original group contains exactly four devices
+7/6/8/9 and show HSA GPUVM mapping and RCCL buffer/stream preparation waits.
+Those attachments perturb the observation; it is not an uninstrumented timing
+or stability result. The process subsequently materializes approximately
+19.4–19.7 GB on each selected MI50, so it was progressing rather than remaining
+permanently stuck at the first mapping call.
+
+The canonical 15-minute cell budget expires before logits are emitted; the
+wrapper retires in 908.4 seconds with zero completed cells. Every native process
+retires, VRAM returns to baseline, and the complete `q96` driver window contains
+no findings. Sampled active-rank peak RSS is about 20.5 GiB; this is startup
+resource evidence, not a leak qualification. The immediate blocker is startup
+latency, not an accepted corpus or performance result. No timeout was enlarged.
+Evidence is in `/tmp/qfn-postcheckpoint-unscored-single-q8-corpus-q96/` and
+`/tmp/qfn-postcheckpoint-focused-launch/q96-progress.jsonl`.
+
 ## Focused validation and next measurement
 
 The `q69` real-model retry retained the green prefill final-logit KL

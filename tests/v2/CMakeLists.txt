@@ -2759,6 +2759,7 @@ endif()
 
 # Test: BackendRouter - Backend selection and routing for collective operations
 add_executable(v2_unit_backend_router unit/collective/Test__BackendRouter.cpp)
+target_include_directories(v2_unit_backend_router PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_unit_backend_router 
     llaminar2_core 
     GTest::gtest
@@ -2769,6 +2770,14 @@ add_v2_test(V2_Unit_BackendRouter
     LABELS "V2;Unit;Collective;BackendRouter;Routing"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_PipelineRouterStartupOwnership
+    COMMAND $<TARGET_FILE:v2_unit_backend_router>
+        --gtest_filter=PipelineRouterStartup.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Pipeline;Collective;Ownership;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PipelineRouterStartupOwnership)
 add_v2_test(V2_Integration_MoEProjectionTransportTopology
     COMMAND $<TARGET_FILE:v2_unit_backend_router>
         --gtest_filter=Test__LocalTPCollectiveInventory.PeerCoverageUsesObservedMatrixOrderAndNeverBypassesOneEnabledEdge

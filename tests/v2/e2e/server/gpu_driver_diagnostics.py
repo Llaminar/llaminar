@@ -7,6 +7,8 @@ throughout that lifetime and appends observed records to a bounded-memory
 journal. Rotation after collection is harmless; loss between observations,
 unreadable diagnostics or a retired collector cannot produce a certificate. This observer reads the serving host's shared kernel; it
 does not clear logs, change driver settings, or participate in inference.
+Actual AMD/KFD kernel wait frames also count as driver diagnostics even when
+Linux's hung-task reporter publishes every frame at informational priority.
 """
 from __future__ import annotations
 
@@ -85,6 +87,13 @@ _DRIVER = re.compile(r"\b(?:amdgpu|amdkfd|kfd|nvrm|nvidia(?:[-_](?:uvm|modeset|d
 _PROBLEM = re.compile(
     r"\b(?:warn(?:ing)?|error|fault|fail(?:ed|ure)?|timeout|timed out|overflow|"
     r"reset(?:ting)?|fallen off|xid)\b|callbacks suppressed|hogged CPU", re.I)
+# These are actual backtrace frames from the blocked GPU clock/mapping path,
+# not driver startup prose or an unrelated task's generic dma-fence wait. Linux
+# emits them separately from the hung-task heading, often all at INFO priority.
+_GPU_KERNEL_WAIT_FRAME = re.compile(
+    r"^\s*(?:\?\s*)?(?:__pfx_)?(?:kfd_ioctl_get_clock_counters|"
+    r"amdgpu_amdkfd_gpuvm_sync_memory|kfd_ioctl_map_memory_to_gpu)"
+    r"\+0x[0-9a-f]+/0x[0-9a-f]+\s+\[amdgpu\](?:\s|$)", re.I | re.M)
 _BAD_PRIORITIES = {"emerg", "alert", "crit", "err", "warn", "warning"}
 _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
@@ -92,12 +101,14 @@ _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 def driver_diagnostic(record: KernelRecord) -> bool:
     """Recognize driver severity and faults that some drivers log at INFO.
 
-    NVIDIA Xid, AMD IH overflow and SVM workqueue warnings must not depend on
-    printk priority being correct. Conversely a generic backtrace's module
+    NVIDIA Xid, AMD IH overflow, SVM workqueue warnings and actual KFD blocked
+    kernel frames must not depend on printk priority being correct. Conversely a generic backtrace's module
     inventory does not attribute an unrelated kernel warning to every driver.
     """
     if record.fac != "kern" or record.msg.startswith("Modules linked in:"):
         return False
+    if _GPU_KERNEL_WAIT_FRAME.search(record.msg):
+        return True
     attributed = _DRIVER.search(record.msg) or re.search(
         r"\b\w*ih_get_wptr:.*callbacks suppressed", record.msg, re.I)
     return bool(attributed and (record.pri in _BAD_PRIORITIES or _PROBLEM.search(record.msg)))
