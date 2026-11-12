@@ -599,6 +599,26 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
             llaminar2::TensorType::FP16>(a_data,b_data,c_data,1,1,65);
         ASSERT_TRUE(live_ok);
         EXPECT_EQ(fmlalLeafInvocations()-before_live,fmlalRouteResolved()?1:0)<<"prim live";
+        // (P5) Positive capacity, ALL-INACTIVE span, at the primitive: the
+        // work scope publishes a zero-count range, so the isa schedule's
+        // selection spans are empty — the live-span scan finds nothing, the
+        // count stays put and the output is untouched. This reaches the
+        // primitive's own scan, which the public work-scoped route returns
+        // before.
+        {
+            std::int32_t live_rows=0;
+            ProjectionRowWorkScope scope(ProjectionRowWork::fromPrefix(
+                llaminar2::DeviceRowRange::deviceCounted(1,&live_rows)));
+            FP32Tensor work_input({size_t(1),size_t(65)});
+            std::fill_n(work_input.mutable_data(),65,1.f);
+            std::fill_n(c_data,1,-777.f);
+            const long long before_inactive=fmlalLeafInvocations();
+            const bool inactive_ok=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
+                llaminar2::TensorType::FP16>(a_data,b_data,c_data,1,1,65);
+            ASSERT_TRUE(inactive_ok);
+            EXPECT_EQ(fmlalLeafInvocations()-before_inactive,0)<<"prim all-inactive";
+            EXPECT_EQ(c1.data()[0],-777.f)<<"prim all-inactive C";
+        }
     }
     // (6) Probe restored off: the count holds still.
     {
