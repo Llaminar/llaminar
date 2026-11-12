@@ -1116,3 +1116,15 @@ authorization per the lane's rule; the mini-plan routes for the
 operator decision package. THE B1 ATTRIBUTION ARC IS CLOSED: unknown
 structure → named, root-caused, mechanistically-explained pooling
 target with a quantified expected gain.
+
+### B1 RE-VERIFICATION AT THE LANDED TIP (~07:02Z): the diagnosis HOLDS at 0ad09600b
+
+`multiply_fused_tensor` still loops per member with per-member internal
+OMP_WORKSHARE_REGION (one fork per member call) at the current PR tip;
+the FMLAL additions (leaf + route probe + FPCR admission) live INSIDE
+the per-member matmul schedule and don't touch the forking structure.
+The pooled-workshare fix shape is validated against 0ad09600b per the
+lane's conditions (branch from 0ad09600b, one workshare over all
+members' row tiles, unchanged per-member arithmetic, byte-identity
+proof matrix, fork-count assertion). Implementation waits for the
+operator's explicit authorization.
