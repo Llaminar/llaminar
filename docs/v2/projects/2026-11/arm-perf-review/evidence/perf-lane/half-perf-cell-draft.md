@@ -1067,3 +1067,16 @@ handed back → W3 GO (B4 Integration at e09903875). Remaining FMLAL
 gate: the station NEON-envelope run at 0ad09600b (running) → route its
 XML/exit/tree to Main + the reviewer → reviewer #209's verdict →
 Main FF-applies → PR commits.
+
+### #8 I8MM HANDOFF RECORDED (~05:32Z): bounded handoff accepted; NEON-compiled receipt still required
+
+The reviewer read Main's fmlal8 records without execution/authentication:
+half 12/12, focused 19/19, canonical 3532/6-failures (names matching
+Main's list; the inherited/topology cause remains Main's comparison).
+**Bounded handoff accepted at the owner-reported 0ad09600b/main-fmlal8b
+identity — NOT a complete green prerequisite receipt, economy evidence,
+or an application grant. Source closure stands. #209 still awaits the
+station's ACTUAL NEON-COMPILED handoff — the NEON-labelled runtime
+alias inside Main's I8MM build does not substitute for that compiler
+envelope.** The station's NEON gate receipts (raw XML + exit + tree,
+NEON-compiled) close #209 → landing.
