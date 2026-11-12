@@ -2547,3 +2547,21 @@ agreement framing (normative anchor = estimator-byte-equality preflight
 class; observed final = post-merge seam). The idea-08 input is COMPLETE
 (predicted/estimator, correctly labeled) pending only the post-merge
 observed seam.
+
+### REVIEWER VERDICT on c1a002b50 (~20:09Z): F4b CLOSED + memcmp-removal ACCEPTED; F4a open → fix-forward #3
+
+Closed: the acceptance redesign (per-row arm comparisons before reuse +
+sample-0 references; digest gone; single-arm adjacent-sign-flip and
+common-mode drift both covered) and the final-memcmp removal (last pair
+takes the same checks as every other pair). Open — F4a: retained_* are
+AUTOMATIC storage; atomic_signal_fence does not make non-escaping
+automatic storage signal-observable (no pointer/extent escape to an
+opaque consumer), so the walker stores still lack a mandatory pre-end-
+clock materialization edge (first explicit reader :794-796 is AFTER end
+:786); a naked memory-clobber asm alone is also insufficient. Required:
+an instruction-free compiler primitive with an explicit live-output
+memory operand / pointer-extent escape before the end clock + the input/
+start boundary; fences may remain alongside. Scope note from the
+reviewer: Oracle2 = shared-walker/metamorphic with production leaves
+(accepted framing); sample0 = consistency anchor, not a new oracle.
+Fix-forward #3 dispatched (object-bound empty-asm escape suggested).
