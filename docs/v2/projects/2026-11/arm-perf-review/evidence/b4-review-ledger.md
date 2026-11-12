@@ -335,3 +335,20 @@ K14-B4-E09903875 = the fail reported honestly + JUnit. The result
 routes to addon2 (diagnosis: fixture-side comparison question vs a
 production grouped-verifier gap) + the reviewer (the round-5 re-verdict
 at the landable tip, with JUnit in hand).
+
+### W3 SEAL ANALYZED + ROUND-6 FIX (~06:27Z): cb9255c9a — the :439 fail = missing CPU-backend init
+
+Addon2 pulled the seal from llaminar-spark-results and the JUnit
+pinpointed it: the GroupedTargetRowsMatchSerialM1 failure is NOT a
+comparison mismatch — workspace.allocate(...) returned FALSE at the
+grouped test's admission (:439), the SAME missing-CPU-backend-init
+class as the B1 bench (the two-arg DeviceWorkspaceManager allocates
+through the device backend; the fixture skipped initCPUBackend(-1)).
+FIXED at cb9255c9a (one file/6 lines: hasCPUBackend()/initCPUBackend(-1)
+before the allocation + the include). **W3 SPLIT (the valuable part):
+the byte-proof head test (SelectedRowsAreBitwiseIdenticalAndCounted —
+the full bitwise oracle incl. counted traffic, multi-N, reverse arms,
+second geometry) PASSED on Linux GCC; the portable TU PASSED (A1/A3/A4
+repairs executed-valid).** Only the grouped-vs-serial comparison needs
+the one-line init + a re-run. Routing: the re-run rides any window;
+after it passes, the reviewer's re-verdict lands.
