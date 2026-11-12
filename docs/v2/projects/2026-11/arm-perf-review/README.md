@@ -2410,3 +2410,41 @@ shouldRebalance() fires mid-prefill, discardAllCachedGraphs → next chunk
 RECAPTURES (seconds-scale) — Phase 0 counters prove/disprove on .79.
 Post-merge implementation = station lane (Spark-first), Phase 0/1 host
 runs via arm-sparks.
+
+### CENSUS v1 ANALYSIS (coordinator, ~18:45Z): IDEA-08 PREMISE REFUTED FOR THE 35B; predicted-bytes bug sent back
+
+I analyzed K14-I08A-CENSUS-5C2CEF47's CSV directly (753 rows, right model
+verified: Qwen3.6-35B-A3B-MTP-UD-IQ3_S): (1) **BUG**: the *_exps tensors'
+predicted bytes are PER-EXPERT, not per-tensor (blk.34.ffn_down_exps pred
+917,504 vs src 220,200,960 ≈ 1/n_experts; blk.39 gate/up_exps ~1MB vs
+115MB) — the SUMMARY's 2.26GB-vs-15.3GB "footprint≠pack" reconciliation
+is invalid; sparks regenerates (× n_experts) + re-seals. (2) **MAJOR —
+the encoding map refutes idea-08's premise for this model**: the bulk is
+ALREADY compact — ffn_gate/up_exps = CompactMultiScale on 40/41 layers
+(~7.1GB src), ffn_down_exps = NibbleLUTSourceScale ×37 + NibbleLUT ×1 +
+Q6 ×3 (~6.1GB); expanded encodings = only blk.39 (the UD outlier layer:
+IQ3SExpandedSourceScale gate/up 230MB + 8 tiny ExpandedInt8) ≈ 0.25GB of
+15.3GB. The "IQ3_S expansion = 2.7× decode bytes" story does NOT apply
+to the 35B's decode traffic. Idea-08's residual value on this model =
+dead compensation bytes (NibbleLUT/Compact families) + general layout
+hygiene — a MUCH smaller prize. (3) **Decode-gap attribution shifts**:
+output.weight + token_embd = Q6 ~445MB prepared EACH; the LM head reads
+that every token at M=1 → now the dominant single-tensor decode cost
+(ties to idea-16's LM-head 45GB/s finding + the B4/LM-head lane). The
+census did its job: sized the prize before building the wrong thing.
+Roadmap idea-08 entry + the decode-gap section need revision on the
+re-seal.
+
+### TOURNAMENT REPAIR @ e0f6506c9 → REVIEWER (~18:44Z)
+
+arm-i08repair complete (branch codex/arm-idea16-tournament-repair, one
+file +102/−42): all four findings verified against production
+authorities + fixed (Oracle-1 quad*16 in BYTES — unit nuance vs the
+finding's phrasing; walkers = per-column uint16 planes via
+reinterpret_cast + quad*4; timed path = floor(M/2) SMMLA pairs + DotProd
+tail matching the production tile split; retained per-row outputs +
+byte-for-byte retention oracle). Sign fix untouched; no CMake changes;
+standalone proofs uncommitted per the sign-fix pattern; syntax-only
+clean in all 3 cell envelopes. Focused-pass request dispatched to
+arm-reviewer (01a1a8d9) with the 4 verification points; the .79
+tournament re-run fires only on ACK. Lane stands by for fix-forwards.
