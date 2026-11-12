@@ -1029,3 +1029,29 @@ usable). FMLAL: tip f987501f9 (combined L4+L5) staged for #6
 PLUS the complete canonical Unit+preflight** (L4 changes startup ISA
 admission — the broader gate is warranted); Main starts #6 when
 tender_morse exits.
+
+### B1 ANALYSIS PARTIAL (~03:09Z): GDN question ANSWERED — fused path ENGAGES on both shapes
+
+From the gdn_projection_route records (K14-B1ATTR-12675C956-20261112):
+- **27B dense: GDN runs as TWO fused 2-projection subgroups (qkv+z,
+  alpha+beta; codebooks=none+none)** — grouped_decode_equivalent_
+  verifier_subgroup (MTP/verifier) + same_kernel_mixed_codebook_subgroup
+  (steady decode). GDN = 2 forks/step ✓ (the corrected prediction).
+- 35B: same shape (90/23040 steady; 7920 verifier subgroups in MTP).
+- **The GDN fused path ENGAGES on both shapes — the non-engagement
+  hypothesis is DEAD; GDN was never the 4-fork stage.**
+- The 4-fork once-per-step stage = a DIFFERENT stage; identification
+  needs the named per-stage fork rows.
+
+EXPORT ANOMALY (blocking named attribution): the full-records JSONs
+contain ZERO omp stage-fork records (35b-mtp-full: 6100 records, 1 omp;
+27b-nomtp-full: 47, 1 omp) while the .out stdout tables SHOW the omp
+stage rows (119 visible, tags truncated ~50 chars, 120-row display cap)
+— the JSON filter handling dropped the omp stage family (filter len=21
+suggests the env filter extended beyond omp,kernel). Also: no
+stage_cpu_detail timer rows in the .out at all (the adjacency pairing
+has no timer partner).
+Fork COUNTS = solid; named attribution blocked on the filter anomaly;
+NEXT: addon3 reads filterListFromEnv's parsing (~10 min) → the exact
+env recipe → a sparks re-run of the export step only (~15 min, build
+banked).
