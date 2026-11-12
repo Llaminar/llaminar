@@ -1223,3 +1223,20 @@ then one PerfStats omp fork-evidence run per binary (which directly
 verifies the corrected 4→3-forks prediction). **Landing gate: B ≥ A
 with generated tokens identical** — the operator's same-or-better bar.
 The M=1 window queues behind main-b1ab.
+
+### B1 A/B SEALED (12:07Z): 27B same-or-better; 35B nomtp +0.6% → NOT landing yet; main-b1ab2 final slot GRANTED
+
+main-b1ab (A=ae51ce3f0 vs B=d5e04fdce, Release NEON_I8MM, unprofiled):
+tokens IDENTICAL A=B in every lane; all runs exit 0. Decode p50 ms
+(B/A): 27B nomtp 162.15→161.89 (0.998); 27B mtp 142.41→142.26
+(0.999); 35B nomtp 37.33→37.57 (**1.006** — all 4 B p50 above all 4
+A p50 = consistent); 35B mtp 35.88→36.20 (1.009, overlapping). Fork
+evidence 27B nomtp: GDN_PROJECTION 4.00→3.00 forks/execution, decode
+step 755→707 — **the corrected 4→3 prediction CONFIRMED**. By the
+operator's same-or-better bar, B1 does NOT land yet. **GO granted for
+one final 12-min slot** (main-b1ab2: reversed-lead BAABBAAB 35B nomtp
++ per-binary 35B fork/kernel evidence; real effect vs code-layout
+artifact). **Condition: unconditional handback to sparks after
+main-b1ab2 — no fourth window; B1 rides this verdict (repeat +0.6% =
+defer post-merge with the sealed negatives; flip ≤1.00 or layout
+evidence = land).** Sparks notified of the extension.
