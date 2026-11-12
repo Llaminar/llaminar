@@ -2565,3 +2565,15 @@ start boundary; fences may remain alongside. Scope note from the
 reviewer: Oracle2 = shared-walker/metamorphic with production leaves
 (accepted framing); sample0 = consistency anchor, not a new oracle.
 Fix-forward #3 dispatched (object-bound empty-asm escape suggested).
+
+### FIX-FORWARD #3 @ 3b109793c (~20:16Z) → reviewer ACK request
+
+F4a closed in the required shape: object-bound escape asm
+`("" : : "r"(span), "r"(bytes) : "memory")` at both interval edges
+(pointer+extent escape to an opaque consumer; memory clobber forces
+prior-store materialization before the end-clock read; start-boundary
+escape also proves poison stores precede the timed region); fences kept
+alongside; one span reference per invocation binds dirty/escape/walker/
+scan to the SAME object; dual-compiler verified (AppleClang 21 +
+GCC-14.4, all 3 envelopes); -O2 replication shows the full store
+sequence strictly between the clock reads. ACK request dispatched.
