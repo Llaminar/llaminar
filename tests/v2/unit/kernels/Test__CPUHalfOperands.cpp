@@ -12,7 +12,9 @@
  */
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#if defined(__aarch64__)
 #include "utils/ARMCPUFeatures.h"
+#endif
 #include "../../utils/CPURouterKernelTestAdmission.h"
 #include <gtest/gtest.h>
 #include <omp.h>
@@ -398,9 +400,12 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
  *        pre-existing at the base and is the reviewer's contract question,
  *        not this regression.) */
 TEST(CPUHalfOperands, MixedPolicyKeepsUnroundedFP32AtK16){
-    // Row-major transposed FP16 weights ([K][N]) per the GPU-aligned contract.
-    FP16Tensor weight({size_t(16),size_t(1)},std::vector<uint16_t>(16,0x3C00));
-    Engine engine(&weight,Engine::NumericalPolicy::GPUAlignedExpert,Mode::FP32);
+    // The real mixed FP32-A/FP16-B contract: Mode::Native with the
+    // GPUAlignedExpert policy, weights shaped [N,K] (get_n/get_k are
+    // rows/cols) and transpose_B selecting the transposed read. Unconverted
+    // FP32 A survives the K=16 stripe end to end.
+    FP16Tensor weight({size_t(1),size_t(16)},std::vector<uint16_t>(16,0x3C00));
+    Engine engine(&weight,Engine::NumericalPolicy::GPUAlignedExpert,Mode::Native);
     FP32Tensor input({size_t(1),size_t(16)}),output({size_t(1),size_t(1)});
     std::vector<float> source(16,0.f);
     source[0]=1.f+0x1p-12f;
@@ -412,6 +417,12 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     // The leaf is compiled exactly in the envelope that declares FP16FML; an
     // envelope without it keeps the scalar schedule and never selects the
     // leaf (the dispatch carries no NEON case without the guard).
+#if !defined(__aarch64__)
+    // No AArch64 target: the FMLAL leaf cannot be compiled at all, so the
+    // route probe stays zero and the scalar schedule always runs.
+    EXPECT_FALSE(fmlalLeafCompiledInEnvelope());
+    EXPECT_EQ(fmlalLeafInvocations(), 0ull);
+#else
     EXPECT_EQ(fmlalLeafCompiledInEnvelope(),
         (llaminar2::cpu::ARMCPUCapabilities::compiledEnvelopeFeatures() &
          uint32_t(llaminar2::cpu::ARMCPUFeature::FP16FML))!=0);
@@ -421,8 +432,8 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
         EXPECT_TRUE(llaminar2::cpu::ARMCPUCapabilities::native().supports(
             llaminar2::cpu::ARMCPUFeature::FP16FML));
     // The selection probe proves the FMLAL path — never a silent scalar
-    // fallback — actually executed: one leaf invocation per row tile times
-    // output column (M=1 -> one tile; the scalar route never increments).
+    // fallback — actually executed: one route probe per multiply (the scalar
+    // route never increments).
     {
         FP16Tensor weight({size_t(2),size_t(65)},weightWords(2,65));
         Engine probe_engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
@@ -443,6 +454,16 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
         observed_fp16_no_fhm, observed_fp16_no_fhm |
             uint32_t(llaminar2::cpu::ARMCPUFeature::FP16FML)),
         std::runtime_error);
+    // FPCR profile contract (F3): focused negative controls over synthetic
+    // control-words — only RNE with FZ, FZ16 and AHP off admits the leaf's
+    // ambient conversion; each wrong bit (or rounding mode) is rejected.
+    EXPECT_TRUE(fmlalFpcrProfileAdmitted(0x0ull));
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 19));  // FZ16
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 26));  // AHP
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 24));  // FZ
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 22));  // RMode=01
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x3ull << 22));  // RMode=11
+#endif
 }
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */
 TEST(CPUHalfOperands, EveryPositiveWorkerBudget){
