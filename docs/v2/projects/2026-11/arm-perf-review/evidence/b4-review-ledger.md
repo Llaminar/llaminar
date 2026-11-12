@@ -493,3 +493,14 @@ superseded by the 7a4790c77 restoration (the #204 continuation
 vehicle). The package awaits the 7a4790c77 W3 re-run's fresh JUnit.
 
 ### TERMINOLOGY CORRECTION (reviewer, ~07:20Z): e099 failed ASSERT_TRUE(workspace.allocate(...)) at :439 (actual=false/expected=true) — the shorthand 'ASSERT_FALSE(actual)' was not the source macro. The admission-before-comparison conclusion and the R1-only HOLD are unchanged.
+
+### B4 SEAL PATHS DELIVERED (~07:25Z): both seals' local paths routed
+
+/Users/floriankinder/llaminar-spark-results/K14-B4-E09903875-20261112/
+(the honest failure: b4-ctest.log + the head XML with the admission
+failure at :439) + K14-B4-ADDF3DB78-20261112/ (the GREEN step-2:
+portable 0 failures + head tests=2 failures=0 + 2/2 ctest). Context in
+both seals: .80 host, Integration NEON_I8MM SHARED_CORE=ON, g++-14
+14.2. The package (paths + addon2's assembled lineage/contexts/
+enumeration + the corrected descriptions) routes to the reviewer for
+the #204 continuation at 7a4790c77.
