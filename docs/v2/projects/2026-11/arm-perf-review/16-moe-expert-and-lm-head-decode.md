@@ -684,3 +684,13 @@ the production path uses (the exact env/API from the production
 recording path) → counters advance → the fresh_ asserts pass on real
 recorded data.** Routed to addon2; the B1 seal gates on the collector-
 enabled re-run; timing unaffected.
+
+### W2 COLLECTOR FIX LANDED (~09:32Z): 5c2cef47a — both PerfStats switches enabled in the proof scope
+
+The STT proof scope now enables the domain filter AND the collector's
+overall enabled switch (LLAMINAR_PERF_STATS_SUMMARY=1 trigger), force-
+republishes, restores both envs on exit — the records=0-everywhere
+result explained and fixed. The next re-run's domain dump confirms the
+counters record; the B1 seal K14-I16B1 completes on the passing proof +
+the timing evidence (B≤A: production 217.2 vs transaction 206.3 µs
+mixed-20T). The idea-08 GO/NO-GO inputs follow the seal.
