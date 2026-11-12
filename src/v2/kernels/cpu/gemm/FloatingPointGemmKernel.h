@@ -70,19 +70,27 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 #endif
 #include "../../FloatingActivationOperandPrecision.h"
 /**
- * @brief Test-visible selection probe: the FMLAL leaf's actual execution count.
+ * @brief Test-visible route evidence for the FMLAL leaf, evidence-only by
+ *        default.
  *
- * One relaxed increment per FMLAL dispatch — once per public multiply call,
- * on the calling thread, outside the worksharing region — so device-free
- * contracts can prove the FMLAL path — never a silent scalar fallback — ran
- * under the declaring envelope, at zero cost inside the OpenMP team. Compiled
- * only with the leaf; envelopes without it report zero.
+ * The probe counts ONE admitted live FMLAL dispatch (once per public multiply
+ * call, on the calling thread, after pointer/geometry validation and only
+ * when at least one row span carries live FMLAL vector work). It stays off
+ * unless a contract enables it, so production and clean timing carry a load,
+ * never a write; device-free contracts enable it, assert the resolved-route
+ * count, and disable it again. Compiled only with the leaf; envelopes without
+ * it report zero.
  */
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
 inline std::atomic<unsigned long long> &fmlalLeafCounter() noexcept
 {
     static std::atomic<unsigned long long> counter{0};
     return counter;
+}
+inline std::atomic<bool> &fmlalLeafProbeEnabled() noexcept
+{
+    static std::atomic<bool> enabled{false};
+    return enabled;
 }
 inline unsigned long long fmlalLeafInvocations() noexcept
 {
@@ -1492,6 +1500,32 @@ namespace llaminar2
             static_assert(kLanes == 256,
                           "CPU SIMD schedules implement the 256-lane device tree");
             const int row_tiles = selection ? selection->hostTiles(kRowTile) : (M + kRowTile - 1) / kRowTile;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+            if constexpr ((ISA == ISALevel::NEON || ISA == ISALevel::NEONDotProd) &&
+                          WeightType == TensorType::FP16 && (HalfRNE || HalfStorage))
+            {
+                // Route-probe evidence, counted once per dispatch on the
+                // calling thread and only for ADMITTED LIVE FMLAL execution:
+                // pointer/geometry validation already passed, at least one
+                // row span is non-empty, the weights are in the leaf's
+                // operand domain and K carries at least one full 16-lane
+                // block. Evidence-only by default (the probe is off unless a
+                // contract enables it), so clean timing carries a load, not
+                // a write.
+                bool live = false;
+                for (int row_tile = 0; row_tile < row_tiles && !live; ++row_tile)
+                {
+                    const auto span = selection
+                        ? selection->hostTileSpan(row_tile, kRowTile)
+                        : ProjectionRowSpan{row_tile * kRowTile,
+                                            std::min(M, (row_tile + 1) * kRowTile)};
+                    live = span.size() > 0;
+                }
+                if (live && K >= 16 &&
+                    fmlalLeafProbeEnabled().load(std::memory_order_relaxed))
+                    fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
+            }
+#endif
             auto work = [&]()
             {
 #pragma omp for collapse(2) schedule(static)
@@ -1846,16 +1880,10 @@ namespace llaminar2
                 // FP16FML; startup admission verifies the executing CPU
                 // advertises FEAT_FHM before any leaf instruction runs, so a
                 // mismatch fails fatally instead of faulting on an unimplemented
-                // instruction. The route probe counts one resolved FMLAL
-                // dispatch — FP16 weights in the leaf's operand domain with
-                // work that executes FMLAL vector lanes (K >= 16); FP32/BF16
-                // weights, empty work and tail-only runs never count. One
-                // relaxed add on the calling thread, outside the worksharing
-                // region.
+                // instruction. Route-probe evidence is counted where the leaf
+                // is actually selected for admitted live work (see the isa
+                // body), never here on the pre-validation path.
                 cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::FP16FML);
-                if constexpr (WeightType == TensorType::FP16 && (HalfRNE || HalfStorage))
-                    if (M > 0 && N > 0 && K >= 16)
-                        fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
                 return run_gpu_aligned_expert_fp32_matmul_neon<WeightType, HalfRNE, HalfStorage>(
                     A, B, C, M, N, K, alpha, beta, bias);
 #endif
