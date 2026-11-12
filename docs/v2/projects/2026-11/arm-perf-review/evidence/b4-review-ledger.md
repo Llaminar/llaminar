@@ -535,3 +535,20 @@ N-sweep, no economy; broader checks = Main's post-collection
 responsibility.** → Main's application default (YES if all-arch builds
 + no new canonical failures; the combined-tip canonical is the
 remaining gate).
+
+---
+
+## **B4 LANDED (~08:13Z): PR #43 fast-forwarded 0ad09600b → 7a4790c77**
+
+The B4 draft-vocabulary-budget diagnostic is ON the PR branch. Basis:
+the reviewer's #204 SOURCE ACK + Main's combined-tip canonical
+(main-b4c, Integration NEON_I8MM GCC14): focused 2/2; the full
+Unit+preflight 3534 tests (3532 + 2 new), 0 skipped, 6 failed = the
+same inherited/topology set (0 new); an x86 (AVX2-target) syntax check
+of the portable TU passed (the head TU is aarch64-gated — the D6 split
+validated). PR body updated; build-b4c pruned. **Scope: diagnostic
+only — B4 production routing, N-sweep, and economy remain fenced.**
+Lanes rebase onto 7a4790c77. .80 free → the corrected I8MM M=1 window
+(Release, not Integration, for timing). **The pace directive's
+compounding effect is visible: two collections landed on the PR within
+hours (FMLAL + the B4 diagnostic).**
