@@ -773,3 +773,14 @@ background rounds away the smallest-subnormal contribution in some
 special cases).
 DISPOSITION: implementation authorization intact; economy NOT ADMITTED;
 focused controls = lane obligations; broader checks = Main's campaign.
+
+### FMLAL STATE (~02:50Z): 6c7a1a477 covers L1-L3; ONE combined tip for L4+L5 required; #6 HELD
+
+Main: reviewer 234's HOLD at b5e928e40 (L1-L5) — addon's 6c7a1a477
+ALREADY ADDRESSES L1-L3 (pushed quickly after Main's #5 + reviewer 233).
+L4 (FHM not in ordinary startup ISA admission) + L5 (counter counts
+unexecuted dispatches; unconditional atomic; tests key on the compiled
+envelope not the resolved route) remain open — Main requires ONE tip
+covering both and HOLDS #6 until then. .80 shows container tender_morse
+(presumably the B1 export; sparks pressed for confirmation + the record
+answer). #6 books when the combined tip arrives.
