@@ -19,6 +19,9 @@
  * Bounded loading may supply an already-final CPU tensor. That engine retains
  * its actual storage owner without copying and forbids retiring those live
  * bytes as if they were a disposable source window.
+ * A backend-native fused FP32 transaction whose members all take the skinny
+ * decode primitive runs every member's tasks in one OpenMP workshare, so the
+ * call forks one team rather than one per member, with unchanged arithmetic.
  *
  * @author David Sanftenberg
  * @date 2025-11-26
@@ -53,6 +56,8 @@ inline constexpr bool fmlalLeafCompiledInEnvelope() noexcept
 
 #include <oneapi/dnnl/dnnl.hpp>
 #include <atomic>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -221,6 +226,96 @@ namespace llaminar2
             return value;
         }
 
+        /** @brief Row height of the decode-equivalent skinny FP32 tile. */
+        inline constexpr int kSkinnyFP32RowTile = 4;
+
+        /**
+         * @brief Compute one skinny FP32 tile's dot products in serial decode order.
+         *
+         * Each of the @p tile_rows activation rows owns an independent scalar
+         * accumulator that walks K with explicit std::fma from zero, which is
+         * the exact M=1 decode expression. The shared weight row is loaded once
+         * per K step for every row in the tile. Implicit `acc += a * b` would
+         * leave contraction to each loop shape; AArch64 GCC fused the one-row
+         * loop but not the shared-weight tile, breaking serial/grouped byte
+         * equality. Explicit per-width accumulators keep the compiler from
+         * choosing a different vector/FMA schedule for a runtime row loop.
+         * K is deliberately not vectorized or repartitioned: changing its
+         * reduction order would risk recurrent-state drift in GDN/short-conv
+         * publication.
+         *
+         * @param a0 First activation row of the tile; rows are K floats apart.
+         * @param b_row Contiguous K-element weight row of one output column.
+         * @param tile_rows Active rows in the tile, from 1 to kSkinnyFP32RowTile.
+         * @param K Dot-product length.
+         * @param accumulators Receives one completed dot product per tile row.
+         */
+        inline void skinnyFP32TileDot(const float *a0, const float *b_row, int tile_rows, int K,
+                                      float (&accumulators)[kSkinnyFP32RowTile])
+        {
+            if (tile_rows == 1)
+            {
+                float acc0 = 0.0f;
+                for (int kk = 0; kk < K; ++kk)
+                    acc0 = std::fma(a0[kk], b_row[kk], acc0);
+                accumulators[0] = acc0;
+            }
+            else if (tile_rows == 2)
+            {
+                const float *a1 = a0 + K;
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                for (int kk = 0; kk < K; ++kk)
+                {
+                    const float b = b_row[kk];
+                    acc0 = std::fma(a0[kk], b, acc0);
+                    acc1 = std::fma(a1[kk], b, acc1);
+                }
+                accumulators[0] = acc0;
+                accumulators[1] = acc1;
+            }
+            else if (tile_rows == 3)
+            {
+                const float *a1 = a0 + K;
+                const float *a2 = a1 + K;
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                for (int kk = 0; kk < K; ++kk)
+                {
+                    const float b = b_row[kk];
+                    acc0 = std::fma(a0[kk], b, acc0);
+                    acc1 = std::fma(a1[kk], b, acc1);
+                    acc2 = std::fma(a2[kk], b, acc2);
+                }
+                accumulators[0] = acc0;
+                accumulators[1] = acc1;
+                accumulators[2] = acc2;
+            }
+            else
+            {
+                const float *a1 = a0 + K;
+                const float *a2 = a1 + K;
+                const float *a3 = a2 + K;
+                float acc0 = 0.0f;
+                float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
+                for (int kk = 0; kk < K; ++kk)
+                {
+                    const float b = b_row[kk];
+                    acc0 = std::fma(a0[kk], b, acc0);
+                    acc1 = std::fma(a1[kk], b, acc1);
+                    acc2 = std::fma(a2[kk], b, acc2);
+                    acc3 = std::fma(a3[kk], b, acc3);
+                }
+                accumulators[0] = acc0;
+                accumulators[1] = acc1;
+                accumulators[2] = acc2;
+                accumulators[3] = acc3;
+            }
+        }
+
         /**
          * @brief Multiply small FP32 matrices in serial-decode arithmetic order.
          *
@@ -273,20 +368,15 @@ namespace llaminar2
             }
 
             /*
-             * MTP verifier rows need decode-equivalent FP32 accumulation, so we
-             * keep the scalar kk order used by one-row decode. Every product is
-             * an explicit std::fma: implicit `acc += a * b` left contraction to
-             * each loop shape, and AArch64 GCC fused the one-row loop but not
-             * the shared-weight tile, breaking serial/grouped byte equality. The ordinary
-             * row/column loop below is correct, but it reloads the same B row
-             * once per verifier row. This grouped-column path tiles runtime M
-             * in fixed four-row groups and reuses that B row while maintaining
-             * one independent scalar accumulator per row. The fixed tile bounds
-             * register pressure for deep speculation; it is intentionally not a
-             * vector reduction because changing K reduction order would risk
-             * recurrent-state drift in GDN/short-conv publication.
+             * MTP verifier rows need decode-equivalent FP32 accumulation, so
+             * every row keeps the scalar kk order of one-row decode (see
+             * skinnyFP32TileDot). The ordinary row/column loop below is
+             * correct, but it reloads the same B row once per verifier row.
+             * This grouped-column path tiles runtime M in fixed four-row
+             * groups and reuses that B row; the fixed tile bounds register
+             * pressure for deep speculation.
              */
-            constexpr int kVerifierRowTile = 4;
+            constexpr int kVerifierRowTile = kSkinnyFP32RowTile;
             const int row_tiles = selection ? selection->hostTiles(kVerifierRowTile) : (M + kVerifierRowTile - 1) / kVerifierRowTile;
             const int workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
             const int64_t scalar_tasks = static_cast<int64_t>(M) * N;
@@ -309,80 +399,10 @@ namespace llaminar2
                             const int first_row=span.first;
                             const int tile_rows=span.size();
                             if(tile_rows==0)continue;
-                            const float *b_row =
-                                B + static_cast<size_t>(col) * K;
-                            float accumulators[kVerifierRowTile] = {};
-                            const float *a0 =
-                                A + static_cast<size_t>(first_row) * K;
-
-                            /*
-                             * Keep explicit accumulators for each physical tile
-                             * width. A runtime inner row loop invites the compiler
-                             * to choose a different vector/FMA schedule once M
-                             * exceeds four, which is mathematically valid but not
-                             * byte-identical to the proven M=1 decode expression.
-                             */
-                            if (tile_rows == 1)
-                            {
-                                float acc0 = 0.0f;
-                                for (int kk = 0; kk < K; ++kk)
-                                    acc0 = std::fma(a0[kk], b_row[kk], acc0);
-                                accumulators[0] = acc0;
-                            }
-                            else if (tile_rows == 2)
-                            {
-                                const float *a1 = a0 + K;
-                                float acc0 = 0.0f;
-                                float acc1 = 0.0f;
-                                for (int kk = 0; kk < K; ++kk)
-                                {
-                                    const float b = b_row[kk];
-                                    acc0 = std::fma(a0[kk], b, acc0);
-                                    acc1 = std::fma(a1[kk], b, acc1);
-                                }
-                                accumulators[0] = acc0;
-                                accumulators[1] = acc1;
-                            }
-                            else if (tile_rows == 3)
-                            {
-                                const float *a1 = a0 + K;
-                                const float *a2 = a1 + K;
-                                float acc0 = 0.0f;
-                                float acc1 = 0.0f;
-                                float acc2 = 0.0f;
-                                for (int kk = 0; kk < K; ++kk)
-                                {
-                                    const float b = b_row[kk];
-                                    acc0 = std::fma(a0[kk], b, acc0);
-                                    acc1 = std::fma(a1[kk], b, acc1);
-                                    acc2 = std::fma(a2[kk], b, acc2);
-                                }
-                                accumulators[0] = acc0;
-                                accumulators[1] = acc1;
-                                accumulators[2] = acc2;
-                            }
-                            else
-                            {
-                                const float *a1 = a0 + K;
-                                const float *a2 = a1 + K;
-                                const float *a3 = a2 + K;
-                                float acc0 = 0.0f;
-                                float acc1 = 0.0f;
-                                float acc2 = 0.0f;
-                                float acc3 = 0.0f;
-                                for (int kk = 0; kk < K; ++kk)
-                                {
-                                    const float b = b_row[kk];
-                                    acc0 = std::fma(a0[kk], b, acc0);
-                                    acc1 = std::fma(a1[kk], b, acc1);
-                                    acc2 = std::fma(a2[kk], b, acc2);
-                                    acc3 = std::fma(a3[kk], b, acc3);
-                                }
-                                accumulators[0] = acc0;
-                                accumulators[1] = acc1;
-                                accumulators[2] = acc2;
-                                accumulators[3] = acc3;
-                            }
+                            float accumulators[kSkinnyFP32RowTile] = {};
+                            skinnyFP32TileDot(A + static_cast<size_t>(first_row) * K,
+                                              B + static_cast<size_t>(col) * K,
+                                              tile_rows, K, accumulators);
 
                             for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                             {
@@ -428,6 +448,139 @@ namespace llaminar2
                 }
             };
             OMP_WORKSHARE_REGION(work);
+            return true;
+        }
+
+        /** @brief One member of a pooled skinny FP32 projection transaction. */
+        struct SkinnyFP32Member
+        {
+            const float *B = nullptr;    ///< N-by-K weights, one contiguous row per output column.
+            float *C = nullptr;          ///< Row-major M-by-N output, also read when beta is nonzero.
+            int N = 0;                   ///< Output columns of this member.
+            const float *bias = nullptr; ///< Optional N-element bias.
+        };
+
+        /** @brief Largest member count one pooled skinny FP32 transaction admits. */
+        inline constexpr int kSkinnyFP32MaxPooledMembers = 8;
+
+        /**
+         * @brief Multiply several transposed-weight skinny FP32 projections of one input in one team fork.
+         *
+         * Calling run_fp32_skinny_matmul once per member forks and joins one
+         * OpenMP team per member. Here every member's (row tile, column) task
+         * joins one static workshare instead, so a fused call costs exactly one
+         * fork. Every output element is still the same skinnyFP32TileDot
+         * accumulator and completeSkinnyMatmulValue epilogue, so the pooled
+         * outputs are byte-identical to the per-member calls for every M,
+         * N, member count and worker count; only the task partition changes.
+         *
+         * @param A Row-major M-by-K input shared by all members.
+         * @param members Member weights/outputs; they must not alias A or each other.
+         * @param member_count Number of members, from 1 to kSkinnyFP32MaxPooledMembers.
+         * @param M Input rows.
+         * @param K Shared dot-product length.
+         * @param alpha Multiplier applied after the complete ordered dot product.
+         * @param beta Multiplier of the preceding output; zero disables its read.
+         * @return False for invalid dimensions or pointers; true after publication.
+         * @throws std::invalid_argument For an oversized member count or overlapping storage.
+         */
+        inline bool run_fp32_skinny_matmul_members(const float *A,
+                                                   const SkinnyFP32Member *members,
+                                                   int member_count,
+                                                   int M,
+                                                   int K,
+                                                   float alpha = 1.0f,
+                                                   float beta = 0.0f)
+        {
+            if (member_count < 1 || member_count > kSkinnyFP32MaxPooledMembers || !members)
+                throw std::invalid_argument("Pooled skinny FP32 projection needs 1..8 members");
+            if (!A || M < 0 || K < 0)
+            {
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid pooled skinny FP32 input: "
+                          << "A=" << static_cast<const void *>(A) << " M=" << M << " K=" << K);
+                return false;
+            }
+            // Column offsets of each member in the flattened task grid. The
+            // fixed array keeps the call free of heap allocation.
+            std::array<int, kSkinnyFP32MaxPooledMembers + 1> offsets{};
+            const auto *input_begin = reinterpret_cast<const std::byte *>(A);
+            const auto *input_end = input_begin + static_cast<size_t>(M) * K * sizeof(float);
+            for (int member = 0; member < member_count; ++member)
+            {
+                const auto &current = members[member];
+                if (!current.B || !current.C || current.N < 0)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] Invalid pooled skinny FP32 member " << member
+                              << ": B=" << static_cast<const void *>(current.B)
+                              << " C=" << static_cast<void *>(current.C) << " N=" << current.N);
+                    return false;
+                }
+                // Per-member calls run sequentially, so a later member could
+                // observe an earlier member's output. One pooled workshare
+                // has no such order; overlapping storage is a contract error.
+                const auto *output_begin = reinterpret_cast<const std::byte *>(current.C);
+                const auto *output_end = output_begin + static_cast<size_t>(M) * current.N * sizeof(float);
+                if (output_begin < input_end && input_begin < output_end)
+                    throw std::invalid_argument("Pooled skinny FP32 output overlaps its input");
+                for (int other = 0; other < member; ++other)
+                {
+                    const auto *other_begin = reinterpret_cast<const std::byte *>(members[other].C);
+                    const auto *other_end = other_begin + static_cast<size_t>(M) * members[other].N * sizeof(float);
+                    if (output_begin < other_end && other_begin < output_end)
+                        throw std::invalid_argument("Pooled skinny FP32 member outputs overlap");
+                }
+                offsets[static_cast<size_t>(member) + 1] = offsets[static_cast<size_t>(member)] + current.N;
+            }
+            const int total_columns = offsets[static_cast<size_t>(member_count)];
+
+            const auto selection = cpuFloatingProjectionRows(M);
+            if (selection)
+            {
+                if (selection->physicalRows() != M)
+                    throw std::invalid_argument("Floating projection selection exceeds matrix rows");
+                selection->validateHostPublications();
+            }
+            const int row_tiles = selection ? selection->hostTiles(kSkinnyFP32RowTile)
+                                            : (M + kSkinnyFP32RowTile - 1) / kSkinnyFP32RowTile;
+            if (row_tiles == 0 || total_columns == 0)
+                return true;
+
+            auto pooled_work = [&]()
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
+                {
+                    for (int column = 0; column < total_columns; ++column)
+                    {
+                        const auto span = selection
+                            ? selection->hostTileSpan(row_tile, kSkinnyFP32RowTile)
+                            : ProjectionRowSpan{row_tile * kSkinnyFP32RowTile,
+                                                std::min(M, (row_tile + 1) * kSkinnyFP32RowTile)};
+                        const int first_row = span.first;
+                        const int tile_rows = span.size();
+                        if (tile_rows == 0)
+                            continue;
+                        int member = 0;
+                        while (column >= offsets[static_cast<size_t>(member) + 1])
+                            ++member;
+                        const auto &owner = members[member];
+                        const int col = column - offsets[static_cast<size_t>(member)];
+                        float accumulators[kSkinnyFP32RowTile] = {};
+                        skinnyFP32TileDot(A + static_cast<size_t>(first_row) * K,
+                                          owner.B + static_cast<size_t>(col) * K,
+                                          tile_rows, K, accumulators);
+                        for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
+                        {
+                            const size_t output_index =
+                                static_cast<size_t>(first_row + tile_row) * owner.N + col;
+                            owner.C[output_index] = completeSkinnyMatmulValue(
+                                accumulators[tile_row], alpha, beta, owner.C + output_index,
+                                owner.bias ? owner.bias + col : nullptr);
+                        }
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(pooled_work);
             return true;
         }
 
@@ -1907,6 +2060,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether backend-native FP32 matmul uses the decode-equivalent skinny primitive.
+         * @param M Runtime row count.
+         * @param N Output columns.
+         * @param transpose_B Whether each output column has a contiguous weight row.
+         * @return True for transposed one-row decode and for small M-by-N shapes.
+         */
+        inline bool fp32MatmulUsesSkinnyPrimitive(int M, int N, bool transpose_B) noexcept
+        {
+            return (transpose_B && M == 1) || (M <= 64 && N <= 64);
+        }
+
+        /**
          * @brief Execute FP32 matrix multiplication using OneDNN with optional fused bias
          *
          * @param A Input matrix A [M, K] (FP32, row-major)
@@ -1954,15 +2119,8 @@ namespace llaminar2
              * from a historical `M<=4` size range would conflate execution mode
              * with shape and break as soon as speculative depth grows.
              */
-            if (B && transpose_B && M == 1)
-            {
+            if (fp32MatmulUsesSkinnyPrimitive(M, N, transpose_B))
                 return run_fp32_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta, bias);
-            }
-
-            if (B && M <= 64 && N <= 64)
-            {
-                return run_fp32_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta, bias);
-            }
 
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;
@@ -4048,6 +4206,40 @@ namespace llaminar2
                     }
                 }
 
+                if (weight_type_ == TensorType::FP32 &&
+                    numerical_policy_ == NumericalPolicy::BackendNative &&
+                    projections.size() >= 2 &&
+                    projections.size() <= static_cast<size_t>(kSkinnyFP32MaxPooledMembers) &&
+                    std::all_of(projections.begin(), projections.end(), [m](const auto &projection) {
+                        return fp32MatmulUsesSkinnyPrimitive(m, projection.n, /*transpose_B=*/true);
+                    }))
+                {
+                    // Every member would take run_fp32_skinny_matmul through
+                    // run_onednn_fp32_matmul. Run them as one pooled workshare:
+                    // one team fork per fused call, byte-identical outputs.
+                    std::array<SkinnyFP32Member, kSkinnyFP32MaxPooledMembers> members{};
+                    for (size_t index = 0; index < projections.size(); ++index)
+                    {
+                        const auto &projection = projections[index];
+                        const auto *kernel = static_cast<const FloatingPointGemmKernel *>(projection.kernel);
+                        float *output = projection.output->mutable_data();
+                        if (!output)
+                            return false;
+                        members[index] = SkinnyFP32Member{
+                            kernel->weight_tensor_->data(), output, projection.n,
+                            projection.bias ? projection.bias->data() : nullptr};
+                    }
+                    KERNEL_PROFILE_SCOPE(m == 1 ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32);
+                    if (!run_fp32_skinny_matmul_members(input->data(), members.data(),
+                                                        static_cast<int>(projections.size()), m, k))
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Pooled fused FP32 projection execution failed");
+                        return false;
+                    }
+                    recordFusedProjectionCall(m, k, projections.size());
+                    return true;
+                }
+
                 for (const auto &projection : projections)
                 {
                     auto *kernel = static_cast<FloatingPointGemmKernel *>(
@@ -4197,19 +4389,29 @@ namespace llaminar2
                     }
                 }
 
-                if (PerfStatsCollector::isDomainEnabled("kernel"))
-                {
-                    PerfStatsCollector::addCounter(
-                        "kernel",
-                        "cpu_floating_fused_projection_calls",
-                        1.0,
-                        "gemm",
-                        "cpu",
-                        {{"m", std::to_string(m)},
-                         {"k", std::to_string(k)},
-                         {"projections", std::to_string(projections.size())}});
-                }
+                recordFusedProjectionCall(m, k, projections.size());
                 return true;
+            }
+
+            /**
+             * @brief Count one completed fused floating projection call.
+             * @param m Runtime row count.
+             * @param k Shared reduction width.
+             * @param projections Number of fused members.
+             */
+            static void recordFusedProjectionCall(int m, int k, size_t projections)
+            {
+                if (!PerfStatsCollector::isDomainEnabled("kernel"))
+                    return;
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_floating_fused_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    {{"m", std::to_string(m)},
+                     {"k", std::to_string(k)},
+                     {"projections", std::to_string(projections)}});
             }
 
             /**
