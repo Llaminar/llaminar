@@ -419,3 +419,14 @@ enumeration) — the reviewer's round-5/6 re-verdict at the landable tip
 addf3db78 proceeds. Main's application default: YES if ACK + all-arch
 builds + no new canonical failures + one Main-run canonical on the
 combined tip before applying.
+
+### B4 COMBINED-TIP CANONICAL GO (~06:59Z): Main's campaign-src-b4c (tree 54b9e8e28) started on .80
+
+addf3db78 confirmed directly on 0ad09600b (6 commits, tests-only, the
+head TU aarch64-guarded). Main's canonical = the pre-application gate
+per the default: build + the focused CPUDraftVocabularyBudget pair +
+the full Unit+preflight. B1ATTR2 already completed + sealed
+(K14-B1ATTR2-12675C956-20261112, 16 files) — .80 was idle, so the GO
+was immediate. After the canonical: the B4 application decision (YES
+if no new canonical failures beyond the inherited set) → the .80 queue
+resumes (idea-04 M=1 → 27B rider).
