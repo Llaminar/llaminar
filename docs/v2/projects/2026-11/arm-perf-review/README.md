@@ -1965,3 +1965,16 @@ Raw: .80 campaign-747-results/, /tmp/llaminar-main-bb-linux-results/
 campaign747/. PR body updated.
 NEXT: FMLAL landing cycle (addon rebases onto 74797687f → push → #5
 first-priority on .80 after the B1 export → handback → Main applies).
+
+### SECOND UPSTREAM REBASE IN FLIGHT (~09:20Z): operator-requested, base ca9902d3f
+
+Main rebased PR #43 onto the new upstream base ca9902d3f (6 commits by
+David): candidate **ae51ce3f0** (233 replayed commits + 1
+reconciliation). One semantic conflict: upstream's caller-mask restore
+in configureClusterRankThreads — the branch requires native core
+admission there and keeps the bound master's permanent place; the
+upstream test adapted to assert unbound requests are rejected.
+**Main's validation running (main-rb2, started 09:20:33Z, ~60 min,
+Integration NEON_I8MM); the M=1 window waits; the M=1 re-anchor follows
+Main's new-tip announcement (not 7a4790c77 — the base changed).**
+Lanes rebase onto the announced tip after validation.
