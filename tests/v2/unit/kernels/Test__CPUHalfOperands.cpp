@@ -570,6 +570,12 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
     // where the historical false-count lived. The probe stays enabled for
     // the whole group.
     {
+        // The primitive controls instantiate the INTENDED FMLAL domain
+        // (<FP16, HalfRNE=true>): the default <FP16,false,false> domain is
+        // correctly excluded from FMLAL by production, so its calls would
+        // never reach the route the counter names. The enable scope covers
+        // exactly this group.
+        FmlalProbe probe;
         const std::vector<uint16_t> weight_words=weightWords(1,65);
         const auto *a_data=a65.data();
         const auto *b_data=weight_words.data();
@@ -577,26 +583,26 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
         // (P1) Zero M: zero row tiles -> no live span -> no count.
         const long long before_m=fmlalLeafInvocations();
         const bool zero_m=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
-            llaminar2::TensorType::FP16>(a_data,b_data,c_data,0,1,65);
+            llaminar2::TensorType::FP16, true>(a_data,b_data,c_data,0,1,65);
         ASSERT_TRUE(zero_m);
         EXPECT_EQ(fmlalLeafInvocations()-before_m,0)<<"prim zero-M";
         // (P2) Zero N: zero columns -> no FMLAL vector work -> no count.
         const long long before_n=fmlalLeafInvocations();
         const bool zero_n=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
-            llaminar2::TensorType::FP16>(a_data,b_data,c_data,1,0,65);
+            llaminar2::TensorType::FP16, true>(a_data,b_data,c_data,1,0,65);
         ASSERT_TRUE(zero_n);
         EXPECT_EQ(fmlalLeafInvocations()-before_n,0)<<"prim zero-N";
         // (P3) Null A: pre-validation returns false -> no count.
         const long long before_null=fmlalLeafInvocations();
         const bool null_a=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
-            llaminar2::TensorType::FP16>(nullptr,b_data,c_data,1,1,65);
+            llaminar2::TensorType::FP16, true>(nullptr,b_data,c_data,1,1,65);
         EXPECT_FALSE(null_a);
         EXPECT_EQ(fmlalLeafInvocations()-before_null,0)<<"prim null-A";
         // (P4) Positive live work at the primitive: exactly one admitted
         // dispatch on the resolved FMLAL route.
         const long long before_live=fmlalLeafInvocations();
         const bool live_ok=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
-            llaminar2::TensorType::FP16>(a_data,b_data,c_data,1,1,65);
+            llaminar2::TensorType::FP16, true>(a_data,b_data,c_data,1,1,65);
         ASSERT_TRUE(live_ok);
         EXPECT_EQ(fmlalLeafInvocations()-before_live,fmlalRouteResolved()?1:0)<<"prim live";
         // (P5) Positive capacity, ALL-INACTIVE span, at the primitive: the
