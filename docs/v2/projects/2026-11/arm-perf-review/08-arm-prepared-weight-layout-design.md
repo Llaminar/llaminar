@@ -1,0 +1,694 @@
+# Idea 08 — compact ARM prepared-weight layout: design
+
+Status: **Design complete — reframed after the sealed tournament result;
+implementation gated on an operator capacity-value call** (arm-idea08,
+operator-authorized 2026-11-12T20:58Z). Pinned to `d5e04fdce` (PR #43 tip;
+this lane's read-only base).
+All `file:line` citations resolve at that commit unless prefixed with another
+SHA.
+
+Inputs of record:
+
+- **Corrected census (sealed ~20:03Z, K14-I08A-CENSUS-5C2CEF47 / SUMMARY-v2):**
+  the 35B (Qwen3.6-35B-A3B-MTP-UD-IQ3_S) prepared quantised weights are
+  **26.62 GB predicted vs 15.34 GB source = 1.73×**. Carrier:
+  **CompactMultiScale `ffn_gate/up_exps` (80 tensors, 40/41 layers):
+  6.88→16.11 GB = 2.34×, +9.2 GB**, and **NibbleLUTSourceScale `ffn_down_exps`
+  (37 tensors): 5.28→6.83 GB (+1.55 GB)**. Q6KNativeDualScale is genuinely
+  native (1.06×); IQ3SExpandedSourceScale (blk.39) is negligible. Estimator-based
+  (predicted labeling; `preparedFootprintForFormat` byte-equality is the tested
+  production invariant and the normative anchor). Observed per-tensor
+  enumeration remains a post-merge debug seam — not built here.
+- **Tournament seal (K14-I08A-TOURNEY-3B109793C-20261112, 9/9 green,
+  reviewer-ACK-pinned bench, first valid timing)**: for the IQ3_S family,
+  decoding from a compact source-scale layout (4.25 bpw) is **7.0–8.6×
+  slower** than reading the pre-expanded prepared grid (9.5 bpw) across
+  ASIMD/DotProd/I8MM at M=1/4/15 (e.g. I8MM M1: 4.02 µs expanded vs 34.8 µs
+  compact; M15: 34.6 vs 271.0), despite the compact form reading 2.2× fewer
+  bytes. **Decode at these shapes is dequant-compute-bound, not
+  bandwidth-bound.** The "compact the layout to win decode bandwidth"
+  premise is measured-and-negative for the IQ3_S family; this design claims
+  capacity only, never decode speed (§1.5, §2.3).
+- **Repaired tournament bench (reviewer ACK @ `3b109793c`,
+  `codex/arm-idea16-tournament-repair`)**: the per-invocation observability
+  standard this design's bench plan follows (§7).
+
+Companion idea doc: `08-arm-prepared-weight-layout.md` (same directory). The
+review-head file names (`CPUNativeVNNI*.h`) were consolidated before
+`d5e04fdce` into the `CPUNativeQuantised*` names cited here.
+
+---
+
+## 1. What the expansion bytes actually are
+
+### 1.1 The prepared unit
+
+Every CPU NativeQuantised projection is stored as one interleaved stream of
+**units**: 64 output columns × one 32-value K block
+(`CPUNativeQuantisedWindowPacking.inc:61-64`, `CPUNativeQuantisedWeightView.h:445-448`).
+`data_stride` = payload bytes of a unit; `interleaved_block_stride` = total unit
+bytes including inline metadata. Both come from exactly two constexpr functions
+(`CPUNativeQuantisedPreparedFootprint.h:69-110`) — the single layout authority —
+and every consumer re-derives or validates against them (§6).
+
+Unit = 2048 logical weights, so stride in bytes ÷ 256 = bits per weight.
+
+### 1.2 Section anatomy per encoding (canonical layout, at `d5e04fdce`)
+
+Writes: `CPUNativeQuantisedWindowPacking.inc:168-213` (superblock/native path),
+`CPUNativeQuantisedWeightPacker.h:360-400` (`packExpandedInt8Direct`),
+`CPUNativeQuantisedWeightPacker.h:150-330` (deferred repack). Reads:
+`CPUNativeQuantisedWeightView.h:317-364` (`chunkScales`/`chunkMins`/
+`admittedScales`/`admittedMins`/`chunkEffectiveMins`), `interleavedB`
+(`:372-381`).
+
+| Encoding | Unit sections (canonical) | Stride | bpw |
+|---|---|---|---|
+| NibbleLUT (Q4_0/IQ4_NL/Q4_1) | `[0,1024)` nibble payload (16 B/col, all live) · `[1024,1152)` **int16 compensation ×64** · `[1152,1280)` fp16 scale ×64 · `[1280,1408)` fp16 min ×64 (asym only) | 1280 sym / 1408 asym | 5.0 / 5.5 |
+| NibbleLUTSourceScale (IQ4_XS) | `[0,1024)` nibble payload · `[1024,1152)` **comp ×64** · `[1152,1280)` fp16 base ×64 · `[1280,1408)` raw coefficient ×64 | 1408 fixed | 5.5 |
+| ExpandedInt8 | `[0,2048)` int8 payload · `[2048,2176)` **comp ×64** · scales · mins (asym) | 2304 sym / 2432 asym | 9.0 / 9.5 |
+| IQ3SExpandedSourceScale (IQ3_S) | `[0,2048)` decoded grid · **comp** · half base ×64 · raw nibble ×64 | 2432 fixed | 9.5 |
+| Q6KNativeDualScale | `[0,1024)` payload · `[1024,1536)` high-bit planes (512 B) · scales `[1536,1664)` · signed coefficients `[1664,1792)` | 1792 | 7.0 |
+| CompactMultiScale (Q3_K/Q2_K/IQ2_S/IQ2_XS/IQ1_M) | `[0,1024)` **fixed 4-group payload region** · primary fp16 `[1024,1152)` · secondary `[1152,1280)` · emins uint32 ×64 `[1280,1536)` | 1536 | 6.0 |
+
+### 1.3 The dead bytes, family by family
+
+**(A) CMS payload-region padding.** The CMS payload region is a *fixed*
+`data_stride = 1024` (4 groups × 256 B) regardless of the source payload width
+(`preparedDataStride`, `CPUNativeQuantisedPreparedFootprint.h:69-76`). The
+writer places `payload_bytes × 64` live bytes at `(byte/4)*256 + column*4 +
+byte%4` (`WindowPacking.inc:169-170`); the rest of the region is zero ("Unused
+bytes are zero, not another ledger", `PreparedFootprint.h:106-107`). Live
+payload per unit by codebook (`NativeQuantisedFormatInfo.h:198-210` catalog;
+payload bytes per 32-value block):
+
+| Codebook | Format | payload_bytes | live payload | dead padding |
+|---|---|---|---|---|
+| 9 | Q3_K | 12 | 768 B | 256 B |
+| 10 | Q2_K | 8 | 512 B | 512 B |
+| 13 | IQ2_S | 9 | 576 B | 448 B |
+| 14 | IQ2_XS | 9 | 576 B | 448 B |
+| 17 | IQ1_M | 6 | 384 B | 640 B |
+
+**(B) CMS emins section.** 256 B per unit of `uint32` effective minima at
+`data_stride + 256` (`WindowPacking.inc:173`, view `:357-364`). Only codebook
+10 (Q2_K) reads it (`MultiScaleKernels.h:668` `chunkEffectiveMins`, gated by
+`codebook_id == 10` in the scalar reference `:310-316`; `has_emins` is true
+only for Q2_K in the catalog). For Q3_K, IQ2_S, IQ2_XS, IQ1_M the entire
+256 B is zero-filled dead weight.
+
+**(C) Compensation section, ARM-dead.** The 128 B int16 compensation vector
+exists for x86 `u8xs8` arithmetic: `sum((qa+128)*qw) − 128*sum(qw)`. It is
+written for every non-CMS/non-Q6K encoding (`WindowPacking.inc:197`,
+`WeightPacker.h:620-655`), and read by x86 AVX2/AVX-512 GEMV/GEMM
+(`CPUNativeAVX2Gemv.h:173-178,325-330,492-496` etc.;
+`CPUNativeQuantisedGemv.h:1589,1792,2143,2455,2840,3635,3882,4121,4573,4729,4881,5042`).
+The NEON projection never reads it: ARM SDOT/SMMLA compute signed×signed dots
+directly, and the asymmetric correction uses the **activation's** `sum_qs`
+(`CPUNativeNEONPreparedProjection.h:631-637` `accumulateCorrectedSingleScale-
+BlockNEON` with `a.sum_qs`, panel form `:827-833`), not the weight
+compensation. The idea-08
+review's mutation-test plan (no NEON reader of comp per encoding) is confirmed
+structurally at this head. Dead cost: NibbleLUT 1280 B stride → 10.0% dead;
+NibbleLUTSourceScale 1408 B → 9.1% dead; ExpandedInt8 2304 B → 5.6% dead.
+
+**(D) Scale/secondary replication.** CMS and NLSS store primary (and
+secondary) words **per column per 32-value block** (`chunkScales(chunk, kb)`,
+`WindowPacking.inc:171-172,210-212`), while the source formats store one
+factor set per 256-value superblock (8 blocks). E.g. IQ4_XS source: 1088 B/unit
+(`native_block_bytes_for_format` = 136 B per 256 values,
+`WeightPacker.h:76-100`) vs 1408 B prepared: +128 B dead comp, +112 B base
+replication (2 B per 64 columns per block vs 2 B per 8 blocks), +80 B
+coefficient widening (6-bit source scale → uint16).
+
+### 1.4 Per-family expansion table (unit = 2048 weights)
+
+Source bytes per unit = `native_block_bytes_for_format × 8` for superblock
+formats (256-value blocks), `× 64` for 32-value blocks:
+
+| Format (cb) | Source B/unit | Prepared B/unit | Expansion | Anatomy |
+|---|---|---|---|---|
+| **IQ2_S (13)** | 656 | **1536** | **2.34×** | 448 pad + 256 dead emins + 128×2 scale repl. |
+| IQ2_XS (14) | 592 | 1536 | 2.59× | same |
+| Q2_K (10) | 672 | 1536 | 2.29× | 512 pad (emins live) + scale repl. |
+| Q3_K (9) | 880 | 1536 | 1.75× | 256 pad + dead emins |
+| IQ1_M (17) | 448 | 1536 | 3.43× | 640 pad + dead emins |
+| **IQ4_XS (4+s)** | 1088 | **1408** | **1.29×** | 128 comp + 192 repl. |
+| Q4_0/IQ4_NL (0/4) | 1152 | 1280 | 1.11× | 128 comp |
+| Q4_1 (5) | 1280 | 1408 | 1.10× | 128 comp |
+| Q8_0 (19) | 2176 | 2304 | 1.06× | 128 comp |
+| Q6_K (8) | 1680 | 1792 | 1.07× | ~native; none addressed here |
+
+The census carrier ratio (2.34×) identifies the 35B gate/up experts as
+IQ2_S-dominant, exactly matching the 1536/656 unit arithmetic — the census and
+the packer agree without any observed seam.
+
+### 1.5 The tournament result: what it refutes, and what it does not touch
+
+The sealed tournament asked a **decode-program question**: for IQ3_S, is it
+cheaper to (A) read pre-decoded grid bytes (9.5 bpw — the production
+IQ3SExpandedSourceScale layout) or (B) decode the compact source payload
+inline per invocation (4.25 bpw — scalar gathers from the 512-entry grid
+plus the sign program, "the irreducibly scalar part on this ISA", bench
+header @ `3b109793c`)? Measured answer: (B) is 7.0–8.6× slower per
+invocation; decode at these shapes is **dequant-compute-bound**, so the
+2.2× byte reduction buys nothing. Two consequences, kept strictly separate:
+
+1. **The measured price does not attach to this design.** This design never
+   changes a decode program. The CMS family's production kernel *already*
+   decodes inline from the native payload — an existing production choice,
+   retained unchanged: IQ2_S/IQ2_XS quarters assemble a 10-bit grid index
+   from `word(0)/word(1)` and fetch each eight-byte grid entry with four
+   scalar `vld1q_lane_u64` lane loads plus `vuzp` transposes
+   (`CPUNativeNEONMultiScaleOps.h:203-222` `gridPair`, driven from
+   `CPUNativeQuantisedMultiScaleKernels.h:405-420` and `:476-492`);
+   Q3_K/Q2_K use the shift/mask linear decoder (`:340-346`);
+   NibbleLUT/NibbleLUTSourceScale decode with one `vqtbl1q` per group
+   against the 16-entry IQ4 LUT (`CPUNativeNEONPreparedProjection.h:206-212`
+   `nibbles()` — the table fits one 16-byte register, categorically cheaper
+   than the 512-entry grid gathers that priced the tournament's compact
+   arm); ExpandedInt8/IQ3_S read pre-decoded bytes (the tournament's
+   *winning* arm). Compaction here removes bytes those exact programs
+   **never load** (§2.1 proves the read set equals the retained bytes per
+   family) and adds zero dequant arithmetic. There is no mechanism by which
+   the 7–8.6× price applies to it.
+2. **The tournament's bandwidth finding does transfer — as a ceiling on
+   claims, not a cost.** CMS inline decode is the same class of per-block
+   dequant work (scalar grid lane loads + transposes) the tournament
+   measured as dominant. If decode is dequant-bound, removing unread bytes
+   is speed-neutral. This design therefore claims **capacity, not speed**;
+   its performance gate is non-regression under the operator's
+   same-or-better bar, with cache/stride side effects treated as noise to
+   measure, never a win to bank (§7, §8).
+
+Dead, explicitly: any proposal that trades pre-expanded bytes for inline
+decode (the tournament's shape) — measured-and-negative, sealed, not
+revisited here. The "~42% reduction as the decode-bandwidth prize" framing
+of the original lane brief is retired. The surviving scope is exactly the
+post-tournament classes: **(a)** dead-byte trimming inside the current
+layouts with the access pattern unchanged — this design; **(b)** the
+capacity value of that trim where admission is memory-bound, quantified
+honestly in §2.3 (no currently-measured topology is blocked by the 1.73×
+expansion; the value is residency headroom); **(c)** nothing that slows the
+expanded decode path — no decode program changes anywhere in this design.
+If a future capacity emergency ever demanded tournament-style source-byte
+residency, the sealed 7.0–8.6× decode price would be the stated, accepted
+cost of that separate decision — not of this one.
+
+---
+
+## 2. The compact ARM layout (per family)
+
+Design principle: **compaction changes byte placement and unit extent only**.
+Payload bits, metadata words, decode expressions, scale programs, partition
+trees, and every FP32 edge are byte-identical to the canonical layout. The
+readers' addressing is already `data_stride`-relative (§1.2), so the compact
+layout is expressed almost entirely through the two stride functions plus one
+view predicate.
+
+### 2.1 Compact unit sections
+
+| Encoding | Compact sections | Stride | bpw |
+|---|---|---|---|
+| NibbleLUT | payload 1024 · scales +0 · mins +128 (asym) — **comp dropped** | 1152 sym / 1280 asym | 4.5 / 5.0 |
+| NibbleLUTSourceScale | payload 1024 · base +0 · coefficient +128 — **comp dropped** | 1280 | 5.0 |
+| ExpandedInt8 | payload 2048 · scales +0 · mins +128 (asym) — **comp dropped** | 2176 sym / 2304 asym | 8.5 / 9.0 |
+| IQ3SExpandedSourceScale | payload 2048 · base +0 · nibble +128 | 2304 | 9.0 |
+| Q6KNativeDualScale | **unchanged** (already native; no comp, no padding) | 1792 | 7.0 |
+| CMS Q3_K | payload `ceil(12/4)×256 = 768` · primary +0 · secondary +128 | 1024 | 4.0 |
+| CMS Q2_K | payload 512 · primary +0 · secondary +128 · emins +256 | 1024 | 4.0 |
+| CMS IQ2_S / IQ2_XS | payload `ceil(9/4)×256 = 768` · primary +0 · secondary +128 | 1024 | 4.0 |
+| CMS IQ1_M | payload 512 · primary +0 · secondary +128 | 768 | 3.0 |
+
+Rules, in one place:
+
+1. **Compensation section: absent.** `usesInlineCompensation()` is false for
+   every encoding under the compact layout (it is already false for Q6K and
+   CMS; `CPUNativeQuantisedWeightView.h:304-305`).
+2. **CMS payload region: tight.** `data_stride = ceil(payload_bytes/4) × 256`
+   (the 4-byte group interleave granularity is retained so NEON `vld1q` lane
+   loads keep their exact addresses — `decodeLinear`'s `word(Group/4)`
+   (`MultiScaleKernels.h:340-346`), IQ2_S quarters `word(0)/word(1)/
+   sign_byte 5+Q → word(1)/word(2)` (`:405-420`), IQ1_M signs at absolute
+   `unit+256` (`:675`), all stay in-range by construction).
+3. **CMS emins: Q2_K only** (`has_emins` from the format catalog — the sole
+   live consumer).
+4. **Q6K: byte-identical.** Its readers use absolute offsets
+   (`unit+1024` planes, `NEONPreparedProjection.h:442` and the `q6Group`
+   helper `:438-452`; scales/coeffs via
+   `admittedScales/admittedMins` at `data_stride+0/+128` with
+   `data_stride = 1536`), which the compact layout leaves untouched.
+
+The view/packer offsets that change are exactly the ones already dual-formed:
+`chunkScales = data_stride + (usesInlineCompensation() ? 128 : 0)` and
+`chunkMins = data_stride + (… ? 256 : 128)` (`WeightView.h:317,330,340,349`);
+`chunkEffectiveMins = data_stride + 256` is layout-invariant. The compact
+layout therefore *reuses the CMS/Q6K addressing form* for the comp-bearing
+encodings. `interleavedB`'s group bound is `data_stride/256` (`WeightView.h:372-381`)
+— tight CMS data strides keep every legal group in range.
+
+**Read-set proof (the zero-arithmetic-change invariant, per family).** The
+retained bytes are exactly the bytes the production kernels load; the
+removed bytes are provably never loaded:
+
+| Family | Production read set within the unit | Removed bytes ever loaded? |
+|---|---|---|
+| CMS Q3_K (9) | payload words 0-2 (`decodeLinear`: `word(Group/4)` for G<8 plus `word(2)` high bits, `MultiScaleKernels.h:340-352`) · primary · secondary | padding beyond 768 B: no; emins: no (Q2_K-only reader `:668`) |
+| CMS Q2_K (10) | payload words 0-1 · primary · secondary · **emins** (`:668-672`) | padding beyond 512 B: no |
+| CMS IQ2_S/IQ2_XS (13/14) | payload words 0-2 (index low `word(0)`, index bits + signs `word(1)`, 9th byte via `word(2)` for Q=3, `:405-420/:476-492`) · primary · secondary | padding beyond 768 B: no; emins: no |
+| CMS IQ1_M (17) | payload words 0-1 (signs at `unit+256` absolute, `:675`) · primary · secondary | padding beyond 512 B: no; emins: no |
+| NibbleLUT / NLSS | payload groups 0-3 (`unit + group*256 + column*4`, `NEONPreparedProjection.h:366-372`) · scales · mins/coeff | comp `[data_stride, data_stride+128)`: no NEON reader (§1.2 C) |
+| ExpandedInt8 / IQ3S | payload groups 0-7 · scales · mins/base/nibble | comp: no NEON reader |
+| Q6K (8) | payload + planes `[0,1536)` · scales · coefficients | nothing removed |
+
+Every retained load keeps its address expression and value; only the unit
+extent and the metadata section base (comp removal) change. This is the
+structural reason the tournament's 7.0–8.6× price cannot attach (§1.5).
+
+### 2.2 What is intentionally NOT compacted (V1)
+
+- **Per-unit scale planes.** Primary/secondary stay per column per block.
+  Superblock dedup (store the shared base once per 8 units) would cut another
+  ~0.7–1.0 bpw for IQ2_S/IQ4_XS but changes view addressing across units —
+  an access-pattern change that no longer qualifies as zero-risk dead-byte
+  trimming under the post-tournament bar; **out of scope** for this lane
+  (§9.3), revisitable only with its own measured non-regression case.
+- **IQ2_S secondary width.** The coefficient is a byte (`≤ 255`,
+  `native_quantised_iq2s_scale::valid`, seal rule `WeightView.h:139`, check
+  sites `:82,:110,:533`) currently stored as uint16. Byte-packing saves 64
+  B/unit (6%) but adds a per-codebook layout branch through
+  seal/reader/packer and widens loads — access-pattern change, **out of
+  scope** (§9.3).
+- **IQ2_S 9th payload byte.** The ceil-to-group padding of 192 B/unit could
+  become a separate 64 B byte-plane section (832 B/unit) — a different
+  payload addressing family for the tail byte; access-pattern change,
+  **out of scope** (§9.3). The group form keeps one uniform payload
+  addressing family.
+
+### 2.3 Sizing and the honest capacity claim (35B, census carrier split)
+
+- CMS gate/up: 16.11 GB × 1024/1536 = **10.74 GB** (−5.37 GB; IQ1_M-shaped
+  tensors would fall to 768, none identified in the census).
+- NLSS down: 6.83 GB × 1280/1408 = **6.21 GB** (−0.62 GB).
+- IQ3S/ExpandedInt8 outliers (blk.39): ≈ −0.03 GB.
+- Q6K (output.weight, token_embd, 3 down tensors): unchanged.
+- **Total: 26.62 → ≈ 20.6 GB prepared quantised (−22.6%, −6.0 GB)**; plan-BOM
+  total 34.9 → ≈ 28.9 GB. Resident expert-byte capacity (gate/up+down)
+  rises ≈ 35% per admitted CMS byte and ≈ 10% per NLSS byte. The remaining
+  gap to "source-sized" (15.34 GB) is scale-plane replication plus the
+  retained group granularity — the out-of-scope access-pattern headroom
+  catalogued (and excluded) in §2.2.
+
+**What this capacity is worth — quantified against the coordinator's
+question ("which topologies does 26.6 GB block that 20.6 GB admits?"):**
+
+- **No currently-measured topology is admission-blocked by the 1.73×
+  expansion.** The GB10 (128 GB UMA) hosts the 35B at a 34.9 GB plan BOM
+  with ample headroom; the same holds for the measured serving cells. The
+  trim does not unblock any deployment that fails today.
+- The value is **residency headroom on memory-bound axes**:
+  (i) ExpertOverlay CPU/expert tiers are admitted by bytes
+  (`PhysicalMemoryAuthority`, `--expert-tier … memory-mb /
+  max-experts-per-layer`): −6.0 GB ≈ 26% more routed experts resident per
+  admitted tier, i.e. fewer cross-tier migrations per token window on the
+  same hardware — a capacity/steady-state effect, **not** a per-token
+  speedup claim; (ii) KV/context headroom (+6 GB) on UMA hosts where KV,
+  weights and GPU workspaces share one pool (idea 2's live-admission gap
+  is the complementary piece); (iii) multi-model packing headroom.
+- **Speed expectation: neutral.** Per §1.5, CMS/NLSS decode is
+  dequant-compute-bound inline work; removing unread bytes does not remove
+  arithmetic. The binding gate is same-or-better measured performance
+  (§7/§8); anything slower is rejected and the lane reverts.
+
+Because the prize is capacity rather than a blocked-topology unlock, the
+lane's expected value is materially lower than the original brief assumed;
+§8 places an explicit operator decision gate before any byte-changing
+phase, and §9 states the close/continue assessment.
+
+The LM-head census finding (Q6 445 MB × 2 read per token at M=1) is untouched
+by this design — it belongs to the idea-16/B4 LM-head lane.
+
+---
+
+## 3. Per-ISA layout identity — x86 unchanged **by construction**
+
+A typed layout dimension, not a runtime mode:
+
+```cpp
+enum class CPUNativeQuantisedLayout : std::uint8_t
+{
+    InterleavedCanonical = 0,   ///< current bytes: inline compensation, fixed CMS payload region
+    InterleavedCompactA64 = 1,  ///< §2: no compensation, tight CMS payload, Q2_K-only emins
+};
+
+#if defined(__aarch64__)
+inline constexpr CPUNativeQuantisedLayout kHostPreparedLayout =
+    CPUNativeQuantisedLayout::InterleavedCompactA64;
+#else
+inline constexpr CPUNativeQuantisedLayout kHostPreparedLayout =
+    CPUNativeQuantisedLayout::InterleavedCanonical;
+#endif
+```
+
+- **Production packers** (`packWeightsCPUNativeQuantised`,
+  `initializeNativeWindowOutput`/`appendNativeWeightGroups`,
+  `packExpandedInt8Direct`, deferred repack) derive the layout from
+  `kHostPreparedLayout`. An x86 build physically produces canonical bytes;
+  no caller can select otherwise — there is no parameter to misuse.
+- **Production execution admission** (`CPUNativeNEONProjectionTile::
+  requireExecutable` / the x86 GEMV/GEMM admission, `PackedWeights::
+  readView`) requires the stream's layout to equal `kHostPreparedLayout`.
+  An ARM build cannot execute canonical bytes; an x86 build cannot execute
+  compact bytes. Retirement is complete per-ISA; no fallback exists.
+- **Estimators take an explicit layout.** `preparedFootprintForFormat(source,
+  rotation, layout = kHostPreparedLayout)` — homogeneous serving (planner on
+  the serving ISA) is unchanged by default; cross-ISA planning (an x86
+  discovery root pricing an ARM CPU tier) passes the target endpoint's layout
+  from the typed inventory. The compact tables are inert constexpr pricing
+  data on x86 — they never select bytes there.
+- **The archive/wire records the layout** (§7) so mismatches are diagnosed,
+  never silently reinterpreted.
+
+Operator bar ("x86 performance unchanged") is met structurally: every x86
+byte-producing and byte-consuming path compiles to the same code with the same
+strides; the only x86-visible changes are the added enum, the widened
+signatures, and the archive/wire version field.
+
+---
+
+## 4. The full ABI chain that moves in one piece
+
+Every site below touches `preparedDataStride` / `preparedInterleavedBlockStride`
+/ section offsets / the stride-derived extent. The change lands as one atomic
+branch state; no partial ABI is ever published.
+
+**Layout authority**
+1. `kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h` — layout enum,
+   host constant, layout-aware `preparedDataStride(layout, encoding, source)`
+   and `preparedInterleavedBlockStride(layout, encoding, source)` (canonical
+   overloads remain as the x86 authority and the dispatcher's canonical arm).
+2. New typed `PreparedUnitSections` (payload extent, has-comp, scales/mins/
+   emins offsets, stride) computed by one function; packer, view, seal and the
+   wire kernels consume it instead of re-deriving offsets
+   (replaces the duplicated `+128/+256` literals at `WindowPacking.inc:171-212`,
+   `WeightView.h:280,317-364`, `WeightPacker.h:620-655`).
+
+**Producer**
+3. `CPUNativeQuantisedWindowPacking.inc` — `initializeNativeWindowOutput`
+   (:55-73) stride/layout selection; `appendNativeWeightGroups` (:88-214)
+   layout-conditional comp/scales/mins placement (CMS branch :168-174 is
+   already offset-relative and comp-free).
+4. `CPUNativeQuantisedWeightPacker.h` — `packExpandedInt8Direct` (:198-412,
+   comp/scale/min placement :620-655); deferred `repackNativeBlocksToInterleaved`
+   (:120-330); rotation path interleaving (:700+).
+
+**Owner / view / seal**
+5. `CPUNativeQuantisedPackedWeights.h` — descriptor gains `layout`;
+   `readView` (:207-223) extent/geometry checks; `normalizePaddingMetadata`
+   (:232-290) secondary-offset; `preparedFootprint()` (:184-196) carries
+   layout.
+6. `CPUNativeQuantisedWeightView.h` — `admitStructure` (:422-465) validates
+   extent = chunks×blocks×`stride(layout, …)`; `usesInlineCompensation()`
+   (:304-305) becomes layout-aware; `CPUNativeQuantisedMetadataSeal::validate`
+   (:502-527) scans the metadata plane under the section offsets.
+7. `CPUNativeQuantisedPublishedBytes.h` — sealed container identity.
+
+**Execution kernels**
+8. `CPUNativeNEONPreparedProjection.h` — no addressing changes beyond the
+   view predicate (§2.1); `requireExecutable` (:100-137) adds the host-layout
+   admission.
+9. `CPUNativeQuantisedMultiScaleKernels.h` — unchanged (all addressing is
+   `data_stride`-relative or payload-relative; scalar reference :288-330 works
+   through accessors).
+10. x86 `CPUNativeAVX2Gemv.h` / `CPUNativeQuantisedGemv.h` /
+    `CPUNativeQuantisedGemmKernel.h` — unchanged (host layout = canonical);
+    admission rejects non-canonical streams.
+11. `CPUQ8ResidualCorrection.h:74-75` — stride validation via the
+    layout-aware function.
+
+**Estimators / BOM (lockstep, per the lane brief)**
+12. `CPUNativeQuantisedEncoding.h` — `preparedFootprintForFormat` overloads
+    (:75-101) gain the layout parameter; `NativeQuantisedPreparedFootprint`
+    gains a `layout` field so BOMs carry identity.
+13. `CPUWeightPreparationMemory.cpp:45-52` — preparation pricing.
+14. `CPUProjectionWorkspaceContract.cpp:37` — workspace contract footprint.
+15. `execution/moe/ExpertPreparedMemoryGeometry.h:182` — expert-tier
+    prepared-memory geometry (layout = target tier's ISA).
+
+**Cache keys / archive**
+16. `kernels/PackedWeightsSerialization.h` — `PACKED_WEIGHTS_VERSION` 7→8
+    (:43-57) with a `prepared_layout` header field; v7 = canonical
+    interpretation. Loader constructs the descriptor and the owner's
+    host-layout check rejects cross-layout archives with a precise
+    diagnostic (ARM: "v7/canonical prepared weights are retired on AArch64;
+    re-prepare from source").
+
+**Movement / wire (MoE overlay)**
+17. `execution/moe/ExpertTierWeightStream.cpp` — manifest gains
+    `cpu_layout`; validation (:290-320, :560-615) re-derives strides through
+    the layout-aware functions; receiving-side materialization writes the
+    host-layout resident unit.
+18. `execution/moe/ExpertTierWeightDeviceLayout.h` —
+    `ExpertTierWeightCPUStorageLayout` gains the layout field; `valid()`
+    (:131-160) checks strides per layout.
+19. `execution/moe/CpuExpertSlotPool.cpp:148-187`,
+    `MoEOverlayPhysicalResidencyFabric.cpp:911,3271-3272`,
+    `MoEOverlayRemoteProjectionProtocol.cpp:206,473,591` — slot geometry,
+    residency-fabric stride equality, remote-projection root validation.
+20. `kernels/cuda/repack/CUDAExpertTierWeightKernels.cu` and
+    `kernels/rocm/repack/ROCmExpertTierWeightKernels.hip` — the CMS
+    conversion kernels are already scalar-parameterized
+    (`compactMultiScaleUnitsCUDAUnit`, `CUDAExpertTierWeightKernels.cu:160-210`:
+    payload at `(byte/4)*(4*columns)`, metadata at
+    `(cpu_data_stride/64)*columns` + `2*columns` + `4*columns`) and work for
+    the compact layout through the manifest scalars. The nibble/expanded
+    conversion kernels (:239-277, :334-389; comp computation :257-268,
+    :371-377) currently write the CPU compensation vector and must become
+    layout-conditional (skip comp, shift scales to `data_stride+0`). Backend
+    symmetry: CUDA and ROCm move together.
+
+**Test surface (updated with the layouts, not after)**
+21. `tests/v2/utils/NativeQuantisedPreparedByteFixture.h`,
+    `Test__PackedWeightsSerialization.cpp`, `Test__NativeQuantisedFormatInfo.cpp`,
+    `Test__CPUNativeQuantisedWeightView.cpp`, `Test__CPUNativeQuantisedMetadataSeal.cpp`,
+    `Test__CPUNativeNEONPreparedProjection.cpp`, `Test__CPUNativeNEONExecution.cpp`,
+    the parity/format sweeps (`Test__CPUNativeQuantised_GEMV.cpp`,
+    `Test__CPUNativeQuantisedWeightPacking.cpp`,
+    `CPUNativeQuantisedExecutionExactPolicy.inc`), the expert-tier wire
+    contracts (`ExpertTierWeightWireTestOracle.h`,
+    `ExpertTierCapturedPackedTransferContract.inc`,
+    `ExpertTierRectangularRemoteContract.inc`, the CUDA/ROCm rectangular
+    contracts, `Test__ExpertTierWeightStream.cpp`,
+    `Test__MoEOverlay*`), and the Perf__ sweeps that read the stream.
+
+Nothing in this chain may ship partially: a stream, archive, slot, seal or
+estimator that disagrees with the packer's layout is a fatal inconsistency by
+construction (typed field + single authority + admission checks), not a
+repaired-after-the-fact condition.
+
+---
+
+## 5. Correctness contract — storage compaction must not change arithmetic
+
+1. **The arithmetic identity is the current production program.** Same payload
+   bytes (bit-identical), same metadata words (bit-identical primary/
+   secondary/emins values), same decode expressions, same INT32 dot order,
+   same FP32 scale program and partition trees. The only permitted
+   differences are *where* those bytes live inside the unit and the unit's
+   total extent.
+2. **Proof obligations per phase (all before any performance claim):**
+   - Unit-level: for every cataloged source format and both layouts, packing
+     the same synthetic source block produces accessors whose payload/
+     metadata words are bit-identical (`interleavedB`, `chunkScales`,
+     `chunkMins`, `chunkEffectiveMins` reads).
+   - Execution-level: compact-layout production kernels vs the layout-neutral
+     scalar reference (`scalarReferenceBlock`,
+     `MultiScaleKernels.h:286-334`) for every encoding/codebook, every
+     admitted NEON family (ASIMD/DotProd/I8MM incl. the SMMLA row-pair walk),
+     M ∈ {1,4,15}-shaped row tiles, symmetric/asymmetric, expert and
+     BackendNative policies — byte-identical FP32 outputs.
+   - Cross-layout equivalence (diagnostic, performance namespace): compact
+     arm vs a bench-local canonical-arm construction of the same source
+     weights, byte-identical outputs per sample (the mirrored form of the
+     ACK'd tournament bench, whose "prepared" arm was production and compact
+     arm was bench-local; post-landing the roles swap because canonical is
+     retired on AArch64 — §9).
+   - Migration/wire: archive and tier-stream round-trips per layout;
+     cross-layout rejection diagnostics (§7).
+3. **Stop-and-report conditions.** If any compact stride would force a
+   reader addressing change beyond offset selection (e.g. a payload-relative
+   address that no longer fits the tight region), or if any format's
+   arithmetic cannot be preserved bit-exactly under the compact placement,
+   the lane stops and reports — that is a different lane (arithmetic change).
+   Nothing of that kind was found during this design pass; all CMS/nibble/
+   expanded addressing is `data_stride`-relative or payload-relative
+   (verified §2.1).
+4. **Serial-row byte equivalence / MTP verifier parity** is untouched: the
+   grouped verifier path consumes the same views; compact storage changes no
+   reduction order. The all-format/backend sweep continues to certify it.
+
+---
+
+## 6. Migration, versioning, and retirement
+
+1. **Archive (`PackedWeightsSerialization.h`)**: v8 adds `prepared_layout`.
+   v7 and earlier mean canonical. On AArch64, loading v7 (or v8-canonical)
+   CPU prepared weights fails admission with a precise re-prepare diagnostic;
+   on x86 they load as today (canonical is x86's *current* layout, not a
+   replaced one). No on-load conversion, no dual-reader period.
+2. **Tier-stream manifest / remote-projection protocol**: layout field added
+   to the manifest identity and hash inputs; receivers re-derive their own
+   layout's strides and reject mismatches. A GPU→CPU demotion targets the
+   receiving CPU endpoint's layout (manifest carries it; conversion kernels
+   parameterized by the layout scalars).
+3. **Cross-ISA CPU tier movement** (x86 rank ↔ AArch64 rank exchanging
+   prepared CPU experts) becomes a typed rejection at the manifest with a
+   precise diagnostic. It is not silently converted (no hidden repack path,
+   no fallback). Mixed-ISA clusters keep working for every topology that
+   does not move prepared CPU weights across ISAs; if a workload needs that
+   movement, an explicit conversion lane is a separate operator decision.
+   The rejection is registered as a focused regression.
+4. **Cache keys**: prepared-weight identity = (archive version, encoding,
+   layout, source identity, geometry). Old keys cannot alias new bytes — the
+   version bump changes the key space. Estimator byte-equality preflight
+   (the normative anchor) runs per-ISA: on AArch64 it certifies compact
+   strides; on x86 canonical strides.
+5. **Invalid states unrepresentable**: the layout is a typed descriptor
+   field; the packer has no layout argument to get wrong; admission compares
+   descriptor layout, strides and extent against one authority; the seal
+   binds the layout into the byte-range identity (`admits()` compares the
+   full descriptor, `WeightView.h:168-182`).
+6. **Complete retirement**: after the AArch64 compact layout lands, no
+   AArch64 production path can materialize, admit, execute or move
+   canonical-layout CPU prepared weights. The canonical packer branches for
+   comp-bearing encodings remain compiled on AArch64 only where shared
+   constexpr/table code requires them (pricing); they are unreachable from
+   production entries.
+
+---
+
+## 7. Bench plan (per-invocation observability standard @ `3b109793c`)
+
+Bench = **non-installed diagnostic**, performance namespace
+(`tests/v2/performance/kernels/cpu/native_quantised/`), never
+`tests/v2/unit`. It follows the reviewer-ACK'd tournament standard
+(`Perf__CPUCompactIQ3SDecode.cpp` @ `3b109793c`). The question it answers is
+**non-regression, not speedup**: per §1.5 the compact layout must time
+within noise of canonical (it executes the identical decode program over
+strictly fewer resident bytes); a compact arm measurably slower than the
+canonical arm is a lane defect and blocks landing.
+
+1. **Two arms, one microkernel**: production compact-layout NEON projection
+   (the installed path, post-landing) vs a bench-local canonical-layout arm
+   built from the same source weights (the retirement mirror of the ACK'd
+   bench). Both arms share the production decode/dot/scale programs
+   (`gridPair`/`decodeLinear`/`nibbles()`, `NEONMultiScaleOps::dot`/
+   `pairDot`, `accumulateSingleScaleBlockNEON`/`…Corrected…`, the IQ2_S
+   coefficient program) and differ only in their weight-vector source and
+   stride/addressing — so any timing difference isolates the layout change
+   itself (unit stride and section offsets), nothing else.
+2. **Per-invocation observability**: every timed invocation's live output
+   span is dirtied with a volatile quiet-NaN sentinel before the clock
+   (poison-then-verify); an instruction-free object-bound escape
+   `asm volatile("" : : "r"(span), "r"(bytes) : "memory")` at **both** clock
+   edges binds dirty/escape/walker/scan to the same object (compiler-level
+   retention, `:649-650` at `3b109793c`); fences remain alongside.
+3. **Untimed validation chain, before any reuse**: sentinel freshness scan
+   (a surviving sentinel = the invocation did not write), per-sample byte
+   comparison arm-vs-arm per row, and comparison against a byte-exact
+   **sample-0 reference**. No digest as acceptance authority (FNV
+   cancellation attack closed by the reviewer); memcmp only as diagnostics.
+   All scans/checks/comparisons stay outside the timed interval.
+4. **Coverage**: census carrier families first — IQ2_S (gate/up shape),
+   IQ4_XS (down shape), plus Q2_K/Q3_K/IQ2_XS/IQ1_M and Q6_K (control,
+   expected stride-identical and ratio exactly 1.0); ISA cells NEON /
+   NEON_DOTPROD / NEON_I8MM; row shapes M=1, M=4, M=15 (grouped tails,
+   DotProd row / SMMLA pairs mirroring the production tile split). Timing
+   reports both arms' per-sample time and the ratio, with per-sample byte
+   comparisons gating every timed sample; the acceptance reading is
+   ratio ≈ 1 within measured noise (canonical-vs-canonical self-run sets
+   the noise band), not ratio < 1.
+5. **Host runs** (`.79/.80 sparks) are requested through the arm-perf
+   coordinator — never direct. Local Mac runs the same bench for correctness
+   (never-green-first-run RED of this bench = this lane's defect, fixed
+   before any host request).
+6. **E2E/in-model validation** (post-merge, coordinator-scheduled): census
+   model decode A/B at fixed placement/policy; PerfStats counters prove the
+   compact path ran. Acceptance = same-or-better decode throughput and
+   latency (operator bar); the −6.0 GB resident footprint is reported
+   alongside as the capacity deliverable. A measured E2E regression reverts
+   the layout change.
+
+## 8. Phase plan (this branch; Unit green each phase; push per checkpoint)
+
+- **Phase 0 — typed layout spine, zero byte change.** Layout enum, host
+  constant, layout-aware stride functions (canonical arms delegate to the
+  existing tables), `PreparedUnitSections` single-authority refactor,
+  descriptor/layout threading through owner/view/seal/packer/stream with
+  `InterleavedCanonical` everywhere. All existing tests stay green on both
+  ISAs (x86 byte fixtures unchanged; ARM still canonical). New device-free
+  Unit tests: layout/stride/section table contract per encoding+source.
+- **OPERATOR GATE — capacity value vs ABI cost.** After Phase 0 the lane
+  reports and waits: the tournament removed the decode-speed prize (§1.5),
+  no measured topology is admission-blocked (§2.3), and the remaining
+  deliverable is −6.0 GB resident prepared bytes (−22.6%) at zero
+  arithmetic risk, for the price of the full ABI chain (§4) and its review.
+  Continue to Phase 1 only on an explicit operator confirmation that the
+  capacity/residency value justifies the churn; otherwise the lane closes
+  with the design + Phase 0 spine as its artifact.
+- **Phase 1 — compact layout on AArch64.** Compact stride tables; packer
+  compact placement (`kHostPreparedLayout`-driven); view/seal/NEON admission;
+  estimator overloads with layout (host default + explicit target).
+  ARM-local Unit: accessor bit-identity vs canonical for every format;
+  execution vs scalar reference byte-exact for every encoding/family/tile.
+  x86: untouched bytes, all green.
+- **Phase 2 — archive/wire/movement versioning.** Archive v8 + layout field
+  + rejection tests; tier-stream/remote-projection/slot-pool/residency
+  fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
+  comp write (CMS kernels already parameterized); cross-layout rejection
+  regressions; estimator/BOM byte-equality per-ISA in preflight.
+- **Phase 3 — bench + focused preflight regressions.** The §7 bench in the
+  performance namespace (non-regression reading); focused regressions
+  registered in `ProductionTestPreflight` for the ABI invariants (layout
+  identity mismatch, archive version rejection, estimator-byte-equality
+  under compact); PerfStats counters for the compact path (which layout a
+  projection executed).
+- **Post-merge (Main integration)**: rebase onto the merged develop tip
+  (reviewer ACKs do not transfer across rebase), E2E decode A/B on the
+  census model via sparks (same-or-better gate; regression ⇒ revert),
+  observed per-tensor enumeration seam if commissioned.
+
+## 9. Risks / open questions for the coordinator
+
+1. **Lane-value assessment (the coordinator's close flag).** My reading:
+  **do not close, but re-baseline expectations.** The design is sound and
+  the tournament negative does not attach to it (§1.5: zero decode-program
+  change, read set preserved per family), so it cannot lose the operator's
+  performance bar by construction — but its deliverable is now purely
+  capacity/residency (−6.0 GB, no blocked topology today), against a real
+  ABI-chain cost. That trade is an operator call, hence the §8 gate. If the
+  operator weighs only decode performance, the lane should close at the
+  gate; if expert-tier residency/KV headroom on UMA hosts matters for the
+  post-merge roadmap, it proceeds.
+2. **Cross-ISA CPU expert tiers** are typed-rejected (§6.3). If a serving
+  topology needs x86↔ARM prepared-CPU movement, an explicit conversion lane
+  must be commissioned — this lane does not build it.
+3. **V2 refinements** (§2.2) are **out of scope under the post-tournament
+  bar**, not merely deferred: superblock scale dedup and secondary
+  byte-packing change the access pattern (cross-unit scale addressing /
+  byte-widening loads), so they no longer qualify as zero-risk dead-byte
+  trimming. They would need their own measured non-regression case.
+4. **Microarchitectural stride effects.** Changing the unit stride (e.g.
+  1536→1024) perturbs DRAM row/bank and prefetcher behavior in principle;
+  the claim "zero speed risk" holds at the program level (identical loads)
+  but not against µarch noise. The §7 noise band (canonical self-run) and
+  the E2E same-or-better gate are the binding protections; a measurable
+  regression reverts the change.
+5. **ARM CI surface**: compact-layout tests are ARM-gated like the existing
+  NEON tests; the x86 develop gate exercises the canonical tables and the
+  shared ABI (versioning, rejection paths, estimators) device-free.
+6. **The tournament's own scope note**: its compact arm was a bench-local
+  IQ3_S inline-decode candidate, not this design; the seal bounds
+  decode-program trades for the IQ3_S family and the bandwidth-bound
+  assumption at those shapes — nothing more. This design cites it as the
+  reason its claims are capacity-only.
