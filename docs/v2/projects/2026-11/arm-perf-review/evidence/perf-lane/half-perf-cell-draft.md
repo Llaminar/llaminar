@@ -865,3 +865,15 @@ FmlalRouteProbeDiscrimination) → JUnit + exit + SHAs to coordinator +
 addon. Functional truth only; same envelope/discipline. Cross-host PASS
 at the J-fix tip completes the FMLAL evidence chain for the landing
 cycle. Idea-04 M=1 window queues behind it.
+
+### FMLAL #7 RESULT (~04:21Z): J1/J2 predictions confirmed — 6 inherited + 3 fixture aliases
+
+#7 at 14888fef3: the 6 inherited + 3 CPUHalfOperands aliases, ALL from
+the new FmlalRouteProbeDiscrimination fixture (probe scope wrong —
+off-cases ran enabled; public zero-N asserted success where admission
+rightly rejects). Everything else passes: specials, K=16 witness,
+selection, H4 caching, no regressions. **Main's directive to addon:
+RUN the half binary natively on ARM Linux before the next push**
+(build-only checks keep missing runtime fixture bugs). The station's
+runtime gate at 67afc62ea is in flight; #8 after the runtime evidence.
+.80 free → W3 + 27B rider next in the queue.
