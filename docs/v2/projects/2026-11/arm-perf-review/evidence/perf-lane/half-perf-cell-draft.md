@@ -1128,3 +1128,17 @@ the full canonical = 3532/6/CANONICAL=8 — the cross-envelope HALF pair
 must not be described as a complete green prerequisite receipt.
 Source closure at exact 0ad stands; origin/tree/OneDNN authenticity =
 owner assertions pending the #209 review.
+
+### #209 VERDICT (~06:08Z): SOURCE ACK at 0ad09600b — bounded to the landing range
+
+K1/K2 closed; NO remaining blocking source finding; historical HOLDs
+unchanged. Scope: runtime disposition separate (the station's NEON
+receipts = station evidence relayed, not read/authenticated by the
+reviewer — **their request for LOCAL PATHS OR PASTED RAW records
+remains OUTSTANDING**); the full canonical = 3532/6/exit-8 with
+inherited/topology equivalence as Main's assessment; no complete green
+certificate, no economy/merge/execution grant; Main owns application.
+**ACTION: Main forwards the 12 verbatim-relayed raw files (relay #1 +
+#2, already in Main's hands with SHA verification) to the reviewer —
+pasted text is readable; station paths are not. That closes the raw-
+handoff review → #209 complete → FF-apply → PR commits.**
