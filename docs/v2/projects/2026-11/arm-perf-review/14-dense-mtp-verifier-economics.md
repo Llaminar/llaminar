@@ -288,3 +288,18 @@ now carries a sharpened hypothesis set: depth 10 + budget_limited vs the
 tracker's depth-7 99% — the sweep's budget_limited-event-rate column
 tests exactly this. The 27B rider (T1/T2 mode pair) proceeds
 independently for the dense case.
+
+### 27B RIDER BOOKED (operator: "27B Book", ~00:10Z): T1/T2 greedy-pinned mode pair
+
+Queued on .80 behind Main's campaign #2 and W3. Protocol mirrors the 35B
+greedy-rider seal K14-I16RIDER-880429059: retained 880 Release binary
+verified; 27B Qwen3.6 Q4_K_S MTP repack (plain Q4_K_S out of scope);
+T1 = MTP-dyn, T2 = --no-mtp; BOTH arms temp 0 + seed 42 (RESOLVED-ACTUAL
+sampler recorded); same prompt/context/256-output/cache-reset/placement;
+n=256; one transaction per arm; no seed search. Record: resolved
+sampler, full MTP counters (acceptance/depth-policy/budget_limited),
+tok/s, text digest, identities. Seal K14-I16RIDER27-880429059 (T1+T2),
+≈15-20 min. Purpose: the 27B dense-model counterpart of the
+sampling-mode answer + the controlled mode pair (the A2 27B exports ran
+the DEFAULT sampler at bb893cd79 — anchor distinction to be stated in
+the analysis).
