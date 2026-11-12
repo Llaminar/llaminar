@@ -2372,3 +2372,22 @@ Lane thinking restored to max on both new lanes (root cause:
 coordinator-shell PI_REASONING_LEVEL=high leaked into the herdr spawn
 and overrode :max at first message injection; fixed via herdr
 agent send-keys shift+tab; spawn-env hygiene lesson memorized).
+
+### STATE AUDIT (~16:30Z): STATION DOWNLOAD = SIZE-COMPLETE (status was stale)
+
+Direct du -sb: /home/gpu/models = 111,731,360,250 B ≈ 111.7 GB — all 4
+Qwen3.8-Flash-Next-UD-Q4_K_XL shards present (49.7 + 32.8 + 28.8 + 0.011
+GB = the expected ~111.3 GB total), plus qwen3-0.6b-q4km. NO active
+download process. The repeated "105G / ~94%" audit readings were a
+GiB/GB unit artifact (105 GiB = 111.7 GB — the same data); the download
+has been effectively complete for some time (shard mtimes read Nov 6
+22:0x — either preserved remote mtimes or finished then with the
+status never updated). The watcher never reported completion.
+POST-MERGE implication: idea-23 model-level validation can proceed;
+integrity verification (checksum or first load) belongs to that step —
+size-completeness alone is not load-certification. Other audit items:
+.80 idle ✓ (post-T2); .79 enumerator GO'd ~30 min, no on-host activity
+yet (code phase presumed — watch item); unknown .79 artifact build-edcc
+(12:49Z, pre-GO — clarify with sparks' enumerator report); both Mac
+lanes think:max ✓ (p25 on codex/arm-p25-design 69% ctx; i08repair 101k
+ctx).
