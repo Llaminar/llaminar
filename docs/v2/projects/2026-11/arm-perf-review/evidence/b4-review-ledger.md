@@ -269,3 +269,16 @@ sequence: (1) B1 attribution export (Release, measurement-only,
 omp+kernel filters) → (2) W3 (Integration 52fec643f, both TUs,
 JUnit seal). Coordinator run-sheet error caught by the executor —
 recorded as the correctness-vs-timing build-class discipline.
+
+### W3 ORDER CORRECTED (~04:21Z): rebase B4 onto 74797687f before the Integration run
+
+Main's catch: 52fec643f sits on the old 12675c956 lineage — a W3 run
+there would pin the JUnit + the reviewer's round-5 verdict to a tip
+that can't land. ORDER: (1) addon2 fixes the open J2 item (primitive-
+level counter controls, reviewer 242); (2) rebase the B4 chain onto
+74797687f (semantic conflict resolution — the registrations + Main's
+GPU guards both stay); (3) push → report the tip → W3 books
+(Integration NEON_I8MM, both Unit targets, --no-tests=error, JUnit
+seal) — runtime evidence only; the 224 HOLD stands until the reviewer's
+re-verdict at the rebased tip. B4 candidate chain: W3 → re-verdict →
+checks → candidate.
