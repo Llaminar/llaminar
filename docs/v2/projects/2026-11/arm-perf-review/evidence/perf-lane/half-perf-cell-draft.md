@@ -705,3 +705,18 @@ focused cells green; worktree clean. HOLDING THE PUSH until Main
 announces PR #43's force-push (naming ebd66f0cb or its successor); on
 that: push → report tip → validation #5 booking → landing verdict pins
 the rebased tip (one cycle). Station cross-host #5 re-run follows.
+
+### FMLAL PUSHED ON THE PR BASE (~02:21Z): tip b5e928e40 on 74797687f
+
+The 8-commit chain rebased onto 74797687f CLEANLY (no
+REQUIRES_BACKEND/registration conflicts; the deferred gate tooling
+correctly absent from this line). Local verification on the rebased
+tip: GCC14/AppleClang 0 errors, identity PASS, NEON 18/18.
+**VALIDATION #5 BOOKED: top of the .80 queue after the in-flight B1
+export** — Integration NEON_I8MM build of b5e928e40; the full
+v2_test_cpu_half_operands binary (byte-identity BOTH routes incl. the
+GPU-aligned K=16 witness + isolated specials + the selection/invocation
+probe) + V2_Unit/Integration_CPUInstructionSetContract; raw JUnit to
+Main + me. Main's locked intent: #5 PASS → reviewer re-pins the landing
+verdict → apply (FF — b5e928e40's parent IS 74797687f) → push + PR body,
+no economy claim. Station cross-host #5 re-run follows on the same tip.
