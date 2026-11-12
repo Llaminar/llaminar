@@ -36,7 +36,9 @@
  * of the compact arm and the expanded arm are bit-identical for every
  * timed row shape and compiled family. Every timed invocation's live
  * output span is dirtied with a NaN sentinel before the clock, pinned
- * inside the timed interval by compiler-only signal fences, and, after
+ * inside the timed interval by compiler-only signal fences plus an
+ * instruction-free object-bound escape of the live span's pointer and
+ * byte extent, and, after
  * its clock edge, freshness-checked and byte-compared against the other
  * arm and against a byte-exact reference retained from the first
  * sample — all untimed and before any reuse, so stale warmup or
@@ -600,8 +602,10 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
     // freshness scan after the clock edge, and byte-exact comparison of
     // the two arms' live spans (and, after the first sample, against the
     // byte-exact reference) before either span is reused. Compiler-only
-    // seq_cst signal fences pin the walker stores inside the timed
-    // interval; all comparison work stays outside it.
+    // seq_cst signal fences plus an instruction-free object-bound escape
+    // of the live span (pointer and byte extent as opaque asm input
+    // operands with a memory clobber) pin the walker stores inside the
+    // timed interval; all comparison work stays outside it.
     // ------------------------------------------------------------------
 #if defined(__ARM_FEATURE_DOTPROD)
     cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::DotProd);
@@ -631,6 +635,20 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
     alignas(16) float retained_compact[kMaxRows][64];
     alignas(16) float reference_expanded[kMaxRows][64];
     alignas(16) float reference_compact[kMaxRows][64];
+
+    // Instruction-free compiler escape of one live span: the span pointer
+    // and byte extent are input operands of an opaque asm with a memory
+    // clobber. The address escapes to a consumer the compiler cannot
+    // analyze, and the clobber declares that this consumer may read or
+    // write memory, so every prior store to that extent is materialized
+    // before the asm — while zero instructions are emitted. This is the
+    // object-bound contract the signal fences cannot supply on their own:
+    // they order accesses, but do not make non-escaping automatic storage
+    // observable. GCC-14 (the .79 gate) and Clang document exactly this
+    // extended-asm contract.
+    const auto escapeSpan = [](const void *span, size_t bytes) {
+        asm volatile("" : : "r"(span), "r"(bytes) : "memory");
+    };
 
     struct RowShape
     {
@@ -769,19 +787,26 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
             {
                 const bool this_expanded =
                     expanded_first ? (pass == 0) : (pass == 1);
+                float (&span)[kMaxRows][64] =
+                    this_expanded ? retained_expanded : retained_compact;
+                const size_t span_bytes = static_cast<size_t>(shape.rows) *
+                    64u * sizeof(float);
                 // Dirty this arm's live span (untimed) so stale warmup or
                 // previous-sample data cannot certify the invocation.
-                dirtyOutputs(this_expanded ? retained_expanded
-                                           : retained_compact);
+                dirtyOutputs(span);
                 const auto begin = std::chrono::steady_clock::now();
-                // Compiler-only interval boundaries: the seq_cst signal
-                // fences emit no instructions but forbid the compiler
-                // from moving any access across them, so the walker's
-                // nonvolatile stores cannot hoist above the begin read
-                // nor sink past the end read — the timed interval
-                // formally contains the walker's memory traffic.
+                // Compiler-only interval boundaries. The span's pointer
+                // and byte extent escape to an opaque, instruction-free
+                // asm consumer at both edges: the automatic span is no
+                // longer compiler-private storage, so the poison stores
+                // are materialized before the timed region starts and
+                // every walker store to the live extent is materialized
+                // before the end-clock read. The seq_cst signal fences
+                // add the compiler reordering barrier in both directions.
                 std::atomic_signal_fence(std::memory_order_seq_cst);
+                escapeSpan(span, span_bytes);
                 one_pass(this_expanded);
+                escapeSpan(span, span_bytes);
                 std::atomic_signal_fence(std::memory_order_seq_cst);
                 const auto end = std::chrono::steady_clock::now();
                 const double microseconds =
@@ -791,9 +816,7 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                     .push_back(microseconds);
                 // Freshness scan at this invocation's timing boundary
                 // (untimed): the invocation overwrote its complete span.
-                checkFreshOutputs(
-                    this_expanded ? retained_expanded : retained_compact,
-                    this_expanded, pair);
+                checkFreshOutputs(span, this_expanded, pair);
                 if (::testing::Test::HasFailure())
                     return;
             }
