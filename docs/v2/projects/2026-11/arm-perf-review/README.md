@@ -2692,3 +2692,36 @@ M4/M15). Main received the table for the PR #43 description (metadata
 only, tip untouched). arm-idea08 lane informed + reframed BEFORE its
 design doc. Census note stands: expansion bytes are real (1.73x) but
 are a deliberate winning trade, not waste.
+
+### STATE AUDIT 22:23Z (exceptions-only): NO exceptions — all verified
+
+.79 idle (0 procs), seal evidence intact (w2-tourney2 10 files), build-tr
+dirs still present (pruning pending, minor, sparks informed); .80 idle
+(0 containers, 0 procs); station alive via dgx-station remote (c290
+idle, c527 CB C1 active — consistent); PR #43 description UPDATED by
+Main at 22:01Z with the tournament table (verified via API: body
+contains the tourney data; state OPEN/MERGEABLE). arm-idea08 delivered
+its reframed design doc (below) — thinking→delivered, no drift. CB lead
+at 89% ctx (their program, noted).
+
+### IDEA-08 DESIGN DOC DELIVERED + VERIFIED (22:25Z): dcebc7ed8 — capacity-only reframe; operator gate after Phase 0
+
+Branch codex/arm-idea08-compact-layout @ dcebc7ed8 (verified: one
+docs-only commit on d5e04fdce), design doc 08-arm-prepared-weight-
+layout-design.md (694 lines). Key findings: (1) the sealed 7.0-8.6x
+negative does NOT attach to a pure dead-byte trim (tournament priced a
+decode-PROGRAM change; this design changes no kernel load set — removes
+only never-loaded bytes: CMS payload padding 448B/unit, non-Q2_K emins
+256B, ARM-dead compensation 128B x86-only; read-set proof table doc
+§2.1); speed-neutrality accepted — NO decode-speed claims remain, bench
+reframed to a NON-REGRESSION gate. (2) Value = capacity only: -6.0GB
+prepared (26.62->~20.6GB, -22.6%) = ~26% more routed experts resident
+per admitted CPU ExpertOverlay tier + 6GB KV headroom on UMA; NO
+currently-measured topology is admission-blocked by the expansion
+(GB10 hosts the 35B at 34.9GB BOM with headroom). (3) Lane self-
+assessment: value dropped a tier; do-not-close-outright; OPERATOR GATE
+after Phase 0 (typed layout spine, zero byte change, reusable either
+way). Local baseline: 128/128 targets, ctest 295/295 green at d5e04fdce
+(Mac NEON portability loop). Routing: lane PROCEEDS to Phase 0, holds
+at the gate. Scale-dedup/secondary-packing V2 = OUT OF SCOPE (access-
+pattern changes), not deferred.
