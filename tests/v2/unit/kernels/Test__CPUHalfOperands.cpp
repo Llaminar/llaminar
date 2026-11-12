@@ -618,7 +618,7 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
             std::fill_n(c_data,1,-777.f);
             const long long before_inactive=fmlalLeafInvocations();
             const bool inactive_ok=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
-                llaminar2::TensorType::FP16>(a_data,b_data,c_data,1,1,65);
+                llaminar2::TensorType::FP16, true>(a_data,b_data,c_data,1,1,65);
             ASSERT_TRUE(inactive_ok);
             EXPECT_EQ(fmlalLeafInvocations()-before_inactive,0)<<"prim all-inactive";
             EXPECT_EQ(c1.data()[0],-777.f)<<"prim all-inactive C";
@@ -631,7 +631,7 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
         ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
         EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"restored-off";
     }
-    // (6) Positive capacity, all-inactive span: the work-scoped route
+    // (7) Positive capacity, all-inactive span: the work-scoped route
     // returns before any schedule runs; nothing counts even with the probe
     // enabled.
     {
