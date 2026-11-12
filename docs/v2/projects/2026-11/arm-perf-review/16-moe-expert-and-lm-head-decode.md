@@ -694,3 +694,21 @@ result explained and fixed. The next re-run's domain dump confirms the
 counters record; the B1 seal K14-I16B1 completes on the passing proof +
 the timing evidence (B≤A: production 217.2 vs transaction 206.3 µs
 mixed-20T). The idea-08 GO/NO-GO inputs follow the seal.
+
+### B1 FIRST ECONOMY DATAPOINT (~10:06Z): transaction/production = 0.951 at mixed-20T (≈4.9% faster)
+
+The W2 runs rendered timing before the counter-proof assertion in every
+placement; at mixed-20T: production (two-region sequence: router-Q8
+bundle + serial SwiGLU + multi-input down) median 217.168 µs vs the
+single-transaction route median 206.320 µs → **transaction/production =
+0.951 (≈4.9% faster on the median, 120 paired samples).** Consistent
+with the B1 hypothesis (the transaction removes one OpenMP region
+transition + one team wake; the arithmetic is byte-identical — the gain
+is purely structural). **B ≤ A non-regression MET on this placement.**
+CAVEATS: one placement so far; the full 4-placement attribution
+completes with the collector-enabled seal re-run at 5c2cef47a; the
+counter-proof gap was a FIXTURE instrumentation gap, not a production
+signal. GO/NO-GO scoping: feeds idea-16's Phase B selection (the
+transaction route is viable); the idea-08 inputs remain gated on the
+tournament + census. STABILIZE-ONLY: diagnostic evidence — no
+production routing until post-merge.
