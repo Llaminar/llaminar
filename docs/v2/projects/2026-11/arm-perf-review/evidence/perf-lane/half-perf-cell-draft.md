@@ -818,3 +818,12 @@ on the executing worker; the 2^-24 weight-side case pins 0x33800000;
 L4 functionally repaired (subject to H4); the L5 improvements accepted.
 NONBLOCKING: x86 arm wording → "no FMLAL" (x86 can run AVX2/AVX512).
 Main owns #6; implementation authorized; economy NOT ADMITTED.
+
+### FMLAL #6 RESULT (~03:39Z): 9 failures = 6 inherited + EXACTLY the 3 H1 aliases — predictions confirmed
+
+#6 at f987501f9 (focused + full canonical): L4 caused no other
+regressions (the startup-admission change is clean beyond the
+predicted fixture failure). **#7 at 14888fef3 (H1-H4 combined)
+running** — container main-fmlal7, started 03:38:40Z, ~45 min; .80
+held by Main. Reviewer re-review requested at 14888fef3. Landing
+cycle: #7 PASS → verdict re-pin → FF-apply → PR commits.
