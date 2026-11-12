@@ -2744,3 +2744,21 @@ remain canonical-only until threaded. GATE QUESTION (operator, DUE):
 CONTINUE to Phase 1 (compact stride tables + packer placement on
 AArch64 + admission + estimator overloads + ARM-local bit-identity) =
 -6.0GB prepared capacity/residency; or CLOSE with the spine retained.
+
+### OPERATOR QUESTION (23:5xZ): "save weight bytes without the latency increase?" — tiered-residency option sized
+
+Answer delivered: (1) dead-byte trim (Phase 1, zero latency by
+construction, -6.0GB); (2) **compact-at-rest / expanded-on-promotion**
+via the existing hot-expert-cache + residency machinery (zero hot-path
+latency change, near-full byte prize, one ms-scale expansion per
+promotion off the critical path, PMA accounts both forms; combined
+floor ~17-21GB for the 35B); (3) cheap-LUT middle representation only
+where codebooks permit (NibbleLUT 1.29x family yes; CMS 256+-entry
+pair grids structurally no — NEON lacks vector gather). Regime note
+recorded: the tournament priced a cache-resident compute-bound
+microbench; production decode is partly DRAM-bound (idea-16 45GB/s LM
+head) — which is why tiering targets RESIDENT bytes, and why a faster
+compact kernel is not the path (structural gather cost stays above the
+2.2x breakeven). arm-idea08 dispatched a design addendum (hot-set math,
+promotion cost, cold-miss policy, combined floor, prefill interaction,
+delta vs Phase-1-only) while holding at the gate.
