@@ -763,9 +763,15 @@ public:
         }
         requireQFN(!distributed_joint || observed_domains.size() == config.moe_routed_expert_plan->domains.size(),
                    "QFN observer is missing an original distributed domain");
+        // Authored omission and explicit default describe the same production
+        // bucket ladder. Reuse the frozen-intent normalization rather than
+        // requiring a new engine cap merely to admit diagnostic metadata.
+        // ExpertOverlay's separately authored segment policy remains part of
+        // the exact config identity; this observer does not override its clamp.
         requireQFN(config.mtp_activation_policy == MTPActivationPolicy::Disabled && !config.mtp.enabled &&
                    !config.prefix_cache.enabled && config.activation_precision == "fp32" &&
-                   config.kv_cache_precision == "fp16" && config.prefill_max_bucket_size == 512 && config.max_seq_len > 0,
+                   config.kv_cache_precision == "fp16" &&
+                   qfnCanonicalConfigurationIntent(config).at("prefill_max_bucket_size") == 512 && config.max_seq_len > 0,
                    "QFN observer requires MTP/prefix off, FP32 activation, FP16 KV and M512");
         requireQFN(source.at("shards").is_array() && source.at("shards").size() == 4,
                    "QFN observer needs all four original source descriptors");

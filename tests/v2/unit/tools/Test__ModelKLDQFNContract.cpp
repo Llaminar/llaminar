@@ -951,3 +951,37 @@ TEST(ModelKLDQFNContract, ResetComparisonPolicyScopesOnlyOriginalDynamicCPUJoint
     }
 }
 } // namespace llaminar2::accuracy
+
+namespace llaminar2::accuracy {
+/** @test Observer M512 admission uses canonical effective defaults while retaining original overlay row policy. */
+TEST(ModelKLDQFNContract, ObserverDefaultPrefillCapPreservesCanonicalOverlayGeometry)
+{
+    for(const bool overlay:{false,true}) {
+        auto config=overlay?distributedCPUJointConfig(2):cpuConfig();
+        if(overlay)config.moe_routed_prefill.overlay_segment_rows=256;
+        for(int replay=0;replay<3;++replay) {
+            config.prefill_max_bucket_size.reset();
+            const auto original=descriptor(config);
+            ASSERT_NO_THROW((void)QFNObserverRequest::parse(original,config));
+            EXPECT_FALSE(config.prefill_max_bucket_size.has_value());
+            const auto omitted=qfnCanonicalConfigurationIntent(config);
+            config.prefill_max_bucket_size=512;
+            ASSERT_NO_THROW((void)QFNObserverRequest::parse(descriptor(config),config));
+            EXPECT_EQ(qfnCanonicalConfigurationIntent(config),omitted);
+            for(const int other:{0,256,1024}) {
+                config.prefill_max_bucket_size=other;
+                EXPECT_THROW((void)QFNObserverRequest::parse(descriptor(config),config),std::invalid_argument);
+            }
+            if(overlay) {
+                config.prefill_max_bucket_size.reset();
+                EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows,256);
+                // M512 is the declared maximum ladder, not permission to
+                // rewrite the production segment clamp. Exact source intent
+                // must still reject a foreign segment policy on replay.
+                auto changed=config;changed.moe_routed_prefill.overlay_segment_rows=512;
+                EXPECT_THROW((void)QFNObserverRequest::parse(original,changed),std::invalid_argument);
+            }
+        }
+    }
+}
+} // namespace llaminar2::accuracy
