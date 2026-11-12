@@ -1278,3 +1278,16 @@ by main-b1). The 35B layout delta ships with it as an accepted,
 operator-weighed cost (the mechanism benefit + fork reduction were the
 deciding factors). Post-merge follow-up if warranted: layout mitigation
 or re-measure on the merged base.
+
+### B1 LANDED (13:14Z): PR #43 FF ae51ce3f0 → d5e04fdce, MERGEABLE/CLEAN
+
+Verified locally: origin/feat/arm64-native-kernels = d5e04fdce
+("perf(cpu): pool skinny FP32 fused projections into one team fork"),
+direct child of ae51ce3f0, tree 8e921b6dd = the exact tree validated
+green in main-b1 (canonical 3569, 0 new). Range = 1 commit. The PR
+body states the evidence plainly: 27B 4→3 forks w/ timing in noise;
+35B Release decode 0.7–0.9% slower attributed to layout (operator-
+weighed, accepted). **New PR tip chain: ae51ce3f0 → d5e04fdce.**
+Lanes rebase onto d5e04fdce; the M=1 window anchor refreshes to
+d5e04fdce (re-pin rule); the W2 lane (idea16) rebases after the
+running census completes.
