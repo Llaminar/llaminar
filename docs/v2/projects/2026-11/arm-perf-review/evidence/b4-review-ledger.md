@@ -504,3 +504,13 @@ both seals: .80 host, Integration NEON_I8MM SHARED_CORE=ON, g++-14
 14.2. The package (paths + addon2's assembled lineage/contexts/
 enumeration + the corrected descriptions) routes to the reviewer for
 the #204 continuation at 7a4790c77.
+
+### THIRD SEAL (~07:54Z): K14-B4-7A4790C7-20261112 — the A4-restored tip's fresh Linux run
+
+ctest 2/2 PASSED (portable 0.17s, head 0.07s); both XMLs tests=2
+failures=0 byte-verbatim. **The three-seal evidence chain is complete:**
+(1) K14-B4-E09903875 = the failed admission run (ASSERT_TRUE at :439);
+(2) K14-B4-ADDF3DB78 = the green step-2; (3) K14-B4-7A4790C7 = the
+A4-restored tip's fresh run. All three paths + addon2's assembled
+package route to the reviewer for the #204 continuation review at
+7a4790c77 = the last gate before Main's application default.
