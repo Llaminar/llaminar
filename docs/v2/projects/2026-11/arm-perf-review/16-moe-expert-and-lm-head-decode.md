@@ -656,3 +656,16 @@ scope** — the counter-NAME fix didn't resolve the zero; the question
 sharpens to the increment-site conditions (grouped-context requirement?
 stats-config gate?) or the fixture's capture scope. Timing renders
 (217-219 vs 205-206 µs, B≤A). B1 seal blocked; the idea-08 inputs wait.
+
+### W2 INSTRUMENTED ROUND (~08:47Z): e120f13e8 — the raw kernel-domain dump discriminates recording-vs-visibility
+
+The static increment-site analysis is exhausted (both A-path counters
+gated only by isDomainEnabled("kernel") on the common success path; the
+proof scope force-publishes the kernel filter; snapshot matching
+verified) — yet B records and BOTH A-path counters read 0. The bench
+now dumps the RAW kernel-domain snapshot before/after each arm
+(CPU_STT_KERNEL_DOMAIN lines): recording-vs-visibility discriminated
+with data. Candidate flagged: a PerfStats policy `enabled` collector
+switch consulted beyond isDomainEnabled would make the filter-only
+proof scope explain the asymmetry. The B1 seal gates on the
+resolution; timing (B≤A) unaffected.
