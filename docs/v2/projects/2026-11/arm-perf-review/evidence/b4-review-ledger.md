@@ -458,3 +458,25 @@ seal K14-B4-7A4790C7 — the grouped fix AND the restored A4 block both
 ride it.** The reviewer's re-verdict material = this tip + the fresh
 JUnit (the Linux-GCC-first process). Main's canonical re-books at the
 same tip.
+
+### #204 COMPLETED VERDICT (~07:19Z): SOURCE HOLD at addf3db78, narrowly for R1 (superseded by 7a4790c77)
+
+Full 0ad..addf range reviewed (3 files +1485); all 6 rebased commits
+source-equivalent; no production delta. R1 = the lost A4 boundary
+coverage (the :34 claim vs the deleted block) — **7a4790c77 is the
+reported R1 successor, not covered by this verdict.** ALL OTHER
+CLOSURES STAND (A1/A3/A2/A5/D6 + CPU-init-before-admission). The
+reviewer read both local seals: e099 = admission ASSERT_FALSE at :439
+(portable 6/6, head 1/2, CTEST 8) — not a numerical comparison
+failure; addf = portable 6/6 + head 2/2, exits 0 — owner-produced
+records.
+RECEIPT CORRECTIONS (not blockers): the failed SUMMARY retains the
+superseded 'byte mismatch' diagnosis + mistypes the tip; the fixed
+SUMMARY says portable=2 but the XML has 6 (2/2 = CTest entries); §4
+mixes Release/Integration; the B4 TUs' evidence = Clang syntax +
+Linux GCC build/run (not the performance TUs' GCC syntax checks); the
+pasted XML excerpts were abridged. Preserve raw history + attach
+corrected descriptions.
+#204 continues awaiting the 7a4790c77 fresh combined handoff under the
+Linux-first process; production/N-sweep/economy + Main's
+application/canonical decisions separately fenced.
