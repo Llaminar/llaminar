@@ -483,9 +483,11 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
         EXPECT_TRUE(llaminar2::cpu::ARMCPUCapabilities::native().supports(
             llaminar2::cpu::ARMCPUFeature::FP16FML));
     // The selection probe proves the FMLAL path — never a silent scalar
-    // fallback — actually executed: one route probe per multiply (the scalar
-    // route never increments).
+    // fallback — actually dispatched: one route probe per multiply. The
+    // route probe is evidence-only, so this contract enables it for the
+    // multiply.
     {
+        FmlalProbe probe;
         FP16Tensor weight({size_t(2),size_t(65)},weightWords(2,65));
         Engine probe_engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
         FP32Tensor probe_a({size_t(1),size_t(65)}),probe_c({size_t(1),size_t(2)});

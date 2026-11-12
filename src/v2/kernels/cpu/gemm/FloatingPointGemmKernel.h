@@ -109,7 +109,7 @@ inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; 
  * format), which would change every FCVT conversion's result format and is
  * therefore part of the same admission.
  */
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+#if defined(__aarch64__)
 inline bool fmlalFpcrProfileAdmitted(std::uint64_t fpcr) noexcept
 {
     constexpr std::uint64_t kRModeMask = 0x3ull << 22;
