@@ -213,7 +213,6 @@ def _observation(
         numerical_correctness=True,
         ordered_reduction=True,
         uses_atomic_reduction=False,
-        physical_launch_evidence={},
     )
 
 
