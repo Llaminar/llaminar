@@ -827,3 +827,28 @@ predicted fixture failure). **#7 at 14888fef3 (H1-H4 combined)
 running** — container main-fmlal7, started 03:38:40Z, ~45 min; .80
 held by Main. Reviewer re-review requested at 14888fef3. Landing
 cycle: #7 PASS → verdict re-pin → FF-apply → PR commits.
+
+### FMLAL #7 PRE-VERDICT (~03:48Z): SOURCE HOLD at 14888fef3 — H1-H4 VERIFIED FIXED; J1-J3 in the new fixture
+
+H1-H4 source-verified: FmlalProbe owned (:493); the FPCR predicate
+covers every AArch64 build incl. RMode=10; evidence gated by
+K>=16,N>0,M>0 + enable BEFORE the live-span walk (:1514-1527);
+complete-envelope admission INSIDE cached initialization incl. Scalar
+(CPUFeatures.h:276-288); x86 wording fixed; the 2^-24 case executes
+both calls. No further arithmetic/routing change requested.
+REMAINING (FmlalRouteProbeDiscrimination fixture only):
+- J1: probe lifetime wrong (alive for the whole test → off-arms
+  enabled, each native multiply counts 1 vs 0) — scope the enable
+  between the off arms.
+- J2: zero-dimension controls use the wrong API (zero-N returns false
+  via validHalfOperands; m=0 THROWS through currentProjectionRowWork(0))
+  — keep public admission; discriminate the primitive counter at the
+  production boundary that permits zero M/N; separate public-rejection
+  from primitive-counter controls; positive-capacity/all-inactive
+  control still absent.
+- J3: resolved-Scalar in I8MM → after_on=0 → unconditional
+  EXPECT_GT(after_on,0) fails; GTEST_SKIP ≠ coverage — build a real
+  no-FMLAL control via the no-op probe + zero-count interface.
+EXPECTED #7 from source: :538 fails, then :553 fails fatally.
+DISPOSITION: Main owns #7; implementation authorized; economy NOT
+ADMITTED; B4 pending; B9 closed.
