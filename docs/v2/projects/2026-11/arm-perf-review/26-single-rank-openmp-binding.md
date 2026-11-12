@@ -1055,3 +1055,19 @@ Fork COUNTS = solid; named attribution blocked on the filter anomaly;
 NEXT: addon3 reads filterListFromEnv's parsing (~10 min) → the exact
 env recipe → a sparks re-run of the export step only (~15 min, build
 banked).
+
+### EXPORT ANOMALY ROOT-CAUSED (~03:10Z): missing CPU_STAGE_TIMING pin — corrected recipe
+
+Root cause (addon3, self-caught by reading the committed artifacts):
+the B1 run sheet OMITTED `LLAMINAR_PERF_STATS_CPU_STAGE_TIMING=1` (the
+A2 sheet had it; dropped in the B1 booking) — the stage publisher
+carries the explicit stage-enable gate from the #186 fix and REFUSES
+by design with the gate off → no stage fork records, no
+stage_cpu_detail rows. The summary publisher (no gate) published ✓.
+The gate worked exactly as reviewed; the run sheet was wrong.
+CORRECTED RECIPE (re-dispatched to sparks): LLAMINAR_PERF_STATS_
+SUMMARY=1 + FILTER=omp,kernel + **CPU_STAGE_TIMING=1** + JSON=
+/work/b1attr-runs/full-records.json; same build (12675c956, banked),
+same 4 configs, ~15 min. Seal K14-B1ATTR2-12675C956-20261112.
+DISCIPLINE NOTE: cross-check env pins against the prior successful
+sheet when adapting it — a diff would have caught the omitted pin.
