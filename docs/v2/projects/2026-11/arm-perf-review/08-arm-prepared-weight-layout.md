@@ -166,3 +166,23 @@ matrix: clang++ AND g++-14 -fsyntax-only both clean; g++-14
 corroborates the STT TU's prior pass. Sparks resumes the W2 build at
 8a5fa75a8 → link → B1 4 placements + tournament + BOM census → the
 idea-08 GO/NO-GO inputs.
+
+### B1 EXPORT SEALED (~03:08Z): K14-B1ATTR-12675C956-20261112 — no overlap, timing usable
+
+16 artifacts + SUMMARY.md at .80 /home/factory/llaminar-i8mm/
+b1attr-runs/; all 4 configs RC=0 (35B/27B × MTP/no-MTP; omp,kernel +
+SUMMARY + full JSONs); tender_morse StartedAt 02:47:52.4Z (verified,
+after #5's 02:41:56Z finish) → NO overlap; the 02:19 claim withdrawn;
+timing fields usable (corrected disclosure in the seal); artifact-path
+confusion resolved (host-vs-container path).
+
+### W2 FIX-BACK #3 (~03:08Z): THIRD g++-14/NEON TU defect — publishPairs
+
+8a5fa75a8 failed at Perf__CPUCompactIQ3SDecode.cpp:322:
+`'publishPairs' is not a member of 'llaminar2::cpu::native_quantised::
+multi_scale::...'` — the MultiScale ops template at the publishPairs
+call (same template-qualification class as the four fixed sites). STT
+target = BUILT ✓; the compact TU = the ONLY blocker. Fix-back #3
+routed to addon2 with the process escalation: after this lands, a full
+g++-14 build of the whole diagnostic bench becomes the standard
+pre-push gate (end the per-error whack-a-mole).
