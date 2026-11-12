@@ -1102,3 +1102,15 @@ disclosed + corrected extract alongside.
 the station's native NEON (GREEN, NEON-compiled). The FMLAL collection
 candidate's evidence chain is CLOSED pending the reviewer's #209
 verdict → Main FF-applies → PR commits.**
+
+### NEON GATE ORIGIN CONFIRMED (~05:48Z): the ARM station session; raw files relayed for #209
+
+Main's attribution caution (post-c527) answered: the NEON gate report =
+OUR station session (the same peer behind every FMLAL station artifact
+tonight — r1-r3, the provision chain, the co-validation; consistent
+watcher IDs + artifact paths + container patterns). The c527 incident
+was a different failure mode (a cross-lane REQUEST routed to the wrong
+worker), not a report-authenticity question. Origin CONFIRMED; the
+station relays the raw full-junit.xml + result.txt + neon-gate-exit.txt
+directly to Main + the reviewer for the #209 authentication. On the
+verdict: Main FF-applies 0ad09600b → PR commits.
