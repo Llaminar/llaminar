@@ -2535,3 +2535,15 @@ buffer reuse); sentinel freshness unchanged. Deliberate removal flagged
 for ruling: the post-loop final-contents memcmp (subsumed + was an
 attack surface). All negatives proven standalone. ACK request queued to
 the compacting reviewer; .79 re-run gated on it.
+
+### CENSUS CLOSED CORRECTLY (~20:03Z)
+
+SUMMARY-v2 amended + re-pinned: idea-08 CONFIRMED at 1.73x (26.62 vs
+15.34 GB); carrier = CompactMultiScale gate/up (2.34x, +9.2 GB) +
+NibbleLUTSourceScale down (+1.55 GB); Q6 native; blk.39/IQ3S negligible;
+~42% prepared-byte reduction potential = the 35B decode-bandwidth prize;
+LM-head 445MBx2 M=1 read-cost stands; consistency line = same-estimator
+agreement framing (normative anchor = estimator-byte-equality preflight
+class; observed final = post-merge seam). The idea-08 input is COMPLETE
+(predicted/estimator, correctly labeled) pending only the post-merge
+observed seam.
