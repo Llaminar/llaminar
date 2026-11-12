@@ -34,11 +34,17 @@ without in-model validation (methodology rule, idea 20).
    is a hard gate, measured not assumed.
 2. **Idea 8 — compact ARM prepared-weight layout.** The 35B decode reads
    ~2.7× more weight bytes than its quantization needs. Phase A plan approved
-   + GO; census (running on .79) = the valid input; tournament bench on
-   SOURCE HOLD — repair lane SPAWNED (arm-i08repair, GLM-5.3 max, 2026-11-12)
-   for the four reviewer findings, then reviewer ACK, then sparks re-run.
-   ABI-bearing (packer → view → footprint → cache keys → wire/movement);
-   per-ISA layout identity keeps x86 untouched by construction.
+   + GO. Inputs: (a) census = estimator-based SIZING input in flight on .79
+   (per-tensor predicted/estimator columns + observed aggregate BOM, strictly
+   labeled — authorized because estimator byte-equality is a tested production
+   invariant; the OBSERVED per-tensor enumeration needs a debug-namespace
+   seam (StageDumper-pattern reader over the prepared store's per-tensor
+   publication) = post-merge, normal review path, added as an idea-08
+   dependency); (b) tournament bench on SOURCE HOLD — repair lane in flight
+   (arm-i08repair) for the four reviewer findings, then reviewer ACK, then
+   sparks re-run. ABI-bearing (packer → view → footprint → cache keys →
+   wire/movement); per-ISA layout identity keeps x86 untouched by
+   construction.
 
 ## Tier 2 — MTP economics (cheap-to-medium, high certainty)
 
