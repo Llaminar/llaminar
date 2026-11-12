@@ -58,6 +58,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionQ8Publication.h"
@@ -494,7 +495,12 @@ namespace
         fillGuardTail(fixture.a_route_output, fixture.liveRoute);
 
         // Admitted invocation workspace for the production down launcher:
-        // the exact bank production declares for one M=1 invocation.
+        // the exact bank production declares for one M=1 invocation. The
+        // two-argument workspace manager allocates through the device
+        // backend, so the CPU backend must be initialized first (the same
+        // fixture pattern every device-free CPU test uses).
+        if (!llaminar2::hasCPUBackend())
+            llaminar2::initCPUBackend(-1);
         const auto q8_requirements =
             cpuProjectionQ8WorkspaceRequirements(kTopK, kIntermediate);
         if (!fixture.workspace.allocate(q8_requirements))
