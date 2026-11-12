@@ -109,3 +109,13 @@ status queried. .79/W2 re-run at 79967de27 (dispatched ~04:45) —
 counter-contract status queried (~1h10m without a status). B1ATTR2
 queue state queried. Last verified: FMLAL #8 GREEN + station NEON gate
 GREEN (receipts relayed); the #209 verdict pending at Main/reviewer.
+
+### STATE AUDIT (07:24Z cycle): .80 answered by Main's direct observation; .79 still overdue
+
+.80: Main's direct observation ON RECORD (the M=1 window failed empty;
+the host idle; the B4 canonical at 7a4790c77 starting) — reconciled;
+B1ATTR2 already sealed (K14-B1ATTR2). .79/W2: the counter-fix re-run
+at 79967de27 = ~2.6h without status — RE-QUERIED. Station: the NEON
+gate complete (GREEN; receipts relayed); the c527 incident resolved to
+origin; idle-with-queue. A2 exports: consumed. The M=1 re-booking
+follows the B4 canonical (the hard-fail run-sheet fix routed to addon).
