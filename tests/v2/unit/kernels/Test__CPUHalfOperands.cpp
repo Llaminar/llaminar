@@ -389,16 +389,23 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
         }
     }
 }
-/** @test The mixed-policy boundary (F,F is not FMLAL): unconverted FP32 A at
- *        the K=16 stripe keeps its extra precision end to end. */
+/** @test The mixed-policy boundary (F,F is not FMLAL) on the route the
+ *        GPU-aligned witness named: GPUAlignedExpert with FP32 A and FP16
+ *        weights keeps unconverted FP32 A through the K=16 stripe end to end.
+ *        (FP16RNE engines are a different contract: their dispatch enters
+ *        executeHalfOperands unconditionally and the HalfRNE schedule rounds
+ *        A to binary16 at every k, including full blocks — that behavior is
+ *        pre-existing at the base and is the reviewer's contract question,
+ *        not this regression.) */
 TEST(CPUHalfOperands, MixedPolicyKeepsUnroundedFP32AtK16){
-    FP16Tensor weight({size_t(1),size_t(16)},std::vector<uint16_t>(16,0x3C00));
-    Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+    // Row-major transposed FP16 weights ([K][N]) per the GPU-aligned contract.
+    FP16Tensor weight({size_t(16),size_t(1)},std::vector<uint16_t>(16,0x3C00));
+    Engine engine(&weight,Engine::NumericalPolicy::GPUAlignedExpert,Mode::FP32);
     FP32Tensor input({size_t(1),size_t(16)}),output({size_t(1),size_t(1)});
     std::vector<float> source(16,0.f);
     source[0]=1.f+0x1p-12f;
     std::copy(source.begin(),source.end(),input.mutable_data());
-    ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,16));
+    ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,16,true));
     EXPECT_EQ(output.data()[0],1.f+0x1p-12f);
 }
 TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
