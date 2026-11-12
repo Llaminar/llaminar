@@ -771,8 +771,13 @@ namespace
     /** @brief Fresh-counter proof that both intended production paths ran. */
     void runPathProof(SingleTokenFixture &fixture)
     {
+        // NOTE: the bench calls the KERNEL directly, so the proof asserts
+        // the KERNEL-level counters. The stage-level counter
+        // (kernel.cpu_moe_decode_router_q8_reuse_calls) is recorded by
+        // MoEExpertComputeStage::executeSingleToken and never advances on
+        // a direct-kernel route.
         constexpr const char *kBundleFamily =
-            "kernel.cpu_moe_decode_router_q8_reuse_calls";
+            "kernel.cpu_native_quantised_router_q8_grouped_decode_equivalent_projection_calls";
         constexpr const char *kDownFamily =
             "kernel.cpu_native_quantised_fused_expert_down_calls";
         constexpr const char *kTransactionFamily =
