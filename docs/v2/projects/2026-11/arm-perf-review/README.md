@@ -2521,3 +2521,17 @@ arm-reviewer had no self-service compaction; typed /compact via pane
 send-keys (character-split) — "Compacting context..." confirmed; todos
 #210/#211 (repair review + compact-decode blockers) intact. Reviewer
 clear to resume passes post-compaction (next: fix-forward #2 ACK).
+
+### FIX-FORWARD #2 @ c1a002b50 (~19:58Z) → reviewer ACK request
+
+Issue 1: seq_cst atomic_signal_fence at both interval edges (zero
+instruction cost; signal-handler visibility semantics force walker-store
+materialization before the end-clock read; standardized wrapper of the
+empty memory-clobber asm). Issue 2: lane independently reproduced the
+reviewer's FNV cancellation attack (digest 0x3ea0d00f unchanged) and
+REMOVED the digest entirely — acceptance = untimed per-sample byte
+comparisons (arm-vs-arm per row + byte-exact sample-0 reference, before
+buffer reuse); sentinel freshness unchanged. Deliberate removal flagged
+for ruling: the post-loop final-contents memcmp (subsumed + was an
+attack surface). All negatives proven standalone. ACK request queued to
+the compacting reviewer; .79 re-run gated on it.
