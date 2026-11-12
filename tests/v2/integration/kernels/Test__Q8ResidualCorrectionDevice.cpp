@@ -11,6 +11,8 @@
  * complete prepared HC chains before fusion, with exact bank/guard histories.
  * A separate authored HC-up/read composition preserves a nonzero signal lost
  * by SingleQ8, with independent FP64 source arithmetic and live-prefix replay.
+ * Explicit HC-up K-pair diagnostics keep the production32x64 tile intact
+ * while comparing actual production with an explicit original single-K32 reference.
  * M512 HC-down tile comparisons retain a forced baseline, all native Q8 source
  * aliases and dirty M512/M64 histories independently of installed Auto policy.
  */
@@ -25,6 +27,7 @@
 #include "utils/Q8ResidualAllFormatOracle.h"
 #include "../../utils/Qwen4ExpFAOutputStageFixture.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
+#include "kernels/common/Q8ResidualGroupedDiagnostic.h"
 #include "backends/BackendManager.h"
 #include "backends/ExplicitGPUStream.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -562,10 +565,10 @@ void proveCancellationRead(DeviceId device)
     }).get();
 }
 /** @brief Freeze a complete original HC read chain before installing103. */
-/** @brief Explicit original or typed production graph selection. */
-enum class HC103Path {Control,Typed};
-/** @brief Correctness or the existing disabled paired-chain event observation. */
-enum class HC103Observation {Correctness,Paired};
+/** @brief Original/typed fusion comparison or explicit fixed-tile K-pair staging. */
+enum class HC103Path {Control,Typed,GroupedKPair};
+/** @brief Native replay, paired events, or one event-free retained profile variant. */
+enum class HC103Observation {Correctness,Paired,ProfileProduction,ProfileReference};
 /** @brief Test-only native-address substitution without transferring allocation ownership. */
 class HC103AddressTensor final:public FP32Tensor {
 public:
@@ -586,31 +589,67 @@ private:void* substitute_=nullptr;
  * @param hidden Per-branch width; the real trunk/up width is four times this.
  * @param lowRank Complete source-admitted HC bottleneck width.
  * @param alias Whether raw down and activated use the exact same tensor.
- * @param path Original public chain or the actual declarative typed builder.
- * @param observation Correctness histories or existing opt-in paired events.
+ * @param path Original chain, typed fusion comparison, or actual production/original single-group reference.
+ * @param observation Correctness histories, opt-in paired events or event-free selected profiling.
  * @param format Original registry source; null retains the historical Q8_0 case.
  */
 void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC103Path path,
  HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr) {
- const bool timing=observation==HC103Observation::Paired;const bool ordinaryDown=observation!=HC103Observation::Correctness;const bool typed=path==HC103Path::Typed;
+ const bool timing=observation==HC103Observation::Paired;
+ const bool profiling=observation==HC103Observation::ProfileProduction||observation==HC103Observation::ProfileReference;
+ const bool kPair=path==HC103Path::GroupedKPair;
+ const bool ordinaryDown=observation!=HC103Observation::Correctness;
+ const bool typed=path!=HC103Path::Control;
+ require(!kPair||(device.is_rocm()&&m>=32&&hidden>=16),"HC K-pair diagnostic requires its native ROCm grouped geometry");
+ require(!profiling||kPair,"Event-free HC profiling requires an explicit K-group variant");
  auto *backend=getBackendFor(device);require(backend&&backend->deviceCount()>device.ordinal,"HC103 backend unavailable");
  auto &worker=GPUDeviceContextPool::instance().getContext(device);auto context=IDeviceContext::create(device,1);
  worker.submitAsync([&]{
   SCOPED_TRACE(::testing::Message()<<device.toString()<<" M/H/R="<<m<<'/'<<hidden<<'/'<<lowRank<<" alias="<<alias);
+  int productionGroups=1;
+#ifdef HAVE_ROCM
+  if(kPair){
+   using Arch=native_quantised::NativeQuantisedArchitecture;
+   productionGroups=Arch::fromROCmISATarget(rocmHardwareMetadata().at(device.ordinal).isa_target)==
+    Arch::rocm(9,0,6)?2:1;
+  }
+#endif
   const int trunk=4*hidden;Storage s{device,backend,ExplicitGPUStream(worker.defaultStream()).get()};
   auto downBytes=nativeWeights(lowRank,trunk),upBytes=nativeWeights(trunk,lowRank);
   std::unique_ptr<TensorBase> downSource,upSource;
   if(format) {
+   if(kPair){
+    test::requireQuantizedVerifierSourceShape(*format,lowRank,trunk);
+    test::requireQuantizedVerifierSourceShape(*format,trunk,lowRank);
+   }
    downSource=test::q8_all_formats::source(*format,lowRank,trunk);
    upSource=test::q8_all_formats::source(*format,trunk,lowRank);
   } else {
    downSource=std::make_unique<Q8_0Tensor>(std::vector<std::size_t>{std::size_t(lowRank),std::size_t(trunk)},downBytes);
    upSource=std::make_unique<Q8_0Tensor>(std::vector<std::size_t>{std::size_t(trunk),std::size_t(lowRank)},upBytes);
   }
+  const auto savedDownBytes=kPair?test::q8_all_formats::originalBytes(*downSource):std::vector<std::uint8_t>{};
+  const auto savedUpBytes=kPair?test::q8_all_formats::originalBytes(*upSource):std::vector<std::uint8_t>{};
   auto downPrepared=test::makeGpuPreparedGemm(downSource.get(),device,"hc103.down.weight",ModelContextId{803103});
   auto upPrepared=test::makeGpuPreparedGemm(upSource.get(),device,"hc103.up.weight",ModelContextId{803104});
   auto *downEngine=downPrepared.kernel,*upEngine=upPrepared.kernel;
   DeviceNativeQuantisedMatrixDesc originalUp;require(upEngine->exportNativeQuantisedMatrixDesc(originalUp),"HC103 original prepared source missing");
+  require(!kPair||(originalUp.valid()&&originalUp.codebook_id==19&&originalUp.source_identity_present),
+   "HC K-pair diagnostic requires an authenticated original native Q8 source");
+  if(kPair){
+   const auto sourceCodebook=format?format->source_codebook_id:std::uint8_t{19};
+   const bool sourceSuperblock=format&&format->source_is_superblock;
+   DeviceNativeQuantisedMatrixDesc originalDown;
+   require(downEngine->exportNativeQuantisedMatrixDesc(originalDown)&&originalDown.valid(),
+    "HC K-pair original prepared down descriptor missing");
+   for(const auto* descriptor:{&originalDown,&originalUp})
+    require(descriptor->codebook_id==19&&descriptor->source_identity_present&&
+     descriptor->source_codebook_id==sourceCodebook&&descriptor->source_is_superblock==sourceSuperblock,
+     "HC K-pair prepared source identity differs from its requested original alias");
+   require(originalDown.n==lowRank&&originalDown.k==trunk&&originalDown.blocks_per_row==unsigned(trunk/32)&&
+    originalUp.n==trunk&&originalUp.k==lowRank&&originalUp.blocks_per_row==unsigned(lowRank/32),
+    "HC K-pair prepared source geometry differs from its admitted original operands");
+  }
   FP32Tensor normalized({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
   std::array<std::unique_ptr<FP32Tensor>,2> rawDown,activated,up,read;
   FP32Tensor branchInput({std::size_t(m+1),std::size_t(trunk)},DeviceId::cpu());
@@ -642,6 +681,11 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     .a_buffer_id=BufferId::GATE_PROJ,.c_buffer_id=BufferId::ATTN_OUTPUT,.force_decode_equivalent_verifier_prefill=true,
     .verifier_row_range=rows,.prepared_ref=upPrepared.ref,.prepared_store=upPrepared.store.get(),
     .quantized_operand_precision=QuantizedActivationOperandPrecision::TwoTermQ8};
+   if(kPair){
+    upParams.A=raw;
+    upParams.hc_residual_down=GEMMStage::HCResidualDownPublication{
+     activated[side].get(),alias?BufferId::GATE_PROJ:BufferId::UP_PROJ};
+   }
    upStages[side]=std::make_unique<GEMMStage>(upParams);upStages[side]->setGPUStream(s.stream);
    upWorkspace[side]=std::make_unique<Workspace>(device,upStages[side]->getWorkspaceRequirements(m,trunk,lowRank));
    upStages[side]->bindWorkspace(upWorkspace[side]->value.get());
@@ -804,6 +848,17 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
 #endif
    throw std::runtime_error("HC103 frozen read unavailable");
   };
+  // Borrow the same admitted source, count, outputs and workspace banks for
+  // reference capture and prepublication rejection; no alternate storage owner.
+  auto referenceProjection=[&](int side){
+   return GPUQ8ResidualCorrectionArgs{originalUp,rows,Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
+    static_cast<const float*>((alias?activated[side]:rawDown[side])->gpu_data_ptr()),
+    static_cast<float*>(up[side]->gpu_data_ptr()),
+    static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionPrimaryQ8)),
+    static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionResidualQ8)),
+    static_cast<float*>(upWorkspace[side]->value->getBuffer(kGPUProjectionPrimaryQ8Scales)),
+    static_cast<float*>(upWorkspace[side]->value->getBuffer(kGPUProjectionResidualQ8Scales))};
+  };
   auto chain=[&](int side) {
    if(typed) {
     if(side==0) {
@@ -815,6 +870,15 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    }
    require(downStages[side]->execute(context.get()),"HC103 prepared down rejected");
    const qwen4exp::RowExtent extent{m,count};
+   if(kPair){
+#ifdef HAVE_ROCM
+    rocmHCResidualDownGroupedSingleGroupReference({referenceProjection(side),
+     static_cast<float*>(activated[side]->gpu_data_ptr())},s.stream);
+    primitives->residualRead({extent,hidden,static_cast<const float*>(normalized.gpu_data_ptr()),
+     static_cast<const float*>(up[side]->gpu_data_ptr()),static_cast<float*>(read[side]->gpu_data_ptr())},s.stream);
+    return;
+#endif
+   }
    qwen4exp::ResidualDownArgs activation{extent,lowRank,static_cast<const float*>((alias?activated[side]:rawDown[side])->gpu_data_ptr()),static_cast<float*>(activated[side]->gpu_data_ptr())};
    if(side==0)primitives->residualDown(activation,s.stream);else originalDown(activation);
    require(upStages[side]->execute(context.get()),"HC103 original prepared TwoTerm up rejected");
@@ -830,14 +894,126 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;require(graph->inspectKernelNodes(nodes,&error),"HC103 graph inventory failed");
    inventory[side]=nodes;EXPECT_EQ(graph->nodeCount(),nodes.size());for(const auto&node:nodes) {
     EXPECT_EQ(node.local_memory_bytes_per_thread,0u);require(node.name_resolved,"HC103 unresolved native kernel");
-    std::cout<<"HC103_CONTROL_KERNEL,"<<side<<','<<node.name<<','<<node.grid_x<<','<<node.grid_y<<','<<node.grid_z
-     <<','<<node.block_x<<','<<node.block_y<<','<<node.block_z<<','<<node.registers_per_thread<<','<<node.static_shared_memory_bytes<<','<<node.local_memory_bytes_per_thread<<'\n';
+    std::cout<<(kPair?"HC103_KPAIR_KERNEL,":"HC103_CONTROL_KERNEL,")<<side<<','<<node.name<<','<<node.grid_x<<','<<node.grid_y<<','<<node.grid_z
+     <<','<<node.block_x<<','<<node.block_y<<','<<node.block_z<<','<<node.registers_per_thread<<','<<node.static_shared_memory_bytes<<','<<node.local_memory_bytes_per_thread;
+    if(kPair)std::cout<<",function="<<node.function_identity<<",dynamic_shared="<<node.dynamic_shared_memory_bytes;
+    std::cout<<'\n';
    }
-   std::cout<<"HC103_CONTROL_GRAPH,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<side<<','<<copies<<','<<nodes.size()<<','<<(timing?"ordinary_full_down":"counted_verifier_down")<<'\n';
+   std::cout<<(kPair?"HC103_KPAIR_GRAPH,":"HC103_CONTROL_GRAPH,")<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<side<<','<<copies<<','<<nodes.size()<<','<<(ordinaryDown?"ordinary_full_down":"counted_verifier_down");
+   if(kPair)std::cout<<",role="<<(side==0?"production":"single_group_reference")
+    <<",staged_groups="<<(side==0?productionGroups:1);
+   std::cout<<'\n';
   };
   s.upload(count,std::vector<int32_t>{m});
-  capture(s.graph,0);capture(referenceGraph,1);
-  if(typed) {
+#ifdef HAVE_ROCM
+  if(kPair&&observation==HC103Observation::Correctness&&m==32&&!alias){
+   const GPUHCResidualDownPublication valid{referenceProjection(1),static_cast<float*>(activated[1]->gpu_data_ptr())};
+   const float poison=-2718.25f;
+   for(auto* tensor:{activated[1].get(),up[1].get()})
+    s.upload(static_cast<float*>(tensor->gpu_data_ptr()),std::vector<float>(tensor->numel(),poison));
+   for(auto* bank:{valid.projection.primary,valid.projection.residual})
+    s.upload(bank,std::vector<signed char>(banks,-37));
+   for(auto* bank:{valid.projection.primaryScales,valid.projection.residualScales})
+    s.upload(bank,std::vector<float>(scales,poison));
+   auto rejected=worker.createGraphCapture(s.stream);
+   {
+    ScopedBackendGraphCapture recording(worker,*rejected,"HC K-pair invalid-before-publication");
+    require(recording.begin(),"HC K-pair rejection capture failed");
+    auto rejectBoth=[&](GPUHCResidualDownPublication invalid,void* stream){
+     EXPECT_THROW(rocmHCResidualDownGroupedSingleGroupReference(invalid,stream),std::invalid_argument);
+     EXPECT_THROW(rocmQ8ResidualGroupedSingleGroupReference(invalid.projection,stream),std::invalid_argument);
+    };
+    rejectBoth(valid,nullptr);
+    auto invalid=valid;invalid.projection.rows=DeviceRowRange::deviceCounted(31,count);rejectBoth(invalid,s.stream);
+    invalid=valid;invalid.projection.weights.n=63;rejectBoth(invalid,s.stream);
+    invalid=valid;invalid.projection.weights.codebook_id=0;rejectBoth(invalid,s.stream);
+    invalid=valid;invalid.projection.primary=invalid.projection.residual;rejectBoth(invalid,s.stream);
+    invalid=valid;invalid.projection.rows=DeviceRowRange::deviceCounted(m,reinterpret_cast<const int32_t*>(valid.projection.output));rejectBoth(invalid,s.stream);
+    invalid=valid;invalid.activated=nullptr;
+    EXPECT_THROW(rocmHCResidualDownGroupedSingleGroupReference(invalid,s.stream),std::invalid_argument);
+    invalid=valid;invalid.activated=valid.projection.output;
+    EXPECT_THROW(rocmHCResidualDownGroupedSingleGroupReference(invalid,s.stream),std::invalid_argument);
+    recording.finish();
+   }
+   // Zero captured operations proves rejection precedes publication, while
+   // native byte observations retain every admitted bank and output guard.
+   EXPECT_EQ(rejected->nodeCount(),0u);
+   std::vector<GPUGraphKernelNodeInfo> rejectedNodes;std::string error;
+   require(rejected->inspectKernelNodes(rejectedNodes,&error),"HC K-pair rejection inventory failed");
+   EXPECT_TRUE(rejectedNodes.empty());rejected->reset();
+   for(auto* tensor:{activated[1].get(),up[1].get()})
+    EXPECT_EQ(s.download(static_cast<const float*>(tensor->gpu_data_ptr()),tensor->numel()),
+     std::vector<float>(tensor->numel(),poison));
+   for(const auto* bank:{valid.projection.primary,valid.projection.residual})
+    EXPECT_EQ(s.download(bank,banks),std::vector<signed char>(banks,-37));
+   for(const auto* bank:{valid.projection.primaryScales,valid.projection.residualScales})
+    EXPECT_EQ(s.download(bank,scales),std::vector<float>(scales,poison));
+   ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+#endif
+  if(profiling){
+   // Match the paired run's full-live authored input, including its guard row;
+   // setup uploads stay outside the selected retained execution interval.
+   std::vector<float> input(std::size_t(m+1)*trunk);
+   for(int row=0;row<=m;++row)for(int column=0;column<trunk;++column)
+    input[std::size_t(row)*trunk+column]=row<m?
+     (column%32==0?float(1+row%7)*3.125f:std::sin(float(row*11+column*7))*.37f):
+     std::numeric_limits<float>::quiet_NaN();
+   s.upload(static_cast<float*>(branchInput.gpu_data_ptr()),input);
+  }
+  if(kPair)require(actualUp[1]->prepareGraphLaunch(context.get(),s.stream),"HC K-pair original workspace admission failed");
+  if(!profiling||observation==HC103Observation::ProfileProduction)capture(s.graph,0);
+  if(!profiling||observation==HC103Observation::ProfileReference)capture(referenceGraph,1);
+  if(kPair){
+   using Key=std::tuple<std::uintptr_t,std::string,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned>;
+   std::array<std::map<Key,int>,2> common;
+   std::array<std::uintptr_t,2> producers{};
+   for(int side=0;side<2;++side){
+    if(inventory[side].empty())continue;
+    const int kernelTemplate=side==0?0:1;
+    const int stagedGroups=side==0?productionGroups:1;
+    int projections=0,publishers=0;
+    for(const auto&node:inventory[side]){
+     if(node.name.find("projectGrouped")!=std::string::npos){
+      ++projections;producers[side]=node.function_identity;
+      EXPECT_TRUE(node.name.find("projectGrouped<"+std::to_string(kernelTemplate)+">")!=std::string::npos||
+       node.name.find("projectGroupedILi"+std::to_string(kernelTemplate)+"EE")!=std::string::npos)<<node.name;
+      EXPECT_EQ(node.grid_x,unsigned(((m+31)/32)*((trunk+63)/64)));
+      EXPECT_EQ(node.grid_y,1u);EXPECT_EQ(node.grid_z,1u);
+      EXPECT_EQ(node.block_x,256u);EXPECT_EQ(node.block_y,1u);EXPECT_EQ(node.block_z,1u);
+      EXPECT_EQ(node.static_shared_memory_bytes,4608u*stagedGroups);
+      EXPECT_EQ(node.dynamic_shared_memory_bytes,0u);
+      EXPECT_EQ(node.local_memory_bytes_per_thread,0u);
+     }else{
+      if(node.name.find("publishHCResidualDown")!=std::string::npos)++publishers;
+      ++common[side][Key{node.function_identity,node.name,node.grid_x,node.grid_y,node.grid_z,
+       node.block_x,node.block_y,node.block_z}];
+     }
+    }
+    EXPECT_EQ(projections,copies);EXPECT_EQ(publishers,copies);
+   }
+   if(!profiling){
+    if(productionGroups!=1)EXPECT_NE(producers[0],producers[1]);
+    EXPECT_EQ(common[0],common[1]);
+   }
+   ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  if(profiling){
+   // Intercepted SDMA timing markers have a known SDK timestamp-owner defect.
+   // This mode creates no events and executes only the selected retained chain.
+   // Drain all setup copies at this explicit diagnostic boundary before replay.
+   require(backend->synchronizeStream(s.stream,device.ordinal),"HC profile setup retirement failed");
+   auto& selected=observation==HC103Observation::ProfileProduction?s.graph:referenceGraph;
+   for(int warm=0;warm<8;++warm)require(selected->launch(),"HC profile warmup failed");
+   for(int replay=0;replay<31;++replay)require(selected->launch(),"HC profile observation failed");
+   require(backend->synchronizeStream(s.stream,device.ordinal),"HC profile terminal retirement failed");
+   std::cout<<"HC103_KPAIR_PROFILE,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','
+    <<(observation==HC103Observation::ProfileProduction?productionGroups:1)
+    <<",role="<<(observation==HC103Observation::ProfileProduction?"production":"single_group_reference")
+    <<",row_tile=32,column_tile=64,threads=256,warmup=8,observations=31,event_free=1\n";
+   s.retire();referenceGraph.reset();return;
+  }
+  if(typed&&!kPair) {
    ASSERT_EQ(inventory[0].size()+copies,inventory[1].size());
    using Key=std::tuple<std::string,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned>;
    std::array<std::map<Key,int>,2> remaining;
@@ -877,7 +1053,8 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
   const std::array downSignatures{actualDown[0]->graphCaptureVariantSignature(),actualDown[1]->graphCaptureVariantSignature()};
   const std::array upSignatures{actualUp[0]->graphCaptureVariantSignature(),actualUp[1]->graphCaptureVariantSignature()};
   const auto retainedOwners=s.owners->size();
-  for(int replay=0;replay<(observation==HC103Observation::Correctness?20:1);++replay) {
+  const int replays=observation==HC103Observation::Correctness?20:1;
+  for(int replay=0;replay<replays;++replay) {
    const int live=timing||replay%4==0?m:replay%4==1?std::min(m,1):replay%4==2?0:std::max(0,m-1);
    SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<" live="<<live);
    std::vector<float> input(std::size_t(m+1)*trunk);
@@ -927,16 +1104,47 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    DeviceNativeQuantisedMatrixDesc after;require(upEngine->exportNativeQuantisedMatrixDesc(after),"HC103 original source vanished");
    EXPECT_EQ(after.payload,originalUp.payload);EXPECT_EQ(after.scales,originalUp.scales);
    EXPECT_EQ(after.source_codebook_id,originalUp.source_codebook_id);
+   if(kPair){
+    EXPECT_EQ(after.source_identity_present,originalUp.source_identity_present);
+    EXPECT_EQ(after.source_is_superblock,originalUp.source_is_superblock);
+    EXPECT_EQ(after.codebook_id,originalUp.codebook_id);
+    EXPECT_EQ(after.n,originalUp.n);EXPECT_EQ(after.k,originalUp.k);
+    EXPECT_EQ(after.blocks_per_row,originalUp.blocks_per_row);
+   }
    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  if(kPair){
+   EXPECT_EQ(savedDownBytes,test::q8_all_formats::originalBytes(*downSource));
+   EXPECT_EQ(savedUpBytes,test::q8_all_formats::originalBytes(*upSource));
   }
   if(observation!=HC103Observation::Correctness) {
    struct Events {IBackend*b;int device;void*stream;void*first;void*last;/** @brief Drain pending event use before release on every exception path. */ ~Events(){if(!b->synchronizeStream(stream,device))std::terminate();if(last)b->destroyEvent(last,device);if(first)b->destroyEvent(first,device);}} events{backend,device.ordinal,s.stream,backend->createTimingEvent(device.ordinal),backend->createTimingEvent(device.ordinal)};
    require(events.first&&events.last,"HC103 timing event creation failed");
    auto sample=[&](IGPUGraphCapture &graph){require(backend->recordEvent(events.first,device.ordinal,s.stream),"HC103 start event failed");require(graph.launch(),"HC103 timed replay failed");require(backend->recordEvent(events.last,device.ordinal,s.stream),"HC103 stop event failed");require(backend->waitForEvent(events.last,device.ordinal),"HC103 terminal timing observation failed");float ms=0;require(backend->eventElapsedTimeMs(events.first,events.last,device.ordinal,&ms),"HC103 elapsed event failed");require(std::isfinite(ms)&&ms>0,"HC103 invalid event duration");return ms*1000.f/copies;};
    for(int warm=0;warm<5;++warm){(void)sample(*s.graph);(void)sample(*referenceGraph);}
+   if(kPair){
+    const char* sourceName=format?format->label:"Q8_0";
+    std::cout<<"HC103_KPAIR_CASE,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<alias<<','<<copies
+     <<",production_vs_single_group_reference,production_staged_groups="<<productionGroups
+     <<",reference_staged_groups=1,same_fused_publication_and_read,ordinary_full_down,counted_two_term_up,source="<<sourceName
+     <<",sample_columns=production0/production1/reference0/reference1/production_mean/reference_mean\n";
+    for(int pair=0;pair<31;++pair){
+     std::array<float,2> production{},reference{};
+     const std::array order=pair&1?std::array{1,0,0,1}:std::array{0,1,1,0};
+     std::array<int,2> next{};
+     for(const int side:order){
+      const float us=sample(side==0?*s.graph:*referenceGraph);
+      (side==0?production:reference)[next[side]++]=us;
+     }
+     std::cout<<"HC103_KPAIR_PAIR,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<sourceName<<','<<pair
+      <<','<<(pair&1?"BAAB":"ABBA")<<','<<production[0]<<','<<production[1]<<','<<reference[0]<<','<<reference[1]
+      <<','<<(production[0]+production[1])*.5f<<','<<(reference[0]+reference[1])*.5f<<",complete_chain_us\n";
+    }
+   }else{
    if(typed)std::cout<<"HC103_CANDIDATE_CASE,"<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<alias<<','<<copies
     <<",actual_typed_builder_vs_frozen_original,ordinary_full_down,counted_two_term_up\n";
    for(int pair=0;pair<31;++pair){float a,b;if(pair&1){b=sample(*referenceGraph);a=sample(*s.graph);}else{a=sample(*s.graph);b=sample(*referenceGraph);}std::cout<<(typed?"HC103_CANDIDATE_PAIR,":"HC103_CONTROL_PAIR,")<<device.toString()<<','<<m<<','<<hidden<<','<<lowRank<<','<<pair<<','<<a<<','<<b<<'\n';}
+   }
   }
   s.retire();referenceGraph.reset();witnessGraph.reset();for(int side=0;side<2;++side){downStages[side]->unbindWorkspace();upStages[side]->unbindWorkspace();}
  }).get();
@@ -954,6 +1162,51 @@ void proveHC103Control(DeviceId device,int m,int hidden,int lowRank,bool alias,b
  const test::QuantizedVerifierFormatCase* format=nullptr) {
  proveHC103Chain(device,m,hidden,lowRank,alias,HC103Path::Control,
   timing?HC103Observation::Paired:HC103Observation::Correctness,format);
+}
+/**
+ * @brief Reuse the complete HC103 chain for one original signed-Q8 source alias.
+ * @param sourceName Existing Q8_0, Q8_1 or Q8_K registry name.
+ * @param observation Byte lifecycle, paired native events or one event-free profile.
+ * @param measuredRows Exact opt-in complete-chain row extent; existing cases retain512.
+ * @details Q8_0/Q8_1 include actual M512/H2560/R320 geometry plus
+ * H64/R96 boundary cases with an odd three-K32-group tail. Original Q8_K
+ * requires complete K256 source blocks and is explicitly H64/R256 geometry,
+ * never a relabeled R320 tensor. Only these new cases consume the existing
+ * LLAMINAR_TEST_ROCM_DEVICE selector; historical fixture ordinals stay intact.
+ */
+void proveHC103KPair(const char* sourceName,HC103Observation observation,int measuredRows=512) {
+#ifdef HAVE_ROCM
+ int ordinal=0;
+ if(const char* selected=std::getenv("LLAMINAR_TEST_ROCM_DEVICE")){
+  const char* end=selected+std::strlen(selected);
+  const auto parsed=std::from_chars(selected,end,ordinal);
+  require(parsed.ec==std::errc{}&&parsed.ptr==end&&ordinal>=0,
+   "LLAMINAR_TEST_ROCM_DEVICE requires a nonnegative native ordinal");
+ }
+ const auto device=DeviceId::rocm(ordinal);
+ auto* backend=getBackendFor(device);
+ require(backend&&backend->deviceCount()>ordinal,"HC K-pair native participant unavailable without visibility changes");
+ const auto& hardware=rocmHardwareMetadata().at(ordinal);
+ const auto& format=test::quantizedMoEVerifierFormat(sourceName);
+ require(format.device_execution_codebook_id==19,"HC K-pair requires an original signed-Q8 source alias");
+ const bool superblock=format.tensor_type==TensorType::Q8_K;
+ std::ostringstream uuid;
+ uuid<<std::hex<<std::setfill('0');
+ for(const auto byte:hardware.uuid)uuid<<std::setw(2)<<unsigned(byte);
+ std::cout<<"HC103_KPAIR_HARDWARE,"<<device.toString()<<','<<hardware.pci_address<<','<<hardware.isa_target
+  <<",uuid="<<uuid.str()<<",source="<<sourceName<<",source_codebook="<<unsigned(format.source_codebook_id)
+  <<",source_superblock="<<format.source_is_superblock<<'\n';
+ if(observation==HC103Observation::Correctness){
+  for(int rows:{32,33,64,65,511,512,513})for(bool alias:{false,true})
+   proveHC103Chain(device,rows,64,superblock?256:96,alias,HC103Path::GroupedKPair,observation,&format);
+  if(!superblock)proveHC103Chain(device,32,64,32,false,HC103Path::GroupedKPair,observation,&format);
+ }
+ proveHC103Chain(device,measuredRows,superblock?64:2560,superblock?256:320,false,
+  HC103Path::GroupedKPair,observation,&format);
+#else
+ (void)sourceName;(void)observation;(void)measuredRows;
+ throw std::runtime_error("HC K-pair diagnostic requires the compiled ROCm backend");
+#endif
 }
 /** @brief Exercise actual HC preparation and native/map retirement boundaries.
  * @param device Exact backend participant; no projection arithmetic is substituted.
@@ -1231,6 +1484,60 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM1PairedChainEvents) 
 /** @test Opt-in one-shape actual builder/frozen-original complete-chain native events. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHC103CandidateM512PairedChainEvents) {
  proveHC103Chain(DeviceId::rocm(0),512,2560,320,false,HC103Path::Typed,HC103Observation::Paired);
+}
+
+/** @test Actual HC-up shape plus row boundaries retain all Q8_0 bytes and graph identities. */
+TEST(Q8ResidualCorrectionDevice,ROCmHCUpKPairCapturedReplayQ8_0) {
+ proveHC103KPair("Q8_0",HC103Observation::Correctness);
+}
+/** @test The same K-group staging comparison preserves the independent Q8_1 source. */
+TEST(Q8ResidualCorrectionDevice,ROCmHCUpKPairCapturedReplayQ8_1) {
+ proveHC103KPair("Q8_1",HC103Observation::Correctness);
+}
+/** @test Q8_K uses its real K256 source geometry through partial, empty and reset replay. */
+TEST(Q8ResidualCorrectionDevice,ROCmHCUpKPairCapturedReplayQ8_K) {
+ proveHC103KPair("Q8_K",HC103Observation::Correctness);
+}
+/** @test Opt-in complete M512/H2560/R320 chain events, actual production versus original single-group reference. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512PairedChainQ8_0) {
+ proveHC103KPair("Q8_0",HC103Observation::Paired);
+}
+/** @test Opt-in identical physical comparison over the independent Q8_1 source. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512PairedChainQ8_1) {
+ proveHC103KPair("Q8_1",HC103Observation::Paired);
+}
+/** @test Opt-in Q8_K M512/H64/R256 chain events, explicitly separate source geometry. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512PairedChainQ8_K) {
+ proveHC103KPair("Q8_K",HC103Observation::Paired);
+}
+/** @test Opt-in matched Q8_0 row spectrum at actual N10240/K320, one complete chain per sample. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairRowSpectrumQ8_0) {
+ for(int rows:{32,128,512,1024,2048})
+  proveHC103KPair("Q8_0",HC103Observation::Paired,rows);
+}
+/** @test Event-free profile of compiled production staging only, Q8_0 actual M512 HC-up shape. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileProductionQ8_0) {
+ proveHC103KPair("Q8_0",HC103Observation::ProfileProduction);
+}
+/** @test Event-free profile of original single-group reference only, Q8_0 actual M512 HC-up shape. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileReferenceQ8_0) {
+ proveHC103KPair("Q8_0",HC103Observation::ProfileReference);
+}
+/** @test Event-free single-group production profile retains independent Q8_1 source identity. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileProductionQ8_1) {
+ proveHC103KPair("Q8_1",HC103Observation::ProfileProduction);
+}
+/** @test Event-free original single-group reference profile retains independent Q8_1 source identity. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileReferenceQ8_1) {
+ proveHC103KPair("Q8_1",HC103Observation::ProfileReference);
+}
+/** @test Event-free single-group production profile of explicitly separate Q8_K H64/R256 geometry. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileProductionQ8_K) {
+ proveHC103KPair("Q8_K",HC103Observation::ProfileProduction);
+}
+/** @test Event-free original single-group reference profile of explicitly separate Q8_K H64/R256 geometry. */
+TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmHCUpKPairM512ProfileReferenceQ8_K) {
+ proveHC103KPair("Q8_K",HC103Observation::ProfileReference);
 }
 #endif
 

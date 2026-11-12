@@ -4,9 +4,13 @@
  *
  * The installed NativeQuantised group maps four rows and adjacent columns to each
  * worker. The retained Q8 fast specialization stages both original activation banks
- * and unchanged native weight words once per32-row tile. Independent integer
- * block dots feed the canonical K32 FP32 contribution/fold and one final sum.
- * No private arrays spill to global memory or output-sized partials are needed.
+ * and unchanged native weight words once per 32-row production tile. The exact
+ * gfx906 program stages successive K32 pairs using separate 64-thread producers
+ * and one producer/retirement join per pair. Other native programs and the
+ * explicit original reference retain single-group staging. Output ownership and
+ * each independent K32 FP32 contribution/fold remain unchanged; the complete
+ * terms receive one final sum. Both schedules retain the shipping zero-spill
+ * gate and need no global partials.
  * Native signed INT8 dot products share the exact unsaturated arithmetic
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
@@ -16,92 +20,116 @@
 #include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 namespace llaminar2::rocm_q8_residual {
 /**
- * @brief Compute one32×64 native-dot tile over the actual live rows only.
+ * @brief Compute one 32x64 native-dot tile over the actual live rows only.
+ * @tparam StagingMode Zero selects the compiled native production schedule; one retains the original single-group reference.
  * @param a Borrowed prepared source, device count and four persistent Q8 banks.
  *
  * K-word-major LDS permits broadcast A and B reads across the source-owned
  * grouped thread mapping. A producer join and reader-retirement join protect
  * each shared slot; no host synchronization or live-count readback is involved.
  */
+template<int StagingMode>
 __global__ __launch_bounds__(256,2) void projectGrouped(GPUQ8ResidualCorrectionArgs a) {
- constexpr int Rows=32,Cols=64,Words=8;
+ static_assert(StagingMode==0||StagingMode==1,"Two-term Q8 staging must name native production or the original single-group reference");
+ // The native code object owns the schedule. The host stub is shared across
+ // architectures and neither queries hardware nor borrows a measured neighbor.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+ constexpr int StagedK32Groups=StagingMode==0?2:1;
+#else
+ constexpr int StagedK32Groups=1;
+#endif
+ constexpr int Rows=32,Cols=64,Words=8,RowsPerThread=4;
  const auto columnTiles=(static_cast<unsigned>(a.weights.n)+Cols-1)/Cols;
  const auto rowBase=static_cast<std::uint64_t>(blockIdx.x/columnTiles)*Rows;
  const unsigned columnBase=(blockIdx.x%columnTiles)*Cols;
  const int live=a.rows.activeRows();if(rowBase>=static_cast<unsigned>(live))return;
- __shared__ int primary[Words][Rows],residual[Words][Rows],weights[Words][Cols];
- __shared__ float primaryScale[Rows],residualScale[Rows],weightScale[Cols];
- const int localRow=(threadIdx.x%8)*4,localColumn=(threadIdx.x/8)*2;
- float sum0[4][2]{},sum1[4][2]{};
- for(unsigned group=0;group<a.weights.blocks_per_row;++group) {
-  if(threadIdx.x<Rows) {
-   const auto row=rowBase+threadIdx.x;
+ __shared__ int primary[StagedK32Groups][Words][Rows],residual[StagedK32Groups][Words][Rows],weights[StagedK32Groups][Words][Cols];
+ __shared__ float primaryScale[StagedK32Groups][Rows],residualScale[StagedK32Groups][Rows],weightScale[StagedK32Groups][Cols];
+ // Output ownership is identical in both specializations. Two disjoint
+ // 64-thread producer cohorts stage successive groups on native gfx906,
+ // preserving the original word-major LDS layout and source word loads.
+ const int localRow=(threadIdx.x%8)*RowsPerThread,localColumn=(threadIdx.x/8)*2;
+ const int producerSlot=StagedK32Groups==1?0:threadIdx.x/64;
+ const int producerThread=StagedK32Groups==1?threadIdx.x:threadIdx.x%64;
+ float sum0[RowsPerThread][2]{},sum1[RowsPerThread][2]{};
+ for(unsigned groupBase=0;groupBase<a.weights.blocks_per_row;groupBase+=StagedK32Groups) {
+  const auto group=groupBase+producerSlot;
+  const bool producerActive=StagedK32Groups==1||(producerSlot<StagedK32Groups&&group<a.weights.blocks_per_row);
+  if(producerActive&&producerThread<Rows) {
+   const auto row=rowBase+producerThread;
    const auto block=row*a.weights.blocks_per_row+group;
 #pragma unroll
    for(int word=0;word<Words;++word) {
-    primary[word][threadIdx.x]=row<static_cast<unsigned>(live)?reinterpret_cast<const int*>(a.primary+block*32)[word]:0;
-    residual[word][threadIdx.x]=row<static_cast<unsigned>(live)?reinterpret_cast<const int*>(a.residual+block*32)[word]:0;
+    primary[producerSlot][word][producerThread]=row<static_cast<unsigned>(live)?reinterpret_cast<const int*>(a.primary+block*32)[word]:0;
+    residual[producerSlot][word][producerThread]=row<static_cast<unsigned>(live)?reinterpret_cast<const int*>(a.residual+block*32)[word]:0;
    }
-   primaryScale[threadIdx.x]=row<static_cast<unsigned>(live)?a.primaryScales[block]:0.f;
-   residualScale[threadIdx.x]=row<static_cast<unsigned>(live)?a.residualScales[block]:0.f;
+   primaryScale[producerSlot][producerThread]=row<static_cast<unsigned>(live)?a.primaryScales[block]:0.f;
+   residualScale[producerSlot][producerThread]=row<static_cast<unsigned>(live)?a.residualScales[block]:0.f;
   }
-  if(threadIdx.x<Cols) {
-   const unsigned column=columnBase+threadIdx.x;
+  if(producerActive&&producerThread<Cols) {
+   const unsigned column=columnBase+producerThread;
    const auto block=static_cast<std::uint64_t>(group)*a.weights.n+column;
 #pragma unroll
    for(int word=0;word<Words;++word)
-    weights[word][threadIdx.x]=column<static_cast<unsigned>(a.weights.n)?reinterpret_cast<const int*>(a.weights.payload+block*32)[word]:0;
-   weightScale[threadIdx.x]=column<static_cast<unsigned>(a.weights.n)?
+    weights[producerSlot][word][producerThread]=column<static_cast<unsigned>(a.weights.n)?reinterpret_cast<const int*>(a.weights.payload+block*32)[word]:0;
+   weightScale[producerSlot][producerThread]=column<static_cast<unsigned>(a.weights.n)?
     __half2float(__ushort_as_half(static_cast<const unsigned short*>(a.weights.scales)[block])):0.f;
   }
   __syncthreads();
-  // Outer products reuse one packed word across all independent outputs.
-  // The earlier row/column-first loop made LDS reread both activations for
-  // every column and the same weight for every row. Exact integer dots may
-  // interleave independently; only each output's K32 FP32 fold is ordered.
-  int dot0[4][2]{},dot1[4][2]{};
+  // Finish each original K32 fold before consuming the following slot. An
+  // absent odd-tail group performs no fold, including no synthetic zero add.
+#pragma unroll
+  for(int slot=0;slot<StagedK32Groups;++slot) {
+   if constexpr(StagedK32Groups==2)
+    if(groupBase+slot>=a.weights.blocks_per_row)break;
+   // Outer products reuse one packed word across all independent outputs.
+   // The earlier row/column-first loop made LDS reread both activations for
+   // every column and the same weight for every row. Exact integer dots may
+   // interleave independently; only each output's K32 FP32 fold is ordered.
+   int dot0[RowsPerThread][2]{},dot1[RowsPerThread][2]{};
 #pragma clang loop unroll_count(2)
-  for(int word=0;word<Words;++word) {
-   int p[4],r[4],w[2];
+   for(int word=0;word<Words;++word) {
+    int p[RowsPerThread],r[RowsPerThread],w[2];
 #pragma unroll
-   for(int row=0;row<4;++row) {
-    p[row]=primary[word][localRow+row];
-    r[row]=residual[word][localRow+row];
-   }
+    for(int row=0;row<RowsPerThread;++row) {
+     p[row]=primary[slot][word][localRow+row];
+     r[row]=residual[slot][word][localRow+row];
+    }
 #pragma unroll
-   for(int column=0;column<2;++column)
-    w[column]=weights[word][localColumn+column];
+    for(int column=0;column<2;++column)
+     w[column]=weights[slot][word][localColumn+column];
 #pragma unroll
-   for(int row=0;row<4;++row) {
+    for(int row=0;row<RowsPerThread;++row) {
 #pragma unroll
-    for(int column=0;column<2;++column) {
-     dot0[row][column]=::llaminar2::rocm_integer_contract::signedDot4(p[row],w[column],dot0[row][column]);
-     dot1[row][column]=::llaminar2::rocm_integer_contract::signedDot4(r[row],w[column],dot1[row][column]);
+     for(int column=0;column<2;++column) {
+      dot0[row][column]=::llaminar2::rocm_integer_contract::signedDot4(p[row],w[column],dot0[row][column]);
+      dot1[row][column]=::llaminar2::rocm_integer_contract::signedDot4(r[row],w[column],dot1[row][column]);
+     }
     }
    }
-  }
-  float pScale[4],rScale[4],wScale[2];
+   float pScale[RowsPerThread],rScale[RowsPerThread],wScale[2];
 #pragma unroll
-  for(int row=0;row<4;++row) {
-   pScale[row]=primaryScale[localRow+row];
-   rScale[row]=residualScale[localRow+row];
-  }
+   for(int row=0;row<RowsPerThread;++row) {
+    pScale[row]=primaryScale[slot][localRow+row];
+    rScale[row]=residualScale[slot][localRow+row];
+   }
 #pragma unroll
-  for(int column=0;column<2;++column)wScale[column]=weightScale[localColumn+column];
+   for(int column=0;column<2;++column)wScale[column]=weightScale[slot][localColumn+column];
 #pragma unroll
-  for(int row=0;row<4;++row) {
+   for(int row=0;row<RowsPerThread;++row) {
 #pragma unroll
-   for(int column=0;column<2;++column) {
-    sum0[row][column]=device_fp32_contract::add(sum0[row][column],
-     device_native_quantised_contract::singleScaleBlock(dot0[row][column],wScale[column],pScale[row]));
-    sum1[row][column]=device_fp32_contract::add(sum1[row][column],
-     device_native_quantised_contract::singleScaleBlock(dot1[row][column],wScale[column],rScale[row]));
+    for(int column=0;column<2;++column) {
+     sum0[row][column]=device_fp32_contract::add(sum0[row][column],
+      device_native_quantised_contract::singleScaleBlock(dot0[row][column],wScale[column],pScale[row]));
+     sum1[row][column]=device_fp32_contract::add(sum1[row][column],
+      device_native_quantised_contract::singleScaleBlock(dot1[row][column],wScale[column],rScale[row]));
+    }
    }
   }
   __syncthreads();
  }
 #pragma unroll
- for(int row=0;row<4;++row) {
+ for(int row=0;row<RowsPerThread;++row) {
 #pragma unroll
   for(int column=0;column<2;++column) {
    const auto mr=rowBase+localRow+row;const unsigned nc=columnBase+localColumn+column;

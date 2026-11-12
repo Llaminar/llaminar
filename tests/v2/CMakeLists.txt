@@ -4599,6 +4599,20 @@ add_v2_test(V2_Integration_HTTPDriverPublicationOrder
     LABELS "V2;Integration;ProductionTestPreflight;E2E;DriverHealth;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
+# Busy driver logs must drain without idle waits or losing their exact cursor.
+add_v2_test(V2_Integration_HTTPDriverBusyLogDrain
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_driver_diagnostics.py
+            GPUDriverDiagnosticsTests.test_direct_record_serialization_preserves_original_jsonl_bytes
+            GPUDriverDiagnosticsTests.test_exact_cursor_prefilter_preserves_full_order_and_ambiguity
+            GPUDriverWindowTests.test_busy_batches_poll_buffered_close_and_preserve_all_original_bytes
+            GPUDriverWindowTests.test_empty_batches_restore_idle_wait_and_close_requires_final_read
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;E2E;DriverHealth;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_HTTPDriverBusyLogDrain)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPDriverBusyLogDrain)
+endif()
+
 # Exercise the actual Python process-group deadline consumer before HTTP cells.
 add_v2_test(V2_Integration_HTTPCellDeadline
     COMMAND ${Python3_EXECUTABLE}
@@ -38466,6 +38480,52 @@ foreach(V2_HC103_PERF_BACKEND CUDA ROCm)
         endforeach()
     endif()
 endforeach()
+
+# Installed HC-up K-pair staging is compared with the original single-group chain.
+# Native source aliases retain independent bytes; Q8_K uses legal K256 geometry.
+if(HAVE_ROCM)
+    foreach(V2_HC_UP_SOURCE Q8_0 Q8_1 Q8_K)
+        if(TARGET v2_test_qwen4exp_device_primitives)
+            set(V2_HC_UP_REPLAY V2_Integration_ROCmHCUpKPairCapturedReplay${V2_HC_UP_SOURCE})
+            add_v2_test(${V2_HC_UP_REPLAY}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=Q8ResidualCorrectionDevice.ROCmHCUpKPairCapturedReplay${V2_HC_UP_SOURCE}
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;TwoTermQ8;Prefill;Capture;Replay;ByteExact;Lifecycle;Regression"
+                ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            if(TEST ${V2_HC_UP_REPLAY})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_HC_UP_REPLAY})
+            endif()
+        endif()
+        if(TARGET v2_perf_q8_residual_prepared_projection)
+            add_v2_test(V2_Perf_ROCmHCUpKPairM512PairedChain${V2_HC_UP_SOURCE}
+                COMMAND $<TARGET_FILE:v2_perf_q8_residual_prepared_projection>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmHCUpKPairM512PairedChain${V2_HC_UP_SOURCE}
+                LABELS "V2;Performance;ROCm;Qwen4Exp;TwoTermQ8;Prefill;ComponentTiming"
+                ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
+            foreach(V2_HC_UP_PROFILE Production Reference)
+                add_v2_test(V2_Perf_ROCmHCUpKPairM512Profile${V2_HC_UP_PROFILE}${V2_HC_UP_SOURCE}
+                    COMMAND $<TARGET_FILE:v2_perf_q8_residual_prepared_projection>
+                        --gtest_also_run_disabled_tests
+                        --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmHCUpKPairM512Profile${V2_HC_UP_PROFILE}${V2_HC_UP_SOURCE}
+                    LABELS "V2;Performance;ROCm;Qwen4Exp;TwoTermQ8;Prefill;ComponentProfile"
+                    ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                    MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
+            endforeach()
+        endif()
+    endforeach()
+    if(TARGET v2_perf_q8_residual_prepared_projection)
+        add_v2_test(V2_Perf_ROCmHCUpKPairRowSpectrumQ8_0
+            COMMAND $<TARGET_FILE:v2_perf_q8_residual_prepared_projection>
+                --gtest_also_run_disabled_tests
+                --gtest_filter=Q8ResidualCorrectionDevice.DISABLED_ROCmHCUpKPairRowSpectrumQ8_0
+            LABELS "V2;Performance;ROCm;Qwen4Exp;TwoTermQ8;Prefill;ComponentTiming"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
+    endif()
+endif()
 
 # Explicit CPU component measurements; correctness aliases remain unchanged.
 foreach(V2_HC103_CPU_ISA Default AVX2)

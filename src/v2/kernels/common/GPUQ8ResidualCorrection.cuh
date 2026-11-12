@@ -9,6 +9,9 @@
  * remain on device and inactive input/output/scratch bytes are untouched.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
+ * The native gfx906 cooperative program stages K32 pairs through this same
+ * boundary; other native programs retain the original single-group schedule.
+ * An explicit HIP reference uses original single-group staging on every target.
  * Native signed INT8 dot products share the exact unsaturated arithmetic
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  */
@@ -40,7 +43,7 @@
 #define Q8R_ERROR_TEXT hipGetErrorString
 #define Q8R_SHFL(x,o) __shfl_xor(x,o,32)
 #endif
-#include "Q8ResidualCorrection.h"
+#include "Q8ResidualGroupedDiagnostic.h"
 #include "utils/PerfStatsCollector.h"
 #include "DeviceFP32NumericalContract.h"
 #include "DeviceNativeQuantisedContributionContract.h"
@@ -386,6 +389,7 @@ inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
  * @param stream Exact non-default native stream retaining all captured owners.
  * @param tables Already cold-declared immutable IQ tables when the source needs them.
  * @param publication Typed already-activated or HC producer declaration.
+ * @tparam SingleGroupReference False selects production; true selects the explicit HIP-only original grouped reference.
  * @tparam Publication Compile-time semantic operation; no prepublished-bank mode exists.
  * @throws std::invalid_argument Before publication for invalid source, storage or geometry.
  * @throws std::runtime_error After a native submission error; failed calls are never counted.
@@ -394,10 +398,16 @@ inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
  * submissions issue this record, using the same immutable launch/storage geometry.
  * Disabled collection does not construct tags or inspect device state.
  */
-template<class Publication>
+template<bool SingleGroupReference=false,class Publication>
 static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, void *stream,
                                        NativeEmbeddingIQTables tables,const Publication& publication)
 {
+#if defined(Q8_RESIDUAL_CUDA)
+    static_assert(!SingleGroupReference,"The original grouped reference belongs only to HIP");
+#endif
+    if constexpr(SingleGroupReference)
+        if(a.weights.codebook_id!=19||a.rows.physicalRows()<32||a.weights.n<64)
+            throw std::invalid_argument("HIP original grouped reference requires codebook19, physical rows>=32 and N>=64");
     const GPUHCResidualDownPublication* hc=nullptr;
     if constexpr(std::is_same_v<Publication,GPUHCResidualDownPublication>)hc=&publication;
     const auto native = Q8R_NAMESPACE::validate(a, stream, tables,hc);
@@ -430,13 +440,23 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     const auto publicationError=Q8R_ERROR();
     if(publicationError!=Q8R_SUCCESS)
         throw std::runtime_error(std::string("Two-term Q8 publication failed: ")+Q8R_ERROR_TEXT(publicationError));
-    if (shortGeometry)
+    if constexpr(SingleGroupReference)
+    {
+#if !defined(Q8_RESIDUAL_CUDA)
+        Q8R_NAMESPACE::projectGrouped<1><<<static_cast<unsigned>(grid),geometry.threads,0,native>>>(a);
+#endif
+    }
+    else if (shortGeometry)
         Q8R_NAMESPACE::launchOrderedShortK(a, *shortGeometry, native);
     else visitQ8ResidualNativeCodebook(a.weights.codebook_id, [&]<std::uint8_t C>() {
         if constexpr (C == 19)
         {
             if (geometry.strategy == Q8ResidualGroupedStrategy::CooperativeMatrix)
+#if defined(Q8_RESIDUAL_CUDA)
                 Q8R_NAMESPACE::projectGrouped<<<static_cast<unsigned>(grid), 256, 0, native>>>(a);
+#else
+                Q8R_NAMESPACE::projectGrouped<0><<<static_cast<unsigned>(grid), 256, 0, native>>>(a);
+#endif
             else if (geometry.rowTile == 1)
                 Q8R_NAMESPACE::project<1><<<static_cast<unsigned>(grid), 128, 0, native>>>(a);
             else
@@ -487,6 +507,28 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs& a,void* stream,NativeEmbeddi
 void Q8R_HC_FACTORY(const GPUHCResidualDownPublication& hc,void* stream,NativeEmbeddingIQTables tables) {
  submitQ8ResidualProjection(hc.projection,stream,tables,hc);
 }
+#if !defined(Q8_RESIDUAL_CUDA)
+/**
+ * @brief Submit original single-group ordinary arithmetic through the shared publication boundary.
+ * @param a Original source, row authority, inputs and admitted output/scratch banks.
+ * @param stream Exact non-default publication/projection stream.
+ * @throws std::exception For any shared admission or native submission failure.
+ */
+void rocmQ8ResidualGroupedSingleGroupReference(const GPUQ8ResidualCorrectionArgs &a,void *stream)
+{
+    submitQ8ResidualProjection<true>(a,stream,{},a);
+}
+/**
+ * @brief Submit original single-group HC arithmetic with complete publication and retained FP32 output.
+ * @param hc Original projection tuple and activated FP32 destination, including exact-alias policy.
+ * @param stream Exact non-default publication/projection stream.
+ * @throws std::exception For any shared admission or native submission failure.
+ */
+void rocmHCResidualDownGroupedSingleGroupReference(const GPUHCResidualDownPublication &hc,void *stream)
+{
+    submitQ8ResidualProjection<true>(hc.projection,stream,{},hc);
+}
+#endif
 /**
  * @brief Submit the immutable original-column M1 arithmetic as a diagnostic reference.
  * @param a Original signed-Q8 prepared source, physicalM1 row authority and admitted banks.

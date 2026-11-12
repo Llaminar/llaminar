@@ -6,9 +6,9 @@ analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Active target: QFN PP(EP(4×MI50), EP(4×MI50)), ngrams sharded in VRAM
-across all eight GPUs.** Tune prefill and decode toward measured compute and
-memory-bandwidth limits; no throughput target is substituted for profiling.
+**Next gate: accuracy panels and OpenCode for QFN PP(EP(4×MI50), EP(4×MI50))
+and TP4 MI50 with hybrid experts.** The PP target retains ngrams sharded in
+VRAM across all eight GPUs. Further tuning waits for this qualification.
 **Prior checkpoint:** **5,256** selected Unit/preflight tests passed, zero skips;
 39 absent-hardware cases remain unqualified. Includes 24 formats per GPU
 backend and 32 EP4/EP4 preparation/lifecycle cases. Interruption prevented a
@@ -21,10 +21,11 @@ numerical limits. Quantisation spikes are accepted; formal canary status remains
 and generation retire cleanly.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
-**Prefill:** **734.87→793.72 P tok/s (+8.01%)**, matched512/1, M512,
-Static, MTP/prefix off. [Publication](../2026-11/QFN_EP4_EP4_PREFILL_PUBLICATION_TUNING_20261112.md)
-and [HC-down tiles by architecture](../2026-11/QFN_EP4_EP4_PREFILL_HC_DOWN_TILES_20261112.md);
-captured byte/reset gates pass. Next: HC two-term up projection.
+**Prefill:** **734.87→817.65 P tok/s (+11.26%)**, matched512/1, M512,
+Static, MTP/prefix off. Latest [HC-up K-pair](../2026-11/QFN_EP4_EP4_PREFILL_HC_UP_KPAIR_20261112.md)
+adds **3.01%** over793.72; all six new byte/reset cells and model health pass.
+The broader ROCm arithmetic case passes but its driver-log cursor is lost under
+bursts; those health windows remain unqualified. Full preflight remains waived.
 Prior512/256 **732.92P/37.26D**; new decode unmeasured.
 [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md): submission/HC fusion unpromoted.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
@@ -36,12 +37,9 @@ but movement differed, so no causal model speedup was claimed.
 [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md),
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 
-**Retained CPU work:** all21 formats are byte-exact; component gains are
-26–31% for FFN scheduling and1.9–2.5% for persistent FFN ILP.
-[All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md),
-[ILP results](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md).
-**GNU wait policy stays unchanged:** spin0/spin1000 regress matched throughput.
-[OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
+**Retained CPU:** [21-format scheduling](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md)
+and [ILP](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md) are byte-exact.
+GNU wait policy stays unchanged ([evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md)).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
 Compact-route witness: MI50 exact; CUDA subnormal normalization differs.
@@ -103,7 +101,7 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
-| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 793.72† | — | — | 37.26‡ | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 817.65† | — | — | 37.26‡ | — | — |
 
 † Latest 512/1 prefill-only run. ‡ Prior 512/256 decode; not remeasured.
 

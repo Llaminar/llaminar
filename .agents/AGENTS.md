@@ -233,6 +233,15 @@ tests. Use that distinction consistently in test names, labels and documentation
     `rocprof`/ISA inspection to report occupancy, registers/VGPRs, spills,
     throughput, memory efficiency, and launch geometry. Tune until occupancy
     and throughput are economical; zero spills is the default expectation.
+
+**Use tensor cores for GPU prefill.** Prefill matrix kernels must use tensor
+cores, or the architecture's equivalent matrix instructions, on GPUs that
+support them. A non-tensor-core implementation is an exception only when
+matched measurements prove that tensor cores are not beneficial for the
+relevant architecture, precision and workload geometry. Preserve the applicable
+numerical contract and retain the comparison evidence with the dispatch policy;
+implementation convenience or an untuned candidate does not justify an exception.
+
 25. **Profile CPU kernels with the same rigor.** Use `perf`, IPC/cache evidence,
     physical-core scaling, AVX2/AVX-512 runtime dispatch, and NUMA-aware tests.
     Work must scale sensibly from one thread through the physical cores per

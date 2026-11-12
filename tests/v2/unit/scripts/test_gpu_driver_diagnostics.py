@@ -6,8 +6,11 @@ retirement, journal corruption and the actual CLI/shell closure protocol.
 Kernel reads are simulated; no model, GPU or elevated privilege is used.
 Real informational KFD clock/memory-map hung-task frames reproduce diagnostics
 that the original severity-and-fault-word classifier incorrectly marked clean.
+Busy-batch and idle-poll contracts preserve every original journal byte without
+requiring fragile elapsed-time assertions.
 """
 from dataclasses import asdict
+import io
 import json
 from pathlib import Path
 import shlex
@@ -75,6 +78,53 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
         """Never inherit a real CI observer while testing simulated kernels."""
         self.enterContext(patch.dict(driver.os.environ))
         driver.os.environ.pop(driver.READER_CONTAINER_ENV, None)
+
+    def test_direct_record_serialization_preserves_original_jsonl_bytes(self):
+        """Immutable-field serialization retains the original asdict encoding."""
+        records = (
+            record(),
+            record('unicode \u03bb \U0001f680, quote " and slash \\, newline\nNUL\0', timestamp=0.0),
+            record('same stamp, distinct record', 'debug', timestamp=0.0, facility='user'),
+            record('negative zero remains exact', timestamp=-0.0),
+        )
+        stream = io.BytesIO()
+        expected = bytearray()
+        for ordinal, row in enumerate(records, 1):
+            original = {'kind': 'record', 'ordinal': ordinal, **asdict(row)}
+            driver.journal_line(stream, {'kind': 'record', 'ordinal': ordinal, **row.to_dict()})
+            expected.extend((json.dumps(original, ensure_ascii=True, separators=(',', ':')) + '\n').encode())
+            self.assertEqual(list(row.to_dict()), list(asdict(row)))
+        self.assertEqual(stream.getvalue(), bytes(expected))
+
+    def test_exact_cursor_prefilter_preserves_full_order_and_ambiguity(self):
+        """A timestamp excludes only impossible anchors, never log records."""
+        rows = tuple(record('large ring ' + str(index), timestamp=index)
+                     for index in range(8192))
+        cursor = rows[4096:4104]
+        comparisons = []
+        original_equal = driver.KernelRecord.__eq__
+
+        def compare(left, right):
+            """Count full record comparisons independently of elapsed time."""
+            comparisons.append((left.time, right.time))
+            return original_equal(left, right)
+
+        with patch.object(driver.KernelRecord, '__eq__', compare):
+            selected = driver.new_records(checkpoint(*cursor), snapshot(*rows))
+        self.assertEqual(selected, rows[4104:])
+        self.assertEqual(comparisons, [(row.time, row.time) for row in cursor])
+
+        # False anchors share a timestamp, and publication order reverses time.
+        # All fields of all cursor records must still match in their old order.
+        exact = (record('anchor', timestamp=9), record('earlier', timestamp=8))
+        false_anchor = (record('different message', timestamp=9), exact[1])
+        tail = record('new equal-time record', timestamp=9)
+        current = snapshot(*false_anchor, *exact, tail)
+        self.assertEqual(driver.new_records(checkpoint(*exact), current), (tail,))
+        for invalid in (snapshot(*exact, tail, *exact), snapshot(*reversed(exact)),
+                        snapshot(*false_anchor, tail)):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'cursor lost or ambiguous'):
+                driver.new_records(checkpoint(*exact), invalid)
 
     def test_amd_and_nvidia_severity_and_misleveled_faults(self):
         """In particular, reproduce MI50 IH overflow and informational Xid."""
@@ -233,7 +283,7 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
 class GPUDriverWindowTests(unittest.TestCase):
     """Long lifetimes rotate the ring without losing collected diagnostics."""
 
-    def run_collector(self, root, before, after, *, controls=None, owners=None):
+    def run_collector(self, root, before, after, *, controls=None, owners=None, poll_timeouts=None):
         """Drive the real collector and journal through a deterministic ring."""
         state = root / 'cell.driver-checkpoint.json'
         window = 'b' * 32
@@ -249,9 +299,58 @@ class GPUDriverWindowTests(unittest.TestCase):
             alive.return_value = True
             control.return_value.__enter__.return_value.recv.side_effect = controls
             passed = driver.collect(state)
+            if poll_timeouts is not None:
+                poll_timeouts.extend(call.args[0] for call in
+                    control.return_value.__enter__.return_value.settimeout.call_args_list)
         terminal = json.loads(state.read_text())
         self.assertEqual(terminal['state'], 'retired')
         return state, terminal['outcome'], passed
+
+    def test_busy_batches_poll_buffered_close_and_preserve_all_original_bytes(self):
+        """Large consecutive batches never idle; buffered close adds a final read."""
+        rows = tuple(record('busy kernel row ' + str(index), timestamp=index % 17)
+                     for index in range(8 + 3 * 2048 + 3))
+        before = snapshot(*rows[:8])
+        ends = (2056, 4104, 6152)
+        after = [snapshot(*rows[end - 2056:end]) for end in ends]
+        # A record published after the close request must remain in the journal.
+        after.append(snapshot(*rows[ends[-1] - 8:]))
+        close = json.dumps({'action': 'close', 'window_id': 'b' * 32}).encode()
+        polls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, after,
+                controls=[BlockingIOError(), BlockingIOError(), close], poll_timeouts=polls)
+            self.assertTrue(passed)
+            self.assertEqual(polls, [0.0, 0.0, 0.0])
+            self.assertEqual(evidence['snapshot_count'], 4)
+            self.assertEqual(evidence['new_record_count'], len(rows) - 8)
+            lines = (root / evidence['journal']).read_bytes().splitlines(keepends=True)
+            original_bytes = [
+                (json.dumps({'kind': 'record', 'ordinal': ordinal, **asdict(row)},
+                            ensure_ascii=True, separators=(',', ':')) + '\n').encode()
+                for ordinal, row in enumerate(rows[8:], 1)]
+            self.assertEqual(lines[1:-1], original_bytes)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+
+    def test_empty_batches_restore_idle_wait_and_close_requires_final_read(self):
+        """Idle polling resumes after a busy batch without losing late records."""
+        before = snapshot(record('initial'))
+        busy = snapshot(*before.records, record('busy publication', timestamp=9))
+        final = snapshot(*busy.records, record('after close', timestamp=8))
+        close = json.dumps({'action': 'close', 'window_id': 'b' * 32}).encode()
+        polls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, evidence, passed = self.run_collector(root, before, [before, busy, busy, final],
+                controls=[socket.timeout(), BlockingIOError(), close], poll_timeouts=polls)
+            self.assertTrue(passed)
+            self.assertEqual(polls, [driver._POLL_SECONDS, 0.0, driver._POLL_SECONDS])
+            self.assertEqual(evidence['snapshot_count'], 4)
+            self.assertEqual(evidence['new_record_count'], 2)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
 
     def test_continuous_collection_survives_repeated_ring_rotation(self):
         """Reproduce the five-hour bookend defect with 128 immediate rotations."""
