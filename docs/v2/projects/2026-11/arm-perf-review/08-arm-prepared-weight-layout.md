@@ -140,3 +140,17 @@ campaign.
   contexts (e886 tip-gb10; 35/5b on .80; b12-e0/final/preserve763 on .79)
   are INTACT. Directive compliance: "prune only your own superseded dirs"
   — executed as ordered, disclosed rather than hidden.
+
+### W2 FIX-BACK #2 (~01:26Z): compact TU fails g++-14/ARM — second clang-pass/g++-14-reality instance
+
+Sparks' literal W2 evidence: the STT target now COMPILES (include fix
+worked; [8/11] reached, stopped via -k0) but the COMPACT target has
+three real g++-14/NEON errors in Perf__CPUCompactIQ3SDecode.cpp:
+:222 `cannot convert const __Uint32x4_t to uint8x16_t` (vtstq_u8 with
+a bit_cast of a u32x4 source) + :607 `'MultiScale' was not declared in
+this scope` + template-argument parse error. NO census/tournament runs
+yet (both need the binary). Fix-back #2 routed to addon2 with the
+concrete fixes (explicit vreinterpretq before vtst; the template
+qualifier) + the process requirement: **g++-14 must join their local
+check matrix for this TU.** Campaign attempt 3 on .80 = FINISHED/EXITED
+(dockerps empty; Main owns the result report).
