@@ -594,3 +594,20 @@ Both bench targets now carry the source root AND tests/v2 include roots
 src root). Root cause of the miss: local syntax checks invoked clang++
 with both -I paths manually, masking the CMake gap. Origin-verified;
 sparks resumes the W2 build on .79.
+
+### W2 FIRST REAL SIGNAL (~04:43Z): the B1 bench caught a production counter gap
+
+.79 runs (all 4 placements): `Perf__CPUMoESingleTokenTransaction.cpp:836:
+Failure — fresh_bundle Which is: 0 vs 1u — arm A must advance the
+production router-Q8 bundle counter` — **the arm-A production route did
+NOT advance the router-Q8 bundle counter in the fixture.** A real
+counter/curve signal, not harness noise (the STT timing otherwise
+rendered: production_median 217.2 vs transaction 206.3 µs at
+mixed-20T). Routed to addon2: fixture-expectation question vs a genuine
+production counter-path gap. **No B1 seal until the counter contract
+resolves — the counter assertion is the bench's core.** This is the B1
+bench working as designed: the diagnostic surfacing a production
+question the first time it ran against the real routes.
+DISK: .80 hit 100% full; sparks pruned their own superseded campaign
+build dirs (~100G → 98G free, 3.4T used); Main's/addon's active
+contexts preserved. B1ATTR2 requeued post-#8.
