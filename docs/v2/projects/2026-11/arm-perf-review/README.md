@@ -1996,3 +1996,20 @@ bundle1-perf-harness (5d606a108 — the Bundle-1 final hop pending);
 codex/arm-half-perf-cell (b512e25a — frozen, superseded by the landed
 FMLAL leaf; deletion candidate awaiting an operator call since the
 content is unmerged-obsolete, not merged).
+
+### PR #43 REBASED AND PUSHED (~09:56Z): new tip ae51ce3f0 (lease from 7a4790c77)
+
+The operator-requested upstream rebase (base ca9902d3f): 233 commits
+replayed, 3 conflicts (2 mechanical: the CMake preflight list + two
+independent ForwardExecutionEngine tests; 1 semantic: upstream's
+ScopedCallerThreadAffinity in configureClusterRankThreads dropped —
+the branch requires native core admission + keeps the bound master's
+permanent place; the upstream MPIBootstrapCallerAffinity test adapted
+to assert unbound requests are rejected + caller/child/workers keep
+the rank mask). **Validation (main-rb2): build OK; focused affinity
+cells 8/8; canonical 3568 tests (34 new from the base), 0 skipped, 6
+failed = the same inherited set (0 new). MERGEABLE/CLEAN.**
+build-rb2 pruned. **ALL LANES rebase onto ae51ce3f0, incl. the B1 WIP
+(codex/arm-b1-fused-fork-pooling; the "B1 authorize" quote accepted;
+Main takes the runner-placement pass on a rebased copy).** .80 free →
+the M=1 window (re-anchored to ae51ce3f0).
