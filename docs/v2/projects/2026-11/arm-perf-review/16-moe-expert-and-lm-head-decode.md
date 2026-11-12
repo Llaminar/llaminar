@@ -611,3 +611,19 @@ question the first time it ran against the real routes.
 DISK: .80 hit 100% full; sparks pruned their own superseded campaign
 build dirs (~100G → 98G free, 3.4T used); Main's/addon's active
 contexts preserved. B1ATTR2 requeued post-#8.
+
+### W2 :836 RESOLVED (~04:45Z): counter-level confusion in the bench — kernel vs stage
+
+The :836 expectation was WRONG for the arm-A route as wired: the bench
+calls the KERNEL directly, but the asserted counter
+(cpu_moe_decode_router_q8_reuse_calls) is STAGE-level (recorded by
+MoEExpertComputeStage::executeSingleToken, stage cpp :3891) — a direct-
+kernel route never advances it → structurally 0 in every placement.
+The proof now asserts the KERNEL-level counter the router-Q8 bundle
+path actually records: cpu_native_quantised_router_q8_grouped_decode_
+equivalent_projection_calls (kernel :1807, path tag "decode" at m=1).
+Down/transaction families were already kernel-level (why only the
+bundle assertion failed). Pushed 79967de27; sparks rebuilds + re-runs
+the 4 placements → the B1 seal completes on a passing counter contract.
+Timing evidence stands: production 217.2 vs transaction 206.3 µs
+mixed-20T (B ≤ A non-regression territory).
