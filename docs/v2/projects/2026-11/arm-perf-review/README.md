@@ -2170,3 +2170,14 @@ NOT ARM'S (untouched): feat/qfn-ngram-continuation (the base branch),
 feat/opencode-hybrid-decode (the base owner's harness), feat/qwen38-
 w4a4, feat/qwen-flash-next, feat/clover-moe, feat/continuous-batching-
 c1-ownership, claude/deepseek-*, master — other programs'/owners'.
+
+### HOST LEASE VALIDATION (~11:11Z): direct SSH to .80 — single-occupancy confirmed
+
+Operator asked why sparks AND main both appear on .80. Direct SSH
+(factory@192.168.178.80, zgx-5457) at 11:11:26Z: docker ps = exactly
+ONE container (main-b1ab, Up 2 min — Main's Release A/B, in the build
+phase: cc1plus storm, load 20.5 from a 9.7 15-min avg); NO sparks
+container; the M=1 window is queued behind main-b1ab, not running.
+Serialized lease chain confirmed first-hand. Reporting rule going
+forward: every host report states LEASE HOLDER + QUEUE explicitly
+(association ≠ execution).
