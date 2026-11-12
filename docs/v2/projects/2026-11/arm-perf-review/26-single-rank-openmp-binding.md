@@ -1141,3 +1141,25 @@ prep note said bb893cd79 — outdated; the re-verification ran at
 implement → validate → handback. Expected gain (diagnostic arithmetic
 until measured): 147,600 → ~73,800 forks on the 27B decode path
 (25.6% → ~12.8% of all decode forks).
+
+### B1 POOLING WIP HANDOVER (~09:36Z): the runner-placement structural pass routes to Main
+
+Addon3's implementation (codex/arm-b1-fused-fork-pooling, 2 commits,
+base 7a4790c77, honestly flagged WIP):
+- DONE+VERIFIED: the tile body extraction (a8caee288 — the exact
+  run_gpu_aligned_expert_fp32_matmul_isa work lambda as a static
+  member helper, byte-identical by construction; kRowTile hoisted);
+  the fork-count + byte-identity test file (members 1-4 ×
+  FP32/FP16/BF16 × M tails 1/6/15 × workers 1-8, pooled fork delta == 1
+  + byte identity vs the per-member oracle + the FP16 FMLAL variant);
+  the call-site dispatch shape (GPUAlignedExpert → output-pointer
+  check → weight_type_/ISA switch → the pooled runner).
+- BLOCKED: the runner placement (drafted before the class definition
+  where FloatingPointGemmKernel is undeclared; the relocation hit
+  brace-structure errors at the OneDNN loop; the runner is after the
+  class but the loop below the pooled call site has a structural
+  issue).
+HANDOVER per the protocol (three silent-write failures in this arc):
+Main completes the runner placement (inside the class after the tile
+helper, or namespace scope + forward-declare). The verified pieces are
+banked; the test file validates the completed runner.
