@@ -618,3 +618,19 @@ the corrected check — next report = the real one: exit + JUnit + SHAs.
 NOTE: second self-caught harness defect tonight (dirname peek, awk
 field) — both caught by the station's own verification before they
 could contaminate a receipt.
+
+### OPERATOR DECISION (~00:20Z): "FMLAL accept" — FP16RNE narrowing-by-contract ACCEPTED as baseline
+
+The FMLAL leaf's contract = **byte-identical to base on EVERY route**:
+- FP16RNE route: the base scalar's narrowing of FP32 A at every k is the
+  documented HalfRNE contract — pre-existing behavior, NOT the leaf's
+  doing; the leaf matches base there (no candidate regression).
+- (F,F) mixed route: the F1 narrowing defect lived HERE (GPUAlignedExpert
+  FP32-A/FP16-B); fixed by the domain restriction; new tip 67e8856c9
+  targets this route with the 1+2^-12 witness expectation preserved.
+**Validation #5 = the final gate** (byte-identity both routes + the K=16
+witness + isolated per-class specials). Sequencing: addon rebases the
+FMLAL branch onto dd8f2bd96 BEFORE #5 (validation + the reviewer's
+landing verdict pin the rebased tip in ONE cycle — verdicts do not
+transfer across the rebase), then #5 books after campaign #2 + W3.
+Collection candidate: rebase → #5 PASS → handback → Main applies.
