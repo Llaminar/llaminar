@@ -406,3 +406,16 @@ CLARIFICATION REQUESTED: which rebased commit carries the cb9255c9a
 grouped-fix content (the draft self-corrected mid-stream; the final
 mapping must be 1:1 and precise). The package completes when the
 step-2 re-run lands.
+
+### B4 STEP-2 RE-RUN GREEN (~06:59Z): addf3db78 — 2/2 PASSED, JUnit failures=0
+
+Seal K14-B4-ADDF3DB78-20261112 (sparks, .80): BUILD_OK; 2/2 PASSED
+(portable 0.13s, head 0.06s); both JUnit XMLs failures=0 — the grouped
+GroupedTargetRowsMatchSerialM1 passes after the backend-init fix
+(addmission gap resolved; the same device-free class as B1). **The
+combined handoff package is COMPLETE** (the 6-for-6 lineage mapping +
+build contexts + both runs' raw JUnit/exits + the dual-compiler
+enumeration) — the reviewer's round-5/6 re-verdict at the landable tip
+addf3db78 proceeds. Main's application default: YES if ACK + all-arch
+builds + no new canonical failures + one Main-run canonical on the
+combined tip before applying.
