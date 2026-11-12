@@ -50,3 +50,17 @@ one second (blocks automatic placement of models like Qwen3.8-Flash-Next).
 - The model-level validation (plan -m ... auto without the
   unclassified-work error, matching the --expert-tier workaround)
   waits for both.
+
+### DOWNLOAD RECEIPT (~09:03Z): authenticated source, 4-split LFS oids confirmed, watcher running
+
+The station's download (watcher 7bd15263f) is AUTHENTICATED-SOURCED:
+docs/v2/projects/2026-10/QWEN38_FLASH_NEXT_INFERENCE_RESEARCH.md pins
+unsloth/Qwen3.8-Flash-Next-GGUF @ 766911a6b7369840a91dbcd95f9f997acaab
+6cd6, subpath UD-Q4_K_XL/ — the HF API tree at that revision confirms
+exactly 4 splits (shard1 10.9MB metadata 44481862…; shard2 49.86GB
+3f342f1c…; shard3 49.38GB 56758f40…; shard4 12.09GB 753bda48…; total
+111,324,254,784B ≈ 111.3 GB ✓). Target:
+/home/tdsynnex/repo/llaminar/models/UD-Q4_K_XL/ (models/ git-ignored).
+Authenticated hf CLI (Fankserver), resumable; sha256-expected.txt
+written BEFORE verification; 249G free → ~145G after. 6h monitor
+window, resume-capable.
