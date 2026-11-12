@@ -393,3 +393,16 @@ failure/fixed-run JUnit + exits + the actual 'dual compiler' checks.
 The reviewer reviews after the combined handoff. Non-installed
 diagnostic authorization + the byte-exact contract unchanged;
 production follow-ups Main/operator-owned.
+
+### HANDOFF PACKAGE DRAFT (~06:31Z): high quality; one mapping clarification requested
+
+Addon2's draft covers: the full lineage (fork point 12675c956 → the 6
+rounds → the two rebases with the old→new mapping), the build/compiler/
+ISA/host contexts per run, the raw JUnit + exits for BOTH runs (the
+e099 admission gap + the pending step-2 fixed run), and the enumerated
+dual-compiler checks (clang++-18 + g++-14 × compact/STT TUs; the B4
+Unit TUs ± __ARM_NEON — syntax/semantic only, NOT full builds). ONE
+CLARIFICATION REQUESTED: which rebased commit carries the cb9255c9a
+grouped-fix content (the draft self-corrected mid-stream; the final
+mapping must be 1:1 and precise). The package completes when the
+step-2 re-run lands.
