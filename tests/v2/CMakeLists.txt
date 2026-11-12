@@ -7901,6 +7901,24 @@ add_v2_test(V2_Unit_FusedProjectionParity
     MPI_PROCS 1
 )
 
+# Pooled skinny FP32 fused projections: one team fork per fused call and
+# byte identity with each member's own public multiply across worker counts.
+add_executable(v2_test_fused_skinny_fp32_pooling unit/kernels/Test__FusedSkinnyFP32Pooling.cpp)
+target_link_libraries(v2_test_fused_skinny_fp32_pooling
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_test_fused_skinny_fp32_pooling PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_FusedSkinnyFP32Pooling
+    COMMAND $<TARGET_FILE:v2_test_fused_skinny_fp32_pooling>
+    LABELS "V2;Unit;CPU;Kernels;GEMM;GEMV;FusedKernels;OpenMP;ByteExact;Regression"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
 # Performance: VNNI repack micro-benchmark (deferred packing hot path)
 add_executable(v2_perf_vnni_repack performance/kernels/Perf__VNNIRepack.cpp)
 target_link_libraries(v2_perf_vnni_repack
