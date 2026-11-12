@@ -1080,3 +1080,25 @@ station's ACTUAL NEON-COMPILED handoff — the NEON-labelled runtime
 alias inside Main's I8MM build does not substitute for that compiler
 envelope.** The station's NEON gate receipts (raw XML + exit + tree,
 NEON-compiled) close #209 → landing.
+
+### FMLAL NEON GATE GREEN (~05:47Z): the cross-envelope gate pair COMPLETE at 0ad09600b
+
+Station NEON gate: FMLAL_NEON_GATE_EXIT=0; all three direct binary
+runs GREEN:
+1. Canonical filter 11/11 (FmlalRouteProbeDiscrimination's zero-N arm
+   fired the expected public-admission rejection at :1488; selection/
+   probe = ZERO counts with the probe enabled = the correct leaf-less
+   control outcome; FPCR negatives passed).
+2. P1 cells 4/4 (K-tail, specials oracle, the K=16 mixed-policy witness
+   now HOLDING the unrounded FP32 result, selection/envelope).
+3. Complete unfiltered 12/12.
+ENVELOPE: -march=armv8-a+simd exactly; fp16fml in 0 compile commands
+(= leaf NOT compiled) — an ACTUAL NEON-compiled receipt (the reviewer's
+compiler-envelope requirement satisfied). OneDNN build-neon identity
+separate + flags-bound + origin-authenticated. Receipt SHAs: binary
+0572753c…; JUnit b5ebc1de…/b23ebc7d…/de37c2d6…; the cosmetic grep flaw
+disclosed + corrected extract alongside.
+**Cross-envelope gate pair COMPLETE: Main's native I8MM (#8 GREEN) +
+the station's native NEON (GREEN, NEON-compiled). The FMLAL collection
+candidate's evidence chain is CLOSED pending the reviewer's #209
+verdict → Main FF-applies → PR commits.**
