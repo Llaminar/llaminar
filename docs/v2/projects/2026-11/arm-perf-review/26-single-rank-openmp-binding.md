@@ -1071,3 +1071,13 @@ SUMMARY=1 + FILTER=omp,kernel + **CPU_STAGE_TIMING=1** + JSON=
 same 4 configs, ~15 min. Seal K14-B1ATTR2-12675C956-20261112.
 DISCIPLINE NOTE: cross-check env pins against the prior successful
 sheet when adapting it — a diff would have caught the omitted pin.
+
+### .80 QUEUE ORDER CONFIRMED (~04:44Z): W3 → B1ATTR2 → 27B rider
+
+Post-#8: W3 (B4 Integration, e09903875) → **B1ATTR2 moved ahead of the
+27B rider** (addon3's named-attribution analysis is blocked on it; 15
+min vs the rider's 15-20 — the analysis unblocks a whole lane) → 27B
+rider (K14-I16RIDER27). W3 never started (the earlier attempts were
+the disk-full one; the tree is seeded, no build began). .79/W2: the
+1-failed counter assertion consistent across all 4 placements —
+awaiting addon2's resolution.
