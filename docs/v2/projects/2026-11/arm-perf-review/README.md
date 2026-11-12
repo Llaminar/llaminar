@@ -2060,3 +2060,17 @@ pass with the corrected recipe; the B1 ranking finalization; the
 idea-23 model-level validation post-merge; the depth sweep + 27B rider
 post-campaign). Two addon sessions retired tonight (addon2, addon3) —
 both fully accounted.
+
+### LANE STRUCTURE CHANGE (~10:12Z): the addon lanes on this host are GONE (operator-confirmed)
+
+arm-addon, arm-addon2, arm-addon3 are all gone (addon2/addon3 retired
+cleanly with full handovers; arm-addon gone per the operator). The
+remaining structure: arm-perf (coordinator), Main, arm-sparks (the SOLE
+host-execution lane for .79/.80), arm-reviewer, the station session
+(c290), + the CB program. **Artifact survival: the addon-notes dir
+(/Users/floriankinder/repo/arm-addon-notes/) SURVIVES on disk —
+window-m1-activation.sh, w-m1act-summary.py, the idea-04 M=1 kit, and
+the handover docs are intact; sparks executes the M=1 window from that
+script + their own corrected m1.sh fixes.** Work routing: implementation
+→ Main; host execution → sparks; verdicts → the reviewer; station ops →
+the station; analysis packages → the coordinator or a future re-spawn.
