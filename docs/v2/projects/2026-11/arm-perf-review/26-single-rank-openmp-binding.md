@@ -1174,3 +1174,24 @@ implementation dispatch. The decision package it answered (root cause
 + fix shape + expected arithmetic) restated. Main takes the structural
 pass after the main-rb2 validation completes; the WIP rebases onto the
 announced rebased PR tip once it lands.
+
+### B1 DIAGNOSIS CORRECTION (~10:30Z): the WIP pooled the wrong path — the target is the BackendNative FP32 skinny members
+
+Main's model+code check (27B Qwen3.6-MTP-Q4_K_S): attn_qkv = Q5_K,
+attn_gate (z) = Q4_K, ssm_alpha/ssm_beta = F32 [5120×48]. On CPU
+"codebooks=none" is uninformative (native codebook descriptors are GPU
+exports): qkv+z run on CPUNativeQuantisedGemmKernel (the first
+subgroup); alpha+beta run on FloatingPointGemmKernel with the
+BackendNative policy (NOT GPUAlignedExpert — MoE-expert-only), via
+multiply_fused_tensor → run_onednn_fp32_matmul → run_fp32_skinny_matmul
+PER MEMBER = 2 forks. **addon3's WIP pooled only the GPUAlignedExpert
+branch → the 27B gdn_proj fork count would be unchanged. CORRECTED
+TARGET: pool the BackendNative FP32 skinny members (alpha+beta) into
+one workshare — per-element arithmetic identical by construction (the
+same fma chain + completeSkinnyMatmulValue epilogue). Expected gain:
+4 → 3 forks per GDN-projection execution (one fork saved per layer per
+step), NOT 4 → 2; the remaining forks = the native qkv+z subgroup.**
+Main proceeds on the corrected target under the "B1 authorize" grant
+from ae51ce3f0, gates: byte identity (FP32, members 1-4, M 1-12, N
+tails, ±bias/±beta, all thread counts) + fork-count assertion + Linux
+run + paired Release A/B — lands only if same-or-better.
