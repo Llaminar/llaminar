@@ -78,3 +78,13 @@ fail-closed/identity controls) + contract precision (finite>0 only, extent
 divisibility, memcmp=last output/same-production equivalence, name the upper-
 median statistic) + the 1-ULP negative control must become a real test + the
 log provided. Reviewer moved to #146 (rev3); half-cell separate.
+
+### STATE AUDIT (01:24Z cycle): .79 W2 status OVERDUE — flagged
+
+Exception found: sparks has not answered .79/W2 status across TWO audit
+cycles (23:53Z + this cycle) — the build resumption at a6aee9bac (CMake
+fix-back ~22:28Z) has had no status/launch evidence/result for ~2h.
+Pressed with a literal-facts query (build past 736/764? census/tournament
+running or done? paths/exits). Campaign attempt 3 (main-campaign-ebd,
+00:48:23Z start) = finishing about now; queried in the same message.
+Station r9 co-validation + A2 exports: verified complete via receipts.
