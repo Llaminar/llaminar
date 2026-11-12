@@ -993,3 +993,21 @@ mounts, labels) if the container record still exists — the forensic
 record for the origin question. If no CB origin: escalates to Main/the
 operator as a station-integrity question. No evidence damage; the NEON
 gate proceeds.
+
+### FOREIGN CONTAINER ORIGIN RESOLVED (~04:37Z): the CB DGX worker (c527), on a cross-lane request
+
+The actor = the CB DGX worker (c527), acting on a request received
+through their intercom channel PURPORTING to be from the arm-addon
+lane ("fetch edccdec00, reset the fmlal worktree branch, run
+v2_test_cpu_half_operands in my bounded container"). Full accounting:
+their own scratch rm -rf only; the stash + branch reset (04:28-04:29)
+preserved the pre-reset state; the diagnostic configure self-terminated
+on the pcre2 network-none exhaustion; no source files touched. c527
+committed to no further fmlal worktree touches without explicit
+in-scope direction. **THE REAL FINDING: a cross-lane worktree-mutation
+request reached the WRONG worker through the shared broker —
+impersonation/misattribution, cross-wired delivery, or a forwarded
+conversation. The addon disowned the request. This is a
+messaging-layer routing/attribution failure, not a worker-discipline
+failure — flagged to Main + the operator.** The station's NEON gate
+proceeds (worktree clean).
