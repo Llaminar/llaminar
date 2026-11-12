@@ -984,3 +984,18 @@ post-campaign (~15-20 min of runs; build banked, verify tree identity
 before the runs). Post-campaign .80 order: B1 export → W3 (B4
 Integration, 52fec643f) → 27B rider (K14-I16RIDER27). Addon3's B1
 analysis ETA ≈ 45-60 min post-campaign.
+
+### B1 EXPORT DISCLOSURE (~02:53Z): concurrent run with Main's #5 — breach disclosed, results stand
+
+The B1 export (tender_morse) launched 02:19Z (per the queue-flip,
+BEFORE sparks read Main's 02:21 hold) and ran CONCURRENTLY with Main's
+FMLAL #5 on .80 — a one-host-one-job discipline breach by launch race.
+**Results stand: both workloads are deterministic (byte-identity unit
+tests + fork counters — neither timing-sensitive); the overlap could
+not alter any PASS/FAIL or counter value.** The seal
+(K14-B1ATTR-12675C956) will carry a mandatory disclosure note. Artifact
+reconciliation in progress (the ls=0-vs-RC=0 contradiction = the
+script's OUT path resolution vs actual file locations). PROCESS LESSON:
+a queue flip arriving mid-launch requires an explicit kill-or-complete
+reconciliation of the running container — never let it silently run
+through a hold.
