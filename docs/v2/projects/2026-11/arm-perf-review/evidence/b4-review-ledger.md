@@ -480,3 +480,14 @@ corrected descriptions.
 #204 continues awaiting the 7a4790c77 fresh combined handoff under the
 Linux-first process; production/N-sweep/economy + Main's
 application/canonical decisions separately fenced.
+
+### CORRECTED-DESCRIPTIONS PACKAGE (~07:19Z): C1-C6 attach to the handoff; raw seals untouched
+
+C1: the failed-run diagnosis = the ADMISSION gap (not byte mismatch) +
+the tip typo; C2: "tests=2" = CTest entries (the XML truth = 8/8 test
+cases PASS); C3: both .80 runs = INTEGRATION builds (the §4 mix
+corrected); C4: the B4 TUs' executed evidence = the Linux GCC seals
+(the performance-TU g++-14 syntax checks are separate diagnostics); C5:
+the pasted XML excerpts were abridged (disclosed); C6: the R1 gap is
+superseded by the 7a4790c77 restoration (the #204 continuation
+vehicle). The package awaits the 7a4790c77 W3 re-run's fresh JUnit.
