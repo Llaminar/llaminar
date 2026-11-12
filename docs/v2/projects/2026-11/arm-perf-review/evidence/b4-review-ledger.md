@@ -514,3 +514,24 @@ failures=0 byte-verbatim. **The three-seal evidence chain is complete:**
 A4-restored tip's fresh run. All three paths + addon2's assembled
 package route to the reviewer for the #204 continuation review at
 7a4790c77 = the last gate before Main's application default.
+
+---
+
+## **#204 FINAL: SOURCE ACK at exact 7a4790c77 (~08:01Z)**
+
+Bounded source/handoff review COMPLETE; no remaining blocking source
+finding in the reviewed non-installed diagnostic range. R1 source-
+closed (the addf child restores the actual production-helper calls:
+1/4→accept, 1/2→reject, residual 1/2→token1, the 0/1 endpoints — no
+longer midpoint-inferred). A1/A2/A3/A5/D6 + the CPU-backend-init
+closures intact. Full 0ad..7a = 3 diagnostic files +1539, no
+production delta. The fresh 7a4790c77 seal: PORTABLE 6/6 + HEAD 2/2,
+CTest 2/2, zero failures; GNU 14.2.0, Integration NEON_I8MM — owner-
+produced evidence. RECORD CORRECTIONS: the portable XML is NOT tests=2
+(2/2 = CTest targets); durations 0.17s/0.07s (not 0.13s/0.06s); the
+historical HOLDs retained.
+**SCOPE: diagnostic source only — no production enablement, no
+N-sweep, no economy; broader checks = Main's post-collection
+responsibility.** → Main's application default (YES if all-arch builds
++ no new canonical failures; the combined-tip canonical is the
+remaining gate).
