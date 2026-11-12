@@ -1943,3 +1943,25 @@ rebased locally onto dd8 — redo onto the announced SHA).
 - **Campaign #3** on the final tip 74797687f (tree 9879e16dc), container
   main-campaign-747, started 01:37:54Z — fix-forward continuation within
   Main's window; push only if no branch-introduced failures.
+
+### CAMPAIGN #3 RESULT (~02:19Z): 0 branch-introduced failures — FORCE-PUSH LANDED
+
+Campaign #3 (74797687f): 3532 tests, **6 failed, 0 branch-introduced**:
+- 4 ROCm trainer fixtures (base deleted them) — inherited;
+- CPURootedGatherParallelCopyReplay — the 2-socket cell (hardware-bound);
+- ShmemSpinAbsorbingAbortReplay — **RESOLVED as base topology validation
+  vs a single-NUMA host**: the branch has ZERO diff vs base in
+  NativeCPUCollectiveProgram.cpp + Perf__CPURootedPublicationTransport.cpp;
+  the test builds one member per inventory rank, .80 has one NUMA node,
+  base d1fd0a077's new check rejects before any ShmemSpin code runs —
+  independent of the 12675c956 pinning fix; needs a two-NUMA host (same
+  class as the 2-socket cell).
+- KVStateLifecyclePolicySelfTest PASSED in #3 → one-off flake confirmed.
+- GroupedSealedPlan + MPIBootstrap ×2 now pass.
+**PR #43 FORCE-PUSHED: feat/arm64-native-kernels = 74797687f (tree
+9879e16dc), lease from 12675c956; 207 rebased + 1 reconciliation commit
+on d1fd0a077; GitHub MERGEABLE/CLEAN. Lanes rebase onto 74797687f.**
+Raw: .80 campaign-747-results/, /tmp/llaminar-main-bb-linux-results/
+campaign747/. PR body updated.
+NEXT: FMLAL landing cycle (addon rebases onto 74797687f → push → #5
+first-priority on .80 after the B1 export → handback → Main applies).
