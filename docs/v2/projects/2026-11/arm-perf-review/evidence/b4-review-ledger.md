@@ -363,3 +363,18 @@ landable tip); (3) **Main's application default: YES if the reviewer
 ACKs + all-architecture builds (the D6 split) + no new canonical
 failures — with one Main-run canonical on the combined tip before
 applying.**
+
+### B4 REBASED ONTO 0ad09600b (~06:28Z): addf3db78 — STEP 2 BOOKED on .80
+
+All 6 commits replayed CLEAN (the FMLAL additions didn't conflict with
+the CMake registrations — the expected interaction didn't materialize).
+New tip addf3db78a9d5c613b21700fd98294f60dc20dbd (chain 5bc9bcc10 →
+de4adc05c → f561a0a76 → ef6fd7c4d → dbc1d05c0 → addf3db78 on
+0ad09600b; force-with-lease pinned to cb9255c9a, disclosed). Diff vs
+0ad09600b = exactly the 3 diagnostic files (CMake +38, portable +970,
+head +477), ZERO production files. Both TUs clean post-rebase.
+**STEP 2 BOOKED on .80: the full-pair re-run at addf3db78 (both Unit
+targets, --no-tests=error, JUnit seal K14-B4-ADDF3DB78).** Green →
+the reviewer's re-verdict → Main's application default (YES if ACK +
+all-arch builds + no new canonical failures, one Main-run canonical on
+the combined tip first).
