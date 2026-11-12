@@ -720,3 +720,18 @@ probe) + V2_Unit/Integration_CPUInstructionSetContract; raw JUnit to
 Main + me. Main's locked intent: #5 PASS → reviewer re-pins the landing
 verdict → apply (FF — b5e928e40's parent IS 74797687f) → push + PR body,
 no economy claim. Station cross-host #5 re-run follows on the same tip.
+
+### FMLAL VALIDATION #5 (~02:47Z): FAIL — K=16 witness throws on an INVALID MODE COMBINATION
+
+Main on .80 (main-fmlal5, exited; host handed back → B1 export can go):
+- The K=16 regression **throws before multiply: it uses the invalid
+  Mode::FP32+FP16 weight combination — the validator rejects it, as
+  reviewer 232 predicted.** The witness was constructed with an
+  unreachable mode combination, not the (F,F) GPUAlignedExpert path the
+  production callers use.
+- The specials, selection and ALL OTHER half-operand tests PASS.
+- Reviewer 233 findings: (1) **x86 compile break — unguarded
+  ARMCPUFeatures.h include** (ARM-only header; needs a per-arch guard —
+  the D6 arch-split class); (2) **wrong FZ16 bit — bit 26 is AHP; FZ16
+  is bit 19** (the FPCR-profile admission tests the wrong bit).
+- Sent to addon (not applied); #6 after the fix tip on 74797687f.
