@@ -128,3 +128,19 @@ upstream conflicts); force-push once validated; new tip to be announced.
 Lane branches on the old lineage (FMLAL 0b53fa7a4, B4 52fec643f, idea16
 a6aee9bac) rebase at handover per the anchor-refresh rule; coordinator
 routes the new base when announced.
+
+---
+
+## **B9 TOPIC CLOSED (operator decision: "leave it benched and close this topic")**
+
+FINAL STATE: codex/arm-b9-strengthening @ 108bce2e stays pushed as
+FROZEN UNMERGED TOOLING (the #58 precedent) — the tile-witness grammar
+admits the two new forms; the base/transfer overlap refusal + the three
+f265 alias controls are NOT ported (the reviewer's HOLD verdict stands
+as the final word). NO further work by any lane; no re-verdict is
+coming; B9 is REMOVED from the collection-candidate inventory and will
+NOT be applied to PR #43 now or later without fresh explicit operator
+authorization. The topic is CLOSED, not parked as open tooling (the
+NOGO-means-CLOSE discipline). The station's reusable assets from the
+session (worktree-local OneDNN install + legacy-transport v7 tooling)
+survive for future station builds.
