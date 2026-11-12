@@ -318,8 +318,14 @@ namespace
                     Ops::pairDot(columns01, columns23, act,
                         std::bit_cast<I>(first), std::bit_cast<I>(second));
                 }
-                I dots[2] = {columns01, columns23};
-                Ops::publishPairs(columns01, columns23, dots);
+                // publishPairs is the production TILE's Rows-templated
+                // helper; for one row pair it degenerates to splitPair
+                // plus an add into zero-initialized dots - splitting
+                // directly here is arithmetically identical (exact INT32
+                // accumulation) and keeps the Ops surface to what the
+                // ops struct actually declares.
+                I dots[2];
+                Ops::splitPair(columns01, columns23, dots[0], dots[1]);
                 const F scale0 = Ops::half(reinterpret_cast<const uint16_t *>(
                     source.scalesHalf(block) + static_cast<size_t>(quad) * 4u));
                 const I metadata = Ops::words(reinterpret_cast<const uint16_t *>(
