@@ -2051,3 +2051,12 @@ build_stt removed (nothing local-only). **arm-addon2 retires. The
 idea-08 GO/NO-GO recommendation (inputs-only) transfers to the
 successor session or a re-wakened addon2 when the census + tournament
 data land.**
+
+### arm-addon3 RETIRED (~10:09Z): worktree + build dirs removed (~500MB freed), signed off
+
+The successor session picks up from the handover note (the B1 runner
+placement via Main's structural pass; the named-attribution export
+pass with the corrected recipe; the B1 ranking finalization; the
+idea-23 model-level validation post-merge; the depth sweep + 27B rider
+post-campaign). Two addon sessions retired tonight (addon2, addon3) —
+both fully accounted.
