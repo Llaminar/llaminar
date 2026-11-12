@@ -6,10 +6,13 @@
  * and stage name → key conversion extracted in Phase 2 of DGO refactor.
  * Producer publication tests retain complete/column-partition semantics across
  * MTP namespaces and padded prefill chunks without executing a model or GPU.
+ * HC projection logits, updated residuals and 4H branch norms retain distinct
+ * producer identities through singleton filters and repeated fused publication.
  */
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <cmath>
 #include <numeric>
@@ -17,6 +20,8 @@
 #include <vector>
 
 #include "snapshots/SnapshotCapture.h"
+#include "models/qwen4exp/Qwen4ExpSchema.h"
+#include "execution/debug/TPSnapshot.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
 
@@ -1865,6 +1870,124 @@ TEST(Test__SnapshotCapture_KeyConversion, LongestSuffixMatchesFirst)
     // "_wo_proj" must not be confused with "_q_proj"
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_proj"),
               "layer0_ATTENTION_OUTPUT");
+}
+
+/** @test Exact HC projection outputs never claim a completed residual or branch normalization. */
+TEST(SnapshotCapture, FlashNextHCProjectionAndBranchNormOwnership)
+{
+    const std::vector<float> logits{-0.f,2.f,3.f,4.f};
+    const std::vector<float> trunk{1.f,2.f,3.f,4.f,5.f,6.f,7.f,8.f,9.f,10.f,11.f,12.f};
+    const auto projected=makeSingleOutputDump("C",logits.data(),1,4);
+    const auto wrong=makeSingleOutputDump("output",logits.data(),1,4);
+    const auto written=makeSingleOutputDump("output",trunk.data(),1,12);
+    const Qwen4ExpSchemaFactory schema;
+    const auto sharding=schema.getStageShardingConfig();
+    for(const std::string role:{"attn","ffn"})
+    {
+        const auto prefix="layer2_hc_"+role+"_write";
+        const auto key=std::string("layer2_HC_")+(role=="attn"?"ATTN":"FFN")+"_WRITE_LOGITS";
+        const auto residual=role=="attn"?"layer2_GR_WRITE":"layer2_FFN_RESIDUAL";
+        EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey(prefix+"_projection"),key);
+        EXPECT_EQ(SnapshotCapture::possibleKeysForStageName(prefix+"_projection"),(std::vector<std::string>{key}));
+        EXPECT_EQ(SnapshotCapture::possibleKeysForStage(prefix+"_projection",projected),(std::vector<std::string>{key}));
+        EXPECT_TRUE(SnapshotCapture::possibleKeysForStage(prefix+"_projection",wrong).empty());
+        for(const char *name:{static_cast<const char *>(nullptr),""})
+        {
+            auto unnamed=projected;unnamed.outputs.front().name=name;
+            EXPECT_TRUE(SnapshotCapture::possibleKeysForStage(prefix+"_projection",unnamed).empty());
+            SnapshotCapture rejected;rejected.captureStage(prefix+"_projection",unnamed);
+            EXPECT_FALSE(rejected.getShared(key));
+        }
+        EXPECT_EQ(getStageShardingMode(key,sharding),SnapshotShardingMode::REPLICATED);
+        SnapshotCapture capture;
+        capture.captureStage(prefix+"_projection",wrong);
+        EXPECT_FALSE(capture.getShared(key));EXPECT_FALSE(capture.getShared(residual));
+        capture.captureStage(prefix+"_projection",projected);
+        const auto retained=capture.getShared(key);
+        ASSERT_TRUE(retained);EXPECT_EQ(retained->rows,1u);EXPECT_EQ(retained->cols,4u);
+        EXPECT_EQ(std::memcmp(retained->data.data(),logits.data(),logits.size()*sizeof(float)),0);
+        EXPECT_FALSE(capture.getShared(residual));EXPECT_FALSE(capture.getShared("layer2_ATTENTION_RESIDUAL"));
+        capture.captureStage(prefix,written);
+        ASSERT_TRUE(capture.getShared(residual));
+        EXPECT_EQ(capture.getShared(residual)->cols,12u);
+        EXPECT_EQ(capture.getShared(key).get(),retained.get());
+        EXPECT_EQ(std::memcmp(retained->data.data(),logits.data(),logits.size()*sizeof(float)),0);
+        // Neither a projection helper nor a partial name owns the write key.
+        for(const auto suffix:{"_projection_extra","_helper","_projection_partial"})
+        {
+            const auto keys=SnapshotCapture::possibleKeysForStageName(prefix+suffix);
+            EXPECT_EQ(std::count(keys.begin(),keys.end(),residual),0);
+        }
+        capture.clear();EXPECT_FALSE(capture.getShared(key));
+        EXPECT_EQ(std::memcmp(retained->data.data(),logits.data(),logits.size()*sizeof(float)),0);
+    }
+}
+
+/** @test Fused normalized output owns the actual 4H boundary, never the H-wide FFN read. */
+TEST(SnapshotCapture, FlashNextHCFusedBranchNormPublicationLifecycle)
+{
+    const std::vector<float> trunk{1.f,2.f,3.f,4.f,5.f,6.f,7.f,8.f,9.f,10.f,11.f,12.f},
+        normalized{-0.f,12.f,11.f,10.f,9.f,8.f,7.f,6.f,5.f,4.f,3.f,2.f},read{21.f,22.f,23.f};
+    const auto written=makeSingleOutputDump("output",trunk.data(),1,12);
+    auto branch=makeSingleOutputDump("output",normalized.data(),1,12);
+    auto fused=makeSingleOutputDump("normalized",normalized.data(),1,12);
+    const auto mixed=makeSingleOutputDump("branch_read",read.data(),1,3);
+    const auto wrong=makeSingleOutputDump("C",normalized.data(),1,12);
+    const std::string key="layer2_HC_FFN_BRANCH_NORM";
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer2_hc_ffn_branch_norm"),key);
+    EXPECT_EQ(SnapshotCapture::possibleKeysForStage("layer2_hc_ffn_branch_norm",branch),(std::vector<std::string>{key}));
+    EXPECT_TRUE(SnapshotCapture::possibleKeysForStage("layer2_hc_ffn_branch_norm",wrong).empty());
+    EXPECT_EQ(getStageShardingMode(key,Qwen4ExpSchemaFactory{}.getStageShardingConfig()),SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(SnapshotCapture::possibleKeysForStage("layer2_hc_attn_write",written),
+        (std::vector<std::string>{"layer2_GR_WRITE","layer2_ATTENTION_RESIDUAL"}));
+    EXPECT_EQ(SnapshotCapture::possibleKeysForStage("layer2_hc_attn_write",fused),(std::vector<std::string>{key}));
+    EXPECT_TRUE(SnapshotCapture::possibleKeysForStage("layer2_hc_attn_write",wrong).empty());
+    for(const char *name:{static_cast<const char *>(nullptr),""})
+    {
+        auto unnamed=fused;unnamed.outputs.front().name=name;
+        EXPECT_TRUE(SnapshotCapture::possibleKeysForStage("layer2_hc_attn_write",unnamed).empty());
+        SnapshotCapture rejected;rejected.captureStage("layer2_hc_attn_write",unnamed);
+        EXPECT_FALSE(rejected.getShared(key));
+    }
+    for(int variant=0;variant<4;++variant)
+    {
+        SnapshotCapture capture;
+        capture.captureStage("layer2_ffn_norm",mixed);
+        StageDumpInfo dump;
+        if(variant!=1)dump.outputs.push_back(written.outputs.front());
+        if(variant!=0)dump.outputs.push_back(fused.outputs.front());
+        if(variant==3)std::reverse(dump.outputs.begin(),dump.outputs.end());
+        capture.captureStage("layer2_hc_attn_write",dump);
+        const auto norm=capture.getShared(key),ffn=capture.getShared("layer2_FFN_NORM");
+        ASSERT_TRUE(ffn);EXPECT_EQ(ffn->cols,3u);EXPECT_EQ(ffn->data,read);
+        if(variant==0)EXPECT_FALSE(norm);
+        else{ASSERT_TRUE(norm);EXPECT_EQ(norm->cols,12u);EXPECT_EQ(std::memcmp(norm->data.data(),normalized.data(),normalized.size()*sizeof(float)),0);}
+        if(variant==1)EXPECT_FALSE(capture.getShared("layer2_GR_WRITE"));
+        else{ASSERT_TRUE(capture.getShared("layer2_GR_WRITE"));EXPECT_EQ(capture.getShared("layer2_GR_WRITE")->data,trunk);}
+    }
+    // Original and fused producers preserve the same typed row ownership and context.
+    branch.outputs.front().row_layout=SnapshotOwnedRows{{{0,1}}};
+    fused.outputs.front().row_layout=SnapshotOwnedRows{{{0,1}}};
+    for(const auto &[producer,dump]:std::array<std::pair<std::string,StageDumpInfo>,2>{{
+        {"layer2_hc_ffn_branch_norm",branch},{"layer2_hc_attn_write",fused}}})
+    {
+        SnapshotCapture capture;
+        capture.captureStage("prefill_chunk_3::"+producer,dump);
+        const auto scoped="PREFILL_CHUNK_3_"+key;
+        const auto norm=capture.getShared(scoped);ASSERT_TRUE(norm);
+        EXPECT_EQ(norm->rows,1u);EXPECT_EQ(norm->cols,12u);
+        EXPECT_EQ(norm->row_ownership,(SnapshotOwnedRows{{{0,1}}}));
+        EXPECT_EQ(norm->publication,SnapshotPublication::RowPartition);
+        EXPECT_EQ(SnapshotCapture::possibleKeysForStage("prefill_chunk_3::"+producer,dump),(std::vector<std::string>{scoped}));
+        auto changed=normalized;for(auto &value:changed)value=-value;
+        auto replay=dump;replay.outputs.front().data=changed.data();
+        capture.captureStage("prefill_chunk_3::"+producer,replay);
+        ASSERT_TRUE(capture.getShared(scoped));EXPECT_NE(capture.getShared(scoped).get(),norm.get());
+        EXPECT_EQ(std::memcmp(capture.getShared(scoped)->data.data(),changed.data(),changed.size()*sizeof(float)),0);
+        EXPECT_EQ(std::memcmp(norm->data.data(),normalized.data(),normalized.size()*sizeof(float)),0);
+        capture.clear();EXPECT_FALSE(capture.getShared(scoped));
+        EXPECT_EQ(std::memcmp(norm->data.data(),normalized.data(),normalized.size()*sizeof(float)),0);
+    }
 }
 
 /** @test Packed native INT64 identities remain exact above both floating mantissa limits. */

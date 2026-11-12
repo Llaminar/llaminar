@@ -21,10 +21,12 @@ numerical limits. Quantisation spikes are accepted; formal canary status remains
 and generation retire cleanly.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
-**Release baseline:** median **732.92/37.26 P/D tok/s**, 512 prompt/256 emitted,
-M512, Static, MTP/prefix off. [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md):
-concurrent submission gave **37.12D**, no gain; removed. Next: device-kernel
-fusion and collective latency.
+**Prefill pass:** **734.87→789.43 P tok/s (+7.42%)**, matched 512/1 requests,
+M512, Static, MTP/prefix off. Removed AMD private zero-vector traffic; captured
+bytes pass on MI50/7900XTX/3090. [Result](../2026-11/QFN_EP4_EP4_PREFILL_PUBLICATION_TUNING_20261112.md).
+Next: M512 HC-down tile selection. Retained 512/256 baseline: **732.92P/37.26D**;
+new decode is unmeasured. [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md):
+concurrent submission and HC fusion remain unpromoted.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
 [fixed VRAM ngram plan](QFN_FIXED_VRAM_PIPELINE_PLAN_2026-11-10.md).
 
@@ -34,14 +36,11 @@ but movement differed, so no causal model speedup was claimed.
 [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md),
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 
-**Retained CPU work:** Auto scheduling is byte-exact in all21 formats;
-QFN FFN component gains are **26–31%**. Pair-dot ILP improves gate/up **4.5%**
-and persistent FFN **1.9–2.5%**. These remain scoped component results.
+**Retained CPU work:** all21 formats are byte-exact; component gains are
+26–31% for FFN scheduling and1.9–2.5% for persistent FFN ILP.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md),
 [ILP results](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md).
-**GNU wait policy stays unchanged:** unset **299.560P/38.994D**; spin0
-199.393/29.381 and spin1000 203.445/32.726 regress. All 768 IDs/MTP/config/initial
-placement match. Runtime pause-loop cycle shares are not removable wall time.
+**GNU wait policy stays unchanged:** spin0/spin1000 regress matched throughput.
 [OpenMP evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 **Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
 M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
@@ -104,7 +103,9 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
-| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 732.92 | — | — | 37.26 | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 789.43† | — | — | 37.26‡ | — | — |
+
+† Latest 512/1 prefill-only run. ‡ Prior 512/256 decode; not remeasured.
 
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
 Small C0/C64 row-cache fixtures force movement; performance uses useful admitted

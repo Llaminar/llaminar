@@ -1371,6 +1371,38 @@ cmake --build build_v2_integration --parallel \
   --target v2_integration_parity_qwen2_single_device_matrix
 ```
 
+## Additional diagnostic capture keys
+
+`LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS` adds a comma-separated list of exact
+semantic keys to the existing setup capture inventory. Set it before starting
+the parity process, for example:
+
+```bash
+export LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS='layer0_HC_ATTN_WRITE_LOGITS,layer0_HC_FFN_BRANCH_NORM'
+export LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS='layer0_HC_ATTN_WRITE_LOGITS,layer0_HC_FFN_BRANCH_NORM'
+export LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS='0'
+```
+
+Capture requests are frozen before runner initialization, including an absent
+or empty request. Later environment changes cannot add nodes to retained graphs.
+Keys use identifier syntax (`[A-Za-z_][A-Za-z0-9_]*`); surrounding spaces are
+trimmed, duplicates are removed, and empty list members, paths and wildcard
+patterns are rejected. An explicit request with disabled diagnostic snapshots
+is an error. Builds must support pipeline snapshots as usual.
+
+The capture list adds actual published outputs to the existing typed snapshot
+policy and physical-memory admission path. It does not create references,
+require numerical comparison for those keys, select every publication, or
+change model execution. The existing snapshot arena capacity remains enforced;
+a request does not authorize unaccounted storage or invent a producer for an
+unknown key. Use the exact keys published by the selected model.
+
+`LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS` independently filters already captured
+values for file export (using its existing substring matching). It cannot add
+missing capture nodes. `LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS` limits decode
+export steps, and `LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS` optionally limits
+payload size. Exports are diagnostics, not numerical or performance certification.
+
 ## Troubleshooting
 
 - “reference pack is stale or unauthenticated” names the exact failed identity

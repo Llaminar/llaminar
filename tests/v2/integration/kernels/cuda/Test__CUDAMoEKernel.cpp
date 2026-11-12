@@ -7,6 +7,9 @@
  * from resident-only assignments and survive an empty final apply poll.
  * Collective fixtures admit their maximum live payload and conversion scratch
  * through the same physical-memory BOM used by production graph setup.
+ * Retained original rank-bank publication guards all route/bank/guard bytes
+ * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
+ * Disabled paired events and event-free profile modes isolate one real bridge.
  */
 #include "../../../utils/IQ2SFusedMoEGpuSourceWitness.h"
 #include <gtest/gtest.h>
@@ -57,6 +60,7 @@
 #include "../../../utils/VerifierRowTestInventory.h"
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
+#include "../moe/CanonicalRankBankCapturedRegression.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/NativeQuantisedExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
@@ -28785,6 +28789,58 @@ namespace
         llaminar2::test::runSharedSmallFloatGroupingProductionEvents<
             SharedSmallFloatGroupingCudaBackend>(4, 8, geometry);
     }
+
+
+#ifdef HAVE_CUDA
+/** @brief Existing production bridge; the declaration changes no runtime policy. */
+extern "C" bool cudaMoE_publish_shared_expert_rank_bank(const float *, float *, int, int, int, int, int, const int *, int, void *);
+/** @brief Test-only frozen original entry, linked only into this fixture owner. */
+extern "C" bool testOriginalCUDASharedRankBank(const float *, float *, int, int, int, int, int, const int *, int, void *);
+/** @test Original captured publication retains every route, live/zero bank, nonfinite bit and guard. */
+TEST_F(Test__CUDAMoEKernel, CanonicalRankBankPrefillCapturedBytes)
+{
+    if (!hasCudaDevice())
+        GTEST_SKIP()<<"No CUDA device available";
+    auto factory = [](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::CUDAGraphCapture>(static_cast<cudaStream_t>(stream), 0);
+    };
+    llaminar2::test::canonical_rank_bank::run(cudaMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::cuda(0), stream_, factory,
+        testOriginalCUDASharedRankBank, llaminar2::test::canonical_rank_bank::Run::Functional);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST_F(Test__CUDAMoEKernel, DISABLED_CanonicalRankBankPrefillPairedEvents)
+{
+    if (!hasCudaDevice())
+        GTEST_SKIP()<<"No CUDA device available";
+    auto factory = [](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::CUDAGraphCapture>(static_cast<cudaStream_t>(stream), 0);
+    };
+    llaminar2::test::canonical_rank_bank::run(cudaMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::cuda(0), stream_, factory,
+        testOriginalCUDASharedRankBank, llaminar2::test::canonical_rank_bank::Run::Paired);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST_F(Test__CUDAMoEKernel, DISABLED_CanonicalRankBankPrefillProfileOriginal)
+{
+    if (!hasCudaDevice())
+        GTEST_SKIP()<<"No CUDA device available";
+    auto factory = [](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::CUDAGraphCapture>(static_cast<cudaStream_t>(stream), 0);
+    };
+    llaminar2::test::canonical_rank_bank::run(cudaMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::cuda(0), stream_, factory,
+        testOriginalCUDASharedRankBank, llaminar2::test::canonical_rank_bank::Run::ProfileOriginal);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST_F(Test__CUDAMoEKernel, DISABLED_CanonicalRankBankPrefillProfileProduction)
+{
+    if (!hasCudaDevice())
+        GTEST_SKIP()<<"No CUDA device available";
+    auto factory = [](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::CUDAGraphCapture>(static_cast<cudaStream_t>(stream), 0);
+    };
+    llaminar2::test::canonical_rank_bank::run(cudaMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::cuda(0), stream_, factory,
+        testOriginalCUDASharedRankBank, llaminar2::test::canonical_rank_bank::Run::ProfileProduction);
+}
+#endif
 
 } // namespace
 #endif

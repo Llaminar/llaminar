@@ -26,6 +26,8 @@
  * Linkage to host C++ is via extern "C" wrapper functions.
  * Native signed INT8 dot products share the exact unsaturated arithmetic
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
+ * Shared rank-bank publication uses uniform direct copy/zero stores so
+ * peer-bank zeroing owns no addressable private zero-vector temporary.
  */
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
@@ -15914,12 +15916,20 @@ void rocm_moe_publish_shared_expert_rank_bank_kernel(
         float4 *__restrict__ destination4 =
             reinterpret_cast<float4 *>(
                 canonical_publication + destination_offset);
-        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        for (int index = blockIdx.x * blockDim.x + threadIdx.x;
-             index < d4;
-             index += gridDim.x * blockDim.x)
+        // copy_local is uniform for this bank row. Separate value stores
+        // avoid materializing a named zero vector in private memory and then
+        // selecting that lvalue address instead of a direct register-zero store.
+        if (copy_local)
         {
-            destination4[index] = copy_local ? source4[index] : zero;
+            for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+                 index < d4; index += gridDim.x * blockDim.x)
+                destination4[index] = source4[index];
+        }
+        else
+        {
+            for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+                 index < d4; index += gridDim.x * blockDim.x)
+                destination4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         return;
     }

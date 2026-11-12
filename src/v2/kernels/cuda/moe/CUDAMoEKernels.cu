@@ -16,6 +16,8 @@
  * registers; all row modes reuse the same per-row FP32 accumulation/tree.
  * Four-expert tiles share hidden loads for prefill, while small row capacities
  * retain the measured lower-latency single-expert launch without new storage.
+ * Shared rank-bank publication uses uniform direct copy/zero stores so
+ * peer-bank zeroing owns no addressable private zero-vector temporary.
  */
 
 #include "CUDARouterQ8Prefill.h"
@@ -20601,17 +20603,25 @@ namespace
         if ((d_model & 3) == 0)
         {
             const int n4 = d_model >> 2;
-            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             const float4 *source4 =
                 reinterpret_cast<const float4 *>(shared_output + source_offset);
             float4 *destination4 =
                 reinterpret_cast<float4 *>(
                     canonical_publication + destination_offset);
-            for (int index = blockIdx.x * blockDim.x + threadIdx.x;
-                 index < n4;
-                 index += gridDim.x * blockDim.x)
+            // copy_local is uniform for this bank row. Separate value stores
+            // prevent an lvalue conditional from materializing zero in private
+            // memory and selecting its address for every peer-bank vector.
+            if (copy_local)
             {
-                destination4[index] = copy_local ? source4[index] : zero;
+                for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+                     index < n4; index += gridDim.x * blockDim.x)
+                    destination4[index] = source4[index];
+            }
+            else
+            {
+                for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+                     index < n4; index += gridDim.x * blockDim.x)
+                    destination4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
             return;
         }

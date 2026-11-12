@@ -20,6 +20,9 @@
  *   one model-owned PreparedWeightStore before materializing device storage.
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
+ * Retained original rank-bank publication guards all route/bank/guard bytes
+ * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
+ * Disabled paired events and event-free profile modes isolate one real bridge.
  */
 
 #include "kernels/common/RouterQ8Launch.h"
@@ -73,6 +76,7 @@
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
+#include "../moe/CanonicalRankBankCapturedRegression.h"
 #include "../moe/MoETransferStateMachineTestModel.h"
 #include "../moe/NativeQuantisedExpertTransferParityTest.h"
 #include "../moe/SmallFloatGroupingTestOracle.h"
@@ -30223,3 +30227,86 @@ TEST(Test__ROCmMoEKernel, HalfRouterQ8DemandPublishesOriginalRowsAndPreservesNoD
                 kernel.unbindWorkspace();
             }
 }
+
+
+#ifdef HAVE_ROCM
+/**
+ * @brief Resolve the existing test-only ROCm selector for the new publication cases.
+ * @return Explicit unmasked native ordinal; absent selection uses original device0.
+ * @throws std::invalid_argument For malformed or unavailable explicit selections.
+ * @details This selector does not alter production device selection or any
+ * visibility variable. The original full-facade regression remains on device0.
+ */
+int canonicalRankBankROCmOrdinal()
+{
+    const char *text = std::getenv("LLAMINAR_TEST_ROCM_DEVICE");
+    if (!text)
+        return 0;
+    char *end = nullptr;
+    const long selected = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || selected < 0 ||
+        selected > std::numeric_limits<int>::max())
+        throw std::invalid_argument("LLAMINAR_TEST_ROCM_DEVICE requires a nonnegative native ordinal");
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || selected >= count)
+        throw std::invalid_argument("LLAMINAR_TEST_ROCM_DEVICE is unavailable without visibility changes");
+    return static_cast<int>(selected);
+}
+
+/** @brief Existing production bridge; the declaration changes no runtime policy. */
+extern "C" bool rocmMoE_publish_shared_expert_rank_bank(const float *, float *, int, int, int, int, int, const int *, int, void *);
+/** @brief Test-only frozen original entry, linked only into this fixture owner. */
+extern "C" bool testOriginalROCmSharedRankBank(const float *, float *, int, int, int, int, int, const int *, int, void *);
+/** @test Original captured publication retains every route, live/zero bank, nonfinite bit and guard. */
+TEST(Test__ROCmMoEKernel, CanonicalRankBankPrefillCapturedBytes)
+{
+    SKIP_IF_NO_ROCM();
+    const int ordinal = canonicalRankBankROCmOrdinal();
+    ScopedHipDeviceStream owner(ordinal);
+    ASSERT_EQ(owner.status(), hipSuccess);
+    auto factory = [ordinal](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::HIPGraphCapture>(static_cast<hipStream_t>(stream), ordinal);
+    };
+    llaminar2::test::canonical_rank_bank::run(rocmMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::rocm(ordinal), owner.get(), factory,
+        testOriginalROCmSharedRankBank, llaminar2::test::canonical_rank_bank::Run::Functional);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST(Test__ROCmMoEKernel, DISABLED_CanonicalRankBankPrefillPairedEvents)
+{
+    SKIP_IF_NO_ROCM();
+    const int ordinal = canonicalRankBankROCmOrdinal();
+    ScopedHipDeviceStream owner(ordinal);
+    ASSERT_EQ(owner.status(), hipSuccess);
+    auto factory = [ordinal](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::HIPGraphCapture>(static_cast<hipStream_t>(stream), ordinal);
+    };
+    llaminar2::test::canonical_rank_bank::run(rocmMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::rocm(ordinal), owner.get(), factory,
+        testOriginalROCmSharedRankBank, llaminar2::test::canonical_rank_bank::Run::Paired);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST(Test__ROCmMoEKernel, DISABLED_CanonicalRankBankPrefillProfileOriginal)
+{
+    SKIP_IF_NO_ROCM();
+    const int ordinal = canonicalRankBankROCmOrdinal();
+    ScopedHipDeviceStream owner(ordinal);
+    ASSERT_EQ(owner.status(), hipSuccess);
+    auto factory = [ordinal](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::HIPGraphCapture>(static_cast<hipStream_t>(stream), ordinal);
+    };
+    llaminar2::test::canonical_rank_bank::run(rocmMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::rocm(ordinal), owner.get(), factory,
+        testOriginalROCmSharedRankBank, llaminar2::test::canonical_rank_bank::Run::ProfileOriginal);
+}
+/** @test Explicit one-shape original/production diagnostic, excluded from routine functional gates. */
+TEST(Test__ROCmMoEKernel, DISABLED_CanonicalRankBankPrefillProfileProduction)
+{
+    SKIP_IF_NO_ROCM();
+    const int ordinal = canonicalRankBankROCmOrdinal();
+    ScopedHipDeviceStream owner(ordinal);
+    ASSERT_EQ(owner.status(), hipSuccess);
+    auto factory = [ordinal](void *stream)->std::unique_ptr<llaminar2::IGPUGraphCapture>{
+        return std::make_unique<llaminar2::HIPGraphCapture>(static_cast<hipStream_t>(stream), ordinal);
+    };
+    llaminar2::test::canonical_rank_bank::run(rocmMoE_publish_shared_expert_rank_bank, llaminar2::DeviceId::rocm(ordinal), owner.get(), factory,
+        testOriginalROCmSharedRankBank, llaminar2::test::canonical_rank_bank::Run::ProfileProduction);
+}
+#endif

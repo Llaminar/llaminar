@@ -16,6 +16,10 @@
  * the down producer and complete folded rows at the assembly producer; their
  * typed publication contracts prevent the ordinary expert-sum interpretation.
  *
+ * HC injection logits, updated trunks and next-branch normalization have exact
+ * producer/output identities. Fused normalization publishes its distinct 4H
+ * result only when that descriptor exists; H-wide residual reads stay separate.
+ *
  * Named router outputs drive both semantic publication and singleton descriptor
  * selection, keeping unrequested probability buffers out of retained arenas.
  *
@@ -67,6 +71,50 @@ namespace llaminar2
         }
 
         /**
+         * @brief Resolve exact HC producers without residual/projection substring collisions.
+         * @param name Concrete unqualified graph producer, retaining layer or predictor identity.
+         * @param output Actual output name; empty enumerates possible producer outputs.
+         * @return No value for another producer, otherwise only owned semantic keys.
+         * @details Injection C is four logits, residual output is 4H, and the next
+         * FFN branch norm is 4H. A fused write may expose both latter outputs;
+         * its potential inventory never invents a missing normalized descriptor.
+         */
+        std::optional<std::vector<std::string>> hyperconnectionSnapshotOutputKeys(
+            const std::string &name,std::string_view output)
+        {
+            const auto one=[&](std::string_view suffix,std::string_view operand,
+                std::initializer_list<std::string_view> semantics)
+                ->std::optional<std::vector<std::string>> {
+                if(!name.ends_with(suffix))return std::nullopt;
+                std::vector<std::string> keys;
+                if(output.empty() || output==operand)
+                {
+                    const auto prefix=name.substr(0,name.size()-suffix.size());
+                    for(const auto semantic:semantics)keys.push_back(prefix+std::string(semantic));
+                }
+                return keys;
+            };
+            if(auto keys=one("_hc_attn_write_projection","C",{"_HC_ATTN_WRITE_LOGITS"}))return keys;
+            if(auto keys=one("_hc_ffn_write_projection","C",{"_HC_FFN_WRITE_LOGITS"}))return keys;
+            if(auto keys=one("_hc_attn_branch_norm","output",{"_GR_NORM"}))return keys;
+            if(auto keys=one("_hc_ffn_branch_norm","output",{"_HC_FFN_BRANCH_NORM"}))return keys;
+            constexpr std::string_view write="_hc_attn_write";
+            if(name.ends_with(write))
+            {
+                const auto prefix=name.substr(0,name.size()-write.size());
+                std::vector<std::string> keys;
+                if(output.empty() || output=="output")
+                {
+                    keys.push_back(prefix+"_GR_WRITE");
+                    keys.push_back(prefix+"_ATTENTION_RESIDUAL");
+                }
+                if(output.empty() || output=="normalized")keys.push_back(prefix+"_HC_FFN_BRANCH_NORM");
+                return keys;
+            }
+            return one("_hc_ffn_write","output",{"_FFN_RESIDUAL"});
+        }
+
+        /**
          * @brief Name Flash Next values by their exact producing operation and output.
          * @param name Unqualified graph node, retaining its layer or predictor namespace.
          * @param output Named output; an empty name enumerates all possible semantic keys.
@@ -79,6 +127,7 @@ namespace llaminar2
         std::optional<std::vector<std::string>> flashNextSnapshotOutputKeys(
             const std::string &name, std::string_view output)
         {
+            if(auto keys=hyperconnectionSnapshotOutputKeys(name,output))return keys;
             const auto one = [&](std::string_view suffix, std::string_view operand,
                                  std::initializer_list<std::string_view> semantics)
                 -> std::optional<std::vector<std::string>>
@@ -104,9 +153,6 @@ namespace llaminar2
                 if(output.empty()||output=="normalized")keys.push_back(prefix+"_GDN_NORM_GATE_OUTPUT");
                 return keys;
             }
-            if (auto keys = one("_hc_attn_branch_norm", "output", {"_GR_NORM"})) return keys;
-            if (auto keys = one("_hc_attn_write", "output", {"_GR_WRITE", "_ATTENTION_RESIDUAL"})) return keys;
-            if (auto keys = one("_hc_ffn_write", "output", {"_FFN_RESIDUAL"})) return keys;
             if (auto keys = one("_qsa_query_proj", "C", {"_QSA_INDEXER_RAW_QUERY"})) return keys;
             constexpr std::string_view indexer = "_qsa_indexer";
             if (!name.ends_with(indexer)) return std::nullopt;
@@ -484,7 +530,10 @@ namespace llaminar2
         {
             for (const auto &output : dump.outputs)
             {
-                const auto keys = flashNextSnapshotOutputKeys(name, output.name ? output.name : "");
+                // Empty names request no actual value; only name-only inventory
+                // queries enumerate every potential producer output.
+                if(!output.name || !*output.name)continue;
+                const auto keys = flashNextSnapshotOutputKeys(name, output.name);
                 for (const auto &key : *keys)
                     if (output.data || output.observed_header) storeOutput(key, output);
             }
@@ -1361,6 +1410,9 @@ namespace llaminar2
 
     std::string SnapshotCapture::convertStageNameToSnapshotKey(const std::string &stage_name)
     {
+        // HC ownership is exact and output-specific in the shared selector.
+        // In particular a write_projection is never a completed residual write.
+        if(auto keys=hyperconnectionSnapshotOutputKeys(stage_name,{}))return keys->front();
         if (stage_name.find("_moe_expert_ffn_tier") != std::string::npos)
         {
             std::string result = stage_name;
@@ -1418,9 +1470,6 @@ namespace llaminar2
         // overwriting the semantic stage snapshot used by parity tests.
         static const std::vector<std::pair<std::string, std::string>> suffix_map = {
             // Flash Next semantic values precede generic projection/norm suffixes.
-            {"_hc_attn_branch_norm", "_GR_NORM"},
-            {"_hc_attn_write", "_GR_WRITE"},
-            {"_hc_ffn_write", "_FFN_RESIDUAL"},
             {"_ple_hash", "_PLE_HASH_INDICES"},
             {"_ple_gather", "_PLE_GATHER"},
             {"_ple_gate", "_PLE_GATE"},
@@ -1753,7 +1802,8 @@ namespace llaminar2
             std::vector<std::string> keys;
             for (const auto &output : dump_info.outputs)
             {
-                const auto actual = flashNextSnapshotOutputKeys(stage_name, output.name ? output.name : "");
+                if(!output.name || !*output.name)continue;
+                const auto actual = flashNextSnapshotOutputKeys(stage_name, output.name);
                 for (const auto &key : *actual)
                     if (std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
             }

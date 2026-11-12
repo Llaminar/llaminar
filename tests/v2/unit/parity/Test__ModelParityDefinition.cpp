@@ -10,6 +10,8 @@
  * matching test names cannot hide contradictory dense/routed declarations.
  * Phase-specific numerical allowances must survive expansion without changing
  * the ordinary decode or recursively conditioned MTP logit budgets.
+ * Setup-only diagnostic requests must freeze exact capture keys without
+ * inventing reference tensors or changing numerical comparison obligations.
  */
 
 #include "integration/parity/ModelParityDefinition.h"
@@ -222,6 +224,24 @@ namespace llaminar2::test::parity
             std::vector<std::string> captureFilter() const
             {
                 return paritySnapshotSetupCaptureFilter();
+            }
+
+            /** Freeze through the same pre-initialization gate as runner setup. */
+            void freezeCaptureRequest(bool snapshots_enabled = true) const
+            {
+                freezeParityDiagnosticSnapshotKeys(snapshots_enabled);
+            }
+
+            /** Disable the typed diagnostic graph policy for admission tests. */
+            void disableSnapshots()
+            {
+                config_.graph_snapshot_policy.enabled = false;
+            }
+
+            /** @return Numerical obligations; diagnostic requests must not add any. */
+            std::vector<std::string> requiredKeys() const
+            {
+                return config_.graph_snapshot_policy.required_prefill_snapshot_keys;
             }
 
             /** Declare stages whose oracle values require live collectives. */
@@ -534,6 +554,8 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityDefinition, SnapshotInventoryDefaultsToAuthenticatedCheckpoints)
     {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", std::nullopt);
         ScopedReferenceDirectory reference;
         reference.add("EMBEDDING.npy");
         reference.add("decode_step3_MTP2_FINAL_NORM.npy");
@@ -557,6 +579,8 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityDefinition, EveryPublishedOutputIsAnExplicitEmptyFilter)
     {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", std::nullopt);
         SnapshotInventoryProbe probe;
         probe.configure(
             "/reference-pack-is-deliberately-not-read",
@@ -567,6 +591,8 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityDefinition, PostCollectiveEvidenceInstallsCompletedGraphKeys)
     {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", std::nullopt);
         ScopedReferenceDirectory reference;
         reference.add("layer0_ATTENTION_OUTPUT.npy");
         reference.add("layer0_FFN_NORM.npy");
@@ -595,6 +621,125 @@ namespace llaminar2::test::parity
                 filter.begin(), filter.end(),
                 "layer0_FFN_NORM_ALLREDUCED"),
             filter.end());
+    }
+
+    TEST(ModelParityDefinition, DiagnosticCaptureKeysExtendSetupInventory)
+    {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS",
+            " layer0_HC_ATTN_WRITE_LOGITS,layer0_HC_FFN_BRANCH_NORM,"
+            "layer0_HC_ATTN_WRITE_LOGITS,LM_HEAD ");
+        ScopedReferenceDirectory reference;
+        reference.add("EMBEDDING.npy");
+        SnapshotInventoryProbe probe;
+        probe.configure(
+            reference.path(),
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+
+        EXPECT_EQ(probe.captureFilter(), (std::vector<std::string>{
+            "EMBEDDING", "LM_HEAD", "layer0_HC_ATTN_WRITE_LOGITS",
+            "layer0_HC_FFN_BRANCH_NORM"}));
+        EXPECT_TRUE(probe.requiredKeys().empty());
+        EXPECT_FALSE(std::filesystem::exists(
+            reference.path() / "layer0_HC_FFN_BRANCH_NORM.npy"));
+    }
+
+    TEST(ModelParityDefinition, DiagnosticCaptureKeysFreezeBeforeInitialization)
+    {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", "layer0_HC_ATTN_WRITE_LOGITS");
+        ScopedReferenceDirectory reference;
+        reference.add("EMBEDDING.npy");
+        SnapshotInventoryProbe probe;
+        probe.configure(
+            reference.path(),
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+        probe.freezeCaptureRequest();
+        {
+            ScopedEnvironmentVariable later_request(
+                "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", "layer0_HC_FFN_BRANCH_NORM");
+            const auto filter = probe.captureFilter();
+            EXPECT_EQ(filter, (std::vector<std::string>{
+                "EMBEDDING", "LM_HEAD", "layer0_HC_ATTN_WRITE_LOGITS"}));
+            EXPECT_EQ(probe.captureFilter(), filter);
+        }
+    }
+
+    TEST(ModelParityDefinition, DiagnosticCaptureKeysFreezeEmptyRequest)
+    {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", std::nullopt);
+        ScopedReferenceDirectory reference;
+        reference.add("EMBEDDING.npy");
+        SnapshotInventoryProbe probe;
+        probe.configure(
+            reference.path(),
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+        probe.freezeCaptureRequest();
+        ScopedEnvironmentVariable later_request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", "layer0_HC_FFN_BRANCH_NORM");
+        EXPECT_EQ(probe.captureFilter(), (std::vector<std::string>{
+            "EMBEDDING", "LM_HEAD"}));
+    }
+
+    TEST(ModelParityDefinition, DiagnosticCaptureKeysRejectMalformedRequests)
+    {
+        for (const auto *value : {
+                 "layer*_HC_FFN_BRANCH_NORM", "layer?_HC_ATTN_WRITE_LOGITS",
+                 "layer[0]_HC_FFN_BRANCH_NORM", "layer0_HC_FFN_BRANCH_NORM.npy",
+                 "../LM_HEAD", "layer0_HC FFN_BRANCH_NORM", "0_LM_HEAD",
+                 " ", ",LM_HEAD", "LM_HEAD,", "LM_HEAD,,EMBEDDING", "LM_HEAD,  "})
+        {
+            SCOPED_TRACE(value);
+            ScopedEnvironmentVariable request(
+                "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", value);
+            SnapshotInventoryProbe probe;
+            // Validation must precede both reference access and the explicit
+            // all-publications early return; a pattern never selects all nodes.
+            probe.configure(
+                "/no-reference-pack-needed",
+                ParitySnapshotCaptureInventory::EveryPublishedOutput);
+            EXPECT_THROW(probe.captureFilter(), std::invalid_argument);
+        }
+    }
+
+    TEST(ModelParityDefinition, DiagnosticCaptureKeysRejectDisabledSnapshots)
+    {
+        ScopedEnvironmentVariable request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", "layer0_HC_FFN_BRANCH_NORM");
+        SnapshotInventoryProbe probe;
+        probe.configure(
+            "/no-reference-pack-needed",
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+        probe.disableSnapshots();
+        try
+        {
+            static_cast<void>(probe.captureFilter());
+            FAIL() << "explicit capture request accepted with disabled snapshot policy";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find(
+                "requires enabled diagnostic snapshot capture"), std::string::npos);
+        }
+        // The orchestration setup mode independently rejects a lean-only
+        // initialization even when the fixture's diagnostic policy is enabled.
+        SnapshotInventoryProbe setup_probe;
+        setup_probe.configure(
+            "/no-reference-pack-needed",
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+        setup_probe.freezeCaptureRequest();
+        EXPECT_THROW(setup_probe.freezeCaptureRequest(false), std::invalid_argument);
+
+        ScopedEnvironmentVariable no_request(
+            "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS", std::nullopt);
+        SnapshotInventoryProbe default_probe;
+        default_probe.configure(
+            "/no-reference-pack-needed",
+            ParitySnapshotCaptureInventory::AuthenticatedReferenceCheckpoints);
+        default_probe.disableSnapshots();
+        EXPECT_TRUE(default_probe.captureFilter().empty());
+        EXPECT_NO_THROW(default_probe.freezeCaptureRequest(false));
     }
 
     TEST(ModelParityDefinition, DenseQwen36DeclaresExactOptimizedMTPCheckpointSurface)

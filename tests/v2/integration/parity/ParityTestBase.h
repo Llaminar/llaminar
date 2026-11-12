@@ -10,6 +10,7 @@
  * - Table visualization of layer-by-layer results
  * - Pass/fail assertions with configurable thresholds
  * - Snapshot loading and regeneration
+ * - Setup-frozen exact diagnostic capture requests using the existing arena admission
  * - Rank-owned fresh artifact setup before validated metadata publication
  *
  * MPI Support:
@@ -4331,6 +4332,9 @@ namespace llaminar2::test::parity
         IInferenceRunner *borrowed_runner_ = nullptr;
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
         mutable std::unordered_map<std::string, std::vector<float>> active_snapshot_combined_cache_;
+        /** Setup-only diagnostic keys; an empty engaged value also freezes the request. */
+        mutable std::optional<std::vector<std::string>>
+            parity_diagnostic_capture_keys_;
         mutable std::string parity_reference_capture_filter_cache_dir_;
         mutable std::vector<std::string>
             parity_reference_capture_filter_cache_;
@@ -4814,6 +4818,11 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
+            // Freeze before any backend/model initialization can construct a
+            // retained graph. Later environment changes cannot change topology.
+            freezeParityDiagnosticSnapshotKeys(
+                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).enabled ||
+                parityGraphSnapshotPolicy(ParityForwardPhase::Decode).enabled);
             // Model parity is a production-path canary. Do not let an inherited
             // shell env or a previous test route it through deterministic GEMM.
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
@@ -6361,6 +6370,10 @@ namespace llaminar2::test::parity
             std::optional<ModelContextReuseContract> reuse_contract,
             ParitySnapshotSetupMode snapshot_mode)
         {
+            // Reject an explicit diagnostic request on a lean-only setup before
+            // replacing any runner or creating model/backend resources.
+            freezeParityDiagnosticSnapshotKeys(
+                snapshot_mode != ParitySnapshotSetupMode::Disabled);
             OrchestrationConfig runner_config = orch_config;
             if (frozen_history_replay_)
                 frozen_history_replay_->applyCPUWorkers(runner_config);
@@ -6882,6 +6895,64 @@ namespace llaminar2::test::parity
                     values.push_back(token);
             }
             return values;
+        }
+
+        /**
+         * @brief Freeze an optional exact diagnostic inventory before runner initialization.
+         *
+         * This request adds capture nodes, not numerical-reference obligations.
+         * Keys use identifier syntax only; patterns, paths and empty members
+         * are rejected rather than widening the captured topology. The existing
+         * snapshot policy, source-output projection and PMA admission still own
+         * the graph and its physical storage.
+         *
+         * @param snapshots_enabled Whether this setup prepares diagnostic graphs.
+         * @return The same immutable request for every later phase/reset.
+         * @throws std::invalid_argument For a malformed request or disabled capture.
+         */
+        const std::vector<std::string> &freezeParityDiagnosticSnapshotKeys(
+            bool snapshots_enabled) const
+        {
+            constexpr const char *name = "LLAMINAR_PARITY_CAPTURE_SNAPSHOT_KEYS";
+            if (!parity_diagnostic_capture_keys_)
+            {
+                auto keys = readParityEnvList(name);
+                if (const char *raw = std::getenv(name); raw && *raw)
+                {
+                    // readParityEnvList trims members and omits empty ones.
+                    // Preserve that shared parser while rejecting omitted members
+                    // in an explicit capture request (including a trailing comma).
+                    const std::string request(raw);
+                    const auto members = static_cast<std::size_t>(
+                        std::count(request.begin(), request.end(), ',')) + 1u;
+                    if (keys.size() != members)
+                        throw std::invalid_argument(
+                            std::string(name) + " requires nonempty comma-separated exact keys");
+                    const auto letter = [](char c)
+                    {
+                        return (c >= 'A' && c <= 'Z') ||
+                               (c >= 'a' && c <= 'z') || c == '_';
+                    };
+                    for (const auto &key : keys)
+                    {
+                        if (!letter(key.front()) ||
+                            !std::all_of(key.begin(), key.end(), [&](char c)
+                            {
+                                return letter(c) || (c >= '0' && c <= '9');
+                            }))
+                            throw std::invalid_argument(
+                                std::string(name) + " requires exact identifier keys, without "
+                                "wildcards, paths or whitespace: " + key);
+                    }
+                }
+                std::sort(keys.begin(), keys.end());
+                keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+                parity_diagnostic_capture_keys_ = std::move(keys);
+            }
+            if (!snapshots_enabled && !parity_diagnostic_capture_keys_->empty())
+                throw std::invalid_argument(
+                    std::string(name) + " requires enabled diagnostic snapshot capture");
+            return *parity_diagnostic_capture_keys_;
         }
 
         static std::set<int> readParityEnvStepSet(const char *name)
@@ -11366,7 +11437,9 @@ namespace llaminar2::test::parity
          * Prefill and decode share a serving graph family and therefore cannot
          * change diagnostic graph nodes at phase boundaries. The default
          * inventory is the union of authenticated reference filenames and any
-         * explicitly required keys. Capturing every publication is available
+         * explicitly required keys plus the setup-frozen diagnostic exact list.
+         * Diagnostic additions do not become reference/comparison obligations.
+         * Capturing every publication is available
          * only through the typed @ref ParitySnapshotCaptureInventory policy;
          * an accidentally empty vector can no longer allocate unrelated graph
          * scratch for every retained bucket.
@@ -11384,6 +11457,8 @@ namespace llaminar2::test::parity
             const auto &decode_keys =
                 decode.decode_snapshot_capture_filter;
 
+            const auto &diagnostic_keys = freezeParityDiagnosticSnapshotKeys(
+                prefill.enabled || decode.enabled);
             if (!prefill.enabled && !decode.enabled)
             {
                 return {};
@@ -11399,7 +11474,7 @@ namespace llaminar2::test::parity
                 return {};
             }
 
-            std::vector<std::string> union_keys;
+            std::vector<std::string> union_keys = diagnostic_keys;
             if (prefill.enabled)
             {
                 union_keys.insert(

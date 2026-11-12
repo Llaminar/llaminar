@@ -5697,6 +5697,12 @@ add_v2_test(V2_Unit_ModelParityDefinition
     LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ParityDiagnosticCaptureKeys
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=ModelParityDefinition.DiagnosticCaptureKeys*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Parity;Snapshot;Lifecycle;Regression"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_QwenSparseQueryParityEvidence
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=QwenSparseQueryParityEvidence.*
@@ -11019,18 +11025,39 @@ add_v2_test(V2_Integration_CUDA_NativeQuantised_PrefillWorkspaceEnvelope
 )
 
 if(HAVE_CUDA)
-add_executable(v2_integration_cuda_moe_kernel integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
+add_executable(v2_integration_cuda_moe_kernel
+    integration/kernels/cuda/Test__CUDAMoEKernel.cpp
+    integration/kernels/moe/CanonicalRankBankOriginalCUDA.cu)
 target_link_libraries(v2_integration_cuda_moe_kernel v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
 # Release selects only performance executables. Compile the same captured
 # production fixture against the Release core so timing never mixes snapshot
 # ABIs or carries a second grouping/oracle implementation.
 if(V2_PERF_TESTS_ONLY)
-    add_executable(v2_perf_cuda_moe_grouping integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
+    add_executable(v2_perf_cuda_moe_grouping
+        integration/kernels/cuda/Test__CUDAMoEKernel.cpp
+        integration/kernels/moe/CanonicalRankBankOriginalCUDA.cu)
     target_link_libraries(v2_perf_cuda_moe_grouping v2_expert_transfer_parity_support GTest::gtest_main CUDA::cudart)
     set(V2_CUDA_GROUPING_PERF_TARGET v2_perf_cuda_moe_grouping)
 else()
     set(V2_CUDA_GROUPING_PERF_TARGET v2_integration_cuda_moe_kernel)
 endif()
+add_v2_test(V2_Integration_CUDA_MoESharedRankBankPrefillReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.CanonicalRankBankPrefillCapturedBytes:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Prefill;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+if(TEST V2_Integration_CUDA_MoESharedRankBankPrefillReplay)
+    list(APPEND V2_SHARED_RANK_BANK_PREFLIGHT_TESTS
+        V2_Integration_CUDA_MoESharedRankBankPrefillReplay)
+endif()
+add_v2_test(V2_Perf_CUDA_MoESharedRankBankPrefill
+    COMMAND $<TARGET_FILE:${V2_CUDA_GROUPING_PERF_TARGET}>
+        --gtest_also_run_disabled_tests
+        --gtest_filter=Test__CUDAMoEKernel.DISABLED_CanonicalRankBankPrefillPairedEvents
+        --gtest_brief=1
+    LABELS "V2;Performance;CUDA;MoE;Prefill;GraphCapture;ByteExact"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
 add_v2_test(V2_Perf_CUDA_MoESmallGroupPrefix
     COMMAND $<TARGET_FILE:${V2_CUDA_GROUPING_PERF_TARGET}>
         --gtest_also_run_disabled_tests
@@ -22212,6 +22239,7 @@ if(HAVE_ROCM)
 
     add_executable(v2_integration_rocm_moe_kernel
         integration/kernels/rocm/Test__ROCmMoEKernel.cpp
+        integration/kernels/moe/CanonicalRankBankOriginalROCm.hip
     )
     target_link_libraries(v2_integration_rocm_moe_kernel
         v2_expert_transfer_parity_support
@@ -22220,12 +22248,31 @@ if(HAVE_ROCM)
     # The production fixture is shared with Integration, but Release timing
     # links a Release executable and core with the same snapshot ABI.
     if(V2_PERF_TESTS_ONLY)
-        add_executable(v2_perf_rocm_moe_grouping integration/kernels/rocm/Test__ROCmMoEKernel.cpp)
+        add_executable(v2_perf_rocm_moe_grouping
+            integration/kernels/rocm/Test__ROCmMoEKernel.cpp
+            integration/kernels/moe/CanonicalRankBankOriginalROCm.hip)
         target_link_libraries(v2_perf_rocm_moe_grouping v2_expert_transfer_parity_support GTest::gtest_main)
         set(V2_ROCM_GROUPING_PERF_TARGET v2_perf_rocm_moe_grouping)
     else()
         set(V2_ROCM_GROUPING_PERF_TARGET v2_integration_rocm_moe_kernel)
     endif()
+    add_v2_test(V2_Integration_ROCm_MoESharedRankBankPrefillReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.CanonicalRankBankPrefillCapturedBytes:Test__ROCmMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;GraphCapture;Replay;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    if(TEST V2_Integration_ROCm_MoESharedRankBankPrefillReplay)
+        list(APPEND V2_SHARED_RANK_BANK_PREFLIGHT_TESTS
+            V2_Integration_ROCm_MoESharedRankBankPrefillReplay)
+    endif()
+    add_v2_test(V2_Perf_ROCm_MoESharedRankBankPrefill
+        COMMAND $<TARGET_FILE:${V2_ROCM_GROUPING_PERF_TARGET}>
+            --gtest_also_run_disabled_tests
+            --gtest_filter=Test__ROCmMoEKernel.DISABLED_CanonicalRankBankPrefillPairedEvents
+            --gtest_brief=1
+        LABELS "V2;Performance;ROCm;MoE;Prefill;GraphCapture;ByteExact"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf)
     add_v2_test(V2_Perf_ROCm_MoESmallGroupPrefix
         COMMAND $<TARGET_FILE:${V2_ROCM_GROUPING_PERF_TARGET}>
             --gtest_also_run_disabled_tests
@@ -28996,6 +29043,8 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_ORIGINAL_EXPERT_PEER_PREFLIGHT_TESTS}
+    ${V2_SHARED_RANK_BANK_PREFLIGHT_TESTS}
+    V2_Integration_ParityDiagnosticCaptureKeys
     V2_Integration_MPIBootstrapObservedNUMAMapping
     V2_Integration_MPIBootstrapLocalRankfileAllocation
     ${V2_HIP_SDMA_TIMING_PREFLIGHT_TESTS}
@@ -30703,6 +30752,12 @@ add_v2_test(V2_Integration_Qwen4ExpSnapshotPublication
         --gtest_filter=SnapshotCapture.FlashNext*:SnapshotCapture.ExactInt64*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshot;Qwen4Exp;Regression"
     MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_Qwen4ExpHCSnapshotOwnership
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+        --gtest_filter=SnapshotCapture.FlashNextHCProjectionAndBranchNormOwnership:SnapshotCapture.FlashNextHCFusedBranchNormPublicationLifecycle
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Snapshot;Qwen4Exp;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpHCSnapshotOwnership)
 add_v2_test(V2_Integration_Qwen4ExpGraphStateBindings
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata> --gtest_filter=Qwen4ExpGraphStateBindings.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Graph;Regression"

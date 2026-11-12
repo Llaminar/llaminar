@@ -9,6 +9,8 @@
  *
  * Main sparse KV consumer intent is source-qualified before assignment; branch,
  * lexical and indexer replication policies remain separate declarations.
+ * HC injection logits and 4H branch-normalized outputs are replicated semantic
+ * publications, separate from H-wide FFN residual-read checkpoints.
  */
 #pragma once
 #include "../qwen35moe/Qwen35MoESchema.h"
@@ -79,7 +81,8 @@ public:
     StageShardingConfig getStageShardingConfig() const override
     {
         auto policy=Qwen35MoESchemaFactory::getStageShardingConfig();
-        for(const char *name:{"GR_NORM","GR_READ","GR_WRITE","QSA_INDEXER_RAW_QUERY","QSA_INDEXER_QUERY","QSA_INDEXER_POOLED_KEYS",
+        for(const char *name:{"GR_NORM","GR_READ","GR_WRITE","HC_ATTN_WRITE_LOGITS","HC_FFN_WRITE_LOGITS",
+            "HC_FFN_BRANCH_NORM","QSA_INDEXER_RAW_QUERY","QSA_INDEXER_QUERY","QSA_INDEXER_POOLED_KEYS",
             "QSA_SELECTED_INDICES","PLE_HASH_INDICES","PLE_GATHER","PLE_GATE","PLE_CONVOLUTION"})
             policy[name]=SnapshotShardingMode::REPLICATED;
         return policy;
