@@ -1235,6 +1235,9 @@ TEST(MoEPipelineNativePreparation, PartialOriginalPreparationRejectsBeforePlanni
 } // namespace llaminar2::test
 
 namespace llaminar2::test {
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Actual per-rank admission/preparation preserves source, layers and sole PMA on every owner. */
 TEST(MoEGlobalPipelineMemory, LocalClaimsMTPEnvelopeAndPartialFailureRemainRankOwned)
 {
@@ -1310,6 +1313,7 @@ TEST(MoEGlobalPipelineMemory, LocalClaimsMTPEnvelopeAndPartialFailureRemainRankO
         }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 } // namespace llaminar2::test
 
 namespace llaminar2::test {
