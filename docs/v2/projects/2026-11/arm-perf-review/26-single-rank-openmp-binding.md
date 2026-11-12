@@ -972,3 +972,15 @@ in one pass). Identities recorded per the standard. Measurement-only
 (fork counts the deliverable; timings unlabeled). ~25 min / 4 configs.
 Seal K14-B1ATTR-12675C956-20261111. Booked via sparks; .80 available
 now (FMLAL #4 handback 23:30); fallback .79 AFTER W2.
+
+### B1 EXPORT STATE RESOLVED (~00:29Z): build done, runs NOT started, requeued
+
+Sparks' literal answer: the Release build at 12675c956 = DONE
+(CFG_OK/BUILD_OK, build-b1attr/llaminar2); the 4-config export runs were
+NOT launched before Main's campaign claim (sparks was prepping the run
+script when the sequence changed). NO full-records.json, no seal
+K14-B1ATTR — the 25-min window was spent on the build only. Requeued
+post-campaign (~15-20 min of runs; build banked, verify tree identity
+before the runs). Post-campaign .80 order: B1 export → W3 (B4
+Integration, 52fec643f) → 27B rider (K14-I16RIDER27). Addon3's B1
+analysis ETA ≈ 45-60 min post-campaign.
