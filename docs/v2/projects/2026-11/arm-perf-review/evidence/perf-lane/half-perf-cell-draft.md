@@ -877,3 +877,11 @@ RUN the half binary natively on ARM Linux before the next push**
 (build-only checks keep missing runtime fixture bugs). The station's
 runtime gate at 67afc62ea is in flight; #8 after the runtime evidence.
 .80 free → W3 + 27B rider next in the queue.
+
+### FMLAL J2-SUCCESSOR STATE (~04:25Z): 2af1e08cf adds primitive controls; P5 (positive-capacity all-inactive span at the primitive) still missing — native runs held
+
+Main: 2af1e08cf adds the primitive controls but one 242 item is
+missing — the positive-capacity all-inactive span control at the
+primitive (P5, fixture-only). Both native runs (station I8MM, .80 NEON)
+held for the P5 tip. Sequence: P5 fix → push → both runs pin → runtime
+handoff → reviewer #209 → landing cycle.
