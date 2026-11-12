@@ -378,3 +378,18 @@ targets, --no-tests=error, JUnit seal K14-B4-ADDF3DB78).** Green →
 the reviewer's re-verdict → Main's application default (YES if ACK +
 all-arch builds + no new canonical failures, one Main-run canonical on
 the combined tip first).
+
+### #204 BOUNDARY CLARIFICATIONS (~06:31Z) + the handoff spec
+
+(1) the e099 failure = an ADMISSION gap (workspace.allocate FALSE
+before the grouped-vs-M1 comparison) — NOT a byte-mismatch signal; the
+grouped byte contract UNEXECUTED in that run; the portable/other-head
+passes = separate reported results. (2) Neither e099 nor cb is
+reviewer-declared landable; the latest completed B4 source verdict
+remains 688 HOLD; a passing rerun does not auto-close source review.
+HANDOFF SPEC (addon2 assembles with the step-2 re-run): full candidate
+SHA/lineage back to 52/688 + build/compiler/ISA/host context + raw
+failure/fixed-run JUnit + exits + the actual 'dual compiler' checks.
+The reviewer reviews after the combined handoff. Non-installed
+diagnostic authorization + the byte-exact contract unchanged;
+production follow-ups Main/operator-owned.
