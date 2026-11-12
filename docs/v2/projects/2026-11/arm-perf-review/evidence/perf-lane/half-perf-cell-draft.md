@@ -784,3 +784,11 @@ envelope not the resolved route) remain open — Main requires ONE tip
 covering both and HOLDS #6 until then. .80 shows container tender_morse
 (presumably the B1 export; sparks pressed for confirmation + the record
 answer). #6 books when the combined tip arrives.
+
+### FMLAL #6 RUNNING (~02:58Z): main-fmlal6 at f987501f9, focused + full canonical, ~45 min
+
+tender_morse exited; .80 empty → Main started #6 (campaign-src-fmlal6,
+tree 9d9f020b3). Scope: focused cells PLUS the complete canonical
+Unit+preflight (L4 changes startup ISA admission). .80 held by Main
+until exit. Post-#6 .80 queue: W3 (B4 Integration 52fec643f) → 27B
+rider. B1 export done pending the seal.
