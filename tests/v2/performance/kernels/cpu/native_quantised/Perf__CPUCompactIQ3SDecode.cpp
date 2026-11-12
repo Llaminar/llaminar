@@ -34,8 +34,11 @@
  * the production-expanded engine's own data plane, read at the packer's
  * group*256 + column*4 byte offsets); (2) the full-matrix FP32 outputs
  * of the compact arm and the expanded arm are bit-identical for every
- * timed row shape and compiled family, and the timed passes write
- * retained per-row outputs that are compared after timing. Both arms
+ * timed row shape and compiled family. Every timed invocation's live
+ * output span is dirtied with a NaN sentinel before the clock and
+ * materialized into a per-sample digest at the timing boundary, so
+ * stale warmup or previous-sample data cannot certify a sample; the
+ * final contents are compared byte for byte. Both arms
  * consume the per-column scale/min planes through the production
  * admitted-planes program (admittedScales/admittedMins advanced by
  * column) and share one microkernel template, differing only in their
@@ -74,6 +77,7 @@
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -586,7 +590,11 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
     // Timing: alternating paired samples per arm, per row shape, on the
     // compiled family. The ASIMD/DotProd cells walk rows one by one; the
     // I8MM cell walks floor(M/2) row pairs plus one SDOT tail row for an
-    // odd count, for every M — the production Pair-tile dispatch.
+    // odd count, for every M — the production Pair-tile dispatch. Each
+    // timed invocation is bracketed by untimed controls: a volatile
+    // sentinel dirtying before the clock (check-before-reuse) and a
+    // boundary materialization (sentinel rejection + digest) after it;
+    // all checksum and comparison work stays outside the timed interval.
     // ------------------------------------------------------------------
 #if defined(__ARM_FEATURE_DOTPROD)
     cpu::ARMCPUCapabilities::native().require(cpu::ARMCPUFeature::DotProd);
@@ -626,6 +634,61 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
     {
         std::vector<double> expanded_samples;
         std::vector<double> compact_samples;
+
+        // Per-invocation observation controls. Valid outputs of this walk
+        // are always finite FP32 values (exact INT32 dots times finite
+        // fp16 source scales), so a NaN sentinel can never collide with a
+        // real result.
+        constexpr uint32_t kDirtySentinelBits = 0x7FC00E0Fu;
+        const float dirty_sentinel =
+            std::bit_cast<float>(kDirtySentinelBits);
+        // Check-before-reuse control (untimed): volatile stores are a
+        // formal observation edge the compiler cannot dead-store-eliminate
+        // against the walker stores, so a timed invocation that skips any
+        // live float leaves the sentinel for materialization to reject.
+        const auto dirtyOutputs = [&](float (&span)[kMaxRows][64]) {
+            for (int row = 0; row < shape.rows; ++row)
+            {
+                volatile float *dirty = span[row];
+                for (int column = 0; column < 64; ++column)
+                    dirty[column] = dirty_sentinel;
+            }
+        };
+        // Boundary materialization (untimed, immediately after the timed
+        // interval): reject any surviving sentinel — the invocation did
+        // not write its complete live span — and fold the span's exact
+        // bit patterns into a per-sample digest.
+        const auto materializeEvidence = [&](const float (&span)[kMaxRows][64],
+                                              bool expanded_arm,
+                                              int sample) -> uint32_t {
+            uint32_t digest = 0x811C9DC5u;
+            for (int row = 0; row < shape.rows; ++row)
+                for (int column = 0; column < 64; ++column)
+                {
+                    const uint32_t bits =
+                        std::bit_cast<uint32_t>(span[row][column]);
+                    if (bits == kDirtySentinelBits)
+                    {
+                        ADD_FAILURE() << "timed "
+                                      << (expanded_arm ? "expanded"
+                                                       : "compact")
+                                      << " invocation left the dirty "
+                                         "sentinel at row " << row
+                                      << ", column " << column
+                                      << " (family=" << family_label
+                                      << ", rows=" << shape.label
+                                      << ", sample " << sample << ")";
+                        return 0u;
+                    }
+                    digest = (digest ^ bits) * 0x01000193u;
+                }
+            return digest;
+        };
+        std::vector<uint32_t> evidence_expanded(
+            static_cast<size_t>(samples));
+        std::vector<uint32_t> evidence_compact(
+            static_cast<size_t>(samples));
+
         auto one_pass = [&](bool expanded_arm) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
             // Production Pair-tile dispatch for every row shape:
@@ -704,6 +767,10 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
             {
                 const bool this_expanded =
                     expanded_first ? (pass == 0) : (pass == 1);
+                // Dirty this arm's live span (untimed) so stale warmup or
+                // previous-sample data cannot certify the invocation.
+                dirtyOutputs(this_expanded ? retained_expanded
+                                           : retained_compact);
                 const auto begin = std::chrono::steady_clock::now();
                 one_pass(this_expanded);
                 const auto end = std::chrono::steady_clock::now();
@@ -712,6 +779,44 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                         .count();
                 (this_expanded ? expanded_samples : compact_samples)
                     .push_back(microseconds);
+                // Materialize this exact invocation's evidence at the
+                // timing boundary (untimed).
+                (this_expanded ? evidence_expanded : evidence_compact)
+                    [static_cast<size_t>(pair)] = materializeEvidence(
+                    this_expanded ? retained_expanded : retained_compact,
+                    this_expanded, pair);
+                if (::testing::Test::HasFailure())
+                    return;
+            }
+        }
+
+        // Evidence chain (untimed): every timed invocation of one arm
+        // runs the same deterministic program on the same immutable
+        // inputs, so all of that arm's sample digests must be identical,
+        // and the two arms must agree on every sample. A timed one_pass
+        // that was omitted or left stale/partial data fails here or at
+        // materialization; warmup output can never certify a sample.
+        for (int sample = 0; sample < samples; ++sample)
+        {
+            const uint32_t expanded_digest =
+                evidence_expanded[static_cast<size_t>(sample)];
+            const uint32_t compact_digest =
+                evidence_compact[static_cast<size_t>(sample)];
+            if (expanded_digest != evidence_expanded[0] ||
+                compact_digest != evidence_compact[0])
+            {
+                ADD_FAILURE() << "timed sample digest disagrees with the "
+                                 "deterministic chain (family="
+                              << family_label << ", rows=" << shape.label
+                              << ", sample " << sample << ")";
+                return;
+            }
+            if (expanded_digest != compact_digest)
+            {
+                ADD_FAILURE() << "timed arms disagree at sample " << sample
+                              << " (family=" << family_label
+                              << ", rows=" << shape.label << ")";
+                return;
             }
         }
         const double expanded_median = medianOf(expanded_samples);
@@ -724,11 +829,11 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                   << ",ratio=" << (compact_median / expanded_median)
                   << ",prepared_bpw=9.5,compact_bpw=4.25,unprofiled=1\n";
 
-        // Retention oracle (untimed): the last timed pass left every row
-        // of this shape in its own retained slot. The two arms' timed FP32
-        // work — including the SMMLA pairs and the SDOT tail under I8MM —
-        // must agree byte for byte, proving the timed programs produced
-        // equal outputs, not merely equal decoded weights.
+        // Final-contents oracle (untimed), complementing the per-sample
+        // digest chain with byte-exact comparison: the last timed pass
+        // left every row of this shape in its own retained slot, and the
+        // two arms' timed FP32 work — including the SMMLA pairs and the
+        // SDOT tail under I8MM — must agree byte for byte.
         for (int row = 0; row < shape.rows; ++row)
             compareOutputs(retained_expanded[row], retained_compact[row],
                 64, "timed FP32 retention (family=" +
