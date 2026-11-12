@@ -188,15 +188,14 @@ namespace
             magnitudes = vld1q_lane_u32(&entry2, magnitudes, 2);
             magnitudes = vld1q_lane_u32(&entry3, magnitudes, 3);
 
-            // Four sign nibbles, two per byte: quad*4 is a multiple of four,
-            // so the quad's nibbles never straddle a byte boundary.
+            // Four sign nibbles, two per byte: the compact sign plane holds
+            // one nibble per column (byte column/2, nibble column%2), so a
+            // quad's four columns occupy bytes quad*2 and quad*2+1 exactly.
             const unsigned sign_word =
-                static_cast<unsigned>(signs[quad / 2]) |
-                (static_cast<unsigned>(signs[quad / 2 + 1]) << 8);
-            const unsigned shift = static_cast<unsigned>(quad % 2) * 8u;
+                static_cast<unsigned>(signs[quad * 2]) |
+                (static_cast<unsigned>(signs[quad * 2 + 1]) << 8);
             const auto sign_nibble = [&](int lane) -> unsigned {
-                return (sign_word >> (shift + 4u * static_cast<unsigned>(lane))) &
-                    0xFu;
+                return (sign_word >> (4u * static_cast<unsigned>(lane))) & 0xFu;
             };
             const auto expand = [](unsigned nibble) -> unsigned {
                 // Expand bit j of the nibble to byte j: {1,2,4,8} positions.
@@ -450,8 +449,11 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                         << (column % 8));
                 const unsigned signs = static_cast<unsigned>(
                     payload[9u + static_cast<size_t>(group) / 2u]);
+                // Production contract: the sign byte holds groups 2k (low
+                // nibble) and 2k+1 (high nibble); the destination plane holds
+                // one nibble per column (byte column/2, nibble column%2).
                 const unsigned nibble_position =
-                    4u * static_cast<unsigned>(column % 2);
+                    4u * static_cast<unsigned>(group % 2);
                 section[72u + static_cast<size_t>(column) / 2u] |=
                     static_cast<uint8_t>(((signs >> nibble_position) & 0xFu)
                         << (4u * (column % 2)));
