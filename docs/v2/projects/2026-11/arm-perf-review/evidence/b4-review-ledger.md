@@ -491,3 +491,5 @@ corrected); C4: the B4 TUs' executed evidence = the Linux GCC seals
 the pasted XML excerpts were abridged (disclosed); C6: the R1 gap is
 superseded by the 7a4790c77 restoration (the #204 continuation
 vehicle). The package awaits the 7a4790c77 W3 re-run's fresh JUnit.
+
+### TERMINOLOGY CORRECTION (reviewer, ~07:20Z): e099 failed ASSERT_TRUE(workspace.allocate(...)) at :439 (actual=false/expected=true) — the shorthand 'ASSERT_FALSE(actual)' was not the source macro. The admission-before-comparison conclusion and the R1-only HOLD are unchanged.
