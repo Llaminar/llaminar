@@ -430,3 +430,18 @@ the full Unit+preflight. B1ATTR2 already completed + sealed
 was immediate. After the canonical: the B4 application decision (YES
 if no new canonical failures beyond the inherited set) → the .80 queue
 resumes (idea-04 M=1 → 27B rider).
+
+### #204 PRELIMINARY BLOCKER (~07:09Z): round 5 accidentally DELETED the A4 threshold-boundary block
+
+In Test__CPUDraftVocabularyBudget.cpp the 688→52 replay removed the
+entire block after the omission negative; the current Mode-P test ends
+at :929 with no replacement endpoint/tie calls; production calls use
+ONLY (bin+0.5)/64 thresholds; the header still claims the endpoint
+fixture is restored (:34). **A native 2/2 pass cannot certify the
+strict acceptance tie, residual CDF tie, or endpoint clamp behavior.**
+RESTORE: p=(1/2,1/4,1/8,1/8), q=delta0; threshold 1/4 accepts, 1/2
+rejects; residual 1/2 selects token 1; retain the 0/1 clamp endpoint
+controls. Preservation of previously closed A4 coverage.
+BOUNDED POSITIVES: 6-for-6 source equivalence; A1 closure; the vector-
+inequality repair; the truthful omission counterexample; the CPU-
+backend init (admission repair, not numerical).
