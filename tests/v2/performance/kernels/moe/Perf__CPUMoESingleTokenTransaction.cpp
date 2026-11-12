@@ -789,7 +789,24 @@ namespace
         const auto before_transaction =
             PerfStatsCollector::snapshot({kTransactionFamily});
 
+        // RAW DOMAIN DUMP (diagnostic): the full kernel-domain snapshot
+        // before and after each arm, so the W2/W3 logs carry decisive
+        // evidence about whether the counters record at all on the
+        // direct-kernel route (the static increment-site analysis says
+        // they should; the observed zeros say otherwise - the dump
+        // discriminates recording-vs-visibility).
+        const auto dump_domain = [](const char *label) {
+            const auto records = PerfStatsCollector::snapshot({"kernel"});
+            std::cout << "CPU_STT_KERNEL_DOMAIN," << label
+                      << ",records=" << records.size() << "\n";
+            for (const auto &record : records)
+                std::cout << "CPU_STT_KERNEL_DOMAIN," << label
+                          << ",name=" << record.name << ",count="
+                          << record.count << "\n";
+        };
+        dump_domain("before");
         runProductionArm(fixture);
+        dump_domain("after_production");
         const auto after_a_bundle = PerfStatsCollector::snapshot({kBundleFamily});
         const auto after_a_down = PerfStatsCollector::snapshot({kDownFamily});
         const auto fresh_bundle = [&]() {
@@ -821,7 +838,9 @@ namespace
             return count;
         }();
 
+        dump_domain("after_transaction");
         runTransactionArm(fixture);
+        dump_domain("after_transaction_arm");
         const auto after_b = PerfStatsCollector::snapshot({kTransactionFamily});
         const auto fresh_transaction = [&]() {
             uint64_t count = 0;
