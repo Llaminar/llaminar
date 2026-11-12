@@ -2670,3 +2670,25 @@ bench plan per the 3b109793c observability standard), then phased
 implementation; sparks hosts exclusively via coordinator; artifacts-or-
 silent. Separately: tournament relaunch #2 dispatched to sparks after
 Main caught the silent scp failure (PR-description blocking).
+
+### SEALED+VERIFIED: K14-I08A-TOURNEY-3B109793C-20261112 (9/9 GREEN, first valid idea-08 timing)
+
+Coordinator verified from .79 artifacts (w2-tourney2/: 9 RC=0 cell logs +
+progress.log, 40 samples/cell, byte-oracle OK in every log, medians
+match the report). Table (expanded/compact µs, ratio): ASIMD M1
+5.15/36.6 (7.1x), M4 20.5/145.0 (7.0x), M15 73.6/530.0 (7.2x); DotProd
+M1 4.03/33.4 (8.28x), M4 16.0/127.5 (8.0x), M15 56.4/478.2 (8.5x);
+I8MM M1 4.02/34.8 (8.62x), M4 9.3/67.9 (7.3x), M15 34.6/271.0 (7.9x).
+9.5 vs 4.25 bpw (2.2x fewer bytes). **VERDICT: decode-from-compact is
+7.0-8.6x SLOWER despite 2.2x fewer bytes — the prepared expansion is a
+WINNING speed-for-bytes trade at these shapes on GB10; decode is
+compute-bound (dequant), not bandwidth-bound. Idea-08's "compact =
+decode-bandwidth prize" premise is REFUTED for the IQ3_S family.**
+Surviving scope: dead-byte trimming inside expanded layouts (no access-
+pattern change, capacity-only), capacity-driven compaction where
+admission-bound (7-8.7x decode price stated), and the CMS/NibbleLUT
+burden-of-proof. I8MM = strongest family (expanded I8MM ~2x ASIMD at
+M4/M15). Main received the table for the PR #43 description (metadata
+only, tip untouched). arm-idea08 lane informed + reframed BEFORE its
+design doc. Census note stands: expansion bytes are real (1.73x) but
+are a deliberate winning trade, not waste.
