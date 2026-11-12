@@ -219,7 +219,8 @@ namespace
             // bit position, negate where set, select without branching.
             const auto bit_positions = vdupq_n_u32(0x08040201u);
             const auto negative = vtstq_u8(
-                std::bit_cast<uint8x16_t>(sign_mask), bit_positions);
+                vreinterpretq_u8_u32(sign_mask),
+                vreinterpretq_u8_u32(bit_positions));
             const auto bytes = std::bit_cast<int8x16_t>(magnitudes);
             return std::bit_cast<int8x16_t>(
                 vbslq_s8(negative, vnegq_s8(bytes), bytes));
@@ -604,12 +605,10 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                         &activations[static_cast<size_t>(pair * 2 + 1) *
                                      static_cast<size_t>(kBlocksPerRow)];
                     if (expanded_arm)
-                        walkUnitPairs<MultiScale::NEONMultiScaleOps<
-                            NEONByteDot::I8MM>>(expanded, act0, act1,
+                        walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(expanded, act0, act1,
                             pair_expanded0, pair_expanded1);
                     else
-                        walkUnitPairs<MultiScale::NEONMultiScaleOps<
-                            NEONByteDot::I8MM>>(compact, act0, act1,
+                        walkUnitPairs<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::I8MM>>(compact, act0, act1,
                             pair_compact0, pair_compact1);
                 }
                 return;
@@ -633,11 +632,9 @@ TEST(Perf__CPUCompactIQ3SDecode, CompactDecodeIsByteExactAndTournamentTimed)
                         compact, act, row_compact);
 #else
                 if (expanded_arm)
-                    walkUnitRows<MultiScale::NEONMultiScaleOps<
-                        NEONByteDot::ASIMD>>(expanded, act, row_expanded);
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(expanded, act, row_expanded);
                 else
-                    walkUnitRows<MultiScale::NEONMultiScaleOps<
-                        NEONByteDot::ASIMD>>(compact, act, row_compact);
+                    walkUnitRows<cpu::native_quantised::multi_scale::NEONMultiScaleOps<cpu::native_quantised::multi_scale::NEONByteDot::ASIMD>>(compact, act, row_compact);
 #endif
             }
         };
