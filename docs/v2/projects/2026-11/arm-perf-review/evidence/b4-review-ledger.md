@@ -310,3 +310,16 @@ budget` (the fork-point form) → only the 5 B4 commits replay →
 expected conflicts: CMakeLists registration lines only (semantic:
 registrations + Main's GPU guards both stay). Escalation only if a
 kernel-file conflict appears with the correct form.
+
+### B4 REBASED AND PUSHED (~04:24Z): e09903875 on 74797687f — W3 BOOKS NOW
+
+The fork-point form replayed ONLY the 5 commits, all clean (zero
+conflicts — the registration block landed where Main's GPU guards don't
+reach). New tip e09903875325906d7bba6a190046c68d94252d4f (force-with-
+lease pinned to 52fec643f, disclosed; old tip reachable). Diff vs
+74797687f = exactly the 3 diagnostic files (CMake +38, portable TU
++970, head TU +471); ZERO kernel files. Post-rebase syntax: both TUs
+clean. **W3 BOOKED on .80: Integration NEON_I8MM at e09903875, both
+Unit targets, --no-tests=error, JUnit seal K14-B4-E09903875** → the
+reviewer's round-5 re-verdict binds to this landable tip. Then the 27B
+rider.
