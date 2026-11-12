@@ -1163,3 +1163,14 @@ HANDOVER per the protocol (three silent-write failures in this arc):
 Main completes the runner placement (inside the class after the tile
 helper, or namespace scope + forward-declare). The verified pieces are
 banked; the test file validates the completed runner.
+
+### B1 AUTHORIZATION QUOTE DELIVERED (~09:50Z): Main's relayed-authorization rule satisfied
+
+Main required the operator's literal quote before production kernel
+work (no paraphrase). Delivered verbatim: **"B1 authorize"** — the
+operator's direct two-word answer to the pending-decisions item, no
+qualifiers, recorded in the tracker at 9215506b5 BEFORE any
+implementation dispatch. The decision package it answered (root cause
++ fix shape + expected arithmetic) restated. Main takes the structural
+pass after the main-rb2 validation completes; the WIP rebases onto the
+announced rebased PR tip once it lands.
