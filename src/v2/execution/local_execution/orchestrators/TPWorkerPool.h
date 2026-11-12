@@ -228,6 +228,12 @@ namespace llaminar2
             if (target_generation == 0)
                 return results_;
             ++active_collectors_;
+            struct CollectorAdmission
+            {
+                size_t &count;
+                /** @brief Release admission even when copying the result snapshot throws. */
+                ~CollectorAdmission() noexcept { --count; }
+            } admission{active_collectors_};
 
             auto pred = [this, target_generation]()
             {
@@ -250,7 +256,6 @@ namespace llaminar2
                 collected_generation_ =
                     std::max(collected_generation_, target_generation);
             }
-            --active_collectors_;
             return snapshot;
         }
 

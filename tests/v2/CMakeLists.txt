@@ -16270,6 +16270,18 @@ add_v2_test(V2_Unit_TPWorkerPool
     MPI_PROCS 1
 )
 
+# Actual persistent worker collection with one collector-local allocation fault.
+# This tiny owner compiles the production header directly and loads no GPU core.
+add_executable(v2_test_tp_worker_collection
+    unit/execution/local_execution/orchestrators/Test__TPWorkerPoolCollection.cpp)
+target_include_directories(v2_test_tp_worker_collection PRIVATE "${REPO_ROOT}/src/v2")
+target_link_libraries(v2_test_tp_worker_collection PRIVATE Threads::Threads OpenMP::OpenMP_CXX GTest::gtest_main)
+target_compile_features(v2_test_tp_worker_collection PRIVATE cxx_std_23)
+add_v2_test(V2_Integration_TPWorkerPoolCollectionLifecycle
+    COMMAND $<TARGET_FILE:v2_test_tp_worker_collection>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;LocalTP;Concurrency;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 # Test: MDO Interface Decoupling (IInferenceRunner-based device_runners_)
 # Verifies that RankOrchestrator works through IInferenceRunner interface
 # without concrete DeviceGraphOrchestrator dependency. Tests primaryDeviceId(),
@@ -29104,6 +29116,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_OptionalGPUPreflightRegistration
     V2_Integration_PipelineStageConfigDocument
     V2_Integration_PipelineForwardOnlyHostPublicationLifecycle
+    V2_Integration_TPWorkerPoolCollectionLifecycle
     V2_Integration_ImmutablePreparedSourceSeal
     V2_Integration_TerminalResetFailure
     V2_Integration_MoEPipelinePrefixSummary

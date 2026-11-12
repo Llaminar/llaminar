@@ -11,19 +11,20 @@ across all eight GPUs.** Tune prefill and decode toward measured compute and
 memory-bandwidth limits; no throughput target is substituted for profiling.
 **Prior checkpoint:** **5,256** selected Unit/preflight tests passed, zero skips;
 39 absent-hardware cases remain unqualified. Includes 24 formats per GPU
-backend and the full 32-case EP4/EP4 preparation/lifecycle matrix. Parent
-interruption prevented a whole-run receipt; user requested checkpointing the
-passing slice and skipping the redundant repeat.
+backend and 32 EP4/EP4 preparation/lifecycle cases. Interruption prevented a
+whole-run receipt; the user accepted the checkpoint and waived repetition.
 **Current slice:** [affinity and loading repairs](../2026-11/QFN_HOST_THREAD_AFFINITY_AUDIT_20261112.md)
 pass 47 focused checks plus eight follow-ups. Stale decode-logit publication is
 fixed. The 16-history corpus has P/D mean KL **0.0260/0.0226**, passing unchanged
 numerical limits. Quantisation spikes are accepted; formal canary status remains
 `UNCALIBRATED`. Release reproduces all 112 observations byte for byte; accuracy
-and generation retire cleanly. Kernel VM tests remain inconclusive.
+and generation retire cleanly.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
 **Release baseline:** median **732.92/37.26 P/D tok/s**, 512 prompt/256 emitted,
-M512, Static, MTP/prefix off. Diagnostic timing; stage profiling is next.
+M512, Static, MTP/prefix off. [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md):
+concurrent submission gave **37.12D**, no gain; removed. Next: device-kernel
+fusion and collective latency.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
 [fixed VRAM ngram plan](QFN_FIXED_VRAM_PIPELINE_PLAN_2026-11-10.md).
 
@@ -73,7 +74,7 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission / SDK10.1 | **Focused fixes pass; full rerun waived.** Release accuracy matches Integration; first throughput baseline completes with clean driver/retirement. Next: stage profiling. No whole-run certificate. [Evidence](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
+| Admission / SDK10.1 | **Focused fixes pass; full rerun waived.** Release accuracy and cleanup match. No whole-run certificate. [Evidence](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
 | Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
 | Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 | Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
