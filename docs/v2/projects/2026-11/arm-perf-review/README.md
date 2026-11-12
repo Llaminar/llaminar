@@ -2391,3 +2391,22 @@ yet (code phase presumed — watch item); unknown .79 artifact build-edcc
 (12:49Z, pre-GO — clarify with sparks' enumerator report); both Mac
 lanes think:max ✓ (p25 on codex/arm-p25-design 69% ctx; i08repair 101k
 ctx).
+
+### IDEA-25 DESIGN LANDED (~16:45Z): 25-...-design.md @ a40bbb48b (cherry-picked)
+
+arm-p25design delivered the complete design (702 lines, citations pinned
+to d5e04fdce; lane branch deleted after integration per the branch rule).
+**Phase order adopted** (see the design doc + roadmap): Phase 0 = non-
+attached sub-boundary counters (6 host-wall timers + 2 counters; zero
+behavior change; gate ≥95% wall attributed) → Phase 1 = zero-code pilot
+via the EXISTING --moe-overlay-prefill-segment-rows flag (2160-token
+prompt: 5 chunks → 2) → Phase 2a = maintenance-deferral (the per-chunk
+histogram sync = hidden device wait, 288 D2H × event-wait per boundary;
+first wait drains the whole 340ms replay — the DOMINANT suspect, not
+launch cost at 39-78µs) → Phase 2b+c = family lease + back-to-back
+submission (no CUDA conditional nodes needed) → Phase 3 = defaults only
+after every x86 A/B is same-or-better. **Landmine flagged**: if
+shouldRebalance() fires mid-prefill, discardAllCachedGraphs → next chunk
+RECAPTURES (seconds-scale) — Phase 0 counters prove/disprove on .79.
+Post-merge implementation = station lane (Spark-first), Phase 0/1 host
+runs via arm-sparks.
