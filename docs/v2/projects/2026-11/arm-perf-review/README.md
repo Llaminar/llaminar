@@ -2033,3 +2033,21 @@ CLASSIFIED:
   not stabilization-critical); the idea-04 implementation decision
   (diagnostic evidence only until post-merge); any new windows/ideas;
   MXFP4 (gated on the merge — post-merge phase).
+
+### SESSION RETIREMENT: arm-addon2 (~10:07Z) — retirement-ready after cleanup
+
+Everything LANDED/PUSHED/handed: the B4 diagnostic (PR #43 at 7a4790c77
++ the record corrections fcf2dde9b); codex/arm-idea16-moe-decode @
+5c2cef47a (the complete bench line: the B1 STT bench + the counter fix
++ the collector enablement + the compact tournament + the admission/
+backend-init + the GCC-14 fixes — the W2 re-run's entire payload origin-
+visible); the tag b4-diagnostic-landed @ 7a4790c77 preserves the pinned
+SHA. PENDING (owned by live executors): the W2 re-run (sparks, booked);
+the B1 attribution (delivered — the 4-placement completion rides the
+seal); the idea-08 GO/NO-GO recommendation (inputs only — the successor
+session writes it from the seals); the B4 spec of record 10137aa3 (v4).
+CLEANUP APPROVED: /private/tmp/idea16-wt + /private/tmp/b4-wt +
+build_stt removed (nothing local-only). **arm-addon2 retires. The
+idea-08 GO/NO-GO recommendation (inputs-only) transfers to the
+successor session or a re-wakened addon2 when the census + tournament
+data land.**
