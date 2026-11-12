@@ -263,3 +263,14 @@ IMPLICATION: the M=1 window is now a DIAGNOSTIC of the baseline
 regression's cause, not an activation-reuse headroom probe — the
 headroom hypothesis was already implemented at bb. Window readout lands
 on the §4 tree.
+
+### IDEA-04 M=1 WINDOW BOOKED (~06:09Z): queued behind W3 + B1ATTR2 on .80
+
+The FMLAL queue is CLEAR (PR #43 landed at 0ad09600b). The idea-04 M=1
+decode economy window request: 0ad09600b Release NEON; encodings
+Q8_K/Q8_0/Q4_K + Q6_K control; M=1; baseline shapes; threads 1-20;
+ABBA 31 iters; OMP production binding. Decision gate = the Q8_K
+10-thread regression signal + the per-encoding saturation knees; the
+interpretation kit (w-m1act-summary.py + idea-04-m1-window-notes.md)
+is staged. Seal K14-I04M1-0AD09600-20261112. The implementation gate
+is decided by the window's signal per the integrator's rule.
