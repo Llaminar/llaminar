@@ -1240,3 +1240,28 @@ artifact). **Condition: unconditional handback to sparks after
 main-b1ab2 — no fourth window; B1 rides this verdict (repeat +0.6% =
 defer post-merge with the sealed negatives; flip ≤1.00 or layout
 evidence = land).** Sparks notified of the extension.
+
+### B1 FINAL VERDICT (12:26Z): DOES NOT RIDE THE MERGE — deferred post-merge, evidence sealed
+
+main-b1ab2 (reversed-lead BAABBAAB 35B nomtp + per-binary evidence):
+- 35B nomtp: A p50s 37.15/37.11/37.22/37.15 vs B 37.40/37.46/37.47/
+  37.48 → **B/A = 1.0085 p50, 1.0066 mean — the +0.6–0.8% REPEATS
+  (8/8 pairs across BOTH windows)**; tokens identical.
+- 35B fork/kernel evidence: **forks per decode step = 593 for A AND B;
+  GDN_PROJECTION = 4.00 for both; ZERO cpu_floating_fused_projection_
+  calls on the 35B decode path** → the pooled code NEVER executes
+  there; the slowdown = unchanged code in a different binary =
+  layout/codegen, NOT the pooling.
+- 27B (the path runs): GDN_PROJECTION 4→3, 755→707 forks/step; p50
+  0.998–0.999 = within noise.
+**VERDICT**: a measured cost (35B, reproducible 0.7–0.9%) against an
+unproven benefit (27B gain indistinguishable from noise) fails the
+operator's same-or-better bar → **B1 deferred post-merge** (Main's
+ruling; operator may override). Post-merge: re-measure on the merged
+base (layout effects shift anyway). Preserved: origin/codex/arm-b1-
+skinny-fp32-pooling @ d5e04fdce (correctness green: canonical 3569,
+0 new) + evidence /tmp/llaminar-main-bb-linux-results/b1, b1ab,
+b1ab/followup. PR #43 stays at ae51ce3f0. Main back on call for
+merge-attributed fix-forwards only. **Open question for post-merge:
+is the 27B fork cut worth anything at all?** .80 handed back to sparks
+(unconditional) — M=1 next.
