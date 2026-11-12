@@ -999,3 +999,18 @@ script's OUT path resolution vs actual file locations). PROCESS LESSON:
 a queue flip arriving mid-launch requires an explicit kill-or-complete
 reconciliation of the running container — never let it silently run
 through a hold.
+
+### CONTAMINATION CORRECTION (Main, ~02:52Z): timing in the B1 export is CONTAMINATED
+
+Main's docker-inspect-grade evidence: 02:20 `docker ps` EMPTY; the
+launch assertion `test -z "$(docker ps -q)"` PASSED; main-fmlal5 started
+02:21:15.148Z → tender_morse started AFTER 02:21:15 (sparks' "02:19" =
+the SEND time, not the container start; literal StartedAt to be captured
+via docker inspect). **The B1 export ran alongside a full Integration
+build with unrestricted --parallel → ALL wall-clock and per-fork timing
+in the export is CONTAMINATED and must not be used; the fork/region
+COUNTS stand only as execution-path counts independent of timing
+(purity to be verified and stated in the seal).** Main's #5 result
+unaffected (deterministic). Addon3's analysis constraint: use ONLY the
+count fields + stage names + gdn_projection_route; every timing field
+discarded; the ranking = counts × the fixture-priced per-owner term.
