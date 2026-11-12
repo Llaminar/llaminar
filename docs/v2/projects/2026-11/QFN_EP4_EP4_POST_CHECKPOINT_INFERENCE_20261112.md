@@ -477,5 +477,63 @@ now supplies complete snapshots and fresh public logits. The completed unchanged
 pilot comparison. Accepted isolated quantisation spikes remain visible in the
 raw detailed evidence. The canonical scored panel still requires its original
 successful binding; unscored collection retains its non-certifying status.
-Release throughput and stage profiling are next; no image qualification follows
-from the focused repairs or offline arithmetic proof.
+The first Release throughput observation is complete below. Stage profiling is
+next; no image qualification follows from these focused observations.
+
+## Release accuracy and first throughput baseline
+
+The runtime repairs are checkpointed as `60d9a2f7d` on
+`feat/qfn-ngram-continuation`. The subsequent selective Release configure found
+two test-registration errors: linker options were applied to omitted mmap-reclaim
+and loader-affinity fixtures. Existing `if(TARGET ...)` guards fix both without
+changing runtime code or complete Integration registration. Three focused
+target-selection tests pass. The actual Release rebuild (`q127`) passes in
+178.0 seconds with CUDA 80/86/89/90 and ROCm gfx906/gfx1100 unchanged, including
+the mandatory spill guards.
+
+The Release canary then repeats all 16 histories and reset. All 112 final-logit
+observations are byte-identical to the accepted Integration `q125` observation;
+the maximum change in KL is zero. The unscored report remains `UNCALIBRATED`.
+Both this run and the following generation benchmark retire every native and
+guardian process, leave a clean driver window, and return all eight GPUs to
+their exact 10,866,688-byte idle baseline. No host kernel or driver changed.
+
+The unprofiled public `llaminar2 benchmark` uses the original physical domain
+order, fixed-head GPU ngram ranges and precision policy. Context is 4096,
+prefill uses the default M512 policy, expert placement is Static/Ordinal,
+and MTP and prefix caching are off. The production workload is 512 raw prompt
+tokens (`" test"` repeated 512 times), 256 generated tokens, greedy sampling,
+seed 42, one warmup and three measured iterations. Each request supplies one
+output from prefill logits and 255 during the timed decode phase.
+
+| Phase | Three measured rates, tok/s | Median tok/s |
+|---|---|---:|
+| Prefill | 733.0481, 732.9226, 732.1396 | **732.9226** |
+| After-prefill decode | 37.40243, 37.25986, 37.07988 | **37.25986** |
+
+All three requests complete their full output budget. Retained capture/replay,
+original participant/owner bindings, native fixed-head terminal observations,
+reset and passive counters validate. Stage clocks and profiler instrumentation
+are off. These rates establish a local diagnostic baseline; they do not certify
+an image, a full preflight run, a performance improvement, or proximity to a
+hardware limit. The next step is separate stage/kernel attribution of the same
+workload. Capture-construction durations are not inference-stage timings.
+
+The ordinary benchmark exports exact raw prompt identity, actual token count
+and all generated token IDs, but no prompt-token-ID array. No cross-engine
+token equality is claimed. A first wrapper attempt rejected an inherited
+`HSA_OVERRIDE_GFX_VERSION` before native launch; the completed R2 invocation
+uses the canonical sanitized environment with that override absent. No ISA
+spoofing or visibility masks enter either completed native run.
+
+Local evidence:
+
+- `/tmp/qfn-full-preflight-after-cpu-next/q127-affinity-publication-release-build.json`
+- `/tmp/qfn-release-final-logit16-smoke-20261112/report.json`
+- `/tmp/qfn-release-final-logit16-smoke-prep-20261112/post-retirement-and-q125-audit.json`
+- `/tmp/qfn-release-pp-ep4ep4-baseline-r2-20261112/report.json` and `benchmark.json`
+- `/tmp/qfn-release-pp-ep4ep4-baseline-r2-prep-20261112/post-retirement-audit.json`
+
+These retain the exact commands, Release identities, source delta (only the two
+CMake guards), actual resources, driver observations and cleanup. Run artifacts
+remain outside the source repository.

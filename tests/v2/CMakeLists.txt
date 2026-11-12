@@ -28711,7 +28711,9 @@ target_link_libraries(v2_integration_mmap_reclaim_lifecycle
     GTest::gtest_main
     ${CMAKE_DL_LIBS}
 )
-target_link_options(v2_integration_mmap_reclaim_lifecycle PRIVATE "LINKER:--export-dynamic")
+if(TARGET v2_integration_mmap_reclaim_lifecycle)
+    target_link_options(v2_integration_mmap_reclaim_lifecycle PRIVATE "LINKER:--export-dynamic")
+endif()
 add_v2_test(V2_Integration_MmapReclaimLifecycle
     COMMAND $<TARGET_FILE:v2_integration_mmap_reclaim_lifecycle>
         --gtest_filter=Test__MmapReclaimLifecycleIntegration.*
@@ -39078,7 +39080,9 @@ add_executable(v2_test_loader_control_affinity
     unit/loaders/Test__LoaderControlAffinity.cpp "${_loader_affinity_actual}")
 target_include_directories(v2_test_loader_control_affinity PRIVATE "${_loader_affinity_dir}" "${REPO_ROOT}/src/v2")
 target_link_libraries(v2_test_loader_control_affinity PRIVATE Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
-target_link_options(v2_test_loader_control_affinity PRIVATE "LINKER:--export-dynamic")
+if(TARGET v2_test_loader_control_affinity)
+    target_link_options(v2_test_loader_control_affinity PRIVATE "LINKER:--export-dynamic")
+endif()
 target_compile_features(v2_test_loader_control_affinity PRIVATE cxx_std_23)
 foreach(_loader_owner Staging Progress GPUPreparation)
     foreach(_loader_policy close false)
