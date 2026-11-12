@@ -689,3 +689,19 @@ Binary SHA 1290f6d0…; JUnit + artifact SHA256s archived under
 Station reusable assets: worktree-local OneDNN v3.11.3 install
 (identity b6c4c39b…, digest 7e93a6a7…) + legacy-transport v7 (27 refs,
 refusal semantics armed).
+
+### FMLAL PRE-REBASED ONTO ebd66f0cb (addon, ~00:50Z): new local tip 45e9b6690, HOLDING THE PUSH
+
+Addon had NOT rebased onto dd8 (reset to 67e8856c9 per the correction);
+on Main's ebd66f0cb announcement they rebased directly:
+`git rebase --onto ebd66f0cb 12675c956 codex/arm-fmlal-half-leaf` — all
+8 FMLAL commits replayed CLEANLY (no conflicts; the endif fix is outside
+their touched files). New local tip **45e9b6690** on ebd66f0cb; chain
+7a225437e → 20ba683ab → c805dd372 → a34adb6df → 313dd4bce → 1d37d3f5d →
+cf739375b → 45e9b6690 (old-SHA equivalents a1913240d..67e8856c9 replayed
+1:1). LOCAL VERIFICATION on the rebased tree: GCC14 syntax 0 errors,
+ISA identity contract PASS, NEON portability configure/build + 18/18
+focused cells green; worktree clean. HOLDING THE PUSH until Main
+announces PR #43's force-push (naming ebd66f0cb or its successor); on
+that: push → report tip → validation #5 booking → landing verdict pins
+the rebased tip (one cycle). Station cross-host #5 re-run follows.
