@@ -657,3 +657,35 @@ ruling is X86-AND-ARM (policy-scoped, FloatingPointGemmKernel-wide).
 Any FP16RNE engine on either architecture narrows A to binary16 RNE by
 contract; any future change to that contract = a cross-architecture
 policy decision.**
+
+### STATION FMLAL CO-VALIDATION COMPLETE (~00:30Z): 3/4 PASS, cross-host agreement on the K=16 defect
+
+Station receipt at tip 0b53fa7a4 (verified vs origin; Grace aarch64,
+GCC 14.2.0, envelope -march=armv8-a+simd+dotprod+i8mm+fp16fml,
+FEAT_FHM admission PROVEN by the selection test's invocation
+assertion):
+- KTailBoundariesAllRowsMatchSerial: PASS (K 255..767 × m 1-4 × workers
+  1,3; leaf increments exactly 36/proveLinear; repeated 2,257,3
+  byte-identical).
+- FmlalSpecialOperandsMatchOwnedTree: PASS (isolated per-class
+  specials incl. NaN payloads; bytes = the test-owned fixed-256-lane
+  tree).
+- FmlalLeafSelectionMatchesEnvelope: PASS (compiled-envelope ↔ FEAT_FHM
+  admission; K=65 probe = exactly 1 leaf invocation; FP16-without-FML
+  admits, FML refuses without FHM).
+- **MixedPolicyKeepsUnroundedFP32AtK16: FAIL — output exactly 1.0f,
+  expected 1+2^-12; deterministic across two runs.**
+**CROSS-HOST: .80's #4 at the SAME tip failed the SAME way (Main's
+verbatim finding) → NO divergence; the K=16 defect is real and
+host-independent; the repair tip 67e8856c9 targets exactly it.**
+Validation #5 at the rebased tip should clear it on both hosts; a
+station P1-cell re-run at the rebased tip is queued for cross-host #5
+agreement.
+CTEST-ENTRY LIMITATION (honest): the canonical V2_Unit_CPUHalfOperands
+entry is registered but the focused build cannot execute the session
+wrapper; direct binary runs = same binary + registered filter.
+Binary SHA 1290f6d0…; JUnit + artifact SHA256s archived under
+/home/tdsynnex/repo/llaminar-perf-fmlal/artifacts/fmlal-copilot/.
+Station reusable assets: worktree-local OneDNN v3.11.3 install
+(identity b6c4c39b…, digest 7e93a6a7…) + legacy-transport v7 (27 refs,
+refusal semantics armed).
