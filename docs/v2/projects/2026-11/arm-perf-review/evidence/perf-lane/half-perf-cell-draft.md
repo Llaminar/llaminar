@@ -634,3 +634,26 @@ FMLAL branch onto dd8f2bd96 BEFORE #5 (validation + the reviewer's
 landing verdict pin the rebased tip in ONE cycle — verdicts do not
 transfer across the rebase), then #5 books after campaign #2 + W3.
 Collection candidate: rebase → #5 PASS → handback → Main applies.
+
+### FP16RNE SCOPE RESOLVED (addon code-reading, ~00:23Z): policy-level, X86-AND-ARM
+
+The operator asked whether FP16RNE is ARM-specific or also x86. Answer
+with file/line evidence:
+- The intercept is ARCHITECTURE-BLIND: `if (operand_precision_ ==
+  FloatingActivationOperandPrecision::FP16RNE) return
+  executeHalfOperands(...)` (FloatingPointGemmKernel.h:2722 at base,
+  ~:3102 at the current tip) routes EVERY FP16RNE engine before any ISA
+  switch.
+- x86 instantiates the SAME narrowing: AVX-512
+  `_mm512_cvtph_ps(_mm512_cvtps_ph(activation,
+  _MM_FROUND_TO_NEAREST_INT|_MM_FROUND_NO_EXC))` (:908, F16C, explicit
+  RNE) inside the AVX-512 stripe schedule; analogous AVX2 form; scalar
+  fallback via `HalfRNE ? roundFloatingOperandHalfRNE(value)` (:1655).
+- Identical rounding semantics across architectures (FP32→binary16 RNE);
+  products run as FP32 FMAs of exactly-widened halves — the same
+  arithmetic class FMLAL implements on ARM.
+**CONCLUSION: the operator's "FMLAL accept" narrowing-by-contract
+ruling is X86-AND-ARM (policy-scoped, FloatingPointGemmKernel-wide).
+Any FP16RNE engine on either architecture narrows A to binary16 RNE by
+contract; any future change to that contract = a cross-architecture
+policy decision.**
