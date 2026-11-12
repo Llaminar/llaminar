@@ -969,3 +969,15 @@ scratch dir gone, then launch the NEON gate (one-CPU sequencing).
 Addon ownership query dispatched. PROCESS NOTE: the addon's
 direct-iteration grant was .80-scoped — station usage must be
 coordinated with the station's one-CPU slot discipline explicitly.
+
+### FOREIGN CONTAINER UNATTRIBUTED (~04:35Z): addon disowns; CB lead queried; NEON gate proceeds
+
+strange_euclid = UNATTRIBUTED: not the addon (no station launches; Mac-
+only verification; .80 grant unexercised), not the station peer (all
+their containers llaminar-* named). Candidates: a CB/batch-inference
+session probing the OneDNN failure pattern (queried — read-only actor
+reconciliation), or other station-side automation. The station
+proceeds with the NEON gate once the host is clean; the no-other-
+containers-on-my-worktree request is granted while gate receipts are
+produced. Escalation to Main/operator if it reappears after removal.
+No evidence impact (worktree clean; scratch untracked; self-terminated).
