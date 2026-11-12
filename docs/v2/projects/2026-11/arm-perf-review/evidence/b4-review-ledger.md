@@ -294,3 +294,19 @@ until the reviewer re-verdicts at the rebased + Linux-validated tip.
 Addon2 instructed to NOT start any J2 work (nothing to fix beyond the
 rebase). Lesson: arc-crossing references (FMLAL J-numbers vs B4
 A-numbers) must carry their arc label explicitly in routings.
+
+### B4 REBASE RESOLVED (~04:30Z): the rebase FORM was wrong, not the lineage
+
+Addon2's abort facts verified by the coordinator: merge-base
+12675c956 vs 74797687f = 2948b1e49 (confirmed); FMLAL 67afc62ea NOT
+ancestral to 74797687f (merge-base --is-ancestor: NO — addon2's fact 2
+incorrect); **d7eb73708 touches ONLY tests/v2/CMakeLists.txt +18 + the
+new Test__CPUDraftVocabularyBudget.cpp +982 — the B4 chain touches NO
+kernel files.** The kernel ADD/ADD conflicts = the rebase form: plain
+`git rebase 74797687f` replays everything since the merge-base (all
+209 old-lineage commits incl. the whole ARM kernel tree). CORRECT
+COMMAND: `git rebase --onto 74797687f 12675c956 codex/arm-b4-vocab-
+budget` (the fork-point form) → only the 5 B4 commits replay →
+expected conflicts: CMakeLists registration lines only (semantic:
+registrations + Main's GPU guards both stay). Escalation only if a
+kernel-file conflict appears with the correct form.
