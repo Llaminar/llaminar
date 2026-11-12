@@ -42,11 +42,14 @@ without in-model validation (methodology rule, idea 20).
 
 ## Tier 2 — MTP economics (cheap-to-medium, high certainty)
 
-3. **Greedy MTP-dyn rider (35B)** — settles mode-artifact vs real −27%
-   regression; RUN-SHEET queued with sparks behind the M=1 window (pure
-   measurement, merge-safe). Decision it feeds: if the loss is real, a
-   depth-policy/model-class-aware default (MTPDepthDefaults machinery)
-   recovers most of 27% with zero kernel work.
+3. **Greedy MTP-dyn rider — SETTLED (2026-11-12)**: the −27% is REAL, not a
+   sampling artifact (greedy rider seal: acceptance 38.89% fully greedy,
+   18.39 vs 25.2 tok/s). **Decision it feeds: a depth-policy/model-class-
+   aware default (MTPDepthDefaults machinery) recovers most of 27% with
+   zero kernel work — now the top quick-win candidate.** NEW follow-up:
+   identify why draft acceptance collapsed (38.89% @ depth 10 now vs 99%
+   @ depth 7 recorded in an earlier protocol epoch). T2 control (same-day
+   no-MTP arm) authorized to complete the pair.
 4. **Route verifier rows through the existing grouped LM-head path**
    (byte-neutral, ceiling ~6.5 ms/token ≈ +16% MTP-dyn decode; LMHeadStage
    has the path, the verifier route doesn't take it).
@@ -84,8 +87,10 @@ without in-model validation (methodology rule, idea 20).
 
 ## Launch sequence (post-merge)
 
-1. Immediately: MTP rider verdict → policy decision; idea-28 investigation;
-   B1 layout mitigation attempt (cheap experiments first).
+1. Immediately: **MTP policy decision** (mode-artifact settled — real
+   regression; the policy fix is the top quick win) + acceptance-collapse
+   investigation; idea-28 investigation; B1 layout mitigation attempt
+   (cheap experiments first).
 2. Parallel structural lanes: idea-08 (census → repaired tournament → reviewer
    ACK → implement) and idea-25 (design → counters → phased implementation).
    Station = fast implementer, Spark-first verification (operator directive).
