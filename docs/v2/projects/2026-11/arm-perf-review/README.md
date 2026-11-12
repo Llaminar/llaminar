@@ -2288,3 +2288,22 @@ gets a reviewer ACK. Sparks instructed: census ONLY (independent pure
 model-load input, keep + pin script/artifact paths); tournament re-run
 CANCELLED. adf8efc32 kept as stage-1 (reviewer-confirmed sign fix);
 remaining findings queued for post-merge.
+
+### OPERATOR COORDINATION GRANT (~13:55Z) + PERF LANES SPAWNED
+
+Operator: "You are allowed to coordinate this... spawn 1-3 additional sessions
+via herdr using pi and glm 5.3 with thinking max. or reuse existing sessions."
+Posture change: performance PREP work is authorized during the merge window
+(nothing touches PR #43's tip). Two lanes spawned (both verified
+GLM-5.3 think:max):
+- **arm-i08repair** (subagent-chat-01a1d014-0adf-7100, /tmp/llaminar-i08-wt @
+  adf8efc32 detached): repair the 4 reviewer findings in the idea-08
+  tournament bench; branch codex/arm-idea16-tournament-repair; reviewer ACK
+  gates any re-run.
+- **arm-p25design** (subagent-chat-01a1d014-22cb-7252, /tmp/llaminar-p25-wt @
+  d5e04fdce detached, read-only): idea-25 design doc; branch codex/arm-p25-
+  design; arm-perf integrates.
+Coordinator keeps: MTP rider run-sheet (queued behind the M=1 window),
+the census follow-up, the roadmap (NEW FILE:
+post-merge-performance-roadmap.md = the operator-commissioned full review,
+tiered + sequenced).
