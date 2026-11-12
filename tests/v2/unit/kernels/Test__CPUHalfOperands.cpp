@@ -615,8 +615,6 @@ TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
             std::int32_t live_rows=0;
             ProjectionRowWorkScope scope(ProjectionRowWork::fromPrefix(
                 llaminar2::DeviceRowRange::deviceCounted(1,&live_rows)));
-            FP32Tensor work_input({size_t(1),size_t(65)});
-            std::fill_n(work_input.mutable_data(),65,1.f);
             std::fill_n(c_data,1,-777.f);
             const long long before_inactive=fmlalLeafInvocations();
             const bool inactive_ok=llaminar2::gemm::run_gpu_aligned_expert_fp32_matmul<
