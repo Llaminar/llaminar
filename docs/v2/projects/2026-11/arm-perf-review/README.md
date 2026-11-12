@@ -2577,3 +2577,22 @@ alongside; one span reference per invocation binds dirty/escape/walker/
 scan to the SAME object; dual-compiler verified (AppleClang 21 +
 GCC-14.4, all 3 envelopes); -O2 replication shows the full store
 sequence strictly between the clock reads. ACK request dispatched.
+
+### REVIEWER BOUNDED SOURCE ACK @ 3b109793c (~20:25Z) — repair cycle COMPLETE at source level; .79 tournament GO
+
+F4a source-closed (escapeSpan :649-650 + invocation binding :790-793,
+extents 256/1024/3840B for M=1/4/15, start-escape before the walker,
+end-escape before the end clock); #210/#211 completed for this scope.
+Reviewer precision notes (record, not blockers): start-escape after the
+begin timestamp (poison placement = preceding volatile stores); escape =
+compiler-level retention contract, not hardware store-drain; Oracle2 =
+shared-walker/metamorphic; owner-reported portability/negatives. ACK
+admits NO economy/integration/rebase-transfer/scheduling grant.
+Main's position: bench stays on the lane branch OUTSIDE PR #43,
+diagnostic-only for post-merge idea-08; Main not applying it.
+Base ruling: run at ACK-pinned 3b109793c, NO rebase onto d5e04fdce
+(reviewer ACK non-transferable across rebase; B1 touches only
+FloatingPointGemmKernel.h which the IQ3_S bench never exercises →
+identical measured production path; re-pin to merged develop tip happens
+at idea-08 implementation time). Sparks GO dispatched (K14-I08A-
+TOURNEY-3B109793C, 3 ISA binaries, M=1/4/15, GCC-14).
