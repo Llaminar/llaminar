@@ -1057,3 +1057,13 @@ closure — NOT a claim #8/station passed; no authentication; no landing
 instruction; economy NOT ADMITTED; #209 open for the native handoff.**
 Chain: #8 (running) + station NEON gate (running) → greens → #209 →
 application → PR commits.
+
+### FMLAL #8 GREEN (~05:26Z): the I8MM gate CLOSED — one gate remains (station NEON)
+
+#8 at 0ad09600b: half binary 12/12, focused 19/19; canonical 3532
+tests, 0 skipped, 6 failed = the established inherited/topology set
+(identical to campaign 747). **ZERO FMLAL-introduced failures.** .80
+handed back → W3 GO (B4 Integration at e09903875). Remaining FMLAL
+gate: the station NEON-envelope run at 0ad09600b (running) → route its
+XML/exit/tree to Main + the reviewer → reviewer #209's verdict →
+Main FF-applies → PR commits.
