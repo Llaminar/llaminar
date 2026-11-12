@@ -2657,3 +2657,16 @@ is requested for the PR #43 description — the sealed table (ISA x M,
 prepared vs compact time + ratio) is now blocking; Main receives it on
 seal. Lane-defect classification: launch mechanics (silent scp
 failure), first-run-RED of the launch, not of the bench itself.
+
+### IDEA-08 LANE SPAWNED (21:16Z): arm-idea08 (third session of the operator grant)
+
+Session 01a1d19e-e119-7141-8cb8-8c1814bde037, pane wF:tR, glm-5.3
+think:max VERIFIED after brief injection (env-cleaned spawn held).
+Worktree /tmp/llaminar-idea08-wt, branch codex/arm-idea08-compact-layout
+@ d5e04fdce (read-only base; integrates post-merge via Main). Brief
+delivered: design-doc-first (expansion-byte anatomy, compact layout,
+full ABI chain, per-ISA identity for x86, byte-equivalence contract,
+bench plan per the 3b109793c observability standard), then phased
+implementation; sparks hosts exclusively via coordinator; artifacts-or-
+silent. Separately: tournament relaunch #2 dispatched to sparks after
+Main caught the silent scp failure (PR-description blocking).
