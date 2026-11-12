@@ -18,6 +18,8 @@
  * captured operations, including output-partitioned sum/reduce-scatter.
  * Used and unused communicators share mandatory native finalization; retirement
  * performs no allocation or synthetic collective and never abandons handles.
+ * Independent collective control inherits the admitted OpenMP partition;
+ * construction restores its caller before waiting for native initialization.
  */
 
 #include "RCCLCoordinator.h"
@@ -26,8 +28,10 @@
 #include "../NativeCollectiveRowsContract.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
+#include <optional>
 #include <functional>
 
 #ifdef HAVE_RCCL
@@ -263,8 +267,13 @@ namespace llaminar2
         init_complete_.store(false);
         running_.store(false);
 
-        // Start coordinator thread
-        coordinator_thread_ = std::thread(&RCCLCoordinator::coordinatorLoop, this);
+        {
+            // Native initializer/proxy children inherit this control worker's
+            // admitted partition. Native setup may further bind its own thread;
+            // restore only the creator before waiting for that independent work.
+            const ScopedOpenMPPartitionAffinity control_affinity;
+            coordinator_thread_ = std::thread(&RCCLCoordinator::coordinatorLoop, this);
+        }
 
         // Wait for initialization to complete
         {
@@ -366,29 +375,38 @@ namespace llaminar2
         std::vector<std::thread> abort_threads;
         abort_threads.reserve(active_count);
 
-        for (size_t rank = 0; rank < communicators.size(); ++rank)
         {
-            if (!communicators[rank])
-                continue;
-            abort_threads.emplace_back([&, rank]()
+            // Outer host retirement grants independent abort helpers the rank's
+            // admitted partition. An active OpenMP caller instead retains its
+            // assigned compute/subpartition mask; this any-thread failure API
+            // must not expand placement beyond that caller's explicit context.
+            std::optional<ScopedOpenMPPartitionAffinity> control_affinity;
+            if (active_count != 0 && omp_get_level() == 0)
+                control_affinity.emplace();
+            for (size_t rank = 0; rank < communicators.size(); ++rank)
             {
-                if (rank >= device_ordinals_.size())
+                if (!communicators[rank])
+                    continue;
+                abort_threads.emplace_back([&, rank]()
                 {
-                    device_results[rank] = hipErrorInvalidDevice;
-                    abort_results[rank] = rccl::ncclInvalidArgument;
-                    return;
-                }
-                device_results[rank] =
-                    selectHipDevice(device_ordinals_[rank]);
-                if (device_results[rank] != hipSuccess)
-                {
-                    abort_results[rank] = rccl::ncclUnhandledCudaError;
-                    return;
-                }
-                abort_results[rank] = rccl::ncclCommAbort(
-                    static_cast<rccl::ncclComm_t>(communicators[rank]));
-            });
-        }
+                    if (rank >= device_ordinals_.size())
+                    {
+                        device_results[rank] = hipErrorInvalidDevice;
+                        abort_results[rank] = rccl::ncclInvalidArgument;
+                        return;
+                    }
+                    device_results[rank] =
+                        selectHipDevice(device_ordinals_[rank]);
+                    if (device_results[rank] != hipSuccess)
+                    {
+                        abort_results[rank] = rccl::ncclUnhandledCudaError;
+                        return;
+                    }
+                    abort_results[rank] = rccl::ncclCommAbort(
+                        static_cast<rccl::ncclComm_t>(communicators[rank]));
+                });
+            }
+        } // Restore the creator before joining helpers or cleaning handles.
 
         /* Every active local rank has entered RCCL before any join occurs. */
         for (std::thread &thread : abort_threads)

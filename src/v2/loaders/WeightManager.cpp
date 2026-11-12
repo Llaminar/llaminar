@@ -24,11 +24,14 @@
  * by physical creator/alias lowering; schema fallback retains its existing role.
  * CPU participant rank qualifies each cached shard independently of its shared
  * host storage DeviceId; ordinary/GPU cache access retains device identity.
+ * GPU pipeline futures independently inherit the admitted OpenMP partition;
+ * their creators and every CPU packing path preserve original placement.
  *
  * @author David Sanftenberg
  */
 
 #include "WeightManager.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "CPUWeightRequirementOwner.h"
 #include "tensors/NativeTensorExtent.h"
 #include "loaders/NativeWeightSourceTransaction.h"
@@ -4644,6 +4647,10 @@ namespace llaminar2
         if (is_gpu)
         {
             LOG_DEBUG("[WeightManager] Using GPU weight loading pipeline for " << device_name);
+            // GPU loading is independent control work. Only its future child
+            // inherits the admitted partition; future joins, non-GEMM upload
+            // and every CPU packing path retain original caller placement.
+            const ScopedOpenMPPartitionAffinity control_affinity;
             gemm_future = std::async(
                 std::launch::async,
                 [this, device, &layer_filter, frozen_weights,

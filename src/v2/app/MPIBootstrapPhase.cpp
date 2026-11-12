@@ -8,6 +8,8 @@
  * a NUMA placement. The same intent then selects the CPU MPI tuning profile.
  * An explicit CPU node requires a real physical-core set before self-launch;
  * unresolved locality never disables the default full-team MPI binding.
+ * Rank worker admission restores the caller's exact incoming affinity even
+ * when an initially unbound OpenMP runtime needs no temporary partition mask.
  */
 
 #include "app/MPIBootstrapPhase.h"
@@ -17,6 +19,7 @@
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/NUMATopology.h"
+#include "utils/ScopedCallerThreadAffinity.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <omp.h>
 #include <sched.h>
@@ -459,6 +462,12 @@ namespace llaminar2
 
     void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
     {
+        // Team binding below also runs on the calling OpenMP master. Own its
+        // restoration independently of whether partition admission changes a
+        // mask: OMP_PROC_BIND=false leaves that scope's installed flag clear.
+        // Existing pool workers retain their singleton bindings; subsequent
+        // native control children inherit the caller's original rank mask.
+        const ScopedCallerThreadAffinity preserve_caller;
         // Pre-exec core places can bind the initial thread before main. Derive
         // the rank budget from its already-admitted partition, not just that
         // first place, and restore the caller's exact original mask afterward.

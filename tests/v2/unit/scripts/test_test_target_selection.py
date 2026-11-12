@@ -4,8 +4,8 @@
 Release excludes Unit executables, including standalone host/device arithmetic
 contracts that declare their own language level. Their property declarations
 must be excluded with them, including startup device ownership, while admitted targets retain
-every requirement and CMake must still reject invalid features. Native HTTP
-affinity registrations follow the same selection and preserve their exact
+every requirement and CMake must still reject invalid features. Native HTTP and
+prefix-worker affinity registrations follow the same selection and preserve their exact
 OpenMP startup policy. These probes configure tiny CPU-only projects; they
 never build or run an inference or test executable. QFN performance declarations
 also remain available in Release without admitting functional test binaries.
@@ -1206,30 +1206,38 @@ include("{HTTP_REGISTRATION.as_posix()}")
             return configured, json.loads(inventory.stdout)["tests"]
 
     def test_http_service_registration_follows_target_selection(self):
-        """Both native policies survive Integration and leave no Release target reference."""
+        """Independent services keep both policies without dangling Release references."""
         for performance_only in (False, True):
             with self.subTest(performance_only=performance_only):
                 configured, tests = self.configure_http_registration(performance_only)
                 self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
                 expected = {} if performance_only else {
                     "V2_Integration_HTTPServiceThreadAffinity":
-                        ["OMP_PROC_BIND=close", "OMP_PLACES=cores", "OMP_NUM_THREADS=2"],
+                        ["--unset=KMP_AFFINITY", "OMP_PROC_BIND=close", "OMP_PLACES=cores", "OMP_NUM_THREADS=2"],
                     "V2_Integration_HTTPServiceThreadAffinityUnbound":
-                        ["OMP_PROC_BIND=false", "OMP_NUM_THREADS=2"],
+                        ["--unset=KMP_AFFINITY", "OMP_PROC_BIND=false", "OMP_NUM_THREADS=2"],
+                    "V2_Integration_PrefixArchiveWorkerAffinity":
+                        ["--unset=KMP_AFFINITY", "OMP_PROC_BIND=close", "OMP_PLACES=cores", "OMP_NUM_THREADS=2"],
+                    "V2_Integration_PrefixArchiveWorkerAffinityUnbound":
+                        ["--unset=KMP_AFFINITY", "OMP_PROC_BIND=false", "OMP_NUM_THREADS=2"],
                 }
                 self.assertEqual({test["name"] for test in tests}, set(expected))
                 self.assertEqual(len(tests), len(expected))
                 for test in tests:
                     properties = {value["name"]: value["value"] for value in test["properties"]}
-                    self.assertEqual(set(properties["LABELS"]), {
-                        "V2", "Integration", "ProductionTestPreflight", "HTTP",
-                        "Observability", "Threading", "Regression", "DeviceFree"})
+                    prefix = "PrefixArchive" in test["name"]
+                    labels = {
+                        "V2", "Integration", "ProductionTestPreflight",
+                        "Threading", "Regression", "DeviceFree"}
+                    labels |= {"PrefixCache", "Lifecycle"} if prefix else {"HTTP", "Observability"}
+                    self.assertEqual(set(properties["LABELS"]), labels)
                     self.assertEqual(properties["TIMEOUT"], 30)
                     command = test["command"]
                     self.assertEqual(Path(command[0]).name, "cmake")
                     self.assertEqual(command[1:-2], ["-E", "env", *expected[test["name"]]])
                     self.assertEqual(command[-2], command[0])
-                    self.assertEqual(command[-1], "--gtest_filter=HttpServiceThreadAffinity.*")
+                    suite = "PrefixArchiveWorkerAffinity" if prefix else "HttpServiceThreadAffinity"
+                    self.assertEqual(command[-1], f"--gtest_filter={suite}.*")
 
     def test_http_service_registration_rejects_missing_admitted_target(self):
         """An absent Integration executable remains a fatal configure error."""

@@ -9,6 +9,9 @@
  * idempotent state. It also verifies that tmpfs-backed page advice is suppressed
  * and that the explicit allocation barrier publishes completion before later
  * host allocation.
+ * Separate native-affinity cases exercise the actual reclaim constructor and
+ * worker under enabled/disabled OpenMP binding, explicit pthread defaults and
+ * one-shot construction failure, without touching model files or accelerators.
  */
 
 #include <gtest/gtest.h>
@@ -19,23 +22,132 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <future>
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <memory>
 #include <mutex>
+#include <omp.h>
+#include <sched.h>
 #include <string>
+#include <system_error>
 #include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <pthread.h>
+
+namespace mmap_reclaim_affinity_fault
+{
+    thread_local bool fail_next_thread = false;
+}
+
+/** @brief Inject one native constructor failure; every ordinary call preserves libc attributes exactly. */
+extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attributes,
+                              void *(*entry)(void *), void *argument) noexcept
+{
+    if (mmap_reclaim_affinity_fault::fail_next_thread)
+    {
+        mmap_reclaim_affinity_fault::fail_next_thread = false;
+        return EAGAIN;
+    }
+    using Create = int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    static const auto native = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    if (!native) std::abort();
+    return native(thread, attributes, entry, argument);
+}
 
 namespace llaminar2::test
 {
     namespace
     {
+        /** @return The calling OS thread's exact scheduler mask, or a precise observation failure. */
+        cpu_set_t reclaimCallerMask()
+        {
+            cpu_set_t value{};
+            if (sched_getaffinity(0, sizeof(value), &value) != 0)
+                throw std::system_error(errno, std::generic_category(), "Cannot observe mmap reclaim caller mask");
+            return value;
+        }
+
+        /** @return Independent initial-rank place union, or the unchanged native unbound mask. */
+        cpu_set_t reclaimPartitionMask()
+        {
+            const char *policy = std::getenv("OMP_PROC_BIND");
+            if (!policy || (std::string(policy) != "close" && std::string(policy) != "false") ||
+                ((omp_get_proc_bind() == omp_proc_bind_false) != (std::string(policy) == "false")))
+                throw std::runtime_error("Mmap affinity requires an authenticated pre-exec binding policy");
+            if (omp_get_proc_bind() == omp_proc_bind_false) return reclaimCallerMask();
+            if (omp_get_num_places() < 2)
+                throw std::runtime_error("Mmap affinity requires two admitted OpenMP places");
+            cpu_set_t result{};
+            for (int place = 0; place < omp_get_num_places(); ++place)
+            {
+                std::vector<int> cpus(static_cast<std::size_t>(omp_get_place_num_procs(place)));
+                omp_get_place_proc_ids(place, cpus.data());
+                for (const int cpu : cpus) CPU_SET(cpu, &result);
+            }
+            return result;
+        }
+
+        /** @brief Restore the complete caller-installed pthread default attribute set after one check. */
+        class ReclaimDefaultAffinity final
+        {
+        public:
+            /** @brief Install one exact native affinity override without changing other attributes. */
+            explicit ReclaimDefaultAffinity(const cpu_set_t &mask)
+            {
+                pthread_attr_t changed;
+                if (pthread_getattr_default_np(&original_) != 0 || pthread_getattr_default_np(&changed) != 0)
+                    throw std::runtime_error("Cannot retain reclaim pthread defaults");
+                if (pthread_attr_setaffinity_np(&changed, sizeof(mask), &mask) != 0 ||
+                    pthread_setattr_default_np(&changed) != 0 || pthread_attr_destroy(&changed) != 0)
+                    std::terminate();
+            }
+            /** @brief Never leave altered defaults for a later lifecycle owner. */
+            ~ReclaimDefaultAffinity()
+            {
+                if (pthread_setattr_default_np(&original_) != 0 || pthread_attr_destroy(&original_) != 0)
+                    std::terminate();
+            }
+        private:
+            pthread_attr_t original_{};
+        };
+
+        /** @brief Inspect actual deferred work/descendant masks and exact creator restoration. */
+        void checkReclaimWorkerMask(const cpu_set_t &expected, int repetitions)
+        {
+            const auto creator = reclaimCallerMask();
+            for (int iteration = 0; iteration < repetitions; ++iteration)
+            {
+                cpu_set_t worker{}, descendant{};
+                {
+                    MmapReclaimLifecycle lifecycle([&]() -> std::size_t {
+                        worker = reclaimCallerMask();
+                        std::thread child([&] { descendant = reclaimCallerMask(); });
+                        child.join();
+                        return 17u;
+                    });
+                    const auto constructed = reclaimCallerMask();
+                    EXPECT_TRUE(CPU_EQUAL(&creator, &constructed));
+                    EXPECT_EQ(lifecycle.schedule(), MmapReclaimLifecycle::Submission::Scheduled);
+                    const auto completion = lifecycle.awaitBeforeHostAllocation();
+                    EXPECT_EQ(completion.state, MmapReclaimLifecycle::State::Complete);
+                    EXPECT_EQ(completion.advised_bytes, 17u);
+                    EXPECT_TRUE(CPU_EQUAL(&worker, &expected));
+                    EXPECT_TRUE(CPU_EQUAL(&descendant, &expected));
+                    EXPECT_EQ(lifecycle.schedule(), MmapReclaimLifecycle::Submission::AlreadyComplete);
+                }
+                const auto retired = reclaimCallerMask();
+                EXPECT_TRUE(CPU_EQUAL(&creator, &retired));
+            }
+        }
         /** @brief Owns one memfd shard and the independent MmapRegion opened on it. */
         class MemoryBackedShard final
         {
@@ -108,6 +220,66 @@ namespace llaminar2::test
             std::uint8_t first_byte_ = 0;
         };
     } // namespace
+
+    TEST(Test__MmapReclaimAffinity, SubmittedWorkerAndDescendantsRetainAdmissionAndNativeDefaults)
+    {
+        const auto expected = reclaimPartitionMask();
+        checkReclaimWorkerMask(expected, 20);
+        cpu_set_t explicit_default{};
+        for (int cpu = CPU_SETSIZE - 1; cpu >= 0; --cpu)
+            if (CPU_ISSET(cpu, &expected)) { CPU_SET(cpu, &explicit_default); break; }
+        const ReclaimDefaultAffinity defaults(explicit_default);
+        checkReclaimWorkerMask(explicit_default, 1);
+    }
+
+    TEST(Test__MmapReclaimAffinity, IdleAndFailedWorkerRetirementPreserveCreator)
+    {
+        (void)reclaimPartitionMask();
+        const auto creator = reclaimCallerMask();
+        {
+            MmapReclaimLifecycle idle([] { return 0u; });
+            EXPECT_EQ(idle.awaitBeforeHostAllocation().state, MmapReclaimLifecycle::State::Idle);
+        }
+        {
+            MmapReclaimLifecycle failed([]() -> std::size_t { throw std::runtime_error("authored reclaim failure"); });
+            EXPECT_EQ(failed.schedule(), MmapReclaimLifecycle::Submission::Scheduled);
+            EXPECT_THROW((void)failed.awaitBeforeHostAllocation(), std::runtime_error);
+            EXPECT_EQ(failed.schedule(), MmapReclaimLifecycle::Submission::AlreadyFailed);
+        }
+        const auto retired = reclaimCallerMask();
+        EXPECT_TRUE(CPU_EQUAL(&creator, &retired));
+    }
+
+    TEST(Test__MmapReclaimAffinity, RejectedConstructionAndNestedEntryRestoreCreator)
+    {
+        (void)reclaimPartitionMask();
+        const auto creator = reclaimCallerMask();
+        EXPECT_THROW((MmapReclaimLifecycle{MmapReclaimLifecycle::Work{}}), std::invalid_argument);
+        mmap_reclaim_affinity_fault::fail_next_thread = true;
+        EXPECT_THROW((MmapReclaimLifecycle{[] { return 0u; }}), std::system_error);
+        EXPECT_FALSE(mmap_reclaim_affinity_fault::fail_next_thread);
+        const auto rejected = reclaimCallerMask();
+        EXPECT_TRUE(CPU_EQUAL(&creator, &rejected));
+        bool nested_rejected = false, nested_preserved = false;
+#pragma omp parallel num_threads(1)
+        {
+            try
+            {
+                const auto before = reclaimCallerMask();
+                try { MmapReclaimLifecycle nested([] { return 0u; }); }
+                catch (const std::runtime_error &error)
+                {
+                    nested_rejected = std::string(error.what()).find("outer host thread") != std::string::npos;
+                    const auto after = reclaimCallerMask();
+                    nested_preserved = CPU_EQUAL(&before, &after);
+                }
+            }
+            catch (...) { nested_rejected = false; nested_preserved = false; }
+        }
+        EXPECT_TRUE(nested_rejected && nested_preserved);
+        const auto restored = reclaimCallerMask();
+        EXPECT_TRUE(CPU_EQUAL(&creator, &restored));
+    }
 
     TEST(Test__MmapReclaimLifecycleIntegration,
          SplitMemoryFilesystemMappingsReclaimExactlyOnceOffAuthorityThread)

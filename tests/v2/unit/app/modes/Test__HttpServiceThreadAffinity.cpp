@@ -8,16 +8,24 @@
  * the existing inference placement and restore its caller, including unwind.
  * Real loopback requests also inspect the production listener's HTTP pool;
  * directly testing the guard cannot prove its use at the serving boundary.
+ * Actual process collectors and prefix archive workers have the same independent
+ * progress requirement. Their observed masks and retirement are checked through
+ * the public constructors, without substituting a test-created service thread.
  */
 #include "app/modes/HttpServiceThreadAffinity.h"
+#include "app/modes/HttpProcessStats.h"
 #include "app/modes/SerializedInferenceExecutor.h"
 #include "app/modes/ServerMode.h"
+#include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "httplib.h"
 
 #include <gtest/gtest.h>
+#include <filesystem>
 #include <future>
+#include <set>
 #include <thread>
 #include <vector>
+#include <cstdlib>
 
 using namespace llaminar2;
 
@@ -50,6 +58,97 @@ namespace
                 CPU_SET(cpu, &expected);
         }
         return expected;
+    }
+
+    /** @return Live task identities in this fixture process, never another job's threads. */
+    std::set<pid_t> taskIds()
+    {
+        std::set<pid_t> result;
+        for (const auto &entry : std::filesystem::directory_iterator("/proc/self/task"))
+            result.insert(static_cast<pid_t>(std::stol(entry.path().filename().string())));
+        return result;
+    }
+
+    /** @brief Own one exclusively created temporary archive directory through worker retirement. */
+    class TemporaryArchiveDirectory
+    {
+    public:
+        /** @brief Create a fresh task-owned path without touching another test's cache. */
+        TemporaryArchiveDirectory()
+        {
+            auto pattern = (std::filesystem::temp_directory_path() / "llaminar-prefix-affinity-XXXXXX").string();
+            const char *created = ::mkdtemp(pattern.data());
+            if (!created) throw std::runtime_error("Cannot create prefix affinity fixture directory");
+            path = created;
+        }
+        /** @brief Remove only this fixture's files after all archive workers have joined. */
+        ~TemporaryArchiveDirectory()
+        {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+        std::filesystem::path path; ///< Exclusive fixture root, never a configured user cache.
+    };
+}
+
+TEST(HttpServiceThreadAffinity, ProductionProcessCollectorUsesPartitionAndRestoresCaller)
+{
+    const auto original = observedMask();
+    const auto partition = expectedPartition();
+    std::promise<cpu_set_t> sampled;
+    auto observation = sampled.get_future();
+    {
+        HttpProcessStats stats({.interval = std::chrono::hours(1)}, [&] {
+            sampled.set_value(observedMask());
+            return nlohmann::json::object();
+        });
+        const auto after_creation = observedMask();
+        EXPECT_TRUE(CPU_EQUAL(&after_creation, &original));
+        ASSERT_EQ(observation.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        const auto worker = observation.get();
+        EXPECT_TRUE(CPU_EQUAL(&worker, &partition));
+    }
+    const auto after_retirement = observedMask();
+    EXPECT_TRUE(CPU_EQUAL(&after_retirement, &original));
+}
+
+TEST(PrefixArchiveWorkerAffinity, ProductionWriterAndMaintenanceUsePartitionAndRetire)
+{
+    const auto original = observedMask();
+    const auto partition = expectedPartition();
+    TemporaryArchiveDirectory directory;
+    const std::string identity(64, 'a');
+    // Reopen the actual archive after retirement: neither a stale worker nor
+    // a retained caller pin may become the next lifetime's inherited placement.
+    for (int lifetime = 0; lifetime < 2; ++lifetime)
+    {
+        const auto prior_tasks = taskIds();
+        std::set<pid_t> workers;
+        {
+            DiskPrefixStorageBackend archive(directory.path / (identity + ".kvcache"), 4096, identity);
+            ASSERT_TRUE(archive.ready()) << archive.initializationError();
+            const auto after_creation = observedMask();
+            EXPECT_TRUE(CPU_EQUAL(&after_creation, &original));
+            for (const pid_t tid : taskIds())
+                if (!prior_tasks.contains(tid)) workers.insert(tid);
+            // The archive owns one durable writer and one metadata-maintenance
+            // worker. Inspect BOTH actual OS tasks, including their idle state.
+            ASSERT_EQ(workers.size(), 2u);
+            for (const pid_t tid : workers)
+            {
+                cpu_set_t mask{};
+                ASSERT_EQ(sched_getaffinity(tid, sizeof(mask), &mask), 0);
+                EXPECT_TRUE(CPU_EQUAL(&mask, &partition)) << "archive worker " << tid;
+            }
+            std::string error;
+            ASSERT_TRUE(archive.requestCompaction(&error)) << error;
+            ASSERT_TRUE(archive.waitForCompaction(&error)) << error;
+            ASSERT_TRUE(archive.waitForPersistence(&error)) << error;
+        }
+        const auto after_retirement = observedMask();
+        EXPECT_TRUE(CPU_EQUAL(&after_retirement, &original));
+        const auto remaining = taskIds();
+        for (const pid_t tid : workers) EXPECT_FALSE(remaining.contains(tid));
     }
 }
 

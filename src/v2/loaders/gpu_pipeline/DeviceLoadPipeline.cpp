@@ -5,6 +5,10 @@
  * Source coalescing is deliberately a planning operation: immutable parent
  * identities group adjacent expert views, while their tensor views retain the
  * mapped GGUF lifetime until all staging work has completed.
+ * Independent staging lanes inherit the admitted OpenMP partition only while
+ * their threads are constructed; the loader retains its exact caller placement.
+ * Partial construction retires every created lane before its storage unwinds.
+ * Worker entry holds a stable lane pointer while the owner grows its lane vector.
  */
 
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
@@ -16,6 +20,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/WeightLoadingProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -432,31 +437,34 @@ namespace llaminar2
                   h2d_done_events_(h2d_done_events)
             {
                 lanes_.reserve(static_cast<size_t>(lane_count));
-                for (int lane = 0; lane < lane_count; ++lane)
+                try
                 {
-                    lanes_.push_back(std::make_unique<Lane>());
-                    lanes_.back()->worker = std::thread(
-                        [this, lane]
-                        { workerLoop(lane); });
+                    for (int lane = 0; lane < lane_count; ++lane)
+                    {
+                        lanes_.push_back(std::make_unique<Lane>());
+                        {
+                            // These independent I/O lanes must not all inherit a
+                            // bound loader master's one place. Preserve metadata
+                            // allocation and all later loader work on the creator.
+                            const ScopedOpenMPPartitionAffinity control_affinity;
+                            lanes_.back()->worker = std::thread(
+                                [this, lane, state = lanes_.back().get()]
+                                { workerLoop(*state, lane); });
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    // Construction never publishes a partial pool. Retire all
+                    // successfully started workers before their lanes unwind,
+                    // then preserve the original allocation/thread exception.
+                    stopAndJoinWorkers();
+                    throw;
                 }
             }
 
-            ~StagingLanePool()
-            {
-                for (auto &lane : lanes_)
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(lane->mutex);
-                        lane->stop = true;
-                    }
-                    lane->condition.notify_all();
-                }
-                for (auto &lane : lanes_)
-                {
-                    if (lane->worker.joinable())
-                        lane->worker.join();
-                }
-            }
+            /** @brief Join every original worker before lane storage can be released. */
+            ~StagingLanePool() { stopAndJoinWorkers(); }
 
             StagingLanePool(const StagingLanePool &) = delete;
             StagingLanePool &operator=(const StagingLanePool &) = delete;
@@ -508,9 +516,36 @@ namespace llaminar2
                 StagedSource result;
             };
 
-            void workerLoop(int lane_index)
+            /**
+             * @brief Signal every created lane, then join each worker before releasing storage.
+             * Constructor rollback has no submitted jobs; ordinary destruction
+             * retains the existing pending-job drain. A failed join is fatal
+             * before any joinable thread or referenced lane can be destroyed.
+             */
+            void stopAndJoinWorkers() noexcept
             {
-                auto &lane = *lanes_[static_cast<size_t>(lane_index)];
+                for (auto &lane : lanes_)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(lane->mutex);
+                        lane->stop = true;
+                    }
+                    lane->condition.notify_all();
+                }
+                for (auto &lane : lanes_)
+                {
+                    if (lane->worker.joinable())
+                        lane->worker.join();
+                }
+            }
+
+            /**
+             * @brief Execute the original task loop using a pointer-stable lane.
+             * @param lane Heap-owned lane retained through successful join.
+             * @param lane_index Original pinned/event slot for this worker.
+             */
+            void workerLoop(Lane &lane, int lane_index)
+            {
                 while (true)
                 {
                     size_t job_index = 0;

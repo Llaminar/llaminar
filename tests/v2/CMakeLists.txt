@@ -3106,6 +3106,16 @@ add_v2_test(V2_Integration_ClusterInventoryBootstrap
     TIMEOUT 60
 )
 
+# Check actual rank-worker admission with no initial partition mutation. The
+# original master pin must not become inherited affinity for native children.
+# Disable the KMP policy too: LLVM OpenMP gives it precedence over OMP_PROC_BIND.
+add_v2_test(V2_Integration_MPIBootstrapCallerAffinity
+    COMMAND ${CMAKE_COMMAND} -E env "OMP_PROC_BIND=false" "OMP_DYNAMIC=false"
+        "KMP_AFFINITY=disabled"
+        $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap> --caller-affinity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;Bootstrap;OpenMP;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 add_v2_test(V2_Integration_MPIBootstrapOpenMPPlacement
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.PortableOpenMPPlacementPreservesRankLocalWorkerGeometry
@@ -8467,6 +8477,7 @@ target_link_libraries(v2_test_numa_allocator
     llaminar2_core 
     GTest::gtest
     GTest::gtest_main
+    ${CMAKE_DL_LIBS}
 )
 add_v2_test(V2_Unit_NUMAAllocator 
     COMMAND $<TARGET_FILE:v2_test_numa_allocator>
@@ -8483,6 +8494,18 @@ add_v2_test(V2_Unit_NUMAAllocator
 # relax the production placement contract.
 if(TEST V2_Unit_NUMAAllocator)
     set_tests_properties(V2_Unit_NUMAAllocator PROPERTIES RUN_SERIAL TRUE)
+endif()
+
+# Exact production first-touch scope under one-shot syscall/allocation faults.
+# The native seam delegates every unarmed operation without a replacement path.
+add_v2_test(V2_Integration_NUMAFirstTouchPlacementLifetime
+    COMMAND $<TARGET_FILE:v2_test_numa_allocator>
+        --gtest_filter=Test__NUMAAllocator.FirstTouchPlacement*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NUMA;Memory;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+if(TEST V2_Integration_NUMAFirstTouchPlacementLifetime)
+    set_tests_properties(V2_Integration_NUMAFirstTouchPlacementLifetime PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 if(TARGET v2_test_numa_allocator)
@@ -16297,6 +16320,14 @@ add_v2_test(V2_Unit_LogitsGatherer
     LABELS "V2;Unit;MultiDevice;LogitsGatherer;Execution"
     MPI_PROCS 1
 )
+
+# Forward-only pipeline completion must publish the current frame through its
+# original consuming streams before host logits metadata can become visible.
+add_v2_test(V2_Integration_PipelineForwardOnlyHostPublicationLifecycle
+    COMMAND $<TARGET_FILE:v2_test_logits_gatherer>
+        --gtest_filter=Test__LogitsGatherer.PipelineForwardOnly*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;LocalTP;Pipeline;Publication;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Test: DeviceSampler (edge cases, GPU-fallback paths)
 add_executable(v2_test_device_sampler unit/execution/local_execution/orchestrators/Test__DeviceSampler.cpp)
@@ -28678,9 +28709,12 @@ target_link_libraries(v2_integration_mmap_reclaim_lifecycle
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
+    ${CMAKE_DL_LIBS}
 )
+target_link_options(v2_integration_mmap_reclaim_lifecycle PRIVATE "LINKER:--export-dynamic")
 add_v2_test(V2_Integration_MmapReclaimLifecycle
     COMMAND $<TARGET_FILE:v2_integration_mmap_reclaim_lifecycle>
+        --gtest_filter=Test__MmapReclaimLifecycleIntegration.*
     LABELS "V2;Integration;WeightLoading;Mmap;Lifecycle"
     MPI_PROCS 1
     NO_MODELS
@@ -29067,6 +29101,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PreparedContextSealBoundary
     V2_Integration_OptionalGPUPreflightRegistration
     V2_Integration_PipelineStageConfigDocument
+    V2_Integration_PipelineForwardOnlyHostPublicationLifecycle
     V2_Integration_ImmutablePreparedSourceSeal
     V2_Integration_TerminalResetFailure
     V2_Integration_MoEPipelinePrefixSummary
@@ -29088,7 +29123,9 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUAttentionCacheSource
     V2_Integration_CPUAttentionKeyQ8
     V2_Integration_CPUStartupAffinity
+    V2_Integration_NUMAFirstTouchPlacementLifetime
     V2_Integration_ClusterInventoryBootstrap
+    V2_Integration_MPIBootstrapCallerAffinity
     V2_Integration_MPIBootstrapOpenMPPlacement
     V2_Integration_CPUSeededSamplingPositionIdentity
     V2_Integration_PrefixCacheCoordinatorMPI
@@ -38949,12 +38986,15 @@ add_custom_command(
         "${REPO_ROOT}/src/v2/collective/coordinators/NCCLCoordinator.h"
         "${REPO_ROOT}/src/v2/collective/coordinators/RCCLCoordinator.cpp"
         "${REPO_ROOT}/src/v2/collective/coordinators/RCCLCoordinator.h"
+        "${REPO_ROOT}/src/v2/collective/backends/HeterogeneousBackend.cpp"
+        "${REPO_ROOT}/src/v2/collective/backends/HeterogeneousBackend.h"
+        "${REPO_ROOT}/src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp"
     VERBATIM)
 add_executable(v2_test_coordinator_readiness
     unit/collective/Test__CoordinatorReadiness.cpp
     "${_coordinator_readiness_actual}" "${_coordinator_readiness_fields}")
-target_include_directories(v2_test_coordinator_readiness PRIVATE "${_coordinator_readiness_dir}")
-target_link_libraries(v2_test_coordinator_readiness PRIVATE Threads::Threads)
+target_include_directories(v2_test_coordinator_readiness PRIVATE "${_coordinator_readiness_dir}" "${REPO_ROOT}/src/v2")
+target_link_libraries(v2_test_coordinator_readiness PRIVATE Threads::Threads OpenMP::OpenMP_CXX)
 target_compile_features(v2_test_coordinator_readiness PRIVATE cxx_std_23)
 foreach(_coordinator_backend NCCL RCCL)
     foreach(_coordinator_case stop gap-success gap-failure lifecycle)
@@ -38972,6 +39012,84 @@ foreach(_coordinator_backend NCCL RCCL)
         endforeach()
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
             "V2_Integration_CoordinatorReadiness_${_coordinator_backend}_${_coordinator_case_name}")
+    endforeach()
+endforeach()
+
+# Actual owner construction methods, not just the generic affinity scope, prove
+# native control/descendant masks, exact creator restoration, self-placement,
+# explicit pthread defaults and unsupported nested-call rejection. No SDK,
+# compiler or accelerator is needed by the installed test process.
+foreach(_control_owner NCCL RCCL Heterogeneous MoEController)
+    foreach(_control_policy close false)
+        set(_control_test "V2_Integration_CollectiveControlAffinity_${_control_owner}_${_control_policy}")
+        add_v2_test(${_control_test}
+            COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY
+                "OMP_PROC_BIND=${_control_policy}" "OMP_PLACES=cores" "OMP_NUM_THREADS=2" "OMP_DYNAMIC=false"
+                $<TARGET_FILE:v2_test_coordinator_readiness> ${_control_owner} affinity
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Collective;OpenMP;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS "${_control_test}")
+    endforeach()
+endforeach()
+
+# Fatal retirement retains the any-thread API: outer callers admit independent
+# helpers; active OpenMP callers keep their exact assigned compute mask.
+foreach(_abort_owner NCCL RCCL)
+    foreach(_abort_policy close false)
+        set(_abort_test "V2_Integration_CollectiveAbortAffinity_${_abort_owner}_${_abort_policy}")
+        add_v2_test(${_abort_test}
+            COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY
+                "OMP_PROC_BIND=${_abort_policy}" "OMP_PLACES=cores" "OMP_NUM_THREADS=2" "OMP_DYNAMIC=false"
+                $<TARGET_FILE:v2_test_coordinator_readiness> ${_abort_owner} abort-affinity
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Collective;OpenMP;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS "${_abort_test}")
+    endforeach()
+endforeach()
+
+# The prestarted reclaim worker is independent of the model-setup compute owner.
+# Qualify the actual constructor, deferred task and retirement on both policies.
+foreach(_reclaim_policy close false)
+    set(_reclaim_test "V2_Integration_MmapReclaimAffinity_${_reclaim_policy}")
+    add_v2_test(${_reclaim_test}
+        COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY
+            "OMP_PROC_BIND=${_reclaim_policy}" "OMP_PLACES=cores" "OMP_NUM_THREADS=2" "OMP_DYNAMIC=false"
+            $<TARGET_FILE:v2_integration_mmap_reclaim_lifecycle> --gtest_filter=Test__MmapReclaimAffinity.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Mmap;OpenMP;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS "${_reclaim_test}")
+endforeach()
+
+# Compile the complete original loader staging pool and preparation/start/stop
+# bodies. Installed lifecycle tests execute only this native CPU binary.
+set(_loader_affinity_dir "${CMAKE_CURRENT_BINARY_DIR}/loader-control-affinity")
+set(_loader_affinity_actual "${_loader_affinity_dir}/LoaderControlAffinityActual.inc")
+add_custom_command(
+    OUTPUT "${_loader_affinity_actual}"
+    COMMAND ${Python3_EXECUTABLE} -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/extract_loader_control_affinity.py"
+        --source-root "${REPO_ROOT}" --output "${_loader_affinity_actual}"
+    DEPENDS unit/scripts/extract_loader_control_affinity.py unit/scripts/extract_coordinator_readiness.py
+        "${REPO_ROOT}/src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp"
+        "${REPO_ROOT}/src/v2/loaders/WeightLoadProgressAggregator.cpp"
+        "${REPO_ROOT}/src/v2/loaders/WeightManager.cpp"
+    VERBATIM)
+add_executable(v2_test_loader_control_affinity
+    unit/loaders/Test__LoaderControlAffinity.cpp "${_loader_affinity_actual}")
+target_include_directories(v2_test_loader_control_affinity PRIVATE "${_loader_affinity_dir}" "${REPO_ROOT}/src/v2")
+target_link_libraries(v2_test_loader_control_affinity PRIVATE Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+target_link_options(v2_test_loader_control_affinity PRIVATE "LINKER:--export-dynamic")
+target_compile_features(v2_test_loader_control_affinity PRIVATE cxx_std_23)
+foreach(_loader_owner Staging Progress GPUPreparation)
+    foreach(_loader_policy close false)
+        set(_loader_test "V2_Integration_LoaderControlAffinity_${_loader_owner}_${_loader_policy}")
+        add_v2_test(${_loader_test}
+            COMMAND ${CMAKE_COMMAND} -E env --unset=KMP_AFFINITY
+                "OMP_PROC_BIND=${_loader_policy}" "OMP_PLACES=cores" "OMP_NUM_THREADS=2" "OMP_DYNAMIC=false"
+                $<TARGET_FILE:v2_test_loader_control_affinity> ${_loader_owner}
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;OpenMP;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS "${_loader_test}")
     endforeach()
 endforeach()
 

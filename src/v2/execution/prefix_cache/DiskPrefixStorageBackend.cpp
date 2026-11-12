@@ -38,6 +38,8 @@
  * lookup cannot hydrate them, while compaction preserves their original metadata
  * and ordinary eviction may retire their payload. A malformed current CPU
  * encoding fails initialization without truncating a committed journal.
+ * Independent archive maintenance inherits the admitted CPU partition rather
+ * than the inference creator's single OpenMP place; caller placement is restored.
  */
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -46,6 +48,7 @@
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "execution/prefix_cache/PrefixArchiveMaintenanceWriter.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <nlohmann/json.hpp>
 
@@ -827,8 +830,13 @@ namespace llaminar2
         initialization_error_ = std::move(error);
         if (ready_)
         {
-            compaction_worker_ = std::jthread(
-                [this](std::stop_token stop) { maintainArchive(stop); });
+            {
+                // Metadata maintenance is independent of the compute owner.
+                // Restore the creator before the next service is constructed.
+                const ScopedOpenMPPartitionAffinity maintenance_affinity;
+                compaction_worker_ = std::jthread(
+                    [this](std::stop_token stop) { maintainArchive(stop); });
+            }
             persistence_ = std::make_unique<PrefixArchivePersistence>(*this);
         }
     }

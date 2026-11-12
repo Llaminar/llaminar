@@ -84,7 +84,10 @@
 #include <string>
 
 // Forward declaration for fromPlan() factory method
-namespace llaminar2::test { struct RankRetainedStorageRetirementReplayAccess; }
+namespace llaminar2::test {
+    struct RankRetainedStorageRetirementReplayAccess;
+    struct RankPipelineHostPublicationTestAccess;
+}
 
 namespace llaminar2
 {
@@ -2807,11 +2810,18 @@ namespace llaminar2
 
         /** @brief The owning pipeline retires borrowed complete one-shot domain forwards. */
         friend class PipelineDeviceGeneration;
+        /** @brief Device-free fixture drives this same private completion and its real logits gatherer. */
+        friend struct test::RankPipelineHostPublicationTestAccess;
         /**
-         * @brief Retire rank-local bookkeeping after all original domain children completed one row.
+         * @brief Publish optional current host logits and retire one completed local domain row.
          * @details Called only by the enclosing pipeline after independent device
-         * terminal validation and mailbox retirement. The increment describes
-         * scheduler/logits geometry; device KV remains the execution authority.
+         * terminal validation, exact-stream output publication and mailbox retirement.
+         * An enabled tail observation consumes those existing child publications;
+         * hidden or device-only domains perform no host gather. Public geometry
+         * advances only after the optional observation succeeds; device KV remains
+         * the execution authority.
+         * @throws std::logic_error For an invalid domain or missing retained observation owner.
+         * @throws std::runtime_error When the original current-row gather fails.
          */
         void retirePipelineForwardOnlyDomain();
 

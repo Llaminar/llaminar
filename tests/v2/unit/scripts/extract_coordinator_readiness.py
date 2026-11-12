@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Extract actual coordinator lifecycle methods for an SDK-free scheduling replay.
+"""Extract actual coordinator lifecycle and control-construction methods.
 
 Only explicit mutex template arguments are rebound to the fixture's observable
 mutex. Branches, flag operations, condition predicates and thread joins remain
 the actual source. Hardware initialization/cleanup are fixture doubles.
+The control-affinity contract also compiles the complete heterogeneous bridge
+initializer and device-controller activation body with authored hardware operands.
 """
 import argparse
 import hashlib
@@ -44,7 +46,7 @@ def main() -> None:
         owner = vendor + "Coordinator"
         header = path.with_suffix(".h")
         header_text = header.read_text()
-        fields = ["device_ordinals_", "num_devices_", "initialized_", "last_error_", "coordinator_thread_",
+        fields = ["device_ordinals_", "num_devices_", "initialized_", "last_error_", "coordinator_thread_", "comms_", "abort_mutex_",
                   "running_", "init_success_", "init_complete_", "work_queue_", "queue_mutex_", "queue_cv_"]
         if vendor == "RCCL":
             fields.append("collective_performed_")
@@ -58,17 +60,34 @@ def main() -> None:
                                    .replace("std::condition_variable", "ReplayCondition"))
         declarations.append(f"struct {owner} {{\nSchedule schedule;\n" + "\n".join(original_fields) +
             f"\n{owner}(); ~{owner}();\nbool initialize(const std::vector<int>&);\n"
-            "void shutdown(); void coordinatorLoop(); void initializeOnThread(); void cleanupOnThread();\n"
+            "void shutdown(); void abortCommunicators(); void coordinatorLoop(); void initializeOnThread(); void cleanupOnThread();\n"
             + owner + "(const " + owner + "&)=delete;\n" + owner + "& operator=(const " + owner + "&)=delete;\n};\n")
         definitions = []
-        for method in [owner, "~" + owner, "initialize", "shutdown", "coordinatorLoop"]:
+        for method in [owner, "~" + owner, "initialize", "shutdown", "abortCommunicators", "coordinatorLoop"]:
             body = extract(text, owner, method)
             definitions.append(body.replace("<std::mutex>", "<ReplayMutex>"))
         output.append("namespace llaminar2 {\n" + "\n".join(definitions) + "\n}\n")
         inputs.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                        "header": str(header.resolve()), "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
-                       "methods": [owner, "~" + owner, "initialize", "shutdown", "coordinatorLoop"],
+                       "methods": [owner, "~" + owner, "initialize", "shutdown", "abortCommunicators", "coordinatorLoop"],
                        "instrumentation": "explicit mutex template arguments only; hardware calls doubled"})
+    bridge_header = args.source_root / "src/v2/collective/backends/HeterogeneousBackend.h"
+    constants = re.findall(r"^\s*(static constexpr size_t ASYNC_BRIDGE_(?:CHUNK_BYTES|HOST_BUFFER_SLOTS|TRANSACTION_DEPTH)[^;]+;)",
+                           bridge_header.read_text(), re.M)
+    if len(constants) != 3:
+        raise ValueError("Heterogeneous control fixture requires all three original resource geometries")
+    declarations.append("struct HeterogeneousControlGeometry {\n" + "\n".join(constants) + "\n};\n")
+    for relative, owner, method in [
+        ("collective/backends/HeterogeneousBackend.cpp", "HeterogeneousBackend", "initializeAsyncBridgeResources"),
+        ("execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService", "start"),
+    ]:
+        path = args.source_root / "src/v2" / relative
+        output.append("namespace llaminar2 {\n" + extract(path.read_text(), owner, method) + "\n}\n")
+        inputs.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                       "methods": [method], "instrumentation": "none; hardware/resource operands doubled"})
+    inputs.append({"path": str(bridge_header.resolve()),
+                   "sha256": hashlib.sha256(bridge_header.read_bytes()).hexdigest(),
+                   "operands": "original bridge resource geometries"})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("\n".join(output))
     args.output.with_name("CoordinatorReadinessFields.inc").write_text("\n".join(declarations))

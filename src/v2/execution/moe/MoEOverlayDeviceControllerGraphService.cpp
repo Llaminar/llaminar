@@ -14,6 +14,8 @@
  * where an open-ended maintenance wait can starve independent inference.
  * No-movement decisions retain bounded numeric telemetry so idle placement
  * checks cannot grow process memory across a long serving lifetime.
+ * The independent phase submitter inherits the admitted OpenMP partition only
+ * during construction; cold capture and activation retain caller placement.
  */
 
 #include "MoEOverlayDeviceControllerGraphService.h"
@@ -41,6 +43,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/Logger.h"
 #include "utils/Assertions.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1009,11 +1012,17 @@ namespace llaminar2
                         if(!endpoint || !endpoint->runtime_binding.inference_boundary ||
                            !endpoint->runtime_binding.inference_boundary->prepareMoEOverlayFinitePlacementGraphs())
                             throw std::logic_error("Device finite placement lacks an original cold inference-owner graph");
-                dynamic_worker_->thread = std::jthread(
-                    [worker = dynamic_worker_.get()](std::stop_token token)
-                    {
-                        worker->run(token);
-                    });
+                {
+                    // Preserve cold capture placement and restore the creator
+                    // before activation bookkeeping. The submitter alone needs
+                    // independent progress across the original rank partition.
+                    const ScopedOpenMPPartitionAffinity control_affinity;
+                    dynamic_worker_->thread = std::jthread(
+                        [worker = dynamic_worker_.get()](std::stop_token token)
+                        {
+                            worker->run(token);
+                        });
+                }
 
                 /*
                  * The worker can report a fatal setup/protocol error as soon

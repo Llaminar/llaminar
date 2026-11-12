@@ -179,8 +179,7 @@ MTP is off; prefix caching remains enabled by the frozen configuration.
     checks in `q89` pass. This repair is published as `9b970ad61`.
 
 16. **The public local-PP frontend initialized a test-only global router.**
-    Unlike the detailed fixture's direct RankOrchestrator construction, the
-    public OrchestrationRunner called `GlobalBackendRouter::initForTests()`.
+    The public OrchestrationRunner called `GlobalBackendRouter::initForTests()`.
     That helper fabricates a no-MPI rank-zero inventory from every visible
     device. The `q90` observation consequently initialized unrelated CUDA and
     ROCm groups before the actual selected eight-MI50 pipeline. A typed PP
@@ -236,6 +235,138 @@ resource evidence, not a leak qualification. The immediate blocker is startup
 latency, not an accepted corpus or performance result. No timeout was enlarged.
 Evidence is in `/tmp/qfn-postcheckpoint-unscored-single-q8-corpus-q96/` and
 `/tmp/qfn-postcheckpoint-focused-launch/q96-progress.jsonl`.
+
+The fresh `q97` original short-history control completes native execution in
+101.1 seconds on the same boot, with a clean complete driver window and normal
+retirement. Its prefill and all six decode CSV metrics repeat `q78` exactly;
+the unchanged decode-quality failure remains visible. The first intended RCCL
+group returns about 2.8 seconds after loading the library, and the second route
+is published 15.3 seconds later, including intervening setup work. This shows
+the failure is intermittent; it does not rule out a kernel scheduling defect.
+
+Source review corrects the earlier startup hypothesis: both the detailed parity
+fixture and the public canary use the same OrchestrationRunner factory and
+native-worker preparation order. The public configuration also explicitly
+requests 28 threads, applied before RCCL startup; the launcher's initial
+56-thread environment does not establish inference oversubscription. HWLOC
+module policy differs (`-gl,-opencl` in the short control, omitted in `q96`),
+as does optional CUDA discovery. These are experiment candidates, not proven
+causes. A proposed standalone clique constructor was not applied because it
+would introduce a second admission route. Continue through the existing public
+observer, preserving its configuration and native retirement authority.
+
+After the user reboot, `q99` reaches M512 capture but times out at
+`layer24_gdn_wo_allreduce` with one of four participants present. Other threads
+wait inside KFD mapping. `q100` and `q101` then isolate the same wait during
+initial communicator construction, before capture. The blocked allocation is
+the original RCCL uncached P2P buffer, not a newly created late communicator.
+
+The decisive `q101` observation finds a pending AMD TLB-flush software fence
+whose dependency is already signaled. Its CPU work remains queued while both
+workers in the CPU28 `events` pool are idle; one is runnable but receives no
+CPU time for minutes. Four normal-priority native initialization threads spin
+on that CPU inside `ncclProxyCallBlocking`. All ten GPUs' sampled ring fences
+are retired. A brief diagnostic host attachment releases progress. These
+observations strongly implicate host scheduler starvation; they do not establish
+a GPU arithmetic fault or justify changing peer visibility, capture, or timeouts.
+
+The running patched kernel contains a matching upstream CFS reweight defect.
+An isolated repair candidate preserves its existing IOMMU/DRM fixes and keeps
+the installed kernel as rollback. No host installation or reboot has occurred.
+See [the scheduler investigation](QFN_HOST_CFS_TLB_STARVATION_20261112.md) for
+source/boot identity, upstream repair dependencies, passive evidence, and the
+required post-repair native validation. The diagnostic runs remain unscored;
+the original detailed Decode quality gate remained red at that point, and
+commits were held pending the completed corpus below.
+
+## Current startup and observation result
+
+The [broader host-affinity audit](QFN_HOST_THREAD_AFFINITY_AUDIT_20261112.md)
+repairs master-mask leakage in MPI/OpenMP bootstrap and independent control
+workers inheriting one OpenMP place. Its completed combined Integration
+selection passes 47/47 with zero skips, including the loading, mmap reclaim
+and NUMA regressions. Both disk-worker lifetime aliases additionally each
+pass 20 consecutive invocations.
+
+The unchanged 16-history public observer, `q117`, completed in **82.621 seconds**
+on the current ABI1000 kernel without debugger interruption or a stall. Actual
+control-thread masks retain the original rank CPU partition, while existing
+OpenMP workers retain individual placement. All 112 observations completed,
+reset bytes matched, the driver window was clean, all native owners retired and
+the eight selected GPUs returned to their exact baseline VRAM usage. Frozen
+source/build and retirement proof live under
+`/tmp/qfn-postcheckpoint-focused-launch/q117-prep/`.
+
+This is **not an accuracy pass**. All six Decode rows in every history, including
+the reset history, are byte-identical to that history's Prefill row. The public
+observation path is exposing stale logits; its Decode metrics cannot measure
+quantization accuracy. The separately captured detailed snapshots and their
+mean KL 0.1982729 remain unchanged evidence. Repair the original pipeline result
+publication, add a focused freshness regression and rerun the unchanged corpus
+before interpreting its Decode quality. Its report remains `UNCALIBRATED`, with
+`passed: null`; no tolerance or policy was changed.
+
+The separately built ABI1001 scheduler candidate remains uninstalled. Twelve
+paired KVM trials reproduced starvation on neither image, so that experiment
+is inconclusive and does not establish the upstream defect's causality here.
+
+### Fresh publication and completed corpus
+
+The composed parent had already published each terminal child's fresh logits
+on its exact stream. `RankOrchestrator::retirePipelineForwardOnlyDomain` then
+advanced metadata without updating the terminal domain's retained host result.
+The outer pipeline copied that old Prefill row. Completion now invalidates the
+old host result and, only when host observation is enabled, uses the original
+child-consuming gather before publishing rank metadata. Device-only and hidden
+domains perform no host gather. Failed publication leaves no valid host row and
+does not advance rank metadata. No model row is replayed and no arithmetic changes.
+
+The existing LogitsGatherer owner exercises this actual method with CUDA/ROCm
+metadata and participant widths 1/2/3/8, exact consuming streams, repeated
+rows/reset, disabled observation, non-head stages and failed copies. All three
+new lifecycle cases pass; all fail against the saved original core. The `q124`
+selection passes 8/8, including the full LogitsGatherer Unit owner and six
+strengthened loader aliases. The first fixture attempt (`q122`) incorrectly
+read child-owned position to check rank bookkeeping; its assertion was repaired
+without changing production position ownership. The contaminated negative
+control remains retained separately from the valid `r2` proof.
+
+`q125` repeats the unchanged original model/topology/precision corpus and
+completes in **83.44 seconds** including setup, observation, driver checks and
+scoring. Each history now has seven distinct full-vocabulary rows. All 16
+histories/112 observations complete, reset bytes match, the driver window is
+clean, all native owners retire and all eight GPUs return to baseline VRAM.
+
+| Phase | Rows | Mean KL | Top-1 agreement | Mean top-5 overlap |
+|---|---:|---:|---:|---:|
+| Prefill | 16 | 0.0260335 | 87.5% | 92.5% |
+| Decode | 96 | 0.0225803 | 96.875% | 91.875% |
+
+The unchanged original pilot's short-context Prefill/Decode limits and all six
+Decode-offset limits pass in a separate comparison. Five Decode rows exceed
+0.1, below the existing 12.5% tail allowance; maximum KL is 0.525417, below its
+1.0 bound. Three are the original nine-token history's steps 3/4/6, matching the
+earlier detailed CSV values to rounding precision. Their same-input diagnosis
+supports intended Q8 error amplified by closely ranked expert selection. The
+other two are Unicode/accent step 1 (0.224736) and prose/cause step 5 (0.133051);
+those have not been individually isolated. Four of the five preserve top-1.
+Unicode/accent Prefill is the single Prefill row above 0.1 (0.246579).
+
+The user accepted these quantisation-sensitive spikes and authorized this
+checkpoint; they do not block performance work. No arithmetic policy or limit
+was changed. The canonical unscored report remains **UNCALIBRATED / passed:null**:
+the separate passing numerical comparison does not manufacture an approved
+baseline, calibration, full preflight receipt or release certificate.
+
+Peak observed native RSS was 21.99 GB on the active rank and 0.787 GB on the
+other rank, measured separately. GPU peaks were 21.31–21.70 GB per participant;
+native swap was zero. All histories and original native resources retired.
+These finite diagnostic lifetimes do not certify long-session leak behavior.
+The result and unchanged-input/physical-identity/freshness/retirement receipts
+are under `/tmp/qfn-postcheckpoint-unscored-single-q8-corpus-q125/` and
+`/tmp/qfn-postcheckpoint-focused-launch/q125-prep/`. Release throughput and
+stage timings are next; diagnostic wall intervals include full-vocabulary D2H
+and must not be presented as production performance.
 
 ## Focused validation and next measurement
 
@@ -340,11 +471,11 @@ to approximately 10.4 MiB driver usage, and the 114 GB run-scoped source staging
 was removed. Peak sampled active-rank RSS was approximately 49.8 GiB with full
 diagnostic snapshots; this is not a long-session leak qualification.
 
-The functional repairs have focused model-free and native coverage; the
-original model now supplies complete snapshots and authentic source/ownership
-observations. Its final-logit quality remains red on this frozen short history.
-The complete unchanged 16-history observation is the next diagnostic before
-choosing another precision extension. The canonical scored panel still requires
-its original successful binding; unscored collection must retain its own
-non-certifying status. No Release throughput, complete corpus acceptance or
-image qualification follows from the repairs or the offline arithmetic proof.
+The functional repairs have focused model-free and native coverage; the model
+now supplies complete snapshots and fresh public logits. The completed unchanged
+16-history observation passes its existing numerical limits in the separate
+pilot comparison. Accepted isolated quantisation spikes remain visible in the
+raw detailed evidence. The canonical scored panel still requires its original
+successful binding; unscored collection retains its non-certifying status.
+Release throughput and stage profiling are next; no image qualification follows
+from the focused repairs or offline arithmetic proof.

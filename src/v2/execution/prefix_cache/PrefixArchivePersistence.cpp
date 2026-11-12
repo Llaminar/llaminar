@@ -8,11 +8,14 @@
  * published to every outstanding consumer; no mutation is silently retried.
  * Economy counters distinguish new payload writes from metadata-authenticated
  * reuse, so metadata refresh cannot masquerade as additional disk traffic.
+ * Writer startup borrows the admitted CPU partition only for child creation;
+ * the calling inference owner retains its original OpenMP placement.
  */
 #include "execution/prefix_cache/PrefixArchivePersistence.h"
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <limits>
 #include <stdexcept>
@@ -53,8 +56,11 @@ namespace llaminar2
     }
 
     PrefixArchivePersistence::PrefixArchivePersistence(DiskPrefixStorageBackend &backend)
-        : backend_(backend), writer_([this] { run(); })
+        : backend_(backend)
     {
+        // Durability I/O must progress independently of the master's one place.
+        const ScopedOpenMPPartitionAffinity writer_affinity;
+        writer_ = std::thread([this] { run(); });
     }
 
     PrefixArchivePersistence::~PrefixArchivePersistence()

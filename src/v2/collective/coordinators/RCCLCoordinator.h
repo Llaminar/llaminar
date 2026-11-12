@@ -104,6 +104,9 @@ namespace llaminar2
          * one device thread has failed and the other is stuck in RCCL.
          *
          * Thread-safe: may be called from any thread.
+         * Outer host callers create abort helpers within their admitted OpenMP
+         * partition; active OpenMP callers preserve their assigned mask.
+         * Construction restores the caller before joins and handle cleanup.
          */
         void abortCommunicators();
 

@@ -24,6 +24,8 @@
  * Resident condition forwards retire the preceding host result before fan-out.
  * Only an explicitly enabled diagnostic observation republishes current logits;
  * pending input publication and device-only sampling do not gather host rows.
+ * Composed forward-only domain completion refreshes an enabled tail diagnostic
+ * through the original child publication edges before advancing rank metadata.
  * Every main-model entry admits all shared source channels before participant
  * dispatch, including a first MTP condition or verifier after prefix restoration.
  * Input-only publication does not open or replace a storage interval.
@@ -3820,6 +3822,22 @@ namespace llaminar2
     {
         if (device_runners_.empty() || !pp_stage_runners_.empty())
             throw std::logic_error("Pipeline forward-only completion requires its original local TP domain");
+        // The composed parent bypasses forwardTP(), including its host-result
+        // lifecycle. Child tensors already carry publishForwardGraphOutputReady
+        // on each exact parent stream. Retire the old prefill row even when
+        // observation is disabled, then consume only those original producer
+        // edges when this terminal domain explicitly requests a host result.
+        if (logits_gatherer_)
+            logits_gatherer_->invalidate();
+        if (ownsMainForwardLogits() && !skip_logits_gather_decode_ &&
+            (!logits_gatherer_ || !logits_gatherer_->isAllocated()))
+            throw std::logic_error("Pipeline forward-only domain has no retained host logits observation owner");
+        if (ownsMainForwardLogits() && logits_gatherer_ &&
+            logits_gatherer_->needsGather(LogitsForwardPhase::Decode) &&
+            !logits_gatherer_->gather(device_runners_, 1, vocab_size()))
+            throw std::runtime_error("Pipeline forward-only domain failed to publish current host logits");
+        // A rejected observation leaves the prior public geometry unchanged
+        // and its host data invalid; storage capacity never certifies freshness.
         invalidateRankResidentLogicalStateAggregate("pipeline_forward_only_domain", "original_children_consumed");
         ++current_position_;
         for (int &length : current_sequence_lengths_) ++length;

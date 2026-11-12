@@ -9,6 +9,8 @@
  * Batched page-table observations are resolved through a fault-capable lookup
  * when Linux reports a migration/non-present entry; unknown placement is never
  * treated as the requested node. Certification does not move application bytes.
+ * The placement owner is armed before native writes; restoration failure is
+ * fatal, and allocation storage remains owned until its record is published.
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -20,6 +22,9 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
+#include <exception>
+#include <memory>
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -106,17 +111,17 @@ namespace llaminar2
                     return std::nullopt;
                 }
 
-                struct bitmask *node_cpus = numa_allocate_cpumask();
+                std::unique_ptr<bitmask, decltype(&numa_free_cpumask)> node_cpus(
+                    numa_allocate_cpumask(), &numa_free_cpumask);
                 if (!node_cpus)
                 {
                     LOG_ERROR("NUMAAllocator: Could not allocate the first-touch CPU mask");
                     return std::nullopt;
                 }
-                if (numa_node_to_cpus(numa_node, node_cpus) != 0)
+                if (numa_node_to_cpus(numa_node, node_cpus.get()) != 0)
                 {
                     LOG_ERROR("NUMAAllocator: Could not resolve CPUs for NUMA node "
                               << numa_node);
-                    numa_free_cpumask(node_cpus);
                     return std::nullopt;
                 }
 
@@ -127,13 +132,13 @@ namespace llaminar2
                      cpu < node_cpus->size && cpu < CPU_SETSIZE;
                      ++cpu)
                 {
-                    if (numa_bitmask_isbitset(node_cpus, cpu) != 0)
+                    if (numa_bitmask_isbitset(node_cpus.get(), cpu) != 0)
                     {
                         CPU_SET(static_cast<int>(cpu), &target);
                         has_target_cpu = true;
                     }
                 }
-                numa_free_cpumask(node_cpus);
+                node_cpus.reset();
                 if (!has_target_cpu)
                 {
                     LOG_ERROR("NUMAAllocator: Topology exposes no CPU on requested NUMA node "
@@ -141,26 +146,34 @@ namespace llaminar2
                     return std::nullopt;
                 }
 
+                // Prepare every owned byte before borrowing the caller. The saved
+                // owner exists before either native write, including error paths
+                // whose diagnostic construction can itself throw.
+                std::vector<unsigned long> target_nodes(original_nodes.size(), 0);
+                target_nodes[static_cast<size_t>(numa_node) / word_bits] |=
+                    1ul << (static_cast<unsigned long>(numa_node) % word_bits);
+                ScopedThreadNodePlacement placement(
+                    original, original_mode, std::move(original_nodes),
+                    std::move(target_nodes), max_nodes);
                 if (sched_setaffinity(0, sizeof(target), &target) != 0)
                 {
                     LOG_ERROR("NUMAAllocator: Could not bind first-touch thread to NUMA node "
                               << numa_node << ": " << std::strerror(errno));
                     return std::nullopt;
                 }
-                std::vector<unsigned long> target_nodes(original_nodes.size(), 0);
-                target_nodes[static_cast<size_t>(numa_node) / word_bits] |=
-                    1ul << (static_cast<unsigned long>(numa_node) % word_bits);
-                if (set_mempolicy(MPOL_BIND, target_nodes.data(), max_nodes) != 0)
+                placement.affinity_installed_ = true;
+                if (set_mempolicy(MPOL_BIND, placement.observed_nodes_.data(), max_nodes) != 0)
                 {
+                    const int error = errno;
+                    // The rejected policy was never published. Restore only the
+                    // CPU write before constructing a potentially throwing log.
+                    placement.restore();
                     LOG_ERROR("NUMAAllocator: Could not bind first-touch memory policy to NUMA node "
-                              << numa_node << ": " << std::strerror(errno));
-                    if (sched_setaffinity(0, sizeof(original), &original) != 0)
-                        LOG_ERROR("NUMAAllocator: Failed to restore affinity after memory-policy rejection: "
-                                  << std::strerror(errno));
+                              << numa_node << ": " << std::strerror(error));
                     return std::nullopt;
                 }
-                return ScopedThreadNodePlacement(
-                    original, original_mode, std::move(original_nodes), max_nodes);
+                placement.policy_installed_ = true;
+                return std::move(placement);
             }
 
             ScopedThreadNodePlacement(
@@ -174,67 +187,107 @@ namespace llaminar2
                 : original_affinity_(other.original_affinity_),
                   original_mode_(other.original_mode_),
                   original_nodes_(std::move(other.original_nodes_)),
+                  observed_nodes_(std::move(other.observed_nodes_)),
                   max_nodes_(other.max_nodes_),
-                  armed_(std::exchange(other.armed_, false))
+                  affinity_installed_(std::exchange(other.affinity_installed_, false)),
+                  policy_installed_(std::exchange(other.policy_installed_, false))
             {
             }
 
-            /** @brief Restore both incoming thread settings on scope exit. */
-            ~ScopedThreadNodePlacement()
-            {
-                (void)restore();
-            }
+            /** @brief Restore published settings before scope exit; uncertain caller ownership is fatal. */
+            ~ScopedThreadNodePlacement() noexcept { restore(); }
 
             /**
-             * @brief Restore the incoming memory policy and CPU affinity now.
-             * @return `true` when restored or already disarmed.
+             * @brief Restore and authenticate every setting this scope published.
+             *
+             * Both owned settings are attempted even if one fails. Observation
+             * uses preallocated storage, and fatal diagnostics cannot allocate
+             * through Logger or retry a failed restoration during unwinding.
              */
-            bool restore() noexcept
+            void restore() noexcept
             {
-                if (!armed_)
-                    return true;
-                const bool has_nodes = std::any_of(
-                    original_nodes_.begin(), original_nodes_.end(),
-                    [](unsigned long word) { return word != 0; });
-                const bool policy_restored =
-                    set_mempolicy(
-                        original_mode_,
-                        has_nodes ? original_nodes_.data() : nullptr,
-                        has_nodes ? max_nodes_ : 0) == 0;
-                if (!policy_restored)
-                    LOG_ERROR("NUMAAllocator: Failed to restore first-touch thread memory policy: "
-                              << std::strerror(errno));
-                const bool affinity_restored =
-                    sched_setaffinity(0, sizeof(original_affinity_),
-                                      &original_affinity_) == 0;
-                if (!affinity_restored)
+                int policy_error = 0;
+                int affinity_error = 0;
+                if (policy_installed_)
                 {
-                    LOG_ERROR("NUMAAllocator: Failed to restore first-touch thread affinity: "
-                              << std::strerror(errno));
+                    const bool has_nodes = std::any_of(
+                        original_nodes_.begin(), original_nodes_.end(),
+                        [](unsigned long word) { return word != 0; });
+                    if (set_mempolicy(original_mode_,
+                                      has_nodes ? original_nodes_.data() : nullptr,
+                                      has_nodes ? max_nodes_ : 0) != 0)
+                    {
+                        policy_error = errno ? errno : EIO;
+                    }
+                    else
+                    {
+                        int observed_mode = MPOL_DEFAULT;
+                        std::fill(observed_nodes_.begin(), observed_nodes_.end(), 0);
+                        if (get_mempolicy(&observed_mode, observed_nodes_.data(),
+                                          max_nodes_, nullptr, 0) != 0)
+                            policy_error = errno ? errno : EIO;
+                        else if (observed_mode != original_mode_ ||
+                                 observed_nodes_ != original_nodes_)
+                            policy_error = EPROTO;
+                    }
                 }
-                armed_ = !(policy_restored && affinity_restored);
-                return !armed_;
+                if (affinity_installed_)
+                {
+                    if (sched_setaffinity(0, sizeof(original_affinity_), &original_affinity_) != 0)
+                    {
+                        affinity_error = errno ? errno : EIO;
+                    }
+                    else
+                    {
+                        cpu_set_t observed{};
+                        if (sched_getaffinity(0, sizeof(observed), &observed) != 0)
+                            affinity_error = errno ? errno : EIO;
+                        else if (!CPU_EQUAL(&observed, &original_affinity_))
+                            affinity_error = EPROTO;
+                    }
+                }
+                if (policy_error != 0 || affinity_error != 0)
+                {
+                    std::fprintf(stderr,
+                                 "Fatal: NUMAAllocator cannot restore exact first-touch caller placement "
+                                 "(policy_error=%d affinity_error=%d)\n",
+                                 policy_error, affinity_error);
+                    std::terminate();
+                }
+                policy_installed_ = false;
+                affinity_installed_ = false;
             }
 
         private:
-            /** @brief Arm a scope with the exact incoming thread settings. */
+            /**
+             * @brief Retain exact saved settings and preallocated readback storage before any native write.
+             * @param original_affinity Incoming calling-thread scheduler mask.
+             * @param original_mode Incoming NUMA policy, including policy flags.
+             * @param original_nodes Incoming exact policy nodemask.
+             * @param observed_nodes Prepared target mask reused only after policy publication for verification.
+             * @param max_nodes Native nodemask bit extent shared by both retained masks.
+             */
             explicit ScopedThreadNodePlacement(
                 const cpu_set_t &original_affinity,
                 int original_mode,
                 std::vector<unsigned long> original_nodes,
-                unsigned long max_nodes)
+                std::vector<unsigned long> observed_nodes,
+                unsigned long max_nodes) noexcept
                 : original_affinity_(original_affinity),
                   original_mode_(original_mode),
                   original_nodes_(std::move(original_nodes)),
+                  observed_nodes_(std::move(observed_nodes)),
                   max_nodes_(max_nodes)
             {
             }
 
-            cpu_set_t original_affinity_{};
-            int original_mode_ = MPOL_DEFAULT;
-            std::vector<unsigned long> original_nodes_;
-            unsigned long max_nodes_ = 0;
-            bool armed_ = true;
+            cpu_set_t original_affinity_{}; ///< Exact incoming CPU mask, never a topology estimate.
+            int original_mode_ = MPOL_DEFAULT; ///< Exact incoming native policy and flags.
+            std::vector<unsigned long> original_nodes_; ///< Sole saved policy nodemask.
+            std::vector<unsigned long> observed_nodes_; ///< Prepared target then allocation-free restoration scratch.
+            unsigned long max_nodes_ = 0; ///< Native bit extent of both masks.
+            bool affinity_installed_ = false; ///< CPU restoration is owned immediately after its successful write.
+            bool policy_installed_ = false; ///< Rejected policy writes never acquire restoration ownership.
         };
     } // anonymous namespace
 
@@ -348,7 +401,9 @@ namespace llaminar2
 
         size_t allocation_alignment = std::max(alignment, PAGE_SIZE);
         size_t aligned_bytes = alignUp(bytes, allocation_alignment);
-        void *ptr = std::aligned_alloc(allocation_alignment, aligned_bytes);
+        std::unique_ptr<void, decltype(&std::free)> allocation(
+            std::aligned_alloc(allocation_alignment, aligned_bytes), &std::free);
+        void *ptr = allocation.get();
         if (!ptr)
         {
             LOG_ERROR("NUMAAllocator: aligned_alloc failed for " << bytes << " bytes");
@@ -361,19 +416,19 @@ namespace llaminar2
         // page-placement proof on this platform.
         if (!firstTouchPageRangeOnNode(ptr, aligned_bytes, resolved_node))
         {
-            std::free(ptr);
             return nullptr;
         }
 
+        // Finish throwing preparation/diagnostics before publication. Record
+        // insertion may allocate; its success precedes the nonthrowing counter
+        // update, and the local owner releases storage only after both complete.
+        LOG_TRACE("NUMAAllocator: Allocated " << bytes << " bytes on node " << resolved_node);
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
-            allocated_per_node_[resolved_node] += bytes;
             allocation_records_[ptr] = AllocationRecord{resolved_node, bytes};
+            allocated_per_node_[resolved_node] += bytes;
         }
-
-        LOG_TRACE("NUMAAllocator: Allocated " << bytes << " bytes on node " << resolved_node);
-
-        return ptr;
+        return allocation.release();
     }
 
     void *NUMAAllocator::allocateLocal(size_t bytes, size_t alignment)
@@ -477,8 +532,7 @@ namespace llaminar2
             // subsequent transport overwrites the complete logical range.
             pages[offset] = 0;
         }
-        if (!placement->restore())
-            return false;
+        placement->restore();
 
         constexpr size_t kCertificationBatchPages = 1024;
         std::array<void *, kCertificationBatchPages> page_addresses{};

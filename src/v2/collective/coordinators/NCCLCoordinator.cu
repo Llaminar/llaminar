@@ -16,6 +16,8 @@
  * stream; each participant retains a consistent communicator operation order.
  * No coordinator queue, default stream or host wait is inserted into those
  * captured operations, including output-partitioned sum/reduce-scatter.
+ * Independent collective control inherits the admitted OpenMP partition;
+ * construction restores its caller before waiting for native initialization.
  */
 
 #include "NCCLCoordinator.h"
@@ -26,10 +28,12 @@
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "backends/cuda/CUDAHardwareMetadata.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <optional>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -334,8 +338,13 @@ namespace llaminar2
         init_complete_.store(false);
         running_.store(false);
 
-        // Start coordinator thread
-        coordinator_thread_ = std::thread(&NCCLCoordinator::coordinatorLoop, this);
+        {
+            // Native initializer/proxy children inherit this control worker's
+            // admitted partition. Native setup may further bind its own thread;
+            // restore only the creator before waiting for that independent work.
+            const ScopedOpenMPPartitionAffinity control_affinity;
+            coordinator_thread_ = std::thread(&NCCLCoordinator::coordinatorLoop, this);
+        }
 
         // Wait for initialization to complete
         {
@@ -427,28 +436,37 @@ namespace llaminar2
         std::vector<std::thread> abort_threads;
         abort_threads.reserve(active_count);
 
-        for (size_t rank = 0; rank < communicators.size(); ++rank)
         {
-            if (!communicators[rank])
-                continue;
-            abort_threads.emplace_back([&, rank]()
+            // Outer host retirement grants independent abort helpers the rank's
+            // admitted partition. An active OpenMP caller instead retains its
+            // assigned compute/subpartition mask; this any-thread failure API
+            // must not expand placement beyond that caller's explicit context.
+            std::optional<ScopedOpenMPPartitionAffinity> control_affinity;
+            if (active_count != 0 && omp_get_level() == 0)
+                control_affinity.emplace();
+            for (size_t rank = 0; rank < communicators.size(); ++rank)
             {
-                if (rank >= device_ordinals_.size())
+                if (!communicators[rank])
+                    continue;
+                abort_threads.emplace_back([&, rank]()
                 {
-                    device_results[rank] = cudaErrorInvalidDevice;
-                    abort_results[rank] = nccl::ncclInvalidArgument;
-                    return;
-                }
-                device_results[rank] = cudaSetDevice(device_ordinals_[rank]);
-                if (device_results[rank] != cudaSuccess)
-                {
-                    abort_results[rank] = nccl::ncclUnhandledCudaError;
-                    return;
-                }
-                abort_results[rank] = nccl::ncclCommAbort(
-                    static_cast<nccl::ncclComm_t>(communicators[rank]));
-            });
-        }
+                    if (rank >= device_ordinals_.size())
+                    {
+                        device_results[rank] = cudaErrorInvalidDevice;
+                        abort_results[rank] = nccl::ncclInvalidArgument;
+                        return;
+                    }
+                    device_results[rank] = cudaSetDevice(device_ordinals_[rank]);
+                    if (device_results[rank] != cudaSuccess)
+                    {
+                        abort_results[rank] = nccl::ncclUnhandledCudaError;
+                        return;
+                    }
+                    abort_results[rank] = nccl::ncclCommAbort(
+                        static_cast<nccl::ncclComm_t>(communicators[rank]));
+                });
+            }
+        } // Restore the creator before joining helpers or cleaning handles.
 
         /* All active ranks have entered their abort call before any join. */
         for (std::thread &thread : abort_threads)
