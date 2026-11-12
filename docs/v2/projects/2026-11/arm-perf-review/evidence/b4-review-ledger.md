@@ -445,3 +445,16 @@ controls. Preservation of previously closed A4 coverage.
 BOUNDED POSITIVES: 6-for-6 source equivalence; A1 closure; the vector-
 inequality repair; the truthful omission counterexample; the CPU-
 backend init (admission repair, not numerical).
+
+### A4 RESTORED (~07:10Z): 7a4790c77 — the block back verbatim from the round-4 lineage
+
+Pushed (parent addf3db78): p=(1/2,1/4,1/8,1/8), q=δ0; threshold 1/4
+accepts, 1/2 rejects (strict <); residual 1/2 → TOKEN 1 (the residual
+(.5,.25,.25) with r<=cumulative); clamp endpoints asserted (0 stays 0;
+1 → 0.99999994f); the header claim fixed; a stray splice brace fixed;
+both TUs syntax-clean. **W3 RE-BOOKED at 7a4790c77 (the third tip move
+— e099→addf→7a479, each disclosed): build + both Unit targets + JUnit
+seal K14-B4-7A4790C7 — the grouped fix AND the restored A4 block both
+ride it.** The reviewer's re-verdict material = this tip + the fresh
+JUnit (the Linux-GCC-first process). Main's canonical re-books at the
+same tip.
