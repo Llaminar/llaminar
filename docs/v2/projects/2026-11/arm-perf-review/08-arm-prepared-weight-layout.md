@@ -186,3 +186,15 @@ target = BUILT ✓; the compact TU = the ONLY blocker. Fix-back #3
 routed to addon2 with the process escalation: after this lands, a full
 g++-14 build of the whole diagnostic bench becomes the standard
 pre-push gate (end the per-error whack-a-mole).
+
+### W2 FIX-BACK #3 LANDED (~03:09Z): 27b37f0a8 — dual-compiler matrix now standard
+
+publishPairs = the production TILE's Rows-templated static helper
+(CPUNativeNEONPreparedProjection.h), NOT an NEONMultiScaleOps member —
+clang error-recovery resolved it, g++-14 rejected. Fix: walkUnitPairs
+calls Ops::splitPair directly (arithmetically identical for one row
+pair: splitPair + add into zero-init dots, exact INT32). DUAL-COMPILER
+MATRIX now the pre-push standard: both TUs clang++ AND g++-14 clean
+(4/4). STT binary superseded (rebuilt from the new tree). Sparks
+resumes at 27b37f0a8 → link → B1 placements + tournament + census →
+the idea-08 GO/NO-GO inputs.
