@@ -2627,3 +2627,17 @@ worker, thinking). Standing method fixed: fleet hosts are reached via
 intercom list-remote (wsl, hetzner-docker, josh, dgx-station), never
 hardcoded SSH hostnames. Audit exception 2 retracted in full; exception
 1 (tournament launch-lag ping to sparks) stands unchanged.
+
+### OPERATOR AUTHORIZATION (~2026-11-12T20:58Z, verbatim): "I would like you to start Idea-08 in a new session"
+
+Idea-08 (compact ARM prepared-weight layout) implementation lane
+AUTHORIZED to start NOW in a new session — within the merge-window
+prep envelope (lane branch off d5e04fdce; PR tip untouched; x86
+unchanged by construction via per-ISA layout identity; large
+refactorings permitted per the standing ~13:12Z grant: "spawn 1-3
+additional sessions via herdr using pi and glm 5.3 with thinking max").
+This is the third session of that grant (i08repair, p25design closed).
+Inputs sealed: corrected census CONFIRMS 1.73x expansion, carrier =
+CompactMultiScale gate/up (2.34x) + NibbleLUTSourceScale down; repaired
+tournament bench (ACK @ 3b109793c) = the validation methodology
+template; .79 re-run in flight separately.
