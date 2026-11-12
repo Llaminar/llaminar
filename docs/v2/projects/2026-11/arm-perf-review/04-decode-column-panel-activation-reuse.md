@@ -274,3 +274,5 @@ ABBA 31 iters; OMP production binding. Decision gate = the Q8_K
 interpretation kit (w-m1act-summary.py + idea-04-m1-window-notes.md)
 is staged. Seal K14-I04M1-0AD09600-20261112. The implementation gate
 is decided by the window's signal per the integrator's rule.
+
+### MAIN'S CONDITIONS ADOPTED (~06:09Z): one job on the host; record identities; NO profiler on the timing run; prune the build tree afterwards; results = diagnostic evidence NOT an economy admission; any kernel change follows the normal implement → validate → handback path. Seal K14-I04M1-0AD09600-20261112. .80 queue: W3 → B1ATTR2 → idea-04 M=1 → 27B rider.
