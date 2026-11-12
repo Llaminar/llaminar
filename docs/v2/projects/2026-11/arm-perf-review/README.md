@@ -2479,3 +2479,19 @@ fail their control). Open design question for the reviewer:
 materialization at boundary-after-clock vs inside the timed interval
 (one-line flip if required). ACK request dispatched; .79 re-run gated
 on it.
+
+### REVIEWER VERDICT on 74d228047 (~19:31Z): SOURCE HOLD — two F4 residues → fix-forward #2
+
+Validated: sentinel fixture-bound safe (bounded arithmetic worked through
+by the reviewer); placement ruling = scans/checksums/comparisons stay
+OUTSIDE the timer (do not move materializeEvidence inside). **Issue 1**:
+the volatile dirty preserves the poison writes but does not order/
+materialize the NONVOLATILE walker stores before the END timestamp (first
+consumer is after end) — a compiler-only start boundary + live-output
+memory escape before the end-clock edge is required. **Issue 2**:
+concrete digest break — FNV-1a with odd P: flipping 0x80000000 into two
+ADJACENT float words cancels in the digest (both stay finite) → a
+nonfinal-sample pair corruption passes sentinel + chain + final memcmp;
+the digest cannot be the acceptance authority — untimed live-span byte
+comparison per completed two-arm sample before buffer reuse required
+(digest = diagnostic only). Fix-forward #2 dispatched to arm-i08repair.
