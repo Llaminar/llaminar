@@ -1103,6 +1103,23 @@ v2_add_core_free_test(V2_Integration_CPUNativeQuantisedWeightView
     COMMAND $<TARGET_FILE:v2_unit_cpu_native_weight_view>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Quantization Regression)
 
+# The prepared-layout spine (layout enum, host selector, section authority,
+# layout-aware strides) must reproduce canonical geometry exactly on every
+# ISA, thread one layout from packer to sealed view, and fail closed for any
+# not-yet-implemented layout instead of aliasing canonical geometry.
+add_executable(v2_unit_cpu_native_prepared_layout
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUNativeQuantisedPreparedLayout.cpp")
+target_compile_features(v2_unit_cpu_native_prepared_layout PRIVATE cxx_std_20)
+target_include_directories(v2_unit_cpu_native_prepared_layout PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_unit_cpu_native_prepared_layout PRIVATE GTest::gtest_main)
+v2_add_core_free_test(V2_Unit_CPUNativeQuantisedPreparedLayout
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_prepared_layout>
+    LABELS V2 Unit CPU DeviceFree NativeQuantised Quantization)
+v2_add_core_free_test(V2_Integration_CPUNativeQuantisedPreparedLayout
+    COMMAND $<TARGET_FILE:v2_unit_cpu_native_prepared_layout>
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree NativeQuantised Quantization Regression)
+
 # Prepared metadata is admitted once per publication generation; execution
 # never tests reserved bits inside a worker team. Coverage equals the former
 # in-loop rules on every lane, and every mutation (slot rewrite included)

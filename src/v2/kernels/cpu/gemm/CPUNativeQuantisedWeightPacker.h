@@ -167,6 +167,21 @@ namespace llaminar2::cpu::native_quantised
                 "Deferred native-block repacking does not own the source "
                 "superblock context required by native multi-scale layouts");
         }
+        // One section authority for every deferred write below: the packer,
+        // the resident owner and the sealed view must derive identical
+        // metadata offsets from the same layout tuple.
+        const auto *const repack_source = native_quantised_formats::forSourceIdentity(
+            meta.codebook_id, meta.is_superblock);
+        if (!repack_source || !isKnownPreparedLayout(meta.layout))
+            throw std::invalid_argument(
+                "Deferred native-block repacking requires a known source tuple and prepared layout");
+        const PreparedUnitSections repack_sections = preparedUnitSections(
+            meta.layout, meta.encoding, meta.is_asymmetric, *repack_source);
+        if (!repack_sections.isValid() ||
+            repack_sections.payload_stride != static_cast<std::uint32_t>(meta.data_stride) ||
+            repack_sections.block_stride != static_cast<std::uint32_t>(meta.interleaved_block_stride))
+            throw std::invalid_argument(
+                "Deferred native-block repacking requires its complete section layout");
         const int N = meta.N;
         const int bpr = meta.blocks_per_row;
         const int N_chunks = (meta.N_padded) / 64;
@@ -245,7 +260,8 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     // --- Compute comp (sum of decoded INT8 values per column) ---
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + 1024);
+                    int16_t *inline_comp = reinterpret_cast<int16_t *>(
+                        dst + repack_sections.compensation_offset);
                     for (int col = 0; col < n_cols; ++col)
                     {
                         int8_t decoded[32];
@@ -274,13 +290,15 @@ namespace llaminar2::cpu::native_quantised
                         inline_comp[col] = 0;
 
                     // Write scales inline
-                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(dst + 1024 + 128);
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(
+                        dst + repack_sections.scales_offset);
                     std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
 
                     // Write mins inline (if asymmetric)
                     if (meta.is_asymmetric)
                     {
-                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(dst + 1024 + 256);
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(
+                            dst + repack_sections.mins_offset);
                         std::memcpy(inline_mins, mins_buf, 64 * sizeof(uint16_t));
                     }
                 }
@@ -394,17 +412,18 @@ namespace llaminar2::cpu::native_quantised
                     }
 
                     // Write comp + scales
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + meta.data_stride);
+                    int16_t *inline_comp = reinterpret_cast<int16_t *>(
+                        dst + repack_sections.compensation_offset);
                     std::memcpy(inline_comp, comp_buf, 64 * sizeof(int16_t));
 
                     uint16_t *inline_scales = reinterpret_cast<uint16_t *>(
-                        dst + meta.data_stride + 128);
+                        dst + repack_sections.scales_offset);
                     std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
 
                     if (meta.is_asymmetric)
                     {
                         uint16_t *inline_mins = reinterpret_cast<uint16_t *>(
-                            dst + meta.data_stride + 256);
+                            dst + repack_sections.mins_offset);
                         std::memcpy(inline_mins, mins_buf, 64 * sizeof(uint16_t));
                     }
                 }
@@ -457,6 +476,21 @@ namespace llaminar2::cpu::native_quantised
             throw std::invalid_argument(
                 "Direct Expanded-INT8 packing requires the complete 2048-byte data layout");
         }
+        // One section authority for the metadata plane below; the resident
+        // owner and the sealed view derive the identical offsets from the
+        // same layout tuple.
+        const auto *const direct_source = native_quantised_formats::forSourceIdentity(
+            out.codebook_id, out.is_superblock);
+        if (!direct_source || !isKnownPreparedLayout(out.layout))
+            throw std::invalid_argument(
+                "Direct Expanded-INT8 packing requires a known source tuple and prepared layout");
+        const PreparedUnitSections direct_sections = preparedUnitSections(
+            out.layout, out.encoding, out.is_asymmetric, *direct_source);
+        if (!direct_sections.isValid() ||
+            direct_sections.payload_stride != static_cast<std::uint32_t>(out.data_stride) ||
+            direct_sections.block_stride != static_cast<std::uint32_t>(out.interleaved_block_stride))
+            throw std::invalid_argument(
+                "Direct Expanded-INT8 packing requires its complete section layout");
 
         const size_t interleaved_total =
             static_cast<size_t>(N_chunks) * blocks_per_row *
@@ -619,10 +653,10 @@ namespace llaminar2::cpu::native_quantised
 
                         auto *const compensation =
                             reinterpret_cast<int16_t *>(
-                                destination + out.data_stride);
+                                destination + direct_sections.compensation_offset);
                         auto *const inline_scales =
                             reinterpret_cast<uint16_t *>(
-                                destination + out.data_stride + 128);
+                                destination + direct_sections.scales_offset);
                         if (source_column_valid)
                         {
                             int32_t sum = 0;
@@ -649,7 +683,7 @@ namespace llaminar2::cpu::native_quantised
                         {
                             auto *const inline_mins =
                                 reinterpret_cast<uint16_t *>(
-                                    destination + out.data_stride + 256);
+                                    destination + direct_sections.mins_offset);
                             inline_mins[column] = source_column_valid
                                 ? (out.usesIQ3SExpandedSourceScale()
                                     ? source_coefficients[local_kb] : fp32_to_fp16(mins[local_kb])) : 0;
@@ -761,9 +795,15 @@ namespace llaminar2::cpu::native_quantised
         out.encoding = preparedEncodingForSource(
             *fmt, use_rotated_path);
 
-        out.data_stride = preparedDataStride(out.encoding);
+        // The packer fixes the physical layout once: every stride, section
+        // write, admission and movement link below derives from this tuple.
+        // kHostPreparedLayout is the sole production selector; Phase 0 keeps
+        // the canonical bytes on every ISA, and Phase 1 moves AArch64 only.
+        out.layout = kHostPreparedLayout;
+        out.data_stride = preparedDataStride(
+            out.layout, out.encoding, out.is_asymmetric, *fmt);
         out.interleaved_block_stride = preparedInterleavedBlockStride(
-            out.encoding, out.is_asymmetric);
+            out.layout, out.encoding, out.is_asymmetric, *fmt);
 
         // Temporary metadata is allocated only by layouts that still need a
         // distinct source-oriented pass.  Expanded-INT8 preparation writes

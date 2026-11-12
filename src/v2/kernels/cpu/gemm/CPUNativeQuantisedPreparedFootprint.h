@@ -14,6 +14,8 @@
 
 #include <cstdint>
 
+#include "tensors/NativeQuantisedFormatInfo.h"
+
 namespace llaminar2::cpu::native_quantised
 {
 
@@ -110,6 +112,182 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Physical unit-interleaving layout of a prepared CPU stream.
+     *
+     * The prepared encoding fixes the arithmetic families a kernel executes;
+     * this layout fixes how those families' payload, compensation, scales,
+     * minima and effective minima are packed into the resident unit. Layouts
+     * are distinct physical byte formats for the same arithmetic: a view, seal
+     * or movement link rejects a foreign layout instead of reinterpreting it.
+     *
+     * InterleavedCanonical is the production layout on every ISA today: a
+     * fixed-size unit whose unused bytes are zero padding, sized for the
+     * widest codebook of each encoding family. InterleavedCompactA64 is the
+     * tight AArch64-only unit (design: docs/v2/projects/2026-11/arm-perf-review/
+     * 08-arm-prepared-weight-layout-design.md) that trims bytes the NEON
+     * decode programs never load; x86 keeps canonical bytes by construction.
+     */
+    enum class CPUNativeQuantisedLayout : std::uint8_t
+    {
+        InterleavedCanonical = 0,  ///< Fixed-width padded unit, one stride per encoding.
+        InterleavedCompactA64 = 1, ///< Tight AArch64 unit; per-codebook payload width.
+    };
+
+    /**
+     * @brief Return whether a layout value names a known physical layout.
+     *
+     * Knowing a value is not the same as the current build implementing it:
+     * section tables decide implementability and fail closed otherwise.
+     */
+    [[nodiscard]] constexpr bool isKnownPreparedLayout(
+        CPUNativeQuantisedLayout layout) noexcept
+    {
+        switch (layout)
+        {
+        case CPUNativeQuantisedLayout::InterleavedCanonical:
+        case CPUNativeQuantisedLayout::InterleavedCompactA64:
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Layout this build's production packer, owner and kernels execute.
+     *
+     * Phase 0 spine: every ISA still prepares, admits and executes the
+     * canonical interleaving, so every byte and stride is unchanged and this
+     * constant is the sole selector that Phase 1 will move to the compact
+     * unit on AArch64 builds only. x86 bytes can never change because this
+     * constant never changes off AArch64.
+     */
+    inline constexpr CPUNativeQuantisedLayout kHostPreparedLayout =
+        CPUNativeQuantisedLayout::InterleavedCanonical;
+
+    /**
+     * @brief Exact section placement inside one prepared interleaved unit.
+     *
+     * One authority for where every section lives: the packer writes through
+     * these offsets, the view and owner read through them, and footprint
+     * pricing derives its strides from them. Offsets are absolute byte
+     * positions inside one unit; each one is meaningful only while its flag
+     * is set, and isValid() must hold before any offset is consumed.
+     */
+    struct PreparedUnitSections
+    {
+        std::uint32_t payload_stride = 0; ///< Pure payload bytes before metadata.
+        std::uint32_t block_stride = 0;   ///< Total bytes of one unit.
+        std::uint32_t compensation_offset = 0; ///< Inline int16 compensation vector.
+        std::uint32_t scales_offset = 0;  ///< Sixty-four primary FP16 words.
+        std::uint32_t mins_offset = 0;    ///< Sixty-four secondary FP16 words.
+        std::uint32_t emins_offset = 0;   ///< Sixty-four packed effective-minimum words.
+        bool has_compensation = false;
+        bool has_secondary = false;
+        bool has_emins = false;
+
+        /** @brief Return whether these sections describe a complete unit. */
+        [[nodiscard]] constexpr bool isValid() const noexcept
+        {
+            return payload_stride > 0 && block_stride > 0 &&
+                   scales_offset >= payload_stride &&
+                   block_stride >= scales_offset + 128u &&
+                   (!has_compensation ||
+                       (compensation_offset >= payload_stride &&
+                           scales_offset >= compensation_offset + 128u)) &&
+                   (!has_secondary ||
+                       (mins_offset >= scales_offset + 128u &&
+                           block_stride >= mins_offset + 128u)) &&
+                   (!has_emins ||
+                       (emins_offset >= scales_offset + 128u &&
+                           block_stride >= emins_offset + 256u));
+        }
+    };
+
+    /**
+     * @brief Return the exact canonical section placement of one unit.
+     * @param layout Physical layout of the stream.
+     * @param encoding Physical execution encoding of the stream.
+     * @param is_asymmetric Whether the prepared stream stores FP16 minima.
+     *   This is the prepared asymmetry, not the source's: rotation prepares
+     *   asymmetric sources symmetrically.
+     * @param source Original source format; the canonical table ignores it.
+     *   The compact table reads its payload width and effective minima.
+     *
+     * Canonical anatomy: the compensation vector sits directly after the
+     * payload for nibble and expanded encodings, Q6_K and multi-scale units
+     * carry no compensation, scales follow (compensation ? 128 : 0) bytes
+     * into the metadata, secondary words follow the scales, and multi-scale
+     * units always reserve the packed effective-minimum word at payload+256
+     * (zero for codebooks without live effective minima).
+     *
+     * The compact layout fails closed until its Phase 1 tables exist: it
+     * returns an invalid section value no admission or pricing path can
+     * mistake for canonical geometry.
+     */
+    [[nodiscard]] constexpr PreparedUnitSections preparedUnitSections(
+        CPUNativeQuantisedLayout layout,
+        CPUNativeQuantisedEncoding encoding,
+        bool is_asymmetric,
+        [[maybe_unused]] const NativeQuantisedFormatInfo &source) noexcept
+    {
+        PreparedUnitSections sections{};
+        if (layout != CPUNativeQuantisedLayout::InterleavedCanonical)
+            return sections;
+        sections.payload_stride = preparedDataStride(encoding);
+        sections.block_stride =
+            preparedInterleavedBlockStride(encoding, is_asymmetric);
+        if (sections.payload_stride == 0 || sections.block_stride == 0)
+            return sections;
+        sections.has_compensation = encoding != CPUNativeQuantisedEncoding::Q6KNativeDualScale &&
+            encoding != CPUNativeQuantisedEncoding::CompactMultiScale;
+        sections.has_secondary = is_asymmetric ||
+            encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+            encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+            encoding == CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+            encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
+        sections.has_emins = encoding == CPUNativeQuantisedEncoding::CompactMultiScale;
+        sections.compensation_offset = sections.has_compensation
+            ? sections.payload_stride
+            : 0u;
+        sections.scales_offset = sections.payload_stride +
+            (sections.has_compensation ? 128u : 0u);
+        sections.mins_offset = sections.has_secondary
+            ? sections.scales_offset + 128u
+            : 0u;
+        sections.emins_offset = sections.has_emins
+            ? sections.payload_stride + 256u
+            : 0u;
+        return sections;
+    }
+
+    /**
+     * @brief Layout-aware pure weight-data stride of one prepared unit.
+     * @sa preparedDataStride(CPUNativeQuantisedEncoding)
+     */
+    [[nodiscard]] constexpr std::uint32_t preparedDataStride(
+        CPUNativeQuantisedLayout layout,
+        CPUNativeQuantisedEncoding encoding,
+        bool is_asymmetric,
+        const NativeQuantisedFormatInfo &source) noexcept
+    {
+        return preparedUnitSections(layout, encoding, is_asymmetric, source)
+            .payload_stride;
+    }
+
+    /**
+     * @brief Layout-aware total unit stride including metadata.
+     * @sa preparedInterleavedBlockStride(CPUNativeQuantisedEncoding, bool)
+     */
+    [[nodiscard]] constexpr std::uint32_t preparedInterleavedBlockStride(
+        CPUNativeQuantisedLayout layout,
+        CPUNativeQuantisedEncoding encoding,
+        bool is_asymmetric,
+        const NativeQuantisedFormatInfo &source) noexcept
+    {
+        return preparedUnitSections(layout, encoding, is_asymmetric, source)
+            .block_stride;
+    }
+
+    /**
      * @brief Exact resident bytes touched by one logical NativeQuantised tile unit.
      *
      * A weight unit is one 64-column N chunk by one 32-element K block and
@@ -120,6 +298,8 @@ namespace llaminar2::cpu::native_quantised
      */
     struct NativeQuantisedPreparedFootprint
     {
+        CPUNativeQuantisedLayout layout =
+            CPUNativeQuantisedLayout::InterleavedCanonical;
         CPUNativeQuantisedEncoding encoding =
             CPUNativeQuantisedEncoding::ExpandedInt8;
         bool is_asymmetric = false;
@@ -130,7 +310,8 @@ namespace llaminar2::cpu::native_quantised
         /** @brief Return whether all execution-footprint dimensions are valid. */
         [[nodiscard]] constexpr bool isValid() const noexcept
         {
-            return isKnownPreparedEncoding(encoding) &&
+            return isKnownPreparedLayout(layout) &&
+                   isKnownPreparedEncoding(encoding) &&
                    weight_bytes_per_n_chunk_k_block > 0 &&
                    activation_bytes_per_row_k_block > 0 &&
                    output_bytes_per_row_n_chunk > 0;

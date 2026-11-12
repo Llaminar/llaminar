@@ -46,6 +46,7 @@ namespace llaminar2::cpu::native_quantised
         int reduction_width = 0; ///< Logical K before final-block activation padding.
         NativeQuantisedSourceIdentity source; ///< Original source identity, not an execution alias.
         CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+        CPUNativeQuantisedLayout layout = CPUNativeQuantisedLayout::InterleavedCanonical; ///< Physical unit layout of the resident stream.
         CPUProjectionNumericalPolicy numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
         bool is_asymmetric = false; ///< Existing prepared metadata/stride property.
     };
@@ -175,6 +176,7 @@ namespace llaminar2::cpu::native_quantised
                 descriptor.source.is_superblock == identity_.source.is_superblock &&
                 descriptor.source.present == identity_.source.present &&
                 descriptor.encoding == identity_.encoding &&
+                descriptor.layout == identity_.layout &&
                 descriptor.is_asymmetric == identity_.is_asymmetric;
         }
 
@@ -232,6 +234,8 @@ namespace llaminar2::cpu::native_quantised
         const bool is_asymmetric; ///< Published metadata/stride property.
         const bool is_superblock; ///< Original source block geometry.
         const CPUNativeQuantisedEncoding encoding; ///< Validated physical encoding.
+        const CPUNativeQuantisedLayout layout; ///< Validated physical unit layout.
+        const int metadata_delta; ///< Bytes between the payload end and the primary scale vector (0 or 128).
         const CPUProjectionNumericalPolicy numerical_policy; ///< Immutable arithmetic identity.
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
@@ -300,9 +304,15 @@ namespace llaminar2::cpu::native_quantised
         /** @return Whether a compact multi-scale source payload is retained. */
         [[nodiscard]] bool usesCompactMultiScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::CompactMultiScale; }
-        /** @return Whether inline signed weight-sum compensation precedes primary scales. */
+        /** @return Whether inline signed weight-sum compensation precedes primary scales.
+         * Resolved from the unit sections once at admission through the stored
+         * metadata delta. Hot decode kernels branch on it per K block, and the
+         * multi-scale tile programs hold their committed register ratchet only
+         * while this stays a single load. The compact AArch64 unit stores no
+         * compensation, so its decoders can never read a section that does not
+         * exist. */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
-        { return !usesQ6KNativeDualScale() && !usesCompactMultiScale(); }
+        { return metadata_delta != 0; }
         /** @return Borrowed canonical byte root; no source-order mirror exists. */
         [[nodiscard]] const std::uint8_t *interleavedBase() const noexcept { return bytes_.data(); }
         /** @return Exact borrowed publication extent. */
@@ -314,7 +324,7 @@ namespace llaminar2::cpu::native_quantised
          * @return Sixty-four primary half words in original column order.
          */
         [[nodiscard]] const std::uint16_t *chunkScales(int chunk, int block) const
-        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0)); }
+        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + metadata_delta); }
 
         /** @brief Borrow the second source coefficient/scale/minimum vector.
          * @param chunk Physical 64-column chunk.
@@ -327,7 +337,7 @@ namespace llaminar2::cpu::native_quantised
             if (!is_asymmetric && !usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale() &&
                 !usesQ6KNativeDualScale() && !usesCompactMultiScale())
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
-            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128));
+            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + 128 + metadata_delta);
         }
 
         /**
@@ -427,9 +437,10 @@ namespace llaminar2::cpu::native_quantised
             const auto *source = native_quantised_formats::forSourceIdentity(
                 descriptor.source.codebook_id, descriptor.source.is_superblock);
             if (!source || !isKnownPreparedEncoding(descriptor.encoding) ||
+                !isKnownPreparedLayout(descriptor.layout) ||
                 (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
                  descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
-                throw std::invalid_argument("Native CPU weight view requires a known source, encoding and numerical policy");
+                throw std::invalid_argument("Native CPU weight view requires a known source, encoding, layout and numerical policy");
             // Explicit rotation may publish ExpandedInt8 for any original source.
             // Other encodings must retain the source-aware canonical preparation.
             if (descriptor.encoding != CPUNativeQuantisedEncoding::ExpandedInt8 &&
@@ -442,7 +453,8 @@ namespace llaminar2::cpu::native_quantised
             const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
             if (padded > std::numeric_limits<int>::max())
                 throw std::overflow_error("Native CPU padded output width exceeds its ABI");
-            const std::size_t stride = preparedInterleavedBlockStride(descriptor.encoding, descriptor.is_asymmetric);
+            const std::size_t stride = preparedInterleavedBlockStride(
+                descriptor.layout, descriptor.encoding, descriptor.is_asymmetric, *source);
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
             if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
                 throw std::overflow_error("Native CPU weight stream extent overflow");
@@ -469,8 +481,13 @@ namespace llaminar2::cpu::native_quantised
                   d.encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ? 32 : source.payload_bytes),
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
-              numerical_policy(d.numerical_policy), data_stride(preparedDataStride(d.encoding)),
-              interleaved_block_stride(preparedInterleavedBlockStride(d.encoding, d.is_asymmetric)), bytes_(bytes) {}
+              layout(d.layout),
+              metadata_delta(preparedUnitSections(
+                  d.layout, d.encoding, d.is_asymmetric, source).has_compensation ? 128 : 0),
+              numerical_policy(d.numerical_policy),
+              data_stride(preparedDataStride(d.layout, d.encoding, d.is_asymmetric, source)),
+              interleaved_block_stride(preparedInterleavedBlockStride(d.layout, d.encoding, d.is_asymmetric, source)),
+              bytes_(bytes) {}
 
         /** @brief Check one column coordinate without clamping it into a valid lane.
          * @param column Physical column within one 64-column unit.

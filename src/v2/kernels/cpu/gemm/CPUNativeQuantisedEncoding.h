@@ -73,10 +73,13 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
-     * @brief Build an exact cache footprint without materializing a matrix.
+     * @brief Build an exact canonical cache footprint without materializing
+     * a matrix.
      *
      * This helper is used by planning/corpus tools that know format metadata
-     * but intentionally do not allocate production-sized weights.
+     * but intentionally do not allocate production-sized weights. It prices
+     * the canonical layout only: source identity alone cannot select the
+     * compact layout, whose payload width depends on the exact codebook.
      */
     [[nodiscard]] inline NativeQuantisedPreparedFootprint preparedFootprintForFormat(
         uint8_t codebook_id,
@@ -101,15 +104,29 @@ namespace llaminar2::cpu::native_quantised
     /** @brief Compute source-aware footprint without materializing weight data.
      * @param source Exact original source descriptor.
      * @param rotation_enabled Explicit CPU rotation policy.
+     * @param layout Physical unit layout to price; defaults to this build's
+     *   production layout. An unimplemented layout fails closed as an invalid
+     *   footprint instead of substituting canonical geometry.
      * @return Authoritative physical per-unit weight and activation byte counts.
      */
     [[nodiscard]] inline NativeQuantisedPreparedFootprint preparedFootprintForFormat(
-        const NativeQuantisedFormatInfo &source, bool rotation_enabled = false) noexcept
+        const NativeQuantisedFormatInfo &source, bool rotation_enabled = false,
+        CPUNativeQuantisedLayout layout = kHostPreparedLayout) noexcept
     {
-        auto result = preparedFootprintForFormat(source.codebook_id, source.is_asymmetric, rotation_enabled);
-        result.encoding = preparedEncodingForSource(source, rotation_enabled);
-        result.weight_bytes_per_n_chunk_k_block = preparedInterleavedBlockStride(result.encoding, result.is_asymmetric);
-        return result;
+        const CPUNativeQuantisedEncoding encoding =
+            preparedEncodingForSource(source, rotation_enabled);
+        const bool prepared_is_asymmetric =
+            rotation_enabled ? false : source.is_asymmetric;
+        const PreparedUnitSections sections =
+            preparedUnitSections(layout, encoding, prepared_is_asymmetric, source);
+        return NativeQuantisedPreparedFootprint{
+            .layout = layout,
+            .encoding = encoding,
+            .is_asymmetric = prepared_is_asymmetric,
+            .weight_bytes_per_n_chunk_k_block = sections.block_stride,
+            .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
+            .output_bytes_per_row_n_chunk = 64u * sizeof(float),
+        };
     }
 
 } // namespace llaminar2::cpu::native_quantised

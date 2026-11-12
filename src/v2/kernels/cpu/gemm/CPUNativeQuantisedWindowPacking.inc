@@ -60,8 +60,9 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     out.N=n;out.K=k;out.N_padded=(n+63)/64*64;out.blocks_per_row=(k+31)/32;
     out.payload_bytes=format.payload_bytes;out.codebook_id=format.codebook_id;
     out.is_asymmetric=format.is_asymmetric;out.is_superblock=format.is_superblock;
-    out.encoding=preparedEncodingForSource(format);out.data_stride=preparedDataStride(out.encoding);
-    out.interleaved_block_stride=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric);
+    out.encoding=preparedEncodingForSource(format);out.layout=kHostPreparedLayout;
+    out.data_stride=preparedDataStride(out.layout,out.encoding,out.is_asymmetric,format);
+    out.interleaved_block_stride=preparedInterleavedBlockStride(out.layout,out.encoding,out.is_asymmetric,format);
     const auto chunks=size_t(out.N_padded/64),blocks=size_t(out.blocks_per_row);
     if(blocks && chunks>std::numeric_limits<size_t>::max()/blocks/out.interleaved_block_stride)
         throw std::overflow_error("Native weight final extent overflows");
@@ -100,10 +101,19 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
        out.encoding!=preparedEncodingForSource(format) || out.N<=0 || out.K<=0 ||
        out.N_padded!=int((size_t(out.N)+63)/64*64) ||
        out.blocks_per_row!=int((size_t(out.K)+31)/32) ||
-       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.encoding,out.is_asymmetric) ||
+       out.interleaved_block_stride!=preparedInterleavedBlockStride(out.layout,out.encoding,out.is_asymmetric,format) ||
        out.native_interleaved.size()!=size_t(out.N_padded/64)*out.blocks_per_row*out.interleaved_block_stride ||
        source_k<=0 || source_k>std::numeric_limits<int>::max()-31)
         throw std::invalid_argument("Native append changed original codec or final owned geometry");
+    // One section authority for every metadata write below: packer writes,
+    // resident-owner reads and sealed-view admission must agree on it. An
+    // unimplemented layout fails closed here instead of writing foreign bytes.
+    const PreparedUnitSections sections=preparedUnitSections(
+        out.layout,out.encoding,out.is_asymmetric,format);
+    if(!sections.isValid() ||
+       sections.payload_stride!=uint32_t(out.data_stride) ||
+       sections.block_stride!=uint32_t(out.interleaved_block_stride))
+        throw std::invalid_argument("Native append requires its complete section layout");
     const int group_blocks=format.is_superblock?8:1;
     const auto layout=NativePackGroupScratch::checked(format);
     const int groups=blocks>0?1+(blocks-1)/group_blocks:0;
@@ -168,11 +178,14 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                 if(out.usesCompactMultiScale()) {
                     for(int byte=0;byte<format.payload_bytes;++byte)
                         target[(byte/4)*256+column*4+byte%4]=input[byte];
-                    std::memcpy(target+out.data_stride+column*2,primary+b,2);
-                    std::memcpy(target+out.data_stride+128+column*2,secondary+b,2);
-                    std::memcpy(target+out.data_stride+256+column*4,emins+b,4);
+                    std::memcpy(target+sections.scales_offset+column*2,primary+b,2);
+                    std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
+                    std::memcpy(target+sections.emins_offset+column*4,emins+b,4);
                 } else if(out.usesQ6KNativeDualScale()) {
                     for(int g=0;g<4;++g)std::memcpy(target+g*256+column*4,input+g*4,4);
+                    // The six-bit plane region lives inside the payload stride
+                    // (payload 1024 + planes 512); it is payload-internal, not a
+                    // metadata section, and stays at its fixed payload offset.
                     for(int g=0;g<8;++g) {
                         auto* planes=target+1024+g*64+(column/16)*16;
                         uint64_t low=0,high=0;std::memcpy(&low,planes,8);std::memcpy(&high,planes+8,8);
@@ -183,8 +196,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                         }
                         std::memcpy(planes,&low,8);std::memcpy(planes+8,&high,8);
                     }
-                    std::memcpy(target+1536+column*2,primary+b,2);
-                    std::memcpy(target+1664+column*2,secondary+b,2);
+                    std::memcpy(target+sections.scales_offset+column*2,primary+b,2);
+                    std::memcpy(target+sections.mins_offset+column*2,secondary+b,2);
                 } else {
                     const bool nibble=out.usesNibbleLUT();
                     const int8_t* values=nibble?decoded:decoded+b*32;
@@ -194,7 +207,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     } else for(int g=0;g<8;++g)std::memcpy(target+g*256+column*4,values+g*4,4);
                     int32_t sum=0;for(int k=0;k<32;++k)sum+=values[k];
                     const auto compensation=static_cast<int16_t>(sum);
-                    std::memcpy(target+out.data_stride+column*2,&compensation,2);
+                    std::memcpy(target+sections.compensation_offset+column*2,&compensation,2);
                     uint16_t scale=0,minimum=0;
                     if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
@@ -207,9 +220,9 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     } else {scale=fp32_to_fp16(scales[b]);minimum=fp32_to_fp16(mins[b]);}
                     if(out.usesIQ3SExpandedSourceScale() && !native_quantised_iq3s_scale::valid(minimum))
                         throw std::invalid_argument("IQ3_S source nibble is invalid");
-                    std::memcpy(target+out.data_stride+128+column*2,&scale,2);
+                    std::memcpy(target+sections.scales_offset+column*2,&scale,2);
                     if(out.is_asymmetric || out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale())
-                        std::memcpy(target+out.data_stride+256+column*2,&minimum,2);
+                        std::memcpy(target+sections.mins_offset+column*2,&minimum,2);
                 }
             }
         }

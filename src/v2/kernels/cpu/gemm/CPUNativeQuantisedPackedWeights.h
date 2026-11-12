@@ -90,6 +90,11 @@ namespace llaminar2::cpu::native_quantised
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
 
+        /// Physical unit layout of the prepared stream this owner publishes.
+        /// The packer fixes it once at preparation time from kHostPreparedLayout;
+        /// every reader and movement link below re-derives geometry from it.
+        CPUNativeQuantisedLayout layout = CPUNativeQuantisedLayout::InterleavedCanonical;
+
         /**
          * Arithmetic identity selected by the owner of this prepared matrix.
          * ExpertOverlay matrices use the cross-backend reduction and activation
@@ -173,7 +178,8 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         {
-            return !usesQ6KNativeDualScale() && !usesCompactMultiScale();
+            return layout == CPUNativeQuantisedLayout::InterleavedCanonical &&
+                !usesQ6KNativeDualScale() && !usesCompactMultiScale();
         }
 
         /**
@@ -189,6 +195,7 @@ namespace llaminar2::cpu::native_quantised
         [[nodiscard]] NativeQuantisedPreparedFootprint preparedFootprint() const noexcept
         {
             return NativeQuantisedPreparedFootprint{
+                .layout = layout,
                 .encoding = encoding,
                 .is_asymmetric = is_asymmetric,
                 .weight_bytes_per_n_chunk_k_block =
@@ -218,7 +225,7 @@ namespace llaminar2::cpu::native_quantised
             const bool payload_matches = payload_bytes == view.source_payload_bytes ||
                 (view.usesExpandedInt8() && payload_bytes == view.payload_bytes);
             if (view.N_padded != N_padded || view.blocks_per_row != blocks_per_row ||
-                !payload_matches || view.data_stride != data_stride ||
+                !payload_matches || view.layout != layout || view.data_stride != data_stride ||
                 view.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU prepared owner and resident publication geometry disagree");
             return view;
@@ -230,7 +237,7 @@ namespace llaminar2::cpu::native_quantised
             return {
                 .columns = N, .reduction_width = K,
                 .source = {.codebook_id = codebook_id, .is_superblock = is_superblock, .present = true},
-                .encoding = encoding, .numerical_policy = numerical_policy,
+                .encoding = encoding, .layout = layout, .numerical_policy = numerical_policy,
                 .is_asymmetric = is_asymmetric,
             };
         }

@@ -71,8 +71,9 @@ inline void validateCPUQ8ResidualSource(const CPUNativeQuantisedPackedWeights&pa
     packed.is_asymmetric!=format.is_asymmetric||
     (packed.payload_bytes!=format.payload_bytes&&!(packed.usesExpandedInt8()&&packed.payload_bytes==32))||
     packed.encoding!=preparedEncodingForSource(format)||
-    std::int64_t(packed.data_stride)!=preparedDataStride(packed.encoding)||
-    std::int64_t(packed.interleaved_block_stride)!=preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric)||
+    !isKnownPreparedLayout(packed.layout)||
+    std::int64_t(packed.data_stride)!=preparedDataStride(packed.layout,packed.encoding,packed.is_asymmetric,format)||
+    std::int64_t(packed.interleaved_block_stride)!=preparedInterleavedBlockStride(packed.layout,packed.encoding,packed.is_asymmetric,format)||
     packed.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative)
   throw std::invalid_argument("Two-term CPU quantized projection requires its exact canonical prepared source tuple and geometry");
 #if defined(__aarch64__) && defined(__ARM_NEON)
