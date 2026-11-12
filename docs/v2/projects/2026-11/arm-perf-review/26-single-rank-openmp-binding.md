@@ -1195,3 +1195,13 @@ Main proceeds on the corrected target under the "B1 authorize" grant
 from ae51ce3f0, gates: byte identity (FP32, members 1-4, M 1-12, N
 tails, ±bias/±beta, all thread counts) + fork-count assertion + Linux
 run + paired Release A/B — lands only if same-or-better.
+
+### B1 VALIDATION BOOKED (~10:35Z): main-b1 on .80 — the corrected-target candidate d5e04fdce
+
+Main's B1 validation: Integration NEON_I8MM, ~60 min (build, the
+focused fused/GDN cells, the full Unit+preflight) at **d5e04fdce** on
+ae51ce3f0 ("perf(cpu): pool skinny FP32 fused projections into one team
+fork" — the BackendNative alpha+beta pooling, 4→3 forks/execution per
+the corrected analysis). .80 was idle (the M=1 re-run not yet launched;
+it queues behind main-b1). **A paired Release A/B timing window follows
+as a separate booking per the gates — lands only if same-or-better.**
