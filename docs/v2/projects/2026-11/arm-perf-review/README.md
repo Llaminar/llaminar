@@ -2725,3 +2725,22 @@ way). Local baseline: 128/128 targets, ctest 295/295 green at d5e04fdce
 (Mac NEON portability loop). Routing: lane PROCEEDS to Phase 0, holds
 at the gate. Scale-dedup/secondary-packing V2 = OUT OF SCOPE (access-
 pattern changes), not deferred.
+
+### IDEA-08 PHASE 0 COMPLETE + VERIFIED (23:23Z): d3e936fbd — spine landed, HOLDING at operator gate
+
+Lineage d5e04fdce -> dcebc7ed8 (docs) -> d3e936fbd (spine). Coordinator
+verified on origin: 9 files +596/-43 (gemm/ ABI headers + new
+Test__CPUNativeQuantisedPreparedLayout.cpp 260 lines + CMake +17).
+kHostPreparedLayout = InterleavedCanonical on every ISA (zero byte
+change by construction; compact arm fails closed). Tests: NEON
+portability 297/297 = 295 baseline untouched + 2 new registrations
+(Unit + ProductionTestPreflight). Register ratchet note: first spine
+version pushed 21 NEON tile programs 1-2 spills over budget (layout
+check in the hot compensation predicate) — caught by the tile-register
+proof; fixed by resolving compensation presence once at admission into
+a stored 0/128 metadata delta (hot accessors strictly <= baseline;
+proof PASS 64/64). Phase 2 (archive v8/wire/movement) + CUDA/ROCm
+remain canonical-only until threaded. GATE QUESTION (operator, DUE):
+CONTINUE to Phase 1 (compact stride tables + packer placement on
+AArch64 + admission + estimator overloads + ARM-local bit-identity) =
+-6.0GB prepared capacity/residency; or CLOSE with the spine retained.
