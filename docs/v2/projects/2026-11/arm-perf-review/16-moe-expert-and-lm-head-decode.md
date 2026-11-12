@@ -643,3 +643,16 @@ same domain/gate/TU, not in the failure list). RESOLUTION: sparks
 fetches 79967de27, rebuilds, re-runs — the assertion lands at :841
 (the fingerprint) and should PASS → the B1 seal completes. Timing
 unaffected.
+
+### W2 DEFINITIVE DATA (~08:43Z): the :841 tree confirmed in-binary; BOTH kernel counters read 0
+
+Sparks' fingerprint-verified rebuild at 79967de27 (:841 ✓ the counter-
+name fix in-binary) STILL fails — and now TWO assertions:
+`:841 fresh_bundle 0 vs 1` AND `:843 fresh_down 0 vs <1>` (the kernel-
+level down counter ALSO zero). The earlier "down/transaction not in
+the failure list" is CONTRADICTED. **The direct-kernel arm-A route does
+not advance EITHER kernel-level counter at this fixture's sample
+scope** — the counter-NAME fix didn't resolve the zero; the question
+sharpens to the increment-site conditions (grouped-context requirement?
+stats-config gate?) or the fixture's capture scope. Timing renders
+(217-219 vs 205-206 µs, B≤A). B1 seal blocked; the idea-08 inputs wait.
