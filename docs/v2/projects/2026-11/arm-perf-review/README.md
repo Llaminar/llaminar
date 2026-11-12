@@ -2495,3 +2495,29 @@ nonfinal-sample pair corruption passes sentinel + chain + final memcmp;
 the digest cannot be the acceptance authority — untimed live-span byte
 comparison per completed two-arm sample before buffer reuse required
 (digest = diagnostic only). Fix-forward #2 dispatched to arm-i08repair.
+
+### CENSUS CORRECTION OF RECORD (~19:40Z): my "premise refuted" conclusion was WRONG — corrected data CONFIRMS idea-08 at 1.73× with a reassigned target
+
+The v1 "premise refuted / bulk already compact" conclusion (my analysis,
+above) was derived from the encoding NAMES while the byte column was
+per-expert-broken. The CORRECTED census (SUMMARY-v2, per-expert fix):
+predicted 26.62GB vs source 15.34GB = **1.73× expansion**. Carrier =
+**CompactMultiScale gate/up experts 6.88→16.11GB (2.34×, +9.2GB)** +
+NibbleLUTSourceScale down 6.12→... 5.28→6.83 (+1.55GB); Q6 = genuinely
+native (1.06×); IQ3SExpanded (blk.39) = negligible (+0.4GB). Idea-08
+CONFIRMED; compaction target REASSIGNED to CMS + NibbleLUTSourceScale;
+potential ~42% prepared-quantised-byte reduction (26.6→~15.3GB if
+source-sized) = the decode-bandwidth prize on the 35B. Framing note:
+26.62 predicted vs 26.69 plan-BOM = same-estimator agreement (the planner
+BOM is estimator-derived), NOT independent validation; normative anchor =
+the preflight estimator-byte-equality class; observed final = the
+post-merge seam. Sparks amends SUMMARY-v2's finding paragraph (CSV
+stands). LM-head finding stands (Q6 445MB×2 M=1 read = dominant single-
+tensor decode cost). The earlier v1 entry is superseded by this one.
+
+### Reviewer compaction (~19:35Z): triggered from coordinator (operator-delegated)
+
+arm-reviewer had no self-service compaction; typed /compact via pane
+send-keys (character-split) — "Compacting context..." confirmed; todos
+#210/#211 (repair review + compact-decode blockers) intact. Reviewer
+clear to resume passes post-compaction (next: fix-forward #2 ACK).
