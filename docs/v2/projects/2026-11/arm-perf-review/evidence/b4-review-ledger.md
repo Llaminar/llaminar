@@ -352,3 +352,14 @@ second geometry) PASSED on Linux GCC; the portable TU PASSED (A1/A3/A4
 repairs executed-valid).** Only the grouped-vs-serial comparison needs
 the one-line init + a re-run. Routing: the re-run rides any window;
 after it passes, the reviewer's re-verdict lands.
+
+### B4 ORDER CONFIRMED (~06:27Z): rebase onto 0ad09600b → full-pair re-run → Main's application default
+
+(1) addon2 rebases onto 0ad09600b (cb9255c9a sits on 74797687f; the
+FMLAL commits landed between; expected clean, semantic CMake
+resolution); (2) the re-run = the FULL PAIR (portable + head incl. the
+grouped test) on the rebased tip (JUnit + the re-verdict bind to a
+landable tip); (3) **Main's application default: YES if the reviewer
+ACKs + all-architecture builds (the D6 split) + no new canonical
+failures — with one Main-run canonical on the combined tip before
+applying.**
