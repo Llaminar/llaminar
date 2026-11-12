@@ -712,3 +712,16 @@ signal. GO/NO-GO scoping: feeds idea-16's Phase B selection (the
 transaction route is viable); the idea-08 inputs remain gated on the
 tournament + census. STABILIZE-ONLY: diagnostic evidence — no
 production routing until post-merge.
+
+### W2 B1 SEALED GREEN (~10:17Z): K14-I16B1-5C2CEF47-20261112 — the counter arc CLOSED
+
+All 4 placements PASSED; timing B≤A at 20T/10T (−6..−7%); **1T = B>A
+(+6.9%: 4481.954 vs 4791.779 µs) = the single-team overhead exception**
+— contract-safe (the non-regression criterion binds at placement
+sizes; the 1T signal noted as the known pool-overhead regime). The dump
+= collector enablement VERIFIED (counters recorded). **The B1 bench's
+evidence chain is COMPLETE: the counter contract (4/4), the timing
+non-regression at placement sizes, the 1T exception documented. The
+4-placement attribution + the idea-16 Phase B input are ready for the
+post-merge decision.** Continuing W2: the tournament (3 ISA cells) +
+the BOM census = the idea-08 GO/NO-GO inputs.
