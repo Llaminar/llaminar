@@ -1014,3 +1014,18 @@ COUNTS stand only as execution-path counts independent of timing
 unaffected (deterministic). Addon3's analysis constraint: use ONLY the
 count fields + stage names + gdn_projection_route; every timing field
 discarded; the ranking = counts × the fixture-priced per-owner term.
+
+### OVERLAP RESOLVED — NO OVERLAP (Main docker-facts, ~02:55Z): contamination ruling WITHDRAWN
+
+main-fmlal5 (#5): StartedAt 02:21:15.148Z, FinishedAt 02:41:56.662Z,
+exit 0. tender_morse (B1 export): Created/StartedAt 02:47:52.4Z — 6
+minutes AFTER #5 ended. **There was NO overlap: the concurrency-
+contamination ruling is WITHDRAWN; the B1 export's timing fields are
+CLEAN and usable; the "launched 02:19Z" claim was false (sparks' send
+time ≠ container start).** The seal must state the clean-timing fact +
+the artifact-path reconciliation. Addon3 unconstrained (full data
+usable). FMLAL: tip f987501f9 (combined L4+L5) staged for #6
+(campaign-src-fmlal6, tree 9d9f020b3 clean); **#6 scope = focused cells
+PLUS the complete canonical Unit+preflight** (L4 changes startup ISA
+admission — the broader gate is warranted); Main starts #6 when
+tender_morse exits.
