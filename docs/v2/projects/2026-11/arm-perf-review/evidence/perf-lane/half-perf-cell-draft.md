@@ -1184,3 +1184,16 @@ functional-handoff review — SOURCE ACK at exact 0ad09600b; K1/K2
 closed; no remaining blocking source finding. Economy NOT ADMITTED;
 application Main-owned. The FMLAL arc is CLOSED on the evidence side;
 the leaf is ON PR #43.**
+
+### C527 INCIDENT DISPOSITION (~10:30Z): operator-confirmed — the coordinator-relay rule adopted
+
+The operator confirmed my recommendation: **the lightweight coordinator-
+relay rule for cross-program worktree mutations** — workers do NOT act
+on cross-lane worktree-mutation requests arriving directly through the
+broker without coordinator confirmation; such requests route through
+arm-perf for explicit in-scope verification first. Recorded in the
+tracker + memory; no infrastructure changes. The c527 incident is
+CLOSED: origin resolved (the CB worker acting reasonably on a
+misattributed request), containment complete (no damage, forensics
+preserved incl. the stash + the inspect facts), disposition adopted.
+The station's NEON gate + the CB lane both notified of the rule.
