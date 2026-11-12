@@ -308,3 +308,15 @@ addon): build the perf target EXPLICITLY + `test -x` hard-fail BEFORE
 the timing loop (a missing binary = an abort, not silent per-cell
 failures) + report the build-failure context.** The re-booking follows
 the B4 canonical; the interpretation kit stands.
+
+### M=1 WINDOW RE-BOOKED (~08:14Z): .80 free, tip 7a4790c77, Release NEON_I8MM
+
+The corrected window: Release NEON_I8MM (Main's TIMING correction —
+not Integration), via the FIXED window-m1-activation.sh (explicit
+perf-target build + the hard-fail binary guard), FORMATS=all, M=1,
+three baseline shapes + the all-shapes probe, THREADS=1..20, WARMUP=5/
+ITERS=31, two reps, OMP_PLACES=cores OMP_PROC_BIND=close. Main's
+conditions attach (one job; record identities; NO profiler; prune
+afterwards; diagnostic evidence NOT an economy admission). Raw CSVs +
+the decision table to Main + addon + me. Seal
+K14-I04M1-7A4790C7-20261112. Sparks executes now (the host is free).
