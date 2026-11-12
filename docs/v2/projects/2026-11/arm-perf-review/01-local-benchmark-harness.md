@@ -101,3 +101,11 @@ the banked b1attr build for B1ATTR2). #8 retry running
 (main-fmlal8b). The CB c527 cross-wired request = escalated to the
 operator as a messaging-layer attribution incident (Main concurs: not
 a worker-discipline failure).
+
+### STATE AUDIT (05:54Z cycle): queries dispatched
+
+.80/W3 (launched ~05:26 after the #8 handback) — launch/phase/exit
+status queried. .79/W2 re-run at 79967de27 (dispatched ~04:45) —
+counter-contract status queried (~1h10m without a status). B1ATTR2
+queue state queried. Last verified: FMLAL #8 GREEN + station NEON gate
+GREEN (receipts relayed); the #209 verdict pending at Main/reviewer.
