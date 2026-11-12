@@ -2087,3 +2087,51 @@ completes with same-or-better evidence, else immediately post-merge);
 anything worse REJECTED** — the M=1 signal, the B1 non-regression, all
 future changes; (3) the stability-first ordering stands (correctness
 gates → performance evidence).
+
+### ARM BRANCH SURFACE CLEANUP (~10:40Z, operator: "take care of all those old branches created for arm")
+
+FULL ENUMERATION + CLASSIFICATION of every ARM-related branch on origin:
+
+DELETED (1):
+- codex/arm-half-perf-cell @ b512e25a — SUPERSEDED by the landed FMLAL
+  leaf (the half-product path is implemented + landed with the full
+  evidence chain; the half-perf-cell draft is obsolete unmerged work).
+
+DELETED EARLIER TONIGHT (3): codex/arm-fmlal-half-leaf (landed
+0ad09600b); codex/arm-b4-vocab-budget (landed 7a4790c77); codex/
+arm-idea26-openmp-wakeup (merged, deletion verified clean — the
+exemptions cleanup is in the collected lineage).
+
+KEPT (each with its reason):
+- feat/arm64-native-kernels @ ae51ce3f0 — THE PR (MERGEABLE/CLEAN,
+  awaiting the base owner's develop merge).
+- codex/arm-perf-review @ 22633bd05 — the PERMANENT tracker.
+- codex/arm-idea16-moe-decode @ 5c2cef47a — the W2/B1 bench chain (the
+  open W2 payload: the B1 seal re-run + tournament + census executes
+  from it; deletable after the idea-08 inputs complete).
+- codex/arm-b1-fused-fork-pooling @ 9f96536a6 — the B1 WIP (superseded
+  by Main's corrected-target implementation d5e04fdce, but the tile
+  extraction + test file are references; deletable after Main's B1
+  lands).
+- codex/arm-idea23-hc-planning @ 640d625cb — parked per stabilize-only
+  (applies post-merge if the model-level run confirms a gap).
+- codex/bundle1-perf-harness @ 5d606a108 — the parked Bundle-1 final
+  hop.
+- codex/arm-b9-strengthening @ 108bce2e — the benched B9 artifact
+  (closed topic, preserved per the operator's "leave it benched").
+- codex/arm-witness-post-index @ f265d2950 — the addon's B9 composition
+  (the reviewer's range-diff reference; carries the overlap invariant +
+  alias controls the strengthening lacks — the better B9 artifact if
+  the topic is ever revived).
+- codex/arm-s4-nibble-witness @ 7501904e8 — the register-gate arc's
+  preserved artifact (Main's #58 disposition).
+- feat/neon-s4-nibble-lifetimes @ 972c0081e — the register-gate arc's
+  sibling artifact (same preservation class).
+- codex/arm-panel-tournament-policy @ df15aca96 — idea-22 is OPEN (the
+  FA2 policy-tail finding); the branch carries the open topic's work.
+- feat/mxfp4-arm64 @ 6c6993dae — the MXFP4 work (OPEN, post-merge).
+
+NOT ARM'S (left untouched): feat/opencode-hybrid-decode (the base
+owner's harness), feat/qwen38-w4a4, feat/qwen-flash-next, feat/clover-
+moe, feat/continuous-batching-c1-ownership, claude/deepseek-*,
+feat/qfn-ngram-continuation (the base branch), master.
