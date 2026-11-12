@@ -129,3 +129,15 @@ round at e120f13e8 — the CPU_STT_KERNEL_DOMAIN raw dump is the
 deliverable (recording-vs-visibility discrimination for the A-path
 counters). Station: idle-with-queue (the NEON gate done). B1ATTR2:
 sealed; addon3's analysis is the consumer.
+
+### STATE AUDIT (10:24Z cycle): the four live threads queried
+
+.80/main-rb2: COMPLETE per Main (ae51ce3f0 pushed, MERGEABLE/CLEAN) —
+the M=1 re-run status queried (re-anchored to ae51ce3f0). .79/W2: the
+collector-fix re-run at 5c2cef47a — the domain-dump flip + the seal
+status queried. Station: the model download progress queried (6h
+window). B1ATTR2: addon3 retired — the named-attribution analysis
+status queried (the root cause was delivered; the ranking status
+pending). The M=1 window re-anchor note: the surviving
+window-m1-activation.sh at /Users/floriankinder/repo/arm-addon-notes/
++ sparks' corrected m1.sh.
