@@ -88,3 +88,16 @@ Pressed with a literal-facts query (build past 736/764? census/tournament
 running or done? paths/exits). Campaign attempt 3 (main-campaign-ebd,
 00:48:23Z start) = finishing about now; queried in the same message.
 Station r9 co-validation + A2 exports: verified complete via receipts.
+
+### .80 DISK HYGIENE RULE (~05:01Z): prune superseded build trees after each window
+
+.80 hit 100% full during Main's #8 attempt 1 (No space left; 89 GB
+free at 98%). Main pruned their own superseded FMLAL build trees
+(~255G → 346G free, 91%). **STANDING RULE: one Integration build ≈
+25 GB on a disk shared with model storage — prune superseded build
+trees after each window (own trees only; logs + JUnit preserved in
+/work or local).** Sparks asked to prune their superseded dirs (keeping
+the banked b1attr build for B1ATTR2). #8 retry running
+(main-fmlal8b). The CB c527 cross-wired request = escalated to the
+operator as a messaging-layer attribution incident (Main concurs: not
+a worker-discipline failure).
