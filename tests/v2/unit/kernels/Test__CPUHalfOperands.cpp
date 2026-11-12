@@ -417,6 +417,9 @@ TEST(CPUHalfOperands, FmlalSpecialOperandsMatchOwnedTree){
             std::fill_n(output.mutable_data(),1,-777.f);
             ASSERT_TRUE(engine.multiply_tensor(&input,&output,1,1,K));
             EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"minsub W";
+            std::fill_n(output.mutable_data(),1,-777.f);
+            ASSERT_TRUE(engine.multiply_tensor(&half_input,&output,1,1,K));
+            EXPECT_EQ(std::memcmp(output.data(),&expected,sizeof(float)),0)<<"minsub halfA";
         }
         // FP32-A conversion discriminators: RNE ties and the overflow-to-Inf
         // boundary, isolated per run (the hand table is the one
@@ -470,7 +473,7 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     // leaf (the dispatch carries no NEON case without the guard).
 #if !defined(__aarch64__)
     // No AArch64 target: the FMLAL leaf cannot be compiled at all, so the
-    // route probe stays zero and the scalar schedule always runs.
+    // route probe stays zero and no FMLAL schedule exists on this target.
     EXPECT_FALSE(fmlalLeafCompiledInEnvelope());
     EXPECT_EQ(fmlalLeafInvocations(), 0ull);
 #else
@@ -515,7 +518,67 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 26));  // AHP
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 24));  // FZ
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x1ull << 22));  // RMode=01
+    EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x2ull << 22));  // RMode=10
     EXPECT_FALSE(fmlalFpcrProfileAdmitted(0x3ull << 22));  // RMode=11
+#endif
+}
+/** @test The route probe discriminates on/off, zero-N, invalid pointers,
+ *        zero rows and positive live work — resolved-route semantics only. */
+TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+    FmlalProbe probe;
+    FP16Tensor weight({size_t(1),size_t(65)},weightWords(1,65));
+    FP32Tensor a65({size_t(1),size_t(65)}),c1({size_t(1),size_t(1)});
+    std::fill_n(a65.mutable_data(),65,1.f);
+    // (1) Probe off: a valid multiply counts nothing.
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0);
+    }
+    // (2) Probe on, positive live work: exactly one admitted dispatch.
+    long long after_on=0;
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
+        after_on=fmlalLeafInvocations()-before;
+        EXPECT_EQ(after_on,fmlalRouteResolved()?1:0);
+    }
+    // (3) Zero N: the schedule runs zero columns; no FMLAL work, no count.
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,0,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"zero-N";
+    }
+    // (4) Invalid pointer: rejected before any route work; no count.
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        const long long before=fmlalLeafInvocations();
+        EXPECT_FALSE(engine.multiply_tensor(nullptr,&c1,1,1,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"null-A";
+    }
+    // (5) Zero rows: no row tiles; no FMLAL work, no count.
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        FP32Tensor a0({size_t(1),size_t(65)});
+        std::fill_n(a0.mutable_data(),65,1.f);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&a0,&c1,0,1,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"zero-M";
+    }
+    // (6) Probe restored off: the count holds still.
+    {
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"restored-off";
+    }
+    EXPECT_GT(after_on,0);
+#else
+    GTEST_SKIP() << "FMLAL route evidence is AArch64+FP16FML only";
 #endif
 }
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */

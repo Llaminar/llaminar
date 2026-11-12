@@ -1506,24 +1506,26 @@ namespace llaminar2
             {
                 // Route-probe evidence, counted once per dispatch on the
                 // calling thread and only for ADMITTED LIVE FMLAL execution:
-                // pointer/geometry validation already passed, at least one
-                // row span is non-empty, the weights are in the leaf's
-                // operand domain and K carries at least one full 16-lane
-                // block. Evidence-only by default (the probe is off unless a
-                // contract enables it), so clean timing carries a load, not
-                // a write.
-                bool live = false;
-                for (int row_tile = 0; row_tile < row_tiles && !live; ++row_tile)
-                {
-                    const auto span = selection
-                        ? selection->hostTileSpan(row_tile, kRowTile)
-                        : ProjectionRowSpan{row_tile * kRowTile,
-                                            std::min(M, (row_tile + 1) * kRowTile)};
-                    live = span.size() > 0;
-                }
-                if (live && K >= 16 &&
+                // evidence-only by default (the probe is off unless a
+                // contract enables it), K carries at least one full 16-lane
+                // block, N is positive, and — only after the cheap gate —
+                // at least one row span is non-empty. Clean timing carries a
+                // load, not a write.
+                if (K >= 16 && N > 0 && M > 0 &&
                     fmlalLeafProbeEnabled().load(std::memory_order_relaxed))
-                    fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
+                {
+                    bool live = false;
+                    for (int row_tile = 0; row_tile < row_tiles && !live; ++row_tile)
+                    {
+                        const auto span = selection
+                            ? selection->hostTileSpan(row_tile, kRowTile)
+                            : ProjectionRowSpan{row_tile * kRowTile,
+                                                std::min(M, (row_tile + 1) * kRowTile)};
+                        live = span.size() > 0;
+                    }
+                    if (live)
+                        fmlalLeafCounter().fetch_add(1, std::memory_order_relaxed);
+                }
             }
 #endif
             auto work = [&]()

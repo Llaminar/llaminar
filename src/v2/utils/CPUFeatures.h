@@ -271,15 +271,21 @@ namespace llaminar2
      */
     inline ISALevel activeISALevel()
     {
-        static const ISALevel level = resolveCPUISALevel(std::getenv("LLAMINAR_ISA_LEVEL"));
+        // The admission is bound INSIDE the cached initializer: one complete
+        // declared-envelope check per process, never per hot dispatch.
+        static const ISALevel level = []()
+        {
+            const ISALevel resolved = resolveCPUISALevel(std::getenv("LLAMINAR_ISA_LEVEL"));
 #if defined(__aarch64__)
-        // Ordinary process admission binds the COMPLETE declared compiler
-        // envelope (including FP16FML on the I8MM envelope) against the
-        // observed machine once, at ISA resolution — explicit Scalar
-        // selection included, since the binary still carries envelope code
-        // that native routes may reach.
-        ::llaminar2::cpu::ARMCPUCapabilities::native().requireCompiledEnvelope();
+            // Ordinary process admission binds the COMPLETE declared compiler
+            // envelope (including FP16FML on the I8MM envelope) against the
+            // observed machine once, at ISA resolution — explicit Scalar
+            // selection included, since the binary still carries envelope code
+            // that native routes may reach.
+            ::llaminar2::cpu::ARMCPUCapabilities::native().requireCompiledEnvelope();
 #endif
+            return resolved;
+        }();
         return level;
     }
 
