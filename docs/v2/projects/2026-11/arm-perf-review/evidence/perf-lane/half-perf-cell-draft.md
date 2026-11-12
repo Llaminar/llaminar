@@ -930,3 +930,12 @@ formal gate runs (Main I8MM-canonical #8 + the station re-run) pin to
 the green tip after handback. The fixture-only constraint stands (the
 production domain guard stays). This kills the push→validate round-trip
 latency that five fixture rounds have paid.
+
+### FMLAL GATE RE-PIN x2 (~04:32Z): 532fec60f also misses K1 (P5 still on (F,F)) — pin to the next tip
+
+Main's check: P5 still instantiates the default (F,F) <FP16> domain
+(K1 requires ALL of P1-P5 on <FP16,true>) — a one-token addon fix.
+BOTH native runs (station I8MM + .80 NEON) pin to the tip AFTER that
+fix; the .80 NEON slot stays held; #209 waits for the corrected tip's
+handoff. The direct-iteration grant covers the fix (addon builds+runs
+the half binary itself until green under both envelopes).
