@@ -2616,3 +2616,14 @@ tunnel identity needs refreshing from the station side when next
 needed. All other sessions match last verified state (reviewer
 compacted+idle 60% ctx; i08repair idle 80% post-fix; Main idle
 on-call; CB lead thinking — their own program).
+
+### AUDIT CORRECTION: station "tunnel down" exception RETRACTED (my error)
+
+The trycloudflare hostname I probed is the "josh" intercom remote's
+rotating dynamic tunnel — NOT the station (operator correction). The
+station is the configured intercom remote "dgx-station" and is ALIVE:
+two live peers verified (c290 ARM station session, idle; c527 CB C1
+worker, thinking). Standing method fixed: fleet hosts are reached via
+intercom list-remote (wsl, hetzner-docker, josh, dgx-station), never
+hardcoded SSH hostnames. Audit exception 2 retracted in full; exception
+1 (tournament launch-lag ping to sparks) stands unchanged.
