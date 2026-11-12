@@ -2466,3 +2466,16 @@ Also noted by the reviewer: Oracle2 remains shared-walker/metamorphic
 (not independent full-engine proof) — accepted framing for a diagnostic
 bench; uncommitted proofs = lane reports, not reviewer-authenticated
 evidence.
+
+### FINDING-4 FIX-FORWARD @ 74d228047 (~19:22Z) → reviewer ACK request
+
+Per-invocation observation boundary: volatile quiet-NaN sentinel dirty
+before the clock (DSE-proof edge) → boundary materialization after the
+clock edge (sentinel scan + per-sample FNV-1a digest into distinct
+evidence slots) → untimed chain (per-sample determinism + arm equality).
+Acceptance negative proven standalone (omitted one_pass fails on the
+FIRST sample at M=1 and M=15; partial/wrong/stale/arm-disagree each
+fail their control). Open design question for the reviewer:
+materialization at boundary-after-clock vs inside the timed interval
+(one-line flip if required). ACK request dispatched; .79 re-run gated
+on it.
