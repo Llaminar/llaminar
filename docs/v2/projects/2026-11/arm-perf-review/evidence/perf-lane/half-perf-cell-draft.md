@@ -1041,3 +1041,19 @@ inspect/top/network-none facts + the thirsty_benz observation.
 (exit 127; archived attempt15-wrapper-path); the NEON gate NOW RUNNING
 as watcher fmlal-neon-gate-r2 (22ea42db0): reconfigure → NEON build
 (separate OneDNN build-neon identity) → three JUnit runs at 0ad09600b.
+
+### FMLAL SOURCE CLOSURE (~04:39Z): K1/K2 source-closed at 0ad09600b — no remaining blocking source finding
+
+The reviewer's exact-tip source pass: ALL five primitive calls
+explicitly <FP16,true>; FmlalProbe :578 covers P1-P5 and retires before
+the restored-off arm; P1/P2 legal zero-M/zero-N handling; P3 null-
+rejection before instrumentation; P4 = live positive control keyed to
+ACTUAL RESOLVED FMLAL eligibility; P5 = positive dims + real zero-count
+ProjectionRowWorkScope + enabled evidence reaching the live-span scan;
+off/on/off + public-rejection + no-FMLAL/Scalar separated; no
+GTEST_SKIP. Successor = fixture-only (+12/-8 from e8); production/
+admission/arithmetic/CMake unchanged from 14888. **Static source
+closure — NOT a claim #8/station passed; no authentication; no landing
+instruction; economy NOT ADMITTED; #209 open for the native handoff.**
+Chain: #8 (running) + station NEON gate (running) → greens → #209 →
+application → PR commits.
