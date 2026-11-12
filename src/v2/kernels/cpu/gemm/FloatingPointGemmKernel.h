@@ -92,6 +92,28 @@ inline unsigned long long fmlalLeafInvocations() noexcept
 inline constexpr unsigned long long fmlalLeafInvocations() noexcept { return 0; }
 #endif
 
+/**
+ * @brief The FPCR profile the FMLAL leaf's ambient conversion contract runs
+ *        under: RNE rounding with flush-to-zero off for binary32 and
+ *        binary16, and the IEEE binary16 format (AHP off).
+ *
+ * FPCR.FZ16 is bit 19; bit 26 is AHP (the alternative half-precision
+ * format), which would change every FCVT conversion's result format and is
+ * therefore part of the same admission.
+ */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
+inline bool fmlalFpcrProfileAdmitted(std::uint64_t fpcr) noexcept
+{
+    constexpr std::uint64_t kRModeMask = 0x3ull << 22;
+    constexpr std::uint64_t kFZ = 0x1ull << 24;
+    constexpr std::uint64_t kFZ16 = 0x1ull << 19;
+    constexpr std::uint64_t kAHP = 0x1ull << 26;
+    return (fpcr & (kRModeMask | kFZ | kFZ16 | kAHP)) == 0;
+}
+#else
+inline constexpr bool fmlalFpcrProfileAdmitted(std::uint64_t) noexcept { return true; }
+#endif
+
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
@@ -1262,10 +1284,7 @@ namespace llaminar2
             // than silently changing bytes. No global FPCR writes anywhere.
             std::uint64_t fpcr;
             asm volatile("mrs %0, fpcr" : "=r"(fpcr));
-            constexpr std::uint64_t kRModeMask = 0x3ull << 22;
-            constexpr std::uint64_t kFZ = 0x1ull << 24;
-            constexpr std::uint64_t kFZ16 = 0x1ull << 26;
-            if ((fpcr & (kRModeMask | kFZ | kFZ16)) != 0)
+            if (!fmlalFpcrProfileAdmitted(fpcr))
             {
                 LOG_ERROR("FloatingPointGemmKernel - FMLAL leaf requires the "
                           "process FP profile RNE with FZ/FZ16 off; observed "
