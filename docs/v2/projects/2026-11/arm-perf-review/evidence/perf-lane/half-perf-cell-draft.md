@@ -939,3 +939,15 @@ BOTH native runs (station I8MM + .80 NEON) pin to the tip AFTER that
 fix; the .80 NEON slot stays held; #209 waits for the corrected tip's
 handoff. The direct-iteration grant covers the fix (addon builds+runs
 the half binary itself until green under both envelopes).
+
+### FMLAL GATE SCHEDULE FLIP (~04:34Z): Main #8 on .80 (I8MM) + station NEON in parallel
+
+Gate tip 0ad09600b: Main verified ALL 5 primitive calls <FP16,true>
+with per-arm probe scopes (K1 finally closed after two review rounds
+missed P5). Schedule flip (Main's proposal): **Main runs #8 NOW on .80
+(I8MM focused + full canonical = the native I8MM run, Main-
+authenticated); the STATION runs the NEON-envelope build + binary at
+0ad09600b in parallel** (different host, no .80 overlap) — replacing
+the previous station-I8MM plan. W3 (B4) yields .80: not-started →
+holds; mid-build → finishes then #8. Green both → the reviewer's #209
++ application → PR commits.
