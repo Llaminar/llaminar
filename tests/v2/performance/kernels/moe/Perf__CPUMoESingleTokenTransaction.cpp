@@ -151,25 +151,42 @@ namespace
     public:
         KernelDomainProofScope()
         {
+            // Enable BOTH switches the counters gate on: the per-domain
+            // filter (isDomainEnabled) AND the collector's overall enabled
+            // switch. The W2 domain dump proved the filter alone leaves
+            // policy.enabled=false (the profile/legacy/stage-timing/
+            // summary/json/csv triggers all unset), so addCounterObserv-
+            // ationBatch's isDomainEnabled gate passes while the collector
+            // holds nothing - the counters never record. The summary
+            // trigger turns the collector ON without recording stage
+            // timing; the filter then scopes the domains.
             if (const char *value = std::getenv("LLAMINAR_PERF_STATS_FILTER"))
                 prior_filter_ = value;
+            if (const char *value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY"))
+                prior_summary_ = value;
             if (setenv("LLAMINAR_PERF_STATS_FILTER", "kernel", 1) != 0)
                 throw std::runtime_error("Cannot enable the kernel proof domain");
+            if (setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1) != 0)
+                throw std::runtime_error("Cannot enable the stats collector");
             PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
         ~KernelDomainProofScope() noexcept
         {
-            const int status = prior_filter_
+            const int filter_status = prior_filter_
                 ? setenv("LLAMINAR_PERF_STATS_FILTER", prior_filter_->c_str(), 1)
                 : unsetenv("LLAMINAR_PERF_STATS_FILTER");
-            if (status != 0) std::terminate();
+            const int summary_status = prior_summary_
+                ? setenv("LLAMINAR_PERF_STATS_SUMMARY", prior_summary_->c_str(), 1)
+                : unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            if (filter_status != 0 || summary_status != 0) std::terminate();
             PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
         KernelDomainProofScope(const KernelDomainProofScope &) = delete;
         KernelDomainProofScope &operator=(const KernelDomainProofScope &) = delete;
 
     private:
-        std::optional<std::string> prior_filter_; ///< Caller filter, restored on exit.
+        std::optional<std::string> prior_filter_;  ///< Caller filter, restored on exit.
+        std::optional<std::string> prior_summary_; ///< Caller summary env, restored on exit.
     };
 
     /** @brief Fill the guard tail behind a live bank extent. */
