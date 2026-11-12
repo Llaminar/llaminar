@@ -792,3 +792,29 @@ tree 9d9f020b3). Scope: focused cells PLUS the complete canonical
 Unit+preflight (L4 changes startup ISA admission). .80 held by Main
 until exit. Post-#6 .80 queue: W3 (B4 Integration 52fec643f) → 27B
 rider. B1 export done pending the seal.
+
+### FMLAL #6 PRE-VERDICT (~03:05Z): SOURCE HOLD at f987501f9 — H1-H4 (H1/H2/H3 = source-predicted #6 failures)
+
+Fresh exact-tip verdict (full landing identity 74797687f..f987501f9, 7
+files +755/-11 + the b5 successor delta; no execution):
+- H1: the selection fixture never constructs FmlalProbe (defaults false;
+  KTail/Specials restore false) → counts 0 vs :495 expecting 1 on the
+  native route. Source-predicted #6 failure; give the positive control
+  its own evidence scope.
+- H2: the FPCR predicate compiles real only under __ARM_FEATURE_FP16_FML
+  (else returns true for every word) while :512-516 requires five false
+  results under __aarch64__ → ordinary NEON/DOTPROD builds fail all
+  five. Pure integer policy must stay truthful; no always-admit stub;
+  include the RMode=10 discriminator.
+- H3: :1486 admits N=0 (evidence enabled → live-row found, increment 1,
+  column loop zero = no FMLAL work) → N>0 in the predicate; the
+  live-span scan runs BEFORE the enabled check → move it behind.
+- H4: requireCompiledEnvelope() outside the cached initializer (:274
+  caches only resolveCPUISALevel()) → every activeISALevel() call
+  repeats full admission (all ISA_DISPATCH macros use this hot getter).
+  Bind into the cached path, retaining Scalar coverage.
+CLOSED: L1 guarded; L2 the real route + [N,K]={1,16}; L3 FZ16=19/AHP=26
+on the executing worker; the 2^-24 weight-side case pins 0x33800000;
+L4 functionally repaired (subject to H4); the L5 improvements accepted.
+NONBLOCKING: x86 arm wording → "no FMLAL" (x86 can run AVX2/AVX512).
+Main owns #6; implementation authorized; economy NOT ADMITTED.
