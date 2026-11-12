@@ -119,3 +119,13 @@ at 79967de27 = ~2.6h without status — RE-QUERIED. Station: the NEON
 gate complete (GREEN; receipts relayed); the c527 incident resolved to
 origin; idle-with-queue. A2 exports: consumed. The M=1 re-booking
 follows the B4 canonical (the hard-fail run-sheet fix routed to addon).
+
+### STATE AUDIT (08:54Z cycle): M=1 re-run + W2 instrumented round queried
+
+.80: the idea-04 M=1 re-run (the corrected run-sheet at 7a4790c77) —
+launch/phase/seal status queried (the failed-empty class must not
+repeat; the hard-fail guard is the test). .79/W2: the instrumented
+round at e120f13e8 — the CPU_STT_KERNEL_DOMAIN raw dump is the
+deliverable (recording-vs-visibility discrimination for the A-path
+counters). Station: idle-with-queue (the NEON gate done). B1ATTR2:
+sealed; addon3's analysis is the consumer.
