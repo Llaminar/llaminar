@@ -282,3 +282,15 @@ GPU guards both stay); (3) push → report the tip → W3 books
 seal) — runtime evidence only; the 224 HOLD stands until the reviewer's
 re-verdict at the rebased tip. B4 candidate chain: W3 → re-verdict →
 checks → candidate.
+
+### COORDINATOR CORRECTION (~04:25Z): the "J2 fix" in my W3-order message was MY ARC CONFLATION
+
+The "reviewer-242 primitive-level counter controls" item belongs to the
+FMLAL arc (Test__CPUHalfOperands.cpp — the reviewer's 67afc62ea verdict,
+which Main received and I only partially saw). Addon2's B4 branch has NO
+open J2. Corrected B4 pre-W3 steps: (1) rebase onto 74797687f; (2) push
+→ report tip → W3 books. The round-4 HOLD (688b0c14b) stands formally
+until the reviewer re-verdicts at the rebased + Linux-validated tip.
+Addon2 instructed to NOT start any J2 work (nothing to fix beyond the
+rebase). Lesson: arc-crossing references (FMLAL J-numbers vs B4
+A-numbers) must carry their arc label explicitly in routings.
