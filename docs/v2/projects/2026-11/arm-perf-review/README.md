@@ -2181,3 +2181,19 @@ container; the M=1 window is queued behind main-b1ab, not running.
 Serialized lease chain confirmed first-hand. Reporting rule going
 forward: every host report states LEASE HOLDER + QUEUE explicitly
 (association ≠ execution).
+
+### SPARKS DISCLOSURE RECONCILIATION (~11:36Z): the 10:25Z M=1 attempt is NOT evidenced on either host
+
+Sparks disclosed (11:32Z) an M=1 build attempt "starting ~10:25Z" on
+.80 that created build-i04 + /work/i04-run2.log. Direct verification
+(11:34Z, both hosts): (1) .80 docker ps -a — NO lane container ever
+(only main-*); (2) /work/i04-run2.log — absent on BOTH hosts; (3)
+build-i04 on .80 — build.ninja/CMakeCache stamped 08:00-08:04 +0100 =
+the ORIGINAL morning M=1 attempt (the failed-empty one), NOT 10:25Z;
+(4) .79 — no build-i04, no logs. **Conclusion: no overlap ever
+occurred; .80 single-occupant throughout; the 10:34Z grant to Main was
+valid (idle).** Sparks asked to reconcile what actually ran at 10:25Z
+(shell history) and correct the disclosure's artifact claims. NO fault
+assigned — honest-reconciliation culture; the queue discipline stands
+(no launch until Main's explicit handback + arm-perf GO + docker-ps
+re-verification).
