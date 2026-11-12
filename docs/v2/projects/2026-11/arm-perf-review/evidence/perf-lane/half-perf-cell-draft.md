@@ -852,3 +852,16 @@ REMAINING (FmlalRouteProbeDiscrimination fixture only):
 EXPECTED #7 from source: :538 fails, then :553 fails fatally.
 DISPOSITION: Main owns #7; implementation authorized; economy NOT
 ADMITTED; B4 pending; B9 closed.
+
+### FMLAL J-FIX TIP + RUNTIME GATE (~04:07Z): 67afc62ea → station compile+run
+
+Addon's J1/J2 successor tip **67afc62ea** (probe scoping, zero-N/null-A
+public-rejection checks, resolved-route keyed positive-live assertion,
+the all-inactive-span control via a real ProjectionRowWorkScope) maps
+1:1 to Main's #7 findings. **RUNTIME GATE dispatched to the station**
+(Grace GCC 14.2): incremental rebuild (warm OneDNN + legacy-transport
+machinery) → the full v2_test_cpu_half_operands binary (all cells incl.
+FmlalRouteProbeDiscrimination) → JUnit + exit + SHAs to coordinator +
+addon. Functional truth only; same envelope/discipline. Cross-host PASS
+at the J-fix tip completes the FMLAL evidence chain for the landing
+cycle. Idea-04 M=1 window queues behind it.
