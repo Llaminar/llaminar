@@ -2307,3 +2307,46 @@ Coordinator keeps: MTP rider run-sheet (queued behind the M=1 window),
 the census follow-up, the roadmap (NEW FILE:
 post-merge-performance-roadmap.md = the operator-commissioned full review,
 tiered + sequenced).
+
+### STATE AUDIT + RESULTS WAVE (~15:30Z)
+
+**IDEA-04 M=1 WINDOW SEALED — idea-04 CLOSES (measured-and-negative).**
+K14-I04M1-D5E04FDCE-20261112: 6/6 cells exit=0 (.80 results/w-m1act-
+20261112T141025Z; hard-fail guard verified). Q8_K 10-thread regression
+GONE: t10 median 1897 µs vs t8 2211 (−14%); monotone 1→20 on every
+encoding (Q8_K 15561→1631, Q8_0 same, Q6_K 25620→2076, Q4_K 12915→1083);
+knees Q6_K −18% (8→10), Q4_K −7% (10→12); no cliff. The C4/R2 landing
+resolved the original signal; NO implementation needed. Run-1 (13:11Z,
+ae51 anchor, 4 shapes) = discarded by sparks after the re-anchor
+instruction; run-2 (14:10:25Z, d5e04fdce) = the seal. ANCHOR NOTE:
+build-i04 was pruned BEFORE coordinator verification — anchor rests on
+sparks' run record + trees/tip@d5e04fdce (coordinator-verified) + CSVs;
+hygiene reminder sent (keep the last sealed build dir until the seal is
+coordinator-confirmed).
+
+**MTP MODE-ARTIFACT QUESTION SETTLED — the −27% is REAL.** The greedy
+rider seal K14-I16RIDER-880429059 (temp0+seed42, RESOLVED sampler) shows
+acceptance 38.89% at current_depth 10 with stochastic_accepts=0 — FULLY
+GREEDY still accepts only 38.89%, 18.39 tok/s vs no-MTP 25.2 = −27%.
+NOT a sampling artifact; the draft path itself regresses. The tracker's
+99%@depth-7 = a different protocol epoch. T2 CONTROL AUTHORIZED (fresh
+no-MTP arm, same anchor, same-day pair — sparks executing). POST-MERGE
+IMPLICATIONS (roadmap updated): (a) the policy candidate strengthens —
+model-class/topology-aware MTP default for MoE+CPU could recover ~27%;
+(b) NEW investigation: why did draft acceptance collapse (38.89% now vs
+99% recorded earlier — protocol/version diff must be identified);
+(c) the verifier LM-head routing B-candidate remains the kernel-side fix.
+
+**CENSUS = INCOMPLETE (corrected).** plan.json = orchestration CONFIG
+doc; plan.log = aggregate BOM (weights 26.7GB/total 34.9GB). NO per-
+tensor prepared-encoding enumeration exists — that input is still owed
+(observed per-tensor encoding + bytes through the production loader/
+packer; sizes the idea-08 prize). Sparks asked to propose the mechanism.
+
+**Lane ops**: both new lanes working (i08repair verified all 4 findings
+correctly, drafting the walker fix; p25design reading the codebase).
+Thinking-level downgrade detected (max→low→high at 14:13Z, harness-side,
+both lanes); restoration requested per the operator's explicit max
+requirement. Station download ~105GB/111.3GB. CB NUMA exchange closed
+read-only (their investigation continues; our no-change statement +
+confined-path evidence delivered).
