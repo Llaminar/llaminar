@@ -323,3 +323,15 @@ clean. **W3 BOOKED on .80: Integration NEON_I8MM at e09903875, both
 Unit targets, --no-tests=error, JUnit seal K14-B4-E09903875** → the
 reviewer's round-5 re-verdict binds to this landable tip. Then the 27B
 rider.
+
+### W3 RESULT (~06:15Z): BUILD_OK; 1 FAILED — GroupedTargetRowsMatchSerialM1 (:439)
+
+B4 Integration at e09903875 (the landable tip): BUILD_OK; the ctest
+found the recorded set; **1 FAILED: CPUDraftVocabularyBudgetHead.
+GroupedTargetRowsMatchSerialM1 (:439 — grouped verifier-rows vs serial
+M1 mismatch in the HEAD TU)**; the portable TU + the head's other
+cases pass. JUnit re-run ordered (--gtest_output=xml); seal
+K14-B4-E09903875 = the fail reported honestly + JUnit. The result
+routes to addon2 (diagnosis: fixture-side comparison question vs a
+production grouped-verifier gap) + the reviewer (the round-5 re-verdict
+at the landable tip, with JUnit in hand).
