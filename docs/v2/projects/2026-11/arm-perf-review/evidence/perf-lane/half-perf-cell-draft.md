@@ -1114,3 +1114,17 @@ worker), not a report-authenticity question. Origin CONFIRMED; the
 station relays the raw full-junit.xml + result.txt + neon-gate-exit.txt
 directly to Main + the reviewer for the #209 authentication. On the
 verdict: Main FF-applies 0ad09600b → PR commits.
+
+### #209 HANDOFF REVIEW REQUIREMENTS (~05:50Z): local paths/raw contents, not SHA prefixes
+
+The reviewer records the NEON summary as station-attributed (11/11,
+4/4, 12/12, exit 0, actual NEON envelope, FMLAL absent) and requests
+the LOCAL artifact paths (or raw contents) for the XMLs + exit log +
+the source/build/envelope record incl. the corrected flags extract —
+SHA prefixes are not readable receipts.
+Wording corrections: (1) :1488 A=0 = the primitive NULL-A control (P3),
+not zero-N/public admission; (2) Main #8 = green for half/focused but
+the full canonical = 3532/6/CANONICAL=8 — the cross-envelope HALF pair
+must not be described as a complete green prerequisite receipt.
+Source closure at exact 0ad stands; origin/tree/OneDNN authenticity =
+owner assertions pending the #209 review.
