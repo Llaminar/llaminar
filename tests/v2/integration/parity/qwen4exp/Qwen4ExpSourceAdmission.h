@@ -740,12 +740,17 @@ inline void expectQwen4ExpFixedPipelineOwners(const ModelParityCase& cell,
     ASSERT_EQ(pipeline->owners().size(),cell.topology.participants.size());
     ASSERT_EQ(placement.allocators().size(),pipeline->owners().size());
     ASSERT_EQ(placement.consumers().size(),static_cast<size_t>(cell.topology.pipeline_stage_sizes[ple_stage]));
-    ASSERT_TRUE(std::equal(placement.consumers().begin(),placement.consumers().end(),
-        pipeline->consumers().begin(),pipeline->consumers().end()));
-
     std::vector<std::size_t> offsets(stages.size());
     for(size_t stage=1;stage<stages.size();++stage)
         offsets[stage]=offsets[stage-1]+static_cast<size_t>(cell.topology.pipeline_stage_sizes[stage-1]);
+    std::vector<PhysicalMemoryAllocatorIdentity> declared_consumers;
+    for(int member=0;member<cell.topology.pipeline_stage_sizes[ple_stage];++member) {
+        const auto& original=cell.topology.participants.at(offsets[ple_stage]+static_cast<size_t>(member));
+        ASSERT_TRUE(original.world_rank);
+        declared_consumers.push_back({*original.world_rank,original.address.toLocalDeviceId()});
+    }
+    ASSERT_NO_THROW(requireQwen4ExpFixedPipelineConsumerCoordinates(
+        placement.consumers(),*pipeline,declared_consumers));
     std::set<DeviceId> owners;
     std::uint64_t next_row=0;
     int next_head=0;

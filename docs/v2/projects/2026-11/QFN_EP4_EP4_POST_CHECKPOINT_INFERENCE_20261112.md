@@ -1,0 +1,281 @@
+# QFN eight-MI50 inference after the passing checkpoint
+
+## Scope and qualification boundary
+
+Checkpoint `d1fd0a077` is published on `feat/qfn-ngram-continuation`. Its
+completed CTest lanes contain 5,256 passing selected Unit/preflight cases,
+zero skips, and 39 hardware-ineligible cases explicitly unqualified. The
+interrupted continuous driver observer prevented a complete whole-run receipt.
+The user accepted checkpointing that passing slice and canceled its redundant
+repeat. Neither that decision nor the focused work below creates an image,
+release, or complete preflight certificate.
+
+The next workload remains the original observed QFN
+`PP(EP(4×MI50), EP(4×MI50))`: discovery MPI rank 1 owns both stages on NUMA 1;
+stage 0 uses ROCm 7/6/8/9 and layers 0–23, stage 1 uses ROCm 1/3/4/2 and
+layers 24–47. Ngrams retain disjoint fixed-head VRAM ownership across all
+eight GPUs. The original nine prompt tokens, six teacher-forced observations,
+GGUF weights, reference snapshots, precision policy, and context are preserved.
+MTP is off; prefix caching remains enabled by the frozen configuration.
+
+## Defects isolated by the real-model diagnostic
+
+1. **Snapshot admission charged both PP stages for all layers.** The aggregate
+   diagnostic payload had lost layer ownership. Preserve each main-layer
+   contribution and project it through the planner's admitted layer interval;
+   retain global payloads. The materializer was already participant-local.
+   No capacity, bucket, model, or snapshot obligation is reduced. Planner BOM
+   regressions cover uneven intervals, whole-model sizing, malformed ownership,
+   and CUDA/ROCm resource descriptions. The next native attempt passed admission.
+
+2. **A storage-only pipeline participant never materialized its ngram range.**
+   The factory wrapper filtered participants by the PLE layer before reaching
+   the existing fixed-head storage-owner implementation. A shared typed role
+   selector now preserves those owners and uses their original loader,
+   PhysicalMemoryAuthority, source, staging, and publication path. The focused
+   factory test exercises both PLE-stage placements and the original eight-GPU
+   order. The next native attempt reached model forward execution.
+
+3. **Repeated retirement used borrowed stages after their destruction.**
+   Rank retirement correctly retired the pipeline once, but the pipeline's
+   later destructor revisited its borrowed device-stage pointers. Successful
+   retirement now revokes those borrows through a typed lifecycle. Strict
+   device-generation epoch checks remain unchanged. The production-body
+   replay covers 48 cold/submitted/maintenance combinations; the subsequent
+   failing native diagnostic exited normally instead of aborting in teardown.
+
+4. **Parity required an intentionally omitted short-context query projection.**
+   QSA's proven-no-ranking prefill program omits raw/prepared query producers.
+   Decode already had structural omission evidence; prefill did not. A fresh
+   successful exact-retained request observation now records its original
+   logical range, actual physical width, phase, selected program, and admitted
+   participants. The C++ and Python consumers independently verify the empty
+   ranking interval and every participant's counter delta. Missing work gains
+   no numerical samples or equality verdict. Published prefill values keep
+   their existing numerical comparison contract. Stale, padded, partial,
+   foreign-device, and wrong-phase witnesses fail. Actual C++ CSV output is
+   round-tripped through the Python consumer for both phases.
+
+5. **Supporting state publication was mistaken for generation-loop execution.**
+   Zero-output model forwards share event/publication infrastructure with
+   generation. The diagnostic interpreter now distinguishes those support
+   records and exact ForwardOnly admissions from actual generation requests.
+   Every original admitted device still needs complete capture and an
+   authenticated model-forward terminal observation. Setup capture alone is
+   insufficient; forward-only evidence never certifies full generation.
+   Ordinary, speculative, malformed, and unknown generation records retain
+   their existing fail-closed requirements. Replay tests also reject missing
+   completions, foreign devices, invalid counter extents, and overflow.
+
+6. **Nested PP diagnostic participant discovery expected only its leader.**
+   The first repaired native retry (`q53`) still failed the strict omission
+   proof. The top-level TP list is intentionally empty for local PP with
+   per-stage TP; the diagnostic interpreted that as one device. Participant
+   projection must instead retain the original prepared admission stages and
+   every stage's full member list. The focused nested-PP regression preserves
+   the original eight-device order and rejects duplicate, foreign-rank,
+   foreign-host, and conflicting memberships. Missing-query failures also
+   retain their actual counter observations for diagnosis. No participants
+   are inferred from the observed counters and no padded geometry is accepted.
+
+7. **Composed decode bypassed the direct-forward query observation.** A source
+   audit before the next costly native retry found that successful pipeline
+   ForwardOnly transactions never reached the direct DGO observation emitter.
+   Both paths now use one typed production recorder; the composed path records
+   each original child only after every terminal and output publication succeeds.
+   Completion retains its original executed family through admission retirement,
+   so clearing active request state cannot select a different family's signature
+   for cleanup or observation. The production recorder replay covers six rows,
+   participant counts through eleven, reset, partial completion, stale counters,
+   and role/program/width mismatches. It is a metadata observation, not another
+   device-state readback or a change to query computation.
+
+8. **The fixed pipeline hid its final lexical gather from snapshots.** Native
+   `q59` proved the original nine physical rows and all eight query-program
+   witnesses, then correctly rejected the missing `layer1_PLE_GATHER` output.
+   The terminal decoder already produced the full FP32 embedding; its stage
+   returned an empty dump description alongside the intermediate protocol nodes.
+   Only that terminal stage now exposes the original tensor and exact physical
+   subview as `gathered_rows`, using the existing semantic mapping and ordered
+   snapshot authority. Intermediate packets remain private. A device-free
+   regression exercises the actual production descriptor and snapshot extractor,
+   offset/extent validation, repeated/reset geometries, and all three PLE keys.
+   The diagnostic now reports every missing required key in one phase together.
+
+9. **Completed composed Decode did not publish its captured snapshots.** The
+   `q62` prefill gate passed, and its Decode parent completed, but the composed
+   path never invoked the ordinary executor snapshot-publication callbacks.
+   `ForwardExecutionEngine` now authenticates the exact cached child/capture,
+   producer stream and snapshot-configuration epoch, then publishes that child's
+   already-written manifest through the existing acquisition path. It records
+   the original last-executed source only after success. The pipeline uses its
+   retained completed family for every participant; no graph is re-executed or
+   recaptured. An actual-engine mock replay exercises repeated geometries and
+   rejects stale identities, epochs, default streams and reset-invalidated views.
+
+10. **Failed numerics suppressed the authenticated owner configuration.** The
+    original join previously conflated work success and communicator-borrower
+    retirement. They are now separate typed outcomes in the same compact
+    terminal exchange. Only the authenticated original active owner may export
+    after every borrower retires; numerical failures remain failed in receipts.
+    This preserves useful diagnostic configuration without qualifying failed work
+    or inventing an execution/discovery-rank mapping.
+
+11. **Snapshot publication consulted a withdrawn child stream.** A composed
+    parent supplies its exact producer stream, but the executor queried the
+    child's unavailable standalone stream before consulting that override.
+    The explicit producer now owns publication directly; missing, null and
+    default stream validation remains strict. Actual-executor replay covers
+    six observations, exact events and no additional input transfers. `q68`
+    passed all four focused executor/engine aliases. The next native run
+    published all six Decode steps and all eight canonical CSV artifacts.
+
+12. **A one-row prefill tail left replicated GDN state one token behind.**
+    `q69` first diverged at layer 0 short convolution, with relative L2
+    0.134/0.067/0.042 on the first three Decode rows, then approximately
+    0.001. The original prompt uses exact retained chunks of 8+1 rows.
+    Its final chunk is explicitly Prefill and updates TP-local convolution
+    and recurrence banks, but a `rows > 1` graph guard omitted publication
+    into the full banks used by replicated Decode. Prefix serialization
+    faithfully preserved both banks, including the stale full state.
+    Graph and workspace admission now share a typed producer-layout rule:
+    every positive linked-local producer publishes; full replicas do not
+    perform a redundant gather. Regressions distinguish Prefill 8/1/9 from
+    Decode 1/2 and replay retained native handoffs with dirty full banks.
+    The graph/accounting/telemetry selection passed all seven aliases in
+    `q71`; native CUDA and ROCm retained handoff replays both passed in `q74`,
+    with zero driver findings. `q75` confirmed the fix: all six layer-0
+    short-convolution relative errors are 0.00077–0.00110, and recurrence
+    errors 0.00053–0.00130. The old three-token history-error signature is gone.
+
+13. **Outer PP position telemetry reported its scheduler cursor.** The
+    completed child Decode observations advanced from 10 through 15, while
+    the outer probe retained 9. The projection now uses the original terminal
+    stage's already-acquired scalar/vector state, preserving independent
+    positions of other stages and leaving the host scheduler unchanged.
+    Focused replay covers reset, restore, repeated/partial work and a missing
+    terminal observation; its Unit and explicit preflight aliases passed in
+    `q71`; `q75` has no remaining logical-position failure. This observation
+    fix changes no model arithmetic.
+
+14. **The source-admission assertion conflated membership and wire order.**
+    Canonical ngram layout geometry sorts allocator identities; the fixed
+    pipeline intentionally retains the original PLE-stage participant order.
+    Requiring the two orders to match rejected valid unsorted original domains.
+    The test now proves unique exact membership independently of exact
+    original stage/wire order. Per-owner ranges, participant indices, UUIDs,
+    budgets and communication obligations remain unchanged. A focused
+    device-free regression exercises both backend descriptions, both PLE-stage
+    placements, and missing/duplicate/foreign/reordered negative cases.
+
+## Focused validation and next measurement
+
+The `q69` real-model retry retained the green prefill final-logit KL
+**0.012907**, top-1 agreement **1.0**, and top-5 agreement **1.0** on the
+ original frozen prompt. All six Decode observations are now published:
+KL **0.811063, 0.329030, 0.890677, 0.713227, 0.311029, 3.1799**;
+top-1 **4/6**, mean top-5 **0.5667**. This is an actual red numerical result,
+not missing evidence. The state-handoff fix above must resolve it without
+changing the reference, precision or acceptance gates. All eight original
+participant identities and completed terminal joins remain authenticated.
+
+After the handoff and position fixes, `q75` Decode KL is **0.0580601,
+0.0431418, 0.203313, 0.525417, 0.0538835, 0.305822** (mean **0.1982729**),
+top-1 **5/6**, mean top-5 **0.7333**. Prefill is unchanged. All six layer-0
+GDN convolution/recurrence comparisons now agree near 0.1% relative L2.
+The next large discontinuity occurs when the selected expert set changes:
+first affected layers **17, 31, 10, 12, 2, 2** respectively. Small observed
+router errors exceed the independent reference's narrow tenth/eleventh-expert
+probability margins. No selector defect or same-input arithmetic equivalence
+is claimed from that observation. The original SingleQ8 GDN output projection
+is the earliest consistent amplification and needs a same-input comparison
+before assigning the remaining drift to intended quantization. The existing
+parity-owned bounded raw snapshot exporter supplies those operands; the older
+generic SnapshotConfig dump flags have no live call sites in this tree.
+
+`q78` removed the source-admission assertion failures and repeated all six
+`q75` KL measurements unchanged, with a clean driver window and retired native
+owners. The existing bounded exporter retained 2.50 MiB of operands. Offline
+same-input calculations read only the original layer-0 `ssm_out` Q8_0 tensor
+and five original router tensors; no weights were requantized or payloads
+hashed. Native GDN projection versus the independently reconstructed SingleQ8
+operand agrees within **9.42e-8** relative L2 on all six Decode observations;
+the intended Q8 activation effect itself is **0.00833–0.01053** versus the
+same original FP32 input. The nine Prefill rows show the same behavior.
+
+At all six first expert-set changes, independent FP16-operand/FP32-accumulator
+router calculations agree with native probabilities within **1.34e-7** relative
+L2 and reproduce the selected expert sets. Normalized selected weights agree
+within **1.49e-8** maximum absolute error. Original-reference-input FP32
+calculations also reconstruct the reference. Using FP32 operands on the
+already-perturbed native input retains five of the six changed sets: promoting
+the router alone would not remove the main upstream quantization effect.
+These numerical comparisons establish the cause at the checked sites; they
+do not waive the failed final-logit gate or certify every kernel/native byte.
+Reports and offline scripts are under `/tmp/qfn-q75-same-input-diagnosis/`.
+
+The next controlled option is the already-supported TwoTermQ8 GDN output
+operand. It must have its own declared arithmetic binding and frozen replay
+descriptor, with the original source, histories, references and thresholds
+unchanged. Runtime environment changes alone cannot silently alter the
+SingleQ8 case's authenticated policy. Production defaults remain unchanged.
+
+That controlled candidate was prepared under
+`/tmp/qfn-postcheckpoint-focused-panel-prep/gdn-output-two-term/`.
+Only its declared GDN-output selector changed; all document-identity updates
+followed from that change. The canonical freezer accepted it, the fixture-only
+build `q82` passed, and all six binding/history checks passed in `q83`.
+`q84` then stopped before model forwards with the explicit **unqualified TP
+GDN-output source-interval** diagnostic. It has no numerical or performance
+result; native teardown and its driver window completed cleanly.
+
+The existing operator supports local TwoTerm arithmetic, but GDN prefill packs
+potentially noncontiguous value-head column spans. Its current source contract
+requires a complete dense interval. Extending support must authenticate that
+actual packed layout, retain the original native codebook and existing rank
+reduction, and qualify same-topology serial/grouped replay. Removing the guard
+is insufficient. There is also no existing phase-aware operand policy that
+can honestly select SingleQ8 Prefill and TwoTerm Decode under this scalar
+setting. This extension remains separate from the verified production fixes.
+The original SingleQ8 binding was restored in `q85`/`q86`. Next characterize the complete
+frozen corpus through an explicitly unscored diagnostic route, retaining every
+short-history numerical failure and all original acceptance limits.
+
+The original seven admission/factory/retirement registrations passed. The
+extended selection has 17 registrations: 13 passed in `q50`; two new fixture
+mistakes caused the other four aliases to fail. Correcting canonical device
+spellings and separating numerical verdicts from invalid provenance made all
+four pass in `q52`. The existing 146-test campaign-driver suite and native
+collector suite passed. Nested participant regressions passed in `q55`, seven
+composed-observation/retirement/collector checks in `q58`, five PLE/snapshot
+checks in `q61`, eight composed-snapshot/export checks in `q65`, and four
+explicit-stream checks in `q68`. These are focused results, not a full rerun.
+
+The GDN/PP candidate built in `q70` (350.2 s), followed by seven passing
+focused aliases in `q71` (45.1 s). `q72` passed ROCm but exposed an error in
+the revised CUDA regression's selection predicate: CUDA publishes its original
+SM major/minor and leaves the ROCm-style `native_isa` string empty. The fixture
+now checks the existing SM observation for its selected endpoints; no device
+alias, ownership override or extra probe was added. Its single-owner rebuild
+`q73` took 29.1 s. Both native aliases passed in `q74` (11.5 s CTest), with a
+complete clean driver window. The original model retry is `q75`, in
+`numerical-run-9`.
+
+Local evidence is under `/tmp/qfn-full-preflight-after-cpu-next/` and
+`/tmp/qfn-postcheckpoint-focused-launch/`: builds `q48`/`q51`, focused JUnit
+files `q50-focused-evidence-regressions.xml` and
+`q52-focused-evidence-regressions.xml`, and the original failing exact-cell
+artifacts `numerical-run-1` through `numerical-run-8`. The `q69` driver window
+completed with zero findings; native processes retired, all nine MI50s returned
+to approximately 10.4 MiB driver usage, and the 114 GB run-scoped source staging
+was removed. Peak sampled active-rank RSS was approximately 49.8 GiB with full
+diagnostic snapshots; this is not a long-session leak qualification.
+
+The functional repairs have focused model-free and native coverage; the
+original model now supplies complete snapshots and authentic source/ownership
+observations. Its final-logit quality remains red on this frozen short history.
+The complete unchanged 16-history observation is the next diagnostic before
+choosing another precision extension. The canonical scored panel still requires
+its original successful binding; unscored collection must retain its own
+non-certifying status. No Release throughput, complete corpus acceptance or
+image qualification follows from the repairs or the offline arithmetic proof.

@@ -23,6 +23,7 @@
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
 #include "integration/parity/qwen4exp/Qwen4ExpModelParityDefinitions.h"
 #include "integration/parity/qwen4exp/Qwen4ExpObservedPipelineCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpObservedPipelineTerminalEvidence.h"
 #include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
 #include "config/OrchestrationConfigParser.h"
 
@@ -3516,3 +3517,37 @@ TEST(ModelParityDefinition, ObservedQFNFixedVRAMTerminalReceiptsUseLiveExtents)
     EXPECT_THROW((void)native::requireFixedHeadPipelineTerminalEvidence(records,uniform,row_bytes),std::invalid_argument);
 }
 } // namespace llaminar2::test::parity
+
+/** @test Failed numerics preserve original active-owner config only after actual terminal retirement. */
+TEST(ModelParityDefinition, ObservedQFNConfigurationExportRequiresOriginalRetiredOwner)
+{
+    namespace observed=::llaminar2::test::parity::qwen4exp;
+    using ::llaminar2::ExecutionRankSelection;
+    using Retirement=observed::ObservedPipelineRetirement;
+    using Work=observed::ObservedPipelineWorkOutcome;
+    using Outcome=observed::ObservedPipelineRankTerminalOutcome;
+    using Evidence=observed::Qwen4ExpObservedPipelineTerminalEvidence;
+    const std::optional<ExecutionRankSelection> selected{ExecutionRankSelection({1})};
+    std::vector<Outcome> ranks{{Retirement::Retired,Work::Succeeded},{Retirement::Retired,Work::Failed}};
+    const Evidence failed(ranks);
+    EXPECT_TRUE(failed.allRetired());EXPECT_FALSE(failed.succeeded());
+    EXPECT_TRUE(failed.mayExportConfiguration(selected,1));
+    EXPECT_FALSE(failed.mayExportConfiguration(selected,0));
+    EXPECT_FALSE(failed.mayExportConfiguration(std::nullopt,1));
+    EXPECT_FALSE(failed.mayExportConfiguration(selected,-1));
+    EXPECT_FALSE(failed.mayExportConfiguration(selected,2));
+    EXPECT_FALSE(failed.mayExportConfiguration(ExecutionRankSelection({0,1}),1));
+    ranks[1].work=Work::Succeeded;
+    const Evidence succeeded(ranks);
+    EXPECT_TRUE(succeeded.succeeded());EXPECT_TRUE(succeeded.mayExportConfiguration(selected,1));
+    for(const int rank:{0,1}) {
+        auto live=ranks;live[rank].retirement=Retirement::Live;
+        const Evidence unretired(live);
+        EXPECT_FALSE(unretired.succeeded());EXPECT_FALSE(unretired.mayExportConfiguration(selected,1));
+    }
+    const std::optional<Evidence> before_join;
+    EXPECT_FALSE(before_join && before_join->mayExportConfiguration(selected,1));
+    EXPECT_THROW((void)Evidence(std::span<const Outcome>{}),std::invalid_argument);
+    ranks[1].work=static_cast<Work>(2);
+    EXPECT_THROW((void)Evidence(ranks),std::invalid_argument);
+}

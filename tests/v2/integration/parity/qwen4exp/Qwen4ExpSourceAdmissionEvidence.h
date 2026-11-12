@@ -17,6 +17,7 @@
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
 #include "loaders/ImmutableRowTable.h"
+#include "loaders/ImmutableFixedHeadPipelineProjection.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/ModelContext.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -931,5 +932,34 @@ qwen4ExpMTPSourceServingParticipants(const ModelParityCase &cell, int rank,
         return {{"expert-source/rank" + std::to_string(rank), plan.primary_device.toLocalDeviceId(),
                  {}, false, 1, Qwen4ExpMTPSourceParticipantRole::ExpertFragment}};
     return qwen4ExpMTPSourceServingParticipants(plan, programs, host_setup);
+}
+/**
+ * @brief Authenticate placement membership separately from original pipeline consumer coordinates.
+ * @param canonical_consumers Canonical allocator-ordered placement consumer roster.
+ * @param pipeline Original checked stage/wire projection, whose order is semantically significant.
+ * @param declared_consumers Original PLE-stage participant order from the admitted cell.
+ * @throws std::invalid_argument For missing/duplicate/foreign consumers or changed original wire order.
+ * @details Layout geometry sorts membership for canonical source identity; native
+ * pipeline projection retains authored stage order. Neither roster may be
+ * reordered to repair the other, and observations never supply membership.
+ */
+inline void requireQwen4ExpFixedPipelineConsumerCoordinates(
+    std::span<const PhysicalMemoryAllocatorIdentity> canonical_consumers,
+    const ImmutableFixedHeadPipelineProjection& pipeline,
+    std::span<const PhysicalMemoryAllocatorIdentity> declared_consumers)
+{
+    const auto wire=pipeline.consumers();
+    if(canonical_consumers.size()!=wire.size() || declared_consumers.size()!=wire.size())
+        throw std::invalid_argument("Fixed PLE placement and original stage require the complete consumer roster");
+    const auto unique=[](auto roster) {
+        for(std::size_t i=0;i<roster.size();++i)
+            if(std::find(roster.begin()+i+1,roster.end(),roster[i])!=roster.end())return false;
+        return true;
+    };
+    if(!unique(canonical_consumers) || !unique(declared_consumers) ||
+        !std::is_permutation(canonical_consumers.begin(),canonical_consumers.end(),wire.begin(),wire.end()))
+        throw std::invalid_argument("Fixed PLE placement changed its original consumer membership");
+    if(!std::equal(wire.begin(),wire.end(),declared_consumers.begin(),declared_consumers.end()))
+        throw std::invalid_argument("Fixed PLE pipeline changed its original stage consumer order");
 }
 } // namespace llaminar2::test::parity::qwen4exp

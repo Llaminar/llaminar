@@ -9,6 +9,7 @@
  */
 
 #include "utils/ParitySnapshotMemoryCapacity.h"
+#include "planning/MemoryPlanner.h"
 
 #include <cnpy.h>
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -343,5 +344,109 @@ TEST(ParitySnapshotMemoryCapacity, NativeRawQueryWithoutHeaderKeepsOtherHeadersM
         FAIL()<<"A distinct prepared producer still needs its authenticated header";
     } catch(const std::invalid_argument& error) {
         EXPECT_NE(std::string(error.what()).find(prepared.semanticKey()),std::string::npos);
+    }
+}
+
+/** @test PP admission retains only resident canonical layers while preserving wide replay geometry. */
+TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesProjectUnevenPipelineLayers)
+{
+    TemporarySnapshotDirectory snapshots;
+    saveCheckpoint(snapshots.path()/"embedding.npy", {9u, 2u});
+    saveCheckpoint(snapshots.path()/"decode_step0_embedding.npy", {1u, 2u});
+    for (const int layer : {0, 1, 2})
+    {
+        const auto key = "layer" + std::to_string(layer) + "_ATTN_OUTPUT";
+        saveCheckpoint(snapshots.path()/(key+".npy"), {9u, static_cast<std::size_t>(layer+1)});
+        saveCheckpoint(snapshots.path()/("decode_step0_"+key+".npy"), {1u, static_cast<std::size_t>(layer+1)});
+        saveCheckpoint(snapshots.path()/("decode_step1_"+key+".npy"), {1u, static_cast<std::size_t>(layer+1)});
+    }
+    const auto evidence = deriveParitySnapshotMemoryCapacity(snapshots.path(), 9, 512, {}, {},
+        ParitySnapshotPayloadProjection::RetainedMainServingPhases);
+    ASSERT_TRUE(evidence.capacity.main_phase_payload);
+    const auto &payload = *evidence.capacity.main_phase_payload;
+    const auto inventory = llaminar2::ServingSnapshotArenaInventory::ordinary(true, false, 0, 0);
+    ASSERT_EQ(payload.layers.size(), 3u);
+    EXPECT_EQ(payload.bytesFor(inventory), 514u * (2u+1u+2u+3u) * sizeof(float));
+    EXPECT_EQ(payload.bytesFor(inventory, 0, 0), 514u * (2u+1u) * sizeof(float));
+    EXPECT_EQ(payload.bytesFor(inventory, 1, 2), 514u * (2u+2u+3u) * sizeof(float));
+    EXPECT_EQ(payload.bytesFor(inventory, 3, 3), 514u * 2u * sizeof(float));
+    // The global producer remains in both stages; repeated observations never
+    // manufacture extra retained arena owners or shrink the 512-row replay lane.
+    EXPECT_EQ(payload.bytesFor(inventory, 0, 0)+payload.bytesFor(inventory, 1, 2),
+        payload.bytesFor(inventory)+514u*2u*sizeof(float));
+    EXPECT_EQ(deriveParitySnapshotMemoryCapacity(snapshots.path(), 9, 512, {}, {},
+        ParitySnapshotPayloadProjection::RetainedMainServingPhases).capacity, evidence.capacity);
+}
+
+/** @test Malformed ownership cannot silently omit a layer or duplicate an arena charge. */
+TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesRejectInvalidLayerOwnership)
+{
+    const auto inventory = llaminar2::ServingSnapshotArenaInventory::ordinary(true, false, 0, 0);
+    llaminar2::MainSnapshotPhasePayload payload{.layers = {{0, 512u, 1u}, {1, 1024u, 2u}}};
+    EXPECT_THROW((void)payload.bytesFor(inventory, -1, 1), std::invalid_argument);
+    EXPECT_THROW((void)payload.bytesFor(inventory, 2, 1), std::invalid_argument);
+    payload.layers[1].layer = 0;
+    EXPECT_THROW((void)payload.bytesFor(inventory), std::invalid_argument);
+    payload.layers[0].layer = -1;
+    EXPECT_THROW((void)payload.bytesFor(inventory), std::invalid_argument);
+    payload.layers = {{1, 512u, 1u}, {0, 1024u, 2u}};
+    EXPECT_THROW((void)payload.bytesFor(inventory), std::invalid_argument);
+}
+
+/** @test Actual planner BOMs project the authenticated phase inventory onto each resident PP interval. */
+TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesPlannerBOMUsesResidentLayerOwnership)
+{
+    TemporarySnapshotDirectory snapshots;
+    saveCheckpoint(snapshots.path()/"embedding.npy", {9u, 2u});
+    saveCheckpoint(snapshots.path()/"decode_step0_embedding.npy", {1u, 2u});
+    for (const int layer : {0, 1, 2})
+    {
+        const auto key = "layer" + std::to_string(layer) + "_ATTN_OUTPUT";
+        saveCheckpoint(snapshots.path()/(key+".npy"), {9u, static_cast<std::size_t>(layer+1)});
+        saveCheckpoint(snapshots.path()/("decode_step0_"+key+".npy"), {1u, static_cast<std::size_t>(layer+1)});
+    }
+    const auto evidence = deriveParitySnapshotMemoryCapacity(snapshots.path(), 9, 512, {}, {},
+        ParitySnapshotPayloadProjection::RetainedMainServingPhases);
+    llaminar2::ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 3;
+    profile.d_model = profile.head_dim = 64;
+    profile.d_ff = 128;
+    profile.n_heads = profile.n_kv_heads = 1;
+    profile.vocab_size = 128;
+    profile.max_seq_len = 512;
+    for (const auto device : {llaminar2::DeviceId::cuda(0), llaminar2::DeviceId::rocm(0)})
+    {
+        llaminar2::DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.world_rank = 0;
+        cfg.device_compute_units = 60;
+        cfg.device_total_bytes = cfg.device_free_bytes = 8ull << 30;
+        cfg.max_seq_len = cfg.activation_seq_len = 512;
+        cfg.graph_snapshot_memory = evidence.capacity;
+        cfg.graph_snapshot_memory.serving_arenas =
+            llaminar2::ServingSnapshotArenaInventory::ordinary(true, false, 0, 0);
+        // The independent arithmetic below represents one 512-row wide arena
+        // and two scalar arenas. Both partial stages retain the global source.
+        for (const auto [first, last, columns] : {
+            std::array{0, 0, 3}, std::array{1, 2, 7}, std::array{0, 2, 8}})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " layers=" << first << ':' << last);
+            cfg.first_layer = first;
+            cfg.last_layer = last;
+            const auto plan = llaminar2::MemoryPlanner::plan(profile, {cfg});
+            ASSERT_EQ(plan.devices.size(), 1u);
+            const auto *resource = plan.physicalPlan().find({0, device});
+            ASSERT_NE(resource, nullptr);
+            const auto expected = 514u * static_cast<std::size_t>(columns) * sizeof(float);
+            EXPECT_EQ(resource->bytes(llaminar2::PhysicalMemoryOwner::GraphSnapshotArena), expected);
+            EXPECT_EQ(plan.devices.front().graph_snapshot_bytes(), expected);
+        }
+        // Reject a foreign main-layer identity even when the current stage
+        // would otherwise exclude it. Partial projection cannot hide bad BOMs.
+        cfg.first_layer = cfg.last_layer = 0;
+        ASSERT_TRUE(cfg.graph_snapshot_memory.main_phase_payload);
+        cfg.graph_snapshot_memory.main_phase_payload->layers.push_back({3, 512u, 1u});
+        EXPECT_THROW((void)llaminar2::MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
     }
 }

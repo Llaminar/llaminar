@@ -12832,3 +12832,49 @@ namespace
         }
     }
 }
+
+/** @test PP diagnostics project only the original terminal child's acquired logical position across reset/replay. */
+TEST_F(Test__RankOrchestrator, PipelinePrefixProbeProjectsOriginalTerminalLogicalState)
+{
+    /** @brief Device-free immutable diagnostic publication independent of host scheduler metadata. */
+    class PublishedStage final : public MockDeviceGraphOrchestrator {
+    public:
+        PrefixRuntimeStateSnapshot publication;
+        mutable int observations=0;
+        /** @return Recorded original child observation; never a native probe or host cursor. */
+        PrefixRuntimeStateSnapshot prefixStateProbe(const PrefixProbeCapturePolicy&) const override
+        { ++observations;return publication; }
+    };
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm}) {
+        auto head=std::make_unique<PublishedStage>();auto tail=std::make_unique<PublishedStage>();
+        auto *first=head.get();auto *terminal=tail.get();
+        first->set_mock_device_position(9);terminal->set_mock_device_position(9);
+        std::vector<std::unique_ptr<IInferenceRunner>> stages;
+        stages.push_back(std::move(head));stages.push_back(std::move(tail));
+        auto pipeline=RankOrchestrator::createForTestWithPipelineStages(
+            llaminar2::test::MockModelContext::createMinimal(),std::move(stages),makeRankConfigForRunnerCount(2));
+        PrefixProbeCapturePolicy policy;policy.capture_device_logical_state=true;
+        // Tail observations cover first decode, repeated/partial work,
+        // truncation, full reset and restore. The head is deliberately newer
+        // on some calls: a max/head projection would corrupt terminal truth.
+        for(const int position:{10,11,11,4,0,9,10}) {
+            first->publication={};first->publication.initialized=true;
+            first->publication.primary_device={backend,0};first->publication.current_position=position+7;
+            first->publication.positions={position+7};first->publication.sequence_lengths={position+7};
+            terminal->publication={};terminal->publication.initialized=true;
+            terminal->publication.primary_device={backend,1};terminal->publication.current_position=position;
+            terminal->publication.positions={position,position+2};
+            terminal->publication.sequence_lengths={position,position+2};
+            const auto before_first=first->observations,before_terminal=terminal->observations;
+            const auto observed=pipeline->prefixStateProbe(policy);
+            EXPECT_EQ(observed.current_position,position);
+            EXPECT_EQ(observed.positions,terminal->publication.positions);
+            EXPECT_EQ(observed.sequence_lengths,terminal->publication.sequence_lengths);
+            EXPECT_EQ(first->observations,before_first+1);EXPECT_EQ(terminal->observations,before_terminal+1);
+            EXPECT_EQ(pipeline->get_position(),9)<<"Diagnostics cannot mutate host scheduler state";
+        }
+        terminal->publication.initialized=false;
+        EXPECT_THROW((void)pipeline->prefixStateProbe(policy),std::runtime_error)
+            <<"A partial pipeline cannot borrow the head's unrelated publication";
+    }
+}

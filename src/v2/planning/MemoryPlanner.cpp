@@ -45,6 +45,7 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
@@ -1564,7 +1565,11 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             {
                 if (!snapshots.serving_arenas)
                     throw std::invalid_argument("Phase snapshot payload requires the authored serving-arena inventory");
-                graph_snapshot_bytes = snapshots.main_phase_payload->bytesFor(*snapshots.serving_arenas);
+                for (const auto &payload : snapshots.main_phase_payload->layers)
+                    if (payload.layer >= profile.mainLayerCount())
+                        throw std::invalid_argument("Snapshot payload names a layer outside the main-model manifest");
+                graph_snapshot_bytes = snapshots.main_phase_payload->bytesFor(
+                    *snapshots.serving_arenas, cfg.first_layer, last_layer);
             }
             else graph_snapshot_bytes = snapshots.per_accelerator_bytes;
         }
@@ -2231,8 +2236,10 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             // the full maximum-width workspace descriptor is a different role.
             std::optional<gdn_live_state_workspace::Geometry> gdn_handoff;
             if (cfg.device.is_gpu() && replicated_dense_decode && cfg.batch_size > 0 &&
-                checkedMultiply(static_cast<size_t>(cfg.batch_size),
-                    static_cast<size_t>(activation_seq), "GDN handoff flattened rows") > 1u &&
+                gdn_live_state_workspace::requiresPublication(
+                    checkedMultiply(static_cast<size_t>(cfg.batch_size),
+                        static_cast<size_t>(activation_seq), "GDN handoff flattened rows"),
+                    gdn_live_state_workspace::ProducerLayout::LinkedParticipant) &&
                 cfg.total_shards > 1 && cfg.local_tp_backend &&
                 (*cfg.local_tp_backend == CollectiveBackendType::NCCL ||
                  *cfg.local_tp_backend == CollectiveBackendType::RCCL) &&

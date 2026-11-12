@@ -2482,19 +2482,23 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     return headers
 
 
-def expected_query_snapshot_interval(prompt, decode_rows_before, live, capacity):
+def expected_query_snapshot_interval(prompt, decode_rows_before, live, capacity, *, decode=True):
     """Derive original query coordinates from independent request history."""
     if (any(type(value) is not int for value in (prompt, decode_rows_before, live, capacity)) or
             prompt <= 0 or decode_rows_before < 0 or live < 0 or
-            not 0 < capacity <= 2147483647 or prompt + decode_rows_before + live > capacity):
+            type(decode) is not bool or not 0 < capacity <= 2147483647):
         raise ValueError("invalid original query history")
-    prefix = prompt + decode_rows_before
+    if not decode and (decode_rows_before != 0 or live != prompt):
+        raise ValueError("prefill query history must cover the original complete prompt")
+    prefix = prompt + decode_rows_before if decode else 0
+    if prefix + live > capacity:
+        raise ValueError("invalid original query history")
     # Independent complete-pool demand: floor((prefix+row+1)/4)>512.
     first = min(live, max(0, 4 * (512 + 1) - 1 - prefix))
     return prefix, first, live
 
 
-def validate_query_program_omission(text):
+def validate_query_program_omission(text, *, decode=True, live_rows=1):
     """Independently authenticate native path metadata; original history remains separate authority."""
     import json
     import re
@@ -2506,6 +2510,9 @@ def validate_query_program_omission(text):
             result[key] = value
         return result
     try:
+        if (type(decode) is not bool or type(live_rows) is not int or
+                not 0 < live_rows <= 2147483647 or (decode and live_rows != 1)):
+            return "invalid original query program phase or live width"
         witness = json.loads(text, object_pairs_hook=unique_object)
         if (type(witness) is not dict or set(witness) !=
                 {"schema", "participant_source", "expected_devices", "before", "after"} or
@@ -2536,8 +2543,12 @@ def validate_query_program_omission(text):
         before, after = counts(witness["before"]), counts(witness["after"])
         if any(key not in after or after[key] < value for key, value in before.items()):
             return "query counters reset or disappeared"
-        expected_tags = tuple(sorted({"program": "proven_no_ranking", "role": "0", "physical_rows": "1",
-            "observation": "successful_forward_submission_not_native_replay_count"}.items()))
+        expected_tags = {"program": "proven_no_ranking", "role": "0", "physical_rows": str(live_rows),
+            "observation": "successful_forward_submission_not_native_replay_count"}
+        if not decode:
+            expected_tags.update(logical_rows=str(live_rows), logical_begin="0", width_policy="exact_retained")
+        expected_tags = tuple(sorted(expected_tags.items()))
+        expected_phase = "decode" if decode else "prefill"
         submitted = set()
         for key, value in after.items():
             prior = before.get(key, 0)
@@ -2545,7 +2556,7 @@ def validate_query_program_omission(text):
                 continue
             device, phase, kind, tags = key
             if (value - prior != 1 or device not in devices or device in submitted or
-                    phase != "decode" or kind != 0 or tags != expected_tags):
+                    phase != expected_phase or kind != 0 or tags != expected_tags):
                 return "incompatible or non-fresh query program submission"
             submitted.add(device)
         if submitted != set(devices):
@@ -2558,7 +2569,7 @@ def validate_query_program_omission(text):
 def validate_stage_checkpoint_evidence(rows, *, decode):
     """Authenticate query intervals while preserving numerical comparison authority.
 
-    The existing canonical detailed route submits one request and one live row.
+    The canonical route submits one complete prompt or one live Decode row.
     It supplies prompt/submitted-row history independently of native acquisition.
     Structural records keep required identity with no invented numerical metrics.
     Every other stage retains its prior comparison policy and blank query proof.
@@ -2594,7 +2605,7 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
                 if any(row[field] for field in proof_fields) or (decode and query):
                     return "query evidence missing from numerical Decode checkpoint"
                 continue
-            if not decode or not query or kind not in ("authored_query", "unauthored_query"):
+            if not query or kind not in ("authored_query", "unauthored_query"):
                 return "unsupported query evidence kind or phase"
             if (row["structural_valid"] != "1" or row["scalar_type"] != "FP32" or
                     row["integer_mismatch_count"] or row["is_routing"] != "0" or
@@ -2604,10 +2615,10 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
             before = int(row["history_decode_rows_before"])
             live = int(row["history_live_rows"])
             capacity = int(row["history_source_capacity"])
-            prefix, first, end = expected_query_snapshot_interval(prompt, before, live, capacity)
+            prefix, first, end = expected_query_snapshot_interval(prompt, before, live, capacity, decode=decode)
             # This is the actual detailed canonical M1 route. Grouped metadata
             # requires its own immutable transaction history, never M1 extrapolation.
-            if live != 1 or before != int(row["step"]):
+            if decode and (live != 1 or before != int(row["step"])):
                 return "query checkpoint has no canonical submitted-row history"
             omitted = row["query_empty_reason"] == "program_omitted_ranking_not_required"
             if omitted:
@@ -2616,7 +2627,8 @@ def validate_stage_checkpoint_evidence(rows, *, decode):
                 native_fields = [field for field in proof_fields if field.startswith("observed_")]
                 if any(row[field] for field in native_fields):
                     return "omitted query fabricates native snapshot fields"
-                program_error = validate_query_program_omission(row.get("query_program_observation", ""))
+                program_error = validate_query_program_omission(row.get("query_program_observation", ""),
+                    decode=decode, live_rows=live)
                 if program_error:
                     return program_error
                 reference_rows = int(row["reference_rows"])

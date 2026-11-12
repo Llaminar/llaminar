@@ -18421,6 +18421,22 @@ namespace llaminar2
                 const auto child = runner->prefixStateProbe(capture_policy);
                 pipeline_epochs.push_back(child.moe_runtime_movement_epoch);
                 merge_child(child);
+                if (runner.get() == pp_stage_runners_.back().get())
+                {
+                    // Pipeline stages can legitimately be at different rows.
+                    // The original terminal stage owns the completed model's
+                    // logical position, including reset/restore. Project its
+                    // already-acquired observation, never the head's scheduler
+                    // cursor and never a maximum across unrelated stages.
+                    if (!child.initialized && capture_policy.capture_device_logical_state)
+                        throw std::runtime_error("Pipeline prefix diagnostics lost its original terminal logical-state observation");
+                    if (child.initialized)
+                    {
+                        authoritative_child_position = child.current_position;
+                        authoritative_child_positions = child.positions;
+                        authoritative_child_sequence_lengths = child.sequence_lengths;
+                    }
+                }
                 saw_child = true;
             }
             else
@@ -18438,7 +18454,8 @@ namespace llaminar2
             /*
              * The rank host cursor is only a scheduler/response shadow. Child
              * probes own canonical sequence truth across both active mailbox
-             * and post-restore cache-count lifecycles, so rank diagnostics must
+             * and post-restore cache-count lifecycles. TP requires consensus;
+             * PP projects its original terminal stage. Rank diagnostics must
              * never substitute the shadow merely because an outcome mailbox
              * was retired.
              */

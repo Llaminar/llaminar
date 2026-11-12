@@ -13,6 +13,7 @@
 #include <gmock/gmock.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/factory/ImmutableRowTableParticipantRole.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
@@ -1741,3 +1742,32 @@ namespace
     }
 
 } // namespace
+
+/** @test Preserve fixed-head preparation roles across PP ownership and repeated setup decisions. */
+TEST(ImmutableRowTableParticipantPreparation, FixedPipelineStorageSurvivesPLELayerFiltering)
+{
+    const std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> stages{
+        {{0, DeviceId::rocm(7)}, {0, DeviceId::rocm(6)}, {0, DeviceId::rocm(8)}, {0, DeviceId::rocm(9)}},
+        {{0, DeviceId::rocm(1)}, {0, DeviceId::rocm(3)}, {0, DeviceId::rocm(4)}, {0, DeviceId::rocm(2)}}};
+    using Role = ImmutableRowTableParticipantRole;
+    // A second source policy places PLE in the later stage. Physical source
+    // ownership must survive either direction and repeated cold-family setup.
+    for (const int ple_stage : {0, 1, 0}) {
+        const auto pipeline = ImmutableFixedHeadPipelineProjection::checked(0, ple_stage, 32, 64, stages);
+        const int ple = ple_stage * 24;
+        for (int replay = 0; replay < 3; ++replay) {
+            for (int stage = 0; stage < 2; ++stage) {
+                for (const auto &owner : stages[stage]) {
+                    EXPECT_EQ(immutableRowTableParticipantRole(ple, stage * 24, 24, owner.device, &pipeline),
+                        Role::FixedPipelineStorage);
+                    EXPECT_EQ(immutableRowTableParticipantRole(ple, stage * 24, 24, owner.device, nullptr),
+                        stage == ple_stage ? Role::Consumer : Role::None);
+                    EXPECT_EQ(immutableRowTableParticipantRole(std::nullopt, stage * 24, 24, owner.device, &pipeline),
+                        Role::None);
+                }
+            }
+            EXPECT_EQ(immutableRowTableParticipantRole(ple, (1 - ple_stage) * 24, 24,
+                DeviceId::rocm(0), &pipeline), Role::None);
+        }
+    }
+}

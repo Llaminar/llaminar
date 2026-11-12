@@ -1083,6 +1083,26 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
+         * @brief Publish diagnostics from one original forward already completed inside a parent.
+         *
+         * Uses only the exact child's retained snapshot manifest and the parent's
+         * original producer stream. The existing diagnostic acquisition publishes
+         * captured values; no forward, capture, arena allocation or state replay
+         * occurs. The caller must already have authenticated terminal completion.
+         *
+         * @param signature Original executed child identity, retained before request reset.
+         * @param source_capture Exact borrowed child embedded in the completed parent.
+         * @param producer_stream Exact stream on which the parent executed.
+         * @param error Optional first violated source/publication invariant.
+         * @return True after original diagnostics and last-executed view are published.
+         */
+        bool publishComposedForwardSnapshots(
+            const ForwardGraphSignature &signature,
+            const IGPUGraphCapture *source_capture,
+            void *producer_stream,
+            std::string *error = nullptr);
+
+        /**
          * @brief Inspect one exact retained decode graph without requiring monolithic capture.
          *
          * The cache entry must own its complete materialized executable and

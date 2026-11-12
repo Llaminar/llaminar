@@ -4313,17 +4313,16 @@ TEST(Test__MemoryPlanner, ReplicatedDecodeIncludesActualGDNHandoffWorkspace)
                 const auto *after = find(phase_split);
                 ASSERT_NE(before, nullptr);
                 ASSERT_NE(after, nullptr);
-                if (batch * rows > 1)
-                {
-                    EXPECT_GE(after->workspace_bytes(), before->workspace_bytes() + handoff_bytes)
-                        << "participant=" << first.toString() << " batch=" << batch << " rows=" << rows << " degree=" << degree;
-                }
+                // Even the admitted M=1 prefill family owns a TP-local producer.
+                // Its successor full bank must be ready for replicated decode.
+                EXPECT_GE(after->workspace_bytes(), before->workspace_bytes() + handoff_bytes)
+                    << "participant=" << first.toString() << " batch=" << batch << " rows=" << rows << " degree=" << degree;
                 auto without_native = cfg;
                 without_native.local_tp_backend.reset();
                 const auto nonlocal = MemoryPlanner::plan(profile, {without_native});
                 const auto *without = find(nonlocal);
                 ASSERT_NE(without, nullptr);
-                EXPECT_EQ(after->workspace_bytes() - without->workspace_bytes(), batch * rows > 1 ? handoff_bytes : 0u);
+                EXPECT_EQ(after->workspace_bytes() - without->workspace_bytes(), handoff_bytes);
 
                 if (first_layer == 0)
                 {

@@ -11,6 +11,7 @@
  */
 #pragma once
 #include "QwenSparseQueryExpectedInterval.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "snapshots/SnapshotAuthoredTokenRows.h"
 #include <string_view>
 #include "utils/PerfStatsCollector.h"
@@ -27,7 +28,49 @@ enum class ParityCheckpointEvidenceKind {ComparedValues,AuthoredQuery,Unauthored
 /** @return Whether the exact canonical checkpoint is an indexer query operand. */
 inline bool isQwenSparseQueryCheckpoint(std::string_view stage) noexcept
 {return stage=="QSA_INDEXER_RAW_QUERY" || stage=="QSA_INDEXER_QUERY";}
-/** @brief Retained existing path counters bracketing exactly one submitted Decode. */
+/**
+ * @brief Project original admitted model participants without flattening PP leaders into TP.
+ * @param plan Original rank or prepared-stage plan, retaining per-stage TP membership.
+ * @param expectedRank Original owning rank, independently supplied by the admitted parent.
+ * @return Ordered unique physical identities, or an empty invalid projection.
+ * @details A PP coordinator's primary device is not another model participant.
+ * Each stage contributes its complete TP membership exactly once; its leader is
+ * already that membership's first element. No observed counter supplies a member.
+ */
+inline std::vector<std::string> qwenSparseQueryParticipantDevices(const RankExecutionPlan &plan,int expectedRank)
+{
+    if(plan.rank!=expectedRank || expectedRank<0)return {};
+    std::vector<std::string> result;
+    std::set<std::string> seen;
+    const auto append=[&](const GlobalDeviceAddress &address) {
+        const DeviceId device(address.device_type,address.device_ordinal);
+        if(!device.is_valid() || address.hostname!=plan.primary_device.hostname)return false;
+        const auto name=device.toString();
+        if(!seen.insert(name).second)return false;
+        result.push_back(name);return true;
+    };
+    if(!plan.local_pp_devices.empty()) {
+        if(!plan.local_tp_devices.empty() ||
+           (!plan.local_pp_stage_tp_info.empty() && plan.local_pp_stage_tp_info.size()!=plan.local_pp_devices.size()))return {};
+        for(std::size_t index=0;index<plan.local_pp_devices.size();++index) {
+            const auto &leader=plan.local_pp_devices[index];
+            if(plan.local_pp_stage_tp_info.empty() || plan.local_pp_stage_tp_info[index].devices.empty()) {
+                if(!append(leader))return {};
+            } else {
+                const auto &members=plan.local_pp_stage_tp_info[index].devices;
+                if(members.front()!=leader)return {};
+                for(const auto &member:members)if(!append(member))return {};
+            }
+        }
+    } else {
+        if(!plan.local_pp_stage_tp_info.empty())return {};
+        if(plan.local_tp_devices.empty()) {
+            if(!append(plan.primary_device))return {};
+        } else for(const auto &member:plan.local_tp_devices)if(!append(member))return {};
+    }
+    return result;
+}
+/** @brief Retained existing path counters bracketing exactly one submitted main forward. */
 struct QwenSparseQueryProgramObservation
 {
     std::vector<PerfStatRecord> before, after;
@@ -118,7 +161,10 @@ inline QwenSparseQueryEvidence inspectQwenSparseQueryEvidence(const SnapshotInfo
 }
 /**
  * @brief Authenticate absent query work from fresh path evidence AND independent history.
- * @param observed Existing counters around this exact successful single-row main Decode.
+ * @param observed Existing counters around this exact successful main forward.
+ * @details Decode retains its single-row contract. Prefill certifies only an
+ * original complete prefix-zero prompt whose exact retained chunk composition
+ * sums to its original live width. Padded/partial request evidence is rejected.
  * @param history Original input history, never inferred from the observed selected program.
  * @param referenceElements Header-authenticated reference extent; zero is presence-only validation.
  * @return Unauthored structural evidence without claiming a native snapshot or numerical sample.
@@ -129,9 +175,11 @@ inline QwenSparseQueryEvidence inspectOmittedQwenSparseQueryEvidence(
 {
     QwenSparseQueryEvidence result{.history=history,.referenceElements=referenceElements};
     const auto interval=expectedQwenSparseQueryInterval(history);
-    if(!interval || history.liveRows!=1 || interval->firstRow!=interval->endRow)return result;
+    if(!interval || interval->firstRow!=interval->endRow ||
+       (history.phase==QwenSparseQueryPhase::Decode && history.liveRows!=1))return result;
     if(referenceElements && (referenceElements%512 ||
-       (referenceElements/512!=1 && referenceElements/512!=std::size_t(interval->prefixRows)+1)))return result;
+       (referenceElements/512!=static_cast<std::size_t>(history.liveRows) &&
+        referenceElements/512!=std::size_t(interval->prefixRows)+history.liveRows)))return result;
     const std::set<std::string> expected(observed.expected_devices.begin(),observed.expected_devices.end());
     if(expected.empty() || expected.size()!=observed.expected_devices.size() || (expected.contains("") || expected.contains("INVALID") || expected.contains("Unknown")))return result;
     struct Counted {PerfStatRecord record;uint64_t count=0;};
@@ -161,10 +209,19 @@ inline QwenSparseQueryEvidence inspectOmittedQwenSparseQueryEvidence(
         if(entry.count<prior)return result;
         if(entry.count==prior)continue;
         const auto &record=entry.record;
-        const std::map<std::string,std::string> schema{
-            {"program","proven_no_ranking"},{"role","0"},{"physical_rows","1"},
+        std::map<std::string,std::string> schema{
+            {"program","proven_no_ranking"},{"role","0"},{"physical_rows",std::to_string(history.liveRows)},
             {"observation","successful_forward_submission_not_native_replay_count"}};
-        if(record.phase!="decode" || record.kind!=PerfStatRecord::Kind::Counter ||
+        if(history.phase==QwenSparseQueryPhase::Prefill) {
+            // Only a complete original exact-width request is certified here.
+            // Padded or partial chunk observations are unsupported evidence;
+            // they cannot borrow the full prompt's empty ranking interval.
+            schema.emplace("logical_rows",std::to_string(history.liveRows));
+            schema.emplace("logical_begin","0");
+            schema.emplace("width_policy","exact_retained");
+        }
+        const auto phase=history.phase==QwenSparseQueryPhase::Prefill?"prefill":"decode";
+        if(record.phase!=phase || record.kind!=PerfStatRecord::Kind::Counter ||
            record.tags!=schema || !expected.contains(record.device) || entry.count-prior!=1 ||
            !submitted.insert(record.device).second)return result;
     }
@@ -180,16 +237,19 @@ inline QwenSparseQueryEvidence inspectOmittedQwenSparseQueryEvidence(
  * @brief Recheck retained structural evidence without granting numerical equality.
  * @tparam Stage Actual canonical comparison record or a device-free contract fixture.
  * @param stage Exact original checkpoint record.
- * @param requireQueryProof Decode requires original history for both required Q checkpoints.
+ * @param requireQueryProof Require original history for both required Q checkpoints.
+ * @param expectedPhase Original consumer phase; cross-phase witnesses are rejected.
  * @return Whether its typed raw witness is complete, independent of numerical tolerance.
  */
-template<class Stage> bool validParityCheckpointEvidence(const Stage &stage,bool requireQueryProof=false)
+template<class Stage> bool validParityCheckpointEvidence(const Stage &stage,bool requireQueryProof=false,
+    QwenSparseQueryPhase expectedPhase=QwenSparseQueryPhase::Decode)
 {
     if(stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::ComparedValues)
         return stage.evidence_valid && !stage.query_work_evidence &&
             !(requireQueryProof && isQwenSparseQueryCheckpoint(stage.stage_name));
     if(!requireQueryProof || !isQwenSparseQueryCheckpoint(stage.stage_name) || !stage.query_work_evidence)return false;
     const auto &proof=*stage.query_work_evidence;
+    if(proof.history.phase!=expectedPhase)return false;
     if(proof.omitted_program && (!proof.referenceElements || proof.expectedRepeats!=1 ||
        proof.observation.data || proof.observation.size || proof.observation.rows || proof.observation.cols ||
        proof.observation.lifetime_owner || proof.observation.authored_token_rows ||

@@ -24,6 +24,7 @@
 
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "InferenceRunnerFactory.h"
+#include "ImmutableRowTableParticipantRole.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "DenseDecodeWeightSelection.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -284,10 +285,10 @@ namespace llaminar2
             if (!graph.flash_next) return;
             const int ple = static_cast<int>(graph.flash_next->ngrams().decoder_layer);
             const auto& placement = graph.ngram_table_placement;
-            const bool pipeline_storage = placement && placement->fixedHeadPipeline() &&
-                placement->containsAllocator({placement->worldRank(), graph.default_device});
-            if (!pipeline_storage &&
-                (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers)) return;
+            const auto role = immutableRowTableParticipantRole(ple, graph.pp_layer_offset, graph.n_layers,
+                graph.default_device, placement ? placement->fixedHeadPipeline() : nullptr);
+            const bool pipeline_storage = role == ImmutableRowTableParticipantRole::FixedPipelineStorage;
+            if (role == ImmutableRowTableParticipantRole::None) return;
             if (!placement)
                 throw std::logic_error("PLE participant reached weight completion without admitted ngram placement");
             const auto model = std::dynamic_pointer_cast<ModelContext>(context);
@@ -368,8 +369,12 @@ namespace llaminar2
             // a main-model cohort generation merely because policy is retained.
             if (!graph.flash_next) return;
             const int ple = static_cast<int>(graph.flash_next->ngrams().decoder_layer);
-            if (ple < graph.pp_layer_offset || ple >= graph.pp_layer_offset + graph.n_layers) return;
             const auto& placement = graph.ngram_table_placement;
+            // Storage-only PP owners must finish the same drained-loader
+            // materialization as PLE readers before serving ports are bound.
+            if (immutableRowTableParticipantRole(ple, graph.pp_layer_offset, graph.n_layers,
+                    graph.default_device, placement ? placement->fixedHeadPipeline() : nullptr) ==
+                ImmutableRowTableParticipantRole::None) return;
             if (!placement || !placement->isGPUAdaptive() ||
                 placement->gpuAdaptiveRequest().placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal ||
                 placement->gpuAdaptiveLayout().consumers().size() <= 1)

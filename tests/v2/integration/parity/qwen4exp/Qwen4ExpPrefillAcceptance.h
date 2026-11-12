@@ -15,7 +15,7 @@ namespace llaminar2::test::parity::qwen4exp
 {
 /** @brief Numerical policy never changes which original observations must exist. */
 enum class Qwen4ExpMainEvidencePolicy { StrictLayerNumerics, FiniteExactObservations };
-/** @brief Only Decode can prove an intentionally unauthored query from original history. */
+/** @brief Original forward phase authenticates intentionally unauthored query evidence. */
 enum class Qwen4ExpMainEvidencePhase { Prefill, Decode };
 
 /**
@@ -36,7 +36,9 @@ template <typename Layer>
             if constexpr (requires { record.combined_result; }) return record.combined_result;
             else return record;
         }();
-        if (!validParityCheckpointEvidence(stage, phase == Qwen4ExpMainEvidencePhase::Decode) ||
+        if (!validParityCheckpointEvidence(stage,
+                phase == Qwen4ExpMainEvidencePhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                phase == Qwen4ExpMainEvidencePhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill) ||
             (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
             return ::testing::AssertionFailure() << "QFN structural evidence: missing, nonfinite, malformed or non-exact stage "
                 << stage.stage_name << " in decoder " << layer.layer_idx;

@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "Qwen4ExpSourceAdmission.h"
+#include "Qwen4ExpObservedPipelineTerminalEvidence.h"
 #include "app/RuntimeInitPhase.h"
 #include "backends/ComputeBackend.h"
 #include "config/OrchestrationStartupPolicy.h"
@@ -142,11 +143,21 @@ public:
             throw std::logic_error("QFN observed pipeline repeated terminal join");
         const std::weak_ptr<MPIContext> retired=execution_;
         execution_.reset();
-        const int32_t local_completed=locally_succeeded && retired.expired()?1:0;
-        std::vector<int32_t> completed(discovery_size_);
-        discovery_->allgather_bytes(&local_completed,completed.data(),sizeof(local_completed));
+        const ObservedPipelineRankTerminalOutcome local{
+            retired.expired()?ObservedPipelineRetirement::Retired:ObservedPipelineRetirement::Live,
+            locally_succeeded?ObservedPipelineWorkOutcome::Succeeded:ObservedPipelineWorkOutcome::Failed};
+        std::vector<ObservedPipelineRankTerminalOutcome> completed(discovery_size_);
+        discovery_->allgather_bytes(&local,completed.data(),sizeof(local));
+        terminal_.emplace(completed);
         binding_["terminal_join_completed"]=true;
-        return std::all_of(completed.begin(),completed.end(),[](int32_t value){return value==1;});
+        binding_["terminal_owners_retired"]=terminal_->allRetired();
+        return terminal_->succeeded();
+    }
+
+    /** @return Whether this authenticated original active owner retired before diagnostic export. */
+    bool mayExportConfiguration() const noexcept {
+        return terminal_ && binding_.at("active").get<bool>() &&
+            terminal_->mayExportConfiguration(bound_.topology.execution_rank_selection,discovery_rank_);
     }
 
     /** @brief Write one receipt under the existing canonical artifact owner after the terminal join. */
@@ -171,6 +182,7 @@ private:
     std::shared_ptr<const ClusterInventory> inventory_;
     std::shared_ptr<MPIContext> execution_;
     nlohmann::json binding_;
+    std::optional<Qwen4ExpObservedPipelineTerminalEvidence> terminal_;
 };
 
 /**

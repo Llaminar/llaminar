@@ -131,7 +131,7 @@ public:
     /** @return Whether the real global vocabulary domain is owned in this process. */
     bool hasLocalTail() const noexcept { return terminalIndex() < stages_.size(); }
     /** @return Whether native prefill edge ownership has been frozen. */
-    bool prefillPrepared() const noexcept { return forward_edges_.size() == stages_.size(); }
+    bool prefillPrepared() const noexcept { return participant_borrow_lifecycle_ == ParticipantBorrowLifecycle::Live && forward_edges_.size() == stages_.size(); }
     /** @return Whether the installed terminal and every local follower own publication. */
     bool supportsMTPPublication() const;
     /** @brief Admit request inputs once per stage and submit captured chunk DAGs.
@@ -298,7 +298,7 @@ public:
     /** @brief Return only the tail response and validate independent stage KV positions. */
     bool finish(DeviceGenerationTerminalResult *result);
     /** @return Whether this owner has an admitted, not-yet-retired request. */
-    bool active() const noexcept { return phase_ != Phase::Idle; }
+    bool active() const noexcept { return participant_borrow_lifecycle_ == ParticipantBorrowLifecycle::Live && phase_ != Phase::Idle; }
 
 private:
     /** @brief Enclosing owner orders parent retirement before its original PP stages. */
@@ -379,6 +379,11 @@ private:
     void prepareDomainBoundaries();
     /** @brief Submit complete ordinary follower transactions around terminal-domain tickets. */
     bool launchHostedDomainTransactions();
+    /** @brief Borrowed participants are usable only until their exact retirement completes. */
+    enum class ParticipantBorrowLifecycle { Live, Retired };
+    /** @brief Reject an operation after the enclosing owner revoked its stage borrowers.
+     * @throws std::logic_error When participant topology has already retired. */
+    void requireLiveParticipantBorrow() const;
     /** @brief Host submission lifecycle only; no mirrored device decision state. */
     enum class Phase { Idle, Admitted, Materialized, Submitted, Failed };
     /**
@@ -459,6 +464,8 @@ private:
     /** @return Same retained family for immutable identity/lifetime checks. */
     const std::unique_ptr<ForwardOnlyFamily> &forwardOnlyFamily() const;
     std::vector<DeviceGraphOrchestrator *> stages_;
+    /// Terminal retirement authority; immutable pipeline policy remains independent.
+    ParticipantBorrowLifecycle participant_borrow_lifecycle_ = ParticipantBorrowLifecycle::Live;
     std::vector<Domain> domains_;
     size_t global_stage_count_ = 0; ///< Complete original topology, never the local stage-vector length.
     const GlobalPPTopology *rank_topology_ = nullptr; ///< Borrowed original declaration, retained by Global beyond this owner.

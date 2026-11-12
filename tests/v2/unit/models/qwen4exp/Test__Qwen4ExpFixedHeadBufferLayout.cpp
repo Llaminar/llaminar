@@ -8,6 +8,8 @@
  */
 #include "Qwen4ExpMetadataFixture.h"
 #include "models/qwen4exp/Qwen4ExpBufferLayout.h"
+#include "execution/qwen4exp/Qwen4ExpPLEGatherSnapshot.h"
+#include "snapshots/SnapshotCapture.h"
 #include "execution/local_execution/graph/GraphResolver.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -63,4 +65,37 @@ TEST(Qwen4ExpFixedHeadBufferLayout, ForeignCohortAndPacketOverflowRejectBeforeAl
     EXPECT_THROW(qwen4ExpLookupArenaBytes(resolver,g,foreign),std::invalid_argument);
     g.ple_table_row_bytes=std::numeric_limits<std::size_t>::max();
     EXPECT_THROW(qwen4ExpLookupArenaBytes(resolver,g,dimensions(15,2,DeviceId::cuda(0))),std::overflow_error);
+}
+
+/** @test The production pipeline descriptor exposes only original decoded FP32 rows across reset/replay geometries. */
+TEST(Qwen4ExpFixedHeadBufferLayout, PipelineGatherSnapshotRetainsOriginalOutputAndExactSemanticKey)
+{
+    constexpr std::size_t columns=16*3;
+    FP32Tensor output(std::vector<std::size_t>{9*columns+1});
+    auto *values=output.mutable_data();
+    for(std::size_t index=0;index<output.numel();++index)values[index]=static_cast<float>(index);
+    for(const std::size_t rows:{1u,3u,9u,1u}) {
+        const Qwen4ExpPLEGatherSnapshot descriptor(output,rows,columns,sizeof(float));
+        for(int replay=0;replay<3;++replay) {
+            const auto dump=descriptor.describe();
+            ASSERT_TRUE(dump.inputs.empty());ASSERT_EQ(dump.outputs.size(),1u);
+            const auto &view=dump.outputs.front();
+            EXPECT_STREQ(view.name,"gathered_rows");EXPECT_STREQ(view.dtype,"FP32");
+            EXPECT_EQ(view.tensor,&output);EXPECT_EQ(view.tensor_byte_offset,sizeof(float));
+            EXPECT_EQ(view.data,values+1);EXPECT_EQ(view.rows,rows);EXPECT_EQ(view.cols,columns);
+            EXPECT_EQ(view.byte_size,rows*columns*sizeof(float));
+            const auto captured=SnapshotCapture::extractFp32FromOutput(view);
+            ASSERT_EQ(captured.size(),rows*columns);
+            for(std::size_t index=0;index<captured.size();++index)EXPECT_EQ(captured[index],values[index+1]);
+        }
+    }
+    // Existing semantic stage names retain all PLE checkpoints; the descriptor
+    // changes no gate/convolution graph or snapshot key policy.
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer1_ple_gather"),"layer1_PLE_GATHER");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer1_ple_gate"),"layer1_PLE_GATE");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer1_ple_convolution"),"layer1_PLE_CONVOLUTION");
+    EXPECT_THROW((Qwen4ExpPLEGatherSnapshot(output,0,columns)),std::invalid_argument);
+    EXPECT_THROW((Qwen4ExpPLEGatherSnapshot(output,10,columns)),std::invalid_argument);
+    EXPECT_THROW((Qwen4ExpPLEGatherSnapshot(output,1,columns,1)),std::invalid_argument);
+    EXPECT_THROW((Qwen4ExpPLEGatherSnapshot(output,1,std::numeric_limits<std::size_t>::max())),std::invalid_argument);
 }

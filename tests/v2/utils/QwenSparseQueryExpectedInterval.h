@@ -13,13 +13,16 @@
 
 namespace llaminar2::test::parity
 {
-/** @brief Original canonical request history before the observed Decode invocation. */
+/** @brief Original main-forward phase; never inferred from an observed query program. */
+enum class QwenSparseQueryPhase { Decode, Prefill };
+/** @brief Original canonical request history before the observed main invocation. */
 struct QwenSparseQueryHistory
 {
     std::size_t promptRows=0; ///< Independently authenticated original prompt token count.
     std::size_t decodeRowsBefore=0; ///< Original Decode rows preceding this invocation, not accepted candidates.
     int liveRows=1; ///< Original submitted live width before any query-work selection.
     int sourceCapacity=0; ///< Context bound authenticated from the frozen admitted configuration.
+    QwenSparseQueryPhase phase=QwenSparseQueryPhase::Decode; ///< Original submitted phase.
 };
 /** @brief Exact expected request-local suffix in original row coordinates. */
 struct QwenSparseQueryExpectedInterval
@@ -43,7 +46,12 @@ inline std::optional<QwenSparseQueryExpectedInterval> expectedQwenSparseQueryInt
     if(!history.promptRows || history.liveRows<0 || history.sourceCapacity<=0 ||
        history.promptRows>maximum || history.decodeRowsBefore>maximum-history.promptRows)
         return std::nullopt;
-    const auto prefix=history.promptRows+history.decodeRowsBefore;
+    if(history.phase!=QwenSparseQueryPhase::Decode && history.phase!=QwenSparseQueryPhase::Prefill)
+        return std::nullopt;
+    if(history.phase==QwenSparseQueryPhase::Prefill &&
+       (history.decodeRowsBefore || history.liveRows!=static_cast<int>(history.promptRows)))
+        return std::nullopt;
+    const auto prefix=history.phase==QwenSparseQueryPhase::Prefill ? 0u : history.promptRows+history.decodeRowsBefore;
     if(history.liveRows>history.sourceCapacity ||
        prefix>static_cast<std::size_t>(history.sourceCapacity-history.liveRows))
         return std::nullopt;

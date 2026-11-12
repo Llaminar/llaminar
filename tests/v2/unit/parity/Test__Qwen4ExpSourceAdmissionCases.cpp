@@ -3110,4 +3110,40 @@ TEST(Qwen4ExpSourceAdmissionCases, LocalHotRefinedBudgetPreservesMeasuredPolicie
     EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(
         refined.front().makeOrchestrationConfig(refined.front().model.model_path, 0)).empty());
 }
+/** @test Canonical placement membership never changes original stage/wire consumer coordinates. */
+TEST(Qwen4ExpSourceAdmissionCases, FixedPipelineConsumerCoordinatesPreserveOriginalStageOrder)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+        std::vector<std::vector<PhysicalMemoryAllocatorIdentity>> stages(2);
+        for(const int ordinal:{7,6,8,9})stages[0].push_back({1,{backend,ordinal}});
+        for(const int ordinal:{1,3,4,2})stages[1].push_back({1,{backend,ordinal}});
+        for(const int ple_stage:{0,1,0}) {
+            const auto pipeline=ImmutableFixedHeadPipelineProjection::checked(1,ple_stage,16,9,stages);
+            auto canonical=stages[ple_stage];
+            std::sort(canonical.begin(),canonical.end(),[](const auto& a,const auto& b){return a.device.ordinal<b.device.ordinal;});
+            ASSERT_NE(canonical,stages[ple_stage]);
+            for(int replay=0;replay<3;++replay)
+                EXPECT_NO_THROW(requireQwen4ExpFixedPipelineConsumerCoordinates(canonical,pipeline,stages[ple_stage]));
+            for(int defect=0;defect<6;++defect) {
+                auto placement=canonical,declared=stages[ple_stage];
+                switch(defect) {
+                case 0:placement.pop_back();break;
+                case 1:placement.back()=placement.front();break;
+                case 2:placement.back().world_rank=0;break;
+                case 3:placement.back().device={backend,0};break;
+                case 4:std::swap(declared[0],declared[1]);break;
+                case 5:declared.back()=declared.front();break;
+                }
+                EXPECT_THROW(requireQwen4ExpFixedPipelineConsumerCoordinates(placement,pipeline,declared),std::invalid_argument)<<defect;
+            }
+            // The owner projection remains source/head ordered and every PLE
+            // consumer coordinate still names its original physical owner.
+            for(const auto& owner:pipeline.owners())if(owner.stage_index==ple_stage) {
+                EXPECT_EQ(owner.consumer_index,owner.participant_index);
+                EXPECT_EQ(pipeline.consumers()[owner.consumer_index],stages[ple_stage][owner.participant_index]);
+            }
+        }
+    }
+}
+
 }

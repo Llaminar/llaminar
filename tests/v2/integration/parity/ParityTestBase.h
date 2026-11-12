@@ -1898,7 +1898,8 @@ namespace llaminar2::test::parity
                         const auto &actual=proof.observation;
                         const auto &observation=*actual.authored_token_rows;
                         const auto &record=observation.requests.front();
-                        out << ',' << (validParityCheckpointEvidence(stage,decode_step.has_value())?1:0)
+                        out << ',' << (validParityCheckpointEvidence(stage,true,
+                            decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill)?1:0)
                             << ',' << (record.emptyReason==SnapshotEmptyReason::RankingNotRequired?"ranking_not_required":
                                 record.emptyReason==SnapshotEmptyReason::None?"none":"invalid")
                             << ',' << proof.history.promptRows << ',' << proof.history.decodeRowsBefore
@@ -1914,7 +1915,8 @@ namespace llaminar2::test::parity
                     else if(structural && stage.query_work_evidence && stage.query_work_evidence->omitted_program)
                     {
                         const auto &proof=*stage.query_work_evidence;
-                        out << ',' << (validParityCheckpointEvidence(stage,decode_step.has_value())?1:0)
+                        out << ',' << (validParityCheckpointEvidence(stage,true,
+                            decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill)?1:0)
                             << ",program_omitted_ranking_not_required"
                             << ',' << proof.history.promptRows << ',' << proof.history.decodeRowsBefore
                             << ',' << proof.history.liveRows << ',' << proof.history.sourceCapacity
@@ -6591,9 +6593,21 @@ namespace llaminar2::test::parity
             std::vector<std::string> devices;
             if(orch_runner_) {
                 const auto &plan=orch_runner_->executionPlan();
-                if(plan.local_tp_devices.empty())devices.push_back(activePrimaryDevice().toString());
-                else for(const auto &device:plan.local_tp_devices)
-                    devices.push_back(DeviceId(device.device_type,device.device_ordinal).toString());
+                const auto *original=dynamic_cast<const OrchestrationRunner*>(orch_runner_.get());
+                const auto *prepared=original?original->pipelinePreparedPlanForDiagnostics():nullptr;
+                const auto admission=prepared?prepared->admission():nullptr;
+                if(admission) {
+                    if(admission->rankPlan().rank!=plan.rank)return {};
+                    std::set<std::string> seen;
+                    for(const auto &stage:admission->stages()) {
+                        const auto members=qwenSparseQueryParticipantDevices(stage.rankPlan(),plan.rank);
+                        if(members.empty())return {};
+                        for(const auto &member:members) {
+                            if(!seen.insert(member).second)return {};
+                            devices.push_back(member);
+                        }
+                    }
+                } else devices=qwenSparseQueryParticipantDevices(plan,plan.rank);
             } else if(const auto *rank=dynamic_cast<const RankOrchestrator *>(activeLegacyRunner())) {
                 for(int participant=0;participant<rank->device_count();++participant) {
                     const auto *child=rank->deviceRunner(participant);
@@ -6655,25 +6669,35 @@ namespace llaminar2::test::parity
         {
             const auto path = config_.snapshot_dir + "/" + reference_key + ".npy";
             if (!std::filesystem::exists(path)) return std::nullopt;
-            if(query_decode_step && isQwenSparseQueryCheckpoint(stage))
+            if(isQwenSparseQueryCheckpoint(stage))
             {
+                const auto published_keys=activeSnapshotKeys();
+                // Published Prefill values retain their existing numerical
+                // comparison contract. Only genuinely absent producers enter
+                // the complete-request omission proof; Decode keeps its
+                // established authored-interval provenance contract.
+                if(!query_decode_step &&
+                   std::find(published_keys.begin(),published_keys.end(),production_key)!=published_keys.end())
+                    return std::nullopt;
                 const auto descriptor=inspectNpySnapshot(path);
                 const auto actual=activeTypedSnapshot(production_key);
-                auto proof=inspectQwenSparseQueryEvidence(actual,
-                    {.promptRows=config_.token_ids.size(),.decodeRowsBefore=*query_decode_step,
-                     .liveRows=1,.sourceCapacity=canonicalQuerySourceCapacity()},descriptor.count);
-                const auto published_keys=activeSnapshotKeys();
+                const QwenSparseQueryHistory history{
+                    .promptRows=config_.token_ids.size(),.decodeRowsBefore=query_decode_step.value_or(0),
+                    .liveRows=query_decode_step?1:static_cast<int>(config_.token_ids.size()),
+                    .sourceCapacity=canonicalQuerySourceCapacity(),
+                    .phase=query_decode_step?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill};
+                auto proof=inspectQwenSparseQueryEvidence(actual,history,descriptor.count);
                 if(!proof.valid &&
                    std::find(published_keys.begin(),published_keys.end(),production_key)==published_keys.end() &&
                    parity_query_decode_step_==query_decode_step)
                     proof=inspectOmittedQwenSparseQueryEvidence(parity_query_program_observation_,
-                        {.promptRows=config_.token_ids.size(),.decodeRowsBefore=*query_decode_step,
-                         .liveRows=1,.sourceCapacity=canonicalQuerySourceCapacity()},descriptor.count);
+                        history,descriptor.count);
                 const auto &shape=descriptor.shape;
                 const bool reference_shape=(shape.size()==3 && shape[0]==1 && shape[2]==512) ||
                     (stage=="QSA_INDEXER_QUERY" && shape.size()==4 && shape[0]==1 && shape[2]==4 && shape[3]==128);
                 proof.valid=proof.valid && descriptor.scalar==NpySnapshotScalar::FP32 && reference_shape &&
-                    reference_key.starts_with("decode_step"+std::to_string(*query_decode_step)+"_");
+                    (query_decode_step ? reference_key.starts_with("decode_step"+std::to_string(*query_decode_step)+"_") :
+                        !reference_key.starts_with("decode_step"));
                 EXPECT_TRUE(proof.valid)<<"Query snapshot disagrees with independent original history: "<<production_key;
                 StageComparisonResult result;result.stage_name=stage;
                 const auto expected=expectedQwenSparseQueryInterval(proof.history);
@@ -11831,55 +11855,74 @@ namespace llaminar2::test::parity
                     return false;
                 }
 
+                std::vector<std::string> missing;
                 for (const auto &key : policy.requiredSnapshotKeys(phase))
                 {
                     if(usesDistributedPipelineEvidence() && !ownsPipelineParityKey(key))continue;
                     if (std::find(keys.begin(), keys.end(), key) == keys.end())
                     {
                         const auto source=GraphSnapshotSourceOutput::fromQwenSparseSemanticKey(key);
-                        if(phase==ParityForwardPhase::Decode && parity_query_decode_step_ && source &&
+                        if((phase==ParityForwardPhase::Prefill || parity_query_decode_step_) && source &&
                            (source->role()==GraphSnapshotSourceRole::QwenSparseRawQuery ||
                             source->role()==GraphSnapshotSourceRole::QwenSparseQuery) &&
                            inspectOmittedQwenSparseQueryEvidence(parity_query_program_observation_,
-                               {.promptRows=config_.token_ids.size(),.decodeRowsBefore=*parity_query_decode_step_,
-                                .liveRows=1,.sourceCapacity=canonicalQuerySourceCapacity()},0).valid)
+                               {.promptRows=config_.token_ids.size(),.decodeRowsBefore=parity_query_decode_step_.value_or(0),
+                                .liveRows=phase==ParityForwardPhase::Prefill?static_cast<int>(config_.token_ids.size()):1,
+                                .sourceCapacity=canonicalQuerySourceCapacity(),
+                                .phase=phase==ParityForwardPhase::Prefill?QwenSparseQueryPhase::Prefill:QwenSparseQueryPhase::Decode},0).valid)
                             continue;
-                        std::ostringstream present;
-                        constexpr size_t kInventoryLimit = 24;
-                        for (size_t index = 0;
-                             index < keys.size() && index < kInventoryLimit;
-                             ++index)
-                        {
-                            if (index > 0)
-                                present << ',';
-                            present << keys[index];
-                        }
-                        if (keys.size() > kInventoryLimit)
-                            present << ",...(" << keys.size() << " total)";
-                        std::ostringstream related;
-                        size_t related_count = 0;
-                        for (const auto &published_key : keys)
-                        {
-                            if (published_key.find("DOMAIN_ROUTE") ==
-                                    std::string::npos &&
-                                published_key.find("RUNTIME_ROUTE") ==
-                                    std::string::npos &&
-                                published_key.find("OVERLAY_ROUTE") ==
-                                    std::string::npos)
-                            {
-                                continue;
-                            }
-                            if (related_count++ > 0)
-                                related << ',';
-                            related << published_key;
-                        }
-                        ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
-                                      << " missing required snapshot '" << key
-                                      << "'; published={" << present.str()
-                                      << "}; related_route_keys={"
-                                      << related.str() << '}';
-                        return false;
+                        missing.push_back(key);
                     }
+                }
+                if (!missing.empty())
+                {
+                    // Preserve the complete failed inventory in one report.
+                    // A missing early checkpoint must not hide later wiring
+                    // defects behind another expensive model reload.
+                    std::ostringstream missing_keys;
+                    for (size_t index = 0; index < missing.size(); ++index)
+                    {
+                        if (index > 0) missing_keys << ',';
+                        missing_keys << missing[index];
+                    }
+                    std::ostringstream present;
+                    constexpr size_t kInventoryLimit = 24;
+                    for (size_t index = 0;
+                         index < keys.size() && index < kInventoryLimit;
+                         ++index)
+                    {
+                        if (index > 0)
+                            present << ',';
+                        present << keys[index];
+                    }
+                    if (keys.size() > kInventoryLimit)
+                        present << ",...(" << keys.size() << " total)";
+                    std::ostringstream related;
+                    size_t related_count = 0;
+                    for (const auto &published_key : keys)
+                    {
+                        if (published_key.find("DOMAIN_ROUTE") ==
+                                std::string::npos &&
+                            published_key.find("RUNTIME_ROUTE") ==
+                                std::string::npos &&
+                            published_key.find("OVERLAY_ROUTE") ==
+                                std::string::npos)
+                        {
+                            continue;
+                        }
+                        if (related_count++ > 0)
+                            related << ',';
+                        related << published_key;
+                    }
+                    ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
+                                  << " missing required snapshot '" << missing.front()
+                                  << "'; all_missing={" << missing_keys.str()
+                                  << "}; published={" << present.str()
+                                  << "}; related_route_keys={"
+                                  << related.str() << '}'
+                                  << "; query_program_observation="
+                                  << qwenSparseQueryProgramObservationJSON(parity_query_program_observation_);
+                    return false;
                 }
             }
 
@@ -11898,9 +11941,9 @@ namespace llaminar2::test::parity
             if(phase==ParityForwardPhase::Prefill)parity_query_next_decode_step_=0;
             else {
                 parity_query_decode_step_=parity_query_next_decode_step_++;
-                parity_query_program_observation_=QwenSparseQueryProgramObservation::begin(
-                    canonicalQueryParticipantDevices(),[]{return PerfStatsCollector::snapshot({"qsa"});});
             }
+            parity_query_program_observation_=QwenSparseQueryProgramObservation::begin(
+                canonicalQueryParticipantDevices(),[]{return PerfStatsCollector::snapshot({"qsa"});});
             auto total_scope = profileParityScope("forward." + phase_name + ".total");
             if (policy.enabled)
             {
@@ -11921,9 +11964,6 @@ namespace llaminar2::test::parity
                     return false;
             }
 
-            if(phase==ParityForwardPhase::Decode)
-                parity_query_program_observation_.finish([]{return PerfStatsCollector::snapshot({"qsa"});});
-
             if (policy.enabled &&
                 phase == ParityForwardPhase::Prefill &&
                 activePrimaryDevice().is_gpu() &&
@@ -11934,10 +11974,13 @@ namespace llaminar2::test::parity
                 auto scope = profileParityScope("forward." + phase_name + ".capture_retry");
                 activeClearCache();
                 activeClearSnapshots();
+                parity_query_program_observation_=QwenSparseQueryProgramObservation::begin(
+                    canonicalQueryParticipantDevices(),[]{return PerfStatsCollector::snapshot({"qsa"});});
                 if (!executeActiveParityForward(phase, tokens, token_count))
                     return false;
             }
 
+            parity_query_program_observation_.finish([]{return PerfStatsCollector::snapshot({"qsa"});});
             {
                 auto scope = profileParityScope("forward." + phase_name + ".validate_snapshots");
                 return validateParityGraphSnapshots(phase, policy);
@@ -12279,12 +12322,14 @@ namespace llaminar2::test::parity
             std::optional<float> previous_comparable;
             for (const auto &stage : stats.stage_results)
             {
-                actual_evidence_valid = actual_evidence_valid && validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode);
+                actual_evidence_valid = actual_evidence_valid && validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill);
                 if(stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery)
                 {
                     // A structural witness contributes no numerical sample or
                     // tolerance verdict and cannot establish layer coverage.
-                    witnesses_passed=witnesses_passed && phase==ParityForwardPhase::Decode && validParityCheckpointEvidence(stage,true);
+                    witnesses_passed=witnesses_passed && validParityCheckpointEvidence(stage,true,
+                        phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill);
                     continue;
                 }
                 if (stage.integer_mismatch_count)
@@ -12435,7 +12480,8 @@ namespace llaminar2::test::parity
                             if constexpr (requires { record.combined_result; }) return record.combined_result;
                             else return record;
                         }();
-                        if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode))
+                        if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill))
                             return ::testing::AssertionFailure() << "Missing or invalid declared raw checkpoint " << key;
                     }
                 }
@@ -12473,8 +12519,8 @@ namespace llaminar2::test::parity
                         if constexpr (requires { record.combined_result; }) return record.combined_result;
                         else return record;
                     }();
-                    if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode) ||
-                        (phase!=ParityForwardPhase::Decode && stage.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery) ||
+                    if (!validParityCheckpointEvidence(stage,phase==ParityForwardPhase::Decode || stage.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                    phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill) ||
                         (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
                         return ::testing::AssertionFailure() << "Invalid raw checkpoint " << stage.stage_name << " in decoder " << layer.layer_idx;
                 }
@@ -12563,8 +12609,8 @@ namespace llaminar2::test::parity
                     return ::testing::AssertionFailure()<<"Pipeline owned decoder has no original stages";
                 for(const auto& record:layer.stage_results)
                 {
-                    if(!validParityCheckpointEvidence(record,phase==ParityForwardPhase::Decode) ||
-                       (phase==ParityForwardPhase::Prefill && record.checkpoint_evidence_kind==ParityCheckpointEvidenceKind::UnauthoredQuery) ||
+                    if(!validParityCheckpointEvidence(record,phase==ParityForwardPhase::Decode || record.checkpoint_evidence_kind!=ParityCheckpointEvidenceKind::ComparedValues,
+                        phase==ParityForwardPhase::Decode?QwenSparseQueryPhase::Decode:QwenSparseQueryPhase::Prefill) ||
                        (record.integer_mismatch_count && *record.integer_mismatch_count!=0))
                         return ::testing::AssertionFailure()<<"Pipeline invalid original raw checkpoint "<<record.stage_name;
                 }
@@ -13574,14 +13620,6 @@ namespace llaminar2::test::parity
                     std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage_name;
                     std::string pytorch_key = llaminar_key;
 
-                    if (!available_snapshots.count(llaminar_key))
-                    {
-                        if (config_.final_logit_mean_kl)
-                            retainMissingRequiredParityStage(layer_stats, llaminar_key, stage_name,
-                                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
-                        continue;
-                    }
-
                     if (auto integer_result = compareIntegerReference(pytorch_key, llaminar_key, stage_name))
                     {
                         TPStageComparisonResult result;
@@ -13594,6 +13632,14 @@ namespace llaminar2::test::parity
                         layer_stats.stage_results.push_back(std::move(result));
                         continue;
                     }
+                    if (!available_snapshots.count(llaminar_key))
+                    {
+                        if (config_.final_logit_mean_kl)
+                            retainMissingRequiredParityStage(layer_stats, llaminar_key, stage_name,
+                                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
+                        continue;
+                    }
+
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
                     {

@@ -16,6 +16,7 @@
 #include "Qwen35Graph.h"
 #include "execution/mtp/MTPForwardConstruction.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
+#include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
@@ -1319,9 +1320,18 @@ namespace llaminar2
         const bool gdn_state_already_full =
             local_conv_state_floats == full_conv_state_floats &&
             local_recurrence_state_floats == full_recurrence_state_floats;
-        const bool gdn_live_state_handoff_candidate =
-            total_tokens > 1 && live_state_allgather_available &&
-            (gdn_state_is_linked_local || gdn_state_already_full);
+        // The enclosing canonical phase scope selects local prefill versus
+        // replicated decode weights before these state dimensions are resolved.
+        // A terminal Prefill M=1 still writes local state and owes publication;
+        // its complete bank must be current before decode or prefix export.
+        const auto producer_layout = gdn_state_is_linked_local
+            ? gdn_live_state_workspace::ProducerLayout::LinkedParticipant
+            : gdn_state_already_full
+                ? gdn_live_state_workspace::ProducerLayout::FullReplica
+                : gdn_live_state_workspace::ProducerLayout::Unavailable;
+        const bool gdn_live_state_handoff_candidate = live_state_allgather_available &&
+            total_tokens > 0 && gdn_live_state_workspace::requiresPublication(
+                static_cast<std::size_t>(total_tokens), producer_layout);
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -1592,27 +1602,11 @@ namespace llaminar2
             state_gather_params.geometry = linked_state_geometry;
             state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
 
-            if (!gdn_state_already_full)
-            {
-                graph.addNode(prefix + "gdn_live_state_allgather",
-                              ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
-                              device);
-                graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
-                gdn_state_ready_node = prefix + "gdn_live_state_allgather";
-            }
-            else
-            {
-                /*
-                 * Dynamic ExpertOverlay can install replicated dense/GDN weights
-                 * before the long-context prefill begins.  In that case the
-                 * recurrence and short-conv kernels already own full mirrored
-                 * state, so an allgather would be both unnecessary and
-                 * dimensionally invalid (`full == local`, not `local * degree`).
-                 */
-                LOG_TRACE("[Qwen35Graph] Skipping GDN live-state allgather for layer "
-                          << layer_idx
-                          << " because prefill state is already full-sized");
-            }
+            graph.addNode(prefix + "gdn_live_state_allgather",
+                          ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
+                          device);
+            graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
+            gdn_state_ready_node = prefix + "gdn_live_state_allgather";
         }
 
         /*

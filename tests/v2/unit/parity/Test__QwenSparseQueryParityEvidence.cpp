@@ -9,6 +9,8 @@
 #include "integration/parity/qwen4exp/Qwen4ExpPrefillAcceptance.h"
 #include "integration/parity/qwen4exp/Qwen4ExpParityTestBase.h"
 #include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
+#include "execution/qwen4exp/QwenSparseQueryProgramObservation.h"
+#include "utils/DebugEnv.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <chrono>
@@ -554,4 +556,260 @@ TEST(QwenSparseQueryParityEvidence, QFNCompleteDecodeAcceptsOnlyAuthenticatedUna
     EXPECT_FALSE(final_probe.prefillEvidence(prefill));
 }
 
+} // namespace llaminar2::test::parity
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+/** @return One independently recorded complete exact-width Prefill request on its original participant. */
+PerfStatRecord prefillOmissionRecord(uint64_t count, const std::string &device="ROCm:7", int rows=9)
+{
+    auto record=omissionRecord(count);
+    record.phase="prefill";
+    record.device=device;
+    record.tags["physical_rows"]=std::to_string(rows);
+    record.tags.emplace("logical_rows",std::to_string(rows));
+    record.tags.emplace("logical_begin","0");
+    record.tags.emplace("width_policy","exact_retained");
+    return record;
+}
+/** @return Original full prompt history; no native query decision chooses its empty interval. */
+QwenSparseQueryHistory prefillHistory(int rows=9)
+{return {.promptRows=static_cast<std::size_t>(rows),.liveRows=rows,.sourceCapacity=4096,
+    .phase=QwenSparseQueryPhase::Prefill};}
+}
+/** @test Completed exact Prefill authenticates every original participant without numerical sample credit. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionPrefillAuthenticatesFullPromptAndParticipants)
+{
+    QwenSparseQueryProgramObservation path;
+    path.expected_devices={"ROCm:7","ROCm:6","ROCm:8","ROCm:9"};
+    for(const auto &device:path.expected_devices) {
+        path.before.push_back(prefillOmissionRecord(7,device));
+        path.after.push_back(prefillOmissionRecord(8,device));
+    }
+    const auto proof=inspectOmittedQwenSparseQueryEvidence(path,prefillHistory(),9*512);
+    ASSERT_TRUE(proof.valid);EXPECT_TRUE(proof.unauthored);
+    EXPECT_EQ(proof.referenceFirstRow,9u);
+    EXPECT_FALSE(proof.observation.lifetime_owner);
+    auto raw=structural("QSA_INDEXER_RAW_QUERY",proof);
+    EXPECT_TRUE(validParityCheckpointEvidence(raw,true,QwenSparseQueryPhase::Prefill));
+    EXPECT_FALSE(validParityCheckpointEvidence(raw,true,QwenSparseQueryPhase::Decode));
+    EXPECT_FALSE(raw.passed);EXPECT_FALSE(raw.evidence_valid);EXPECT_EQ(raw.total_elements,0u);
+    const auto threshold=inspectOmittedQwenSparseQueryEvidence(
+        {{prefillOmissionRecord(7,"ROCm:7",2051)},{prefillOmissionRecord(8,"ROCm:7",2051)},{"ROCm:7"}},
+        prefillHistory(2051),2051*512);
+    EXPECT_TRUE(threshold.valid);
+    EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(
+        {{},{prefillOmissionRecord(1,"ROCm:7",2052)},{"ROCm:7"}},prefillHistory(2052),2052*512).valid);
+}
+/** @test Wrong phase, stale counters, padded/partial geometry and missing participants cannot certify omission. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionPrefillRejectsStaleForeignOrPartialEvidence)
+{
+    const QwenSparseQueryProgramObservation original{
+        {prefillOmissionRecord(7)},{prefillOmissionRecord(8)},{"ROCm:7"}};
+    const auto valid=[](const QwenSparseQueryProgramObservation &path) {
+        return inspectOmittedQwenSparseQueryEvidence(path,prefillHistory(),9*512).valid;
+    };
+    ASSERT_TRUE(valid(original));
+    for(const auto &[tag,value]:std::vector<std::pair<std::string,std::string>>{
+        {"physical_rows","8"},{"physical_rows","512"},{"logical_rows","8"},
+        {"logical_begin","1"},{"width_policy","retained_padding"},{"program","ranking_possible"},
+        {"role","1"},{"observation","capture_only"}}) {
+        auto bad=original;bad.after.front().tags[tag]=value;
+        EXPECT_FALSE(valid(bad))<<tag<<'='<<value;
+    }
+    auto bad=original;bad.after.front().phase="decode";EXPECT_FALSE(valid(bad));
+    bad=original;bad.after.front().device="ROCm:6";EXPECT_FALSE(valid(bad));
+    bad=original;bad.expected_devices.push_back("ROCm:6");EXPECT_FALSE(valid(bad));
+    bad=original;bad.expected_devices.push_back("ROCm:7");EXPECT_FALSE(valid(bad));
+    bad=original;bad.after=bad.before;EXPECT_FALSE(valid(bad));
+    bad=original;bad.after.front().count=9;EXPECT_FALSE(valid(bad));
+    bad=original;bad.after.front().count=6;EXPECT_FALSE(valid(bad));
+    bad=original;bad.after.push_back(prefillOmissionRecord(1,"ROCm:7",1));EXPECT_FALSE(valid(bad));
+    auto history=prefillHistory();history.decodeRowsBefore=1;
+    EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(original,history,9*512).valid);
+    history=prefillHistory();history.liveRows=8;
+    EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(original,history,9*512).valid);
+    EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(original,prefillHistory(),512).valid);
+}
+/** @test Actual Prefill finalizers preserve both required query identities and reject missing layer coverage. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionPrefillKeepsRequiredLayerCoverageAndNumericalGates)
+{
+    const auto proof=inspectOmittedQwenSparseQueryEvidence(
+        {{prefillOmissionRecord(7)},{prefillOmissionRecord(8)},{"ROCm:7"}},prefillHistory(),9*512);
+    const std::array values{1.f,2.f};
+    const auto attention=compareParityTensorData(values.data(),values.data(),values.size(),"ATTENTION_OUTPUT",.99f);
+    LayerStats layer;layer.layer_idx=3;
+    layer.stage_results={structural("QSA_INDEXER_RAW_QUERY",proof),structural("QSA_INDEXER_QUERY",proof),attention};
+    QueryWorkProbe::finalizePrefillLayerNumerics(layer,ParityConfig{});
+    ASSERT_TRUE(layer.evidence_valid);EXPECT_TRUE(layer.passed);EXPECT_EQ(layer.stages_compared,1);
+    EXPECT_TRUE(qwen4exp::acceptsQwen4ExpLayerEvidence(layer,qwen4exp::Qwen4ExpMainEvidencePhase::Prefill));
+    EXPECT_FALSE(qwen4exp::acceptsQwen4ExpLayerEvidence(layer,qwen4exp::Qwen4ExpMainEvidencePhase::Decode));
+    const std::vector<std::string> required{
+        "layer3_QSA_INDEXER_RAW_QUERY","layer3_QSA_INDEXER_QUERY","layer3_ATTENTION_OUTPUT"};
+    EXPECT_TRUE(QueryWorkProbe::acceptsRequiredRawParityStages(std::vector{layer},required,ParityForwardPhase::Prefill));
+    auto missing=layer;missing.stage_results.erase(missing.stage_results.begin());
+    EXPECT_FALSE(QueryWorkProbe::acceptsRequiredRawParityStages(std::vector{missing},required,ParityForwardPhase::Prefill));
+    auto wrong_layer=required;wrong_layer.front()="layer7_QSA_INDEXER_RAW_QUERY";
+    EXPECT_FALSE(QueryWorkProbe::acceptsRequiredRawParityStages(std::vector{layer},wrong_layer,ParityForwardPhase::Prefill));
+    auto duplicate=layer;duplicate.stage_results.push_back(duplicate.stage_results.front());
+    EXPECT_FALSE(QueryWorkProbe::acceptsRequiredRawParityStages(std::vector{duplicate},required,ParityForwardPhase::Prefill));
+    auto invalid=layer;invalid.stage_results.back().evidence_valid=false;
+    QueryWorkProbe::finalizePrefillLayerNumerics(invalid,ParityConfig{});
+    // Numerical similarity and raw publication validity are separate gates.
+    // Retaining a finite cosine cannot rescue an invalid original observation.
+    EXPECT_FALSE(invalid.evidence_valid);
+    EXPECT_FALSE(QueryWorkProbe::acceptsRequiredRawParityStages(std::vector{invalid},required,ParityForwardPhase::Prefill));
+    EXPECT_FALSE(qwen4exp::acceptsQwen4ExpLayerEvidence(invalid,qwen4exp::Qwen4ExpMainEvidencePhase::Prefill));
+    invalid.stage_results.back().cosine_similarity=std::numeric_limits<float>::quiet_NaN();
+    QueryWorkProbe::finalizePrefillLayerNumerics(invalid,ParityConfig{});EXPECT_FALSE(invalid.passed);
+    invalid=layer;invalid.stage_results.pop_back();
+    QueryWorkProbe::finalizePrefillLayerNumerics(invalid,ParityConfig{});
+    EXPECT_FALSE(invalid.passed);EXPECT_EQ(invalid.stages_compared,0);
+    QueryWorkProbe::finalizeDecodeLayerNumerics(layer,ParityConfig{},true);EXPECT_FALSE(layer.passed);
+}
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Canonical Prefill CSV retains complete prompt provenance without inventing native rows or numerical pass. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionPrefillCSVKeepsNativeFieldsBlank)
+{
+    struct Temporary {
+        std::filesystem::path path=std::filesystem::temp_directory_path()/
+            ("llaminar-query-prefill-omission-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        ~Temporary(){std::error_code error;std::filesystem::remove_all(path,error);}
+    } temporary;
+    const auto proof=inspectOmittedQwenSparseQueryEvidence(
+        {{prefillOmissionRecord(7)},{prefillOmissionRecord(8)},{"ROCm:7"}},prefillHistory(),9*512);
+    LayerStats layer;layer.layer_idx=3;
+    layer.stage_results={structural("QSA_INDEXER_RAW_QUERY",proof),structural("QSA_INDEXER_QUERY",proof)};
+    ParityTestSummary summary;summary.layer_stats={layer};
+    ASSERT_TRUE(ParityCSVArtifactWriter::writePrefill(temporary.path,"ROCm:7",summary));
+    std::ifstream input(temporary.path/"prefill_stages.csv");ASSERT_TRUE(input);
+    std::string header,line;ASSERT_TRUE(std::getline(input,header));ASSERT_TRUE(std::getline(input,line));
+    const auto names=fields(header),row=fields(line);ASSERT_EQ(names.size(),row.size());
+    const auto value=[&](const std::string &name){const auto it=std::find(names.begin(),names.end(),name);
+        return it==names.end()?std::string("missing"):row[std::size_t(it-names.begin())];};
+    EXPECT_EQ(value("structural_valid"),"1");EXPECT_EQ(value("history_prompt_rows"),"9");
+    EXPECT_EQ(value("history_live_rows"),"9");EXPECT_EQ(value("history_decode_rows_before"),"0");
+    EXPECT_EQ(value("observed_prefix_rows"),"");EXPECT_EQ(value("observed_physical_rows"),"");
+    EXPECT_EQ(value("passed"),"0");EXPECT_EQ(value("cosine"),"");
+    EXPECT_EQ(value("reference_rows"),"9");EXPECT_EQ(value("reference_first_row"),"9");
+    if(const char *destination=std::getenv("LLAMINAR_QUERY_OMISSION_CSV_EXPORT")) {
+        const std::filesystem::path target(destination);
+        ASSERT_TRUE(target.is_absolute());ASSERT_FALSE(std::filesystem::exists(target));
+        ASSERT_TRUE(std::filesystem::copy_file(temporary.path/"prefill_stages.csv",target));
+    }
+}
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Original nested PP keeps all stage TP members while its top-level TP vector remains empty. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionPrefillParticipantProjectionKeepsNestedPipelineOwners)
+{
+    RankExecutionPlan plan;plan.rank=0;
+    plan.local_pp_devices={GlobalDeviceAddress::rocm(7,1),GlobalDeviceAddress::rocm(1,1)};
+    plan.local_pp_stage_tp_info.resize(2);
+    for(const int ordinal:{7,6,8,9})plan.local_pp_stage_tp_info[0].devices.push_back(GlobalDeviceAddress::rocm(ordinal,1));
+    for(const int ordinal:{1,3,4,2})plan.local_pp_stage_tp_info[1].devices.push_back(GlobalDeviceAddress::rocm(ordinal,1));
+    ASSERT_TRUE(plan.local_tp_devices.empty());
+    const std::vector<std::string> expected{"ROCm:7","ROCm:6","ROCm:8","ROCm:9","ROCm:1","ROCm:3","ROCm:4","ROCm:2"};
+    EXPECT_EQ(qwenSparseQueryParticipantDevices(plan,0),expected);
+    QwenSparseQueryProgramObservation observation;observation.expected_devices=qwenSparseQueryParticipantDevices(plan,0);
+    for(const auto &device:expected) {
+        observation.before.push_back(prefillOmissionRecord(7,device));
+        observation.after.push_back(prefillOmissionRecord(8,device));
+    }
+    EXPECT_TRUE(inspectOmittedQwenSparseQueryEvidence(observation,prefillHistory(),9*512).valid);
+    observation.expected_devices={"ROCm:7"};
+    EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(observation,prefillHistory(),9*512).valid);
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(plan,1).empty());
+    auto invalid=plan;invalid.local_pp_stage_tp_info[1].devices.back()=GlobalDeviceAddress::rocm(7,1);
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(invalid,0).empty());
+    invalid=plan;invalid.local_pp_stage_tp_info[1].devices.front()=GlobalDeviceAddress::rocm(3,1);
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(invalid,0).empty());
+    invalid=plan;invalid.local_pp_stage_tp_info.pop_back();
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(invalid,0).empty());
+    invalid=plan;invalid.local_pp_stage_tp_info[1].devices.back().hostname="foreign-host";
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(invalid,0).empty());
+    invalid=plan;invalid.local_tp_devices={GlobalDeviceAddress::rocm(7,1)};
+    EXPECT_TRUE(qwenSparseQueryParticipantDevices(invalid,0).empty());
+    RankExecutionPlan stage;stage.rank=0;stage.primary_device=plan.local_pp_devices.front();
+    stage.local_tp_devices=plan.local_pp_stage_tp_info.front().devices;
+    EXPECT_EQ(qwenSparseQueryParticipantDevices(stage,0),(std::vector<std::string>{"ROCm:7","ROCm:6","ROCm:8","ROCm:9"}));
+    stage.local_tp_devices.clear();
+    EXPECT_EQ(qwenSparseQueryParticipantDevices(stage,0),(std::vector<std::string>{"ROCm:7"}));
+}
+}
+
+namespace llaminar2::test::parity {
+/** @test The production direct/composed recorder proves only complete fresh main forwards after reset. */
+TEST(QwenSparseQueryParityEvidence, ProgramOmissionProductionDecodeRecorderReplaysOriginalParticipants)
+{
+    /** @brief Restore the original collector policy after this device-free replay. */
+    struct CollectorScope {
+        std::map<std::string,std::optional<std::string>> saved;
+        /** @brief Enable only the original observation family, preserving process environment. */
+        CollectorScope() {
+            for (const char *key : {"LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"}) {
+                const char *value=std::getenv(key);saved.emplace(key,value?std::optional<std::string>{value}:std::nullopt);
+            }
+            setenv("LLAMINAR_PERF_STATS_JSON","1",1);setenv("LLAMINAR_PERF_STATS_FILTER","qsa",1);
+            mutableDebugEnv().reload();PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
+        }
+        /** @brief Retire test records and restore the exact prior immutable collection policy. */
+        ~CollectorScope() {
+            PerfStatsCollector::reset();
+            for(const auto &[key,value]:saved) {
+                if(value)setenv(key.c_str(),value->c_str(),1);else unsetenv(key.c_str());
+            }
+            mutableDebugEnv().reload();PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+    } scope;
+    const auto read=[] {return PerfStatsCollector::snapshot({"qsa"});};
+    for(const int degree:{1,2,4,8,11}) {
+        std::vector<DeviceId> participants;
+        std::vector<std::string> names;
+        for(int i=0;i<degree;++i){participants.push_back(DeviceId::rocm(i));names.push_back(participants.back().toString());}
+        PerfStatsCollector::reset();
+        for(int step=0;step<6;++step) {
+            auto observed=QwenSparseQueryProgramObservation::begin(names,read);
+            // No observations at cold construction or before successful completion.
+            observed.finish(read);
+            EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(observed,{9,static_cast<std::size_t>(step),1,4096},512).valid);
+            auto selected=SparseQueryExecutionProgram::ProvenNoRanking;
+            const auto executed=selected;
+            selected=SparseQueryExecutionProgram::RankingPossible; // Retired request's later selector.
+            EXPECT_NE(executed,selected);
+            for(int i=0;i<degree;++i) {
+                recordQwenSparseQueryDecodeForward(participants[i],executed,
+                    ForwardExecutionRole::MainInference,1);
+                observed.finish(read);
+                EXPECT_EQ(inspectOmittedQwenSparseQueryEvidence(observed,{9,static_cast<std::size_t>(step),1,4096},512).valid,i+1==degree);
+            }
+            auto repeated=observed;repeated.before=observed.after;repeated.finish(read);
+            EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(repeated,{9,static_cast<std::size_t>(step),1,4096},512).valid);
+        }
+        // A reset within the same observation cannot replace original history.
+        auto reset=QwenSparseQueryProgramObservation::begin(names,read);
+        PerfStatsCollector::reset();reset.finish(read);
+        EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(reset,{9,0,1,4096},512).valid);
+    }
+    for(int defect=0;defect<4;++defect) {
+        PerfStatsCollector::reset();
+        auto observed=QwenSparseQueryProgramObservation::begin({DeviceId::rocm(7).toString()},read);
+        recordQwenSparseQueryDecodeForward(DeviceId::rocm(7),
+            defect==0?SparseQueryExecutionProgram::RankingPossible:SparseQueryExecutionProgram::ProvenNoRanking,
+            defect==1?ForwardExecutionRole::GroupedMTPVerifier:
+                defect==2?ForwardExecutionRole::MTPCondition:ForwardExecutionRole::MainInference,
+            defect==3?2:1);
+        observed.finish(read);
+        EXPECT_FALSE(inspectOmittedQwenSparseQueryEvidence(observed,{9,0,1,4096},512).valid);
+    }
+    EXPECT_THROW(recordQwenSparseQueryDecodeForward(DeviceId::rocm(7),
+        static_cast<SparseQueryExecutionProgram>(99),ForwardExecutionRole::MainInference,1),std::invalid_argument);
+}
 } // namespace llaminar2::test::parity

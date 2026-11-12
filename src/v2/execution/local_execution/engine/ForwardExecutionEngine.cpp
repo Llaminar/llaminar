@@ -2772,6 +2772,34 @@ namespace llaminar2
         return true;
     }
 
+    bool ForwardExecutionEngine::publishComposedForwardSnapshots(
+        const ForwardGraphSignature &signature,
+        const IGPUGraphCapture *source_capture,
+        void *producer_stream,
+        std::string *error)
+    {
+        const auto reject = [&](const char *reason) {
+            if (error) *error = reason;
+            return false;
+        };
+        if (error) error->clear();
+        if (reinterpret_cast<std::uintptr_t>(producer_stream) <= 2)
+            return reject("Composed forward diagnostics require the exact non-default parent stream");
+        if (!observeComposedForwardCompletion(signature, source_capture, 0, error))
+            return false;
+        auto &original = cache_.at(signature);
+        if (original.snapshot_configuration_epoch != executor_.snapshotConfigurationEpoch())
+            return reject("Composed forward diagnostics have a stale original snapshot configuration");
+        // The captured child already wrote this manifest's D2D slots. Use the
+        // ordinary bulk diagnostic acquisition and callbacks on the actual
+        // parent stream, never the stages' retained capture-time stream guesses.
+        if (!executor_.publishSnapshotsAfterGraphExecution(*original.graph, producer_stream,
+                "completed_composed_forward", &original.segment_cache.snapshot_manifest))
+            return reject("Composed forward could not publish its original captured snapshot manifest");
+        recordLastExecutedForwardGraph(signature, true, producer_stream);
+        return true;
+    }
+
     std::vector<RetainedForwardSourceDefinition>
     ForwardExecutionEngine::retainedSourceGraphDefinitions(uint64_t snapshot_identity) const
     {

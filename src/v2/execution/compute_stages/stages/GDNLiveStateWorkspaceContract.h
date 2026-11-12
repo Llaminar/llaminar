@@ -11,6 +11,7 @@
 #include "GDNLinkedLiveStateGeometry.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -22,6 +23,30 @@ inline constexpr const char *FullConv = "gdn_live_state_full_conv";
 inline constexpr const char *LocalRecurrence = "gdn_live_state_local_recurrence";
 inline constexpr const char *GatheredRecurrence = "gdn_live_state_gathered_recurrence";
 inline constexpr const char *FullRecurrence = "gdn_live_state_full_recurrence";
+
+/** @brief Actual state producer selected by the canonical forward phase/weight binding. */
+enum class ProducerLayout
+{
+    LinkedParticipant, ///< A participant-local TP producer must publish a full successor.
+    FullReplica, ///< Replicated decode/MTP already writes the complete live bank.
+    Unavailable, ///< No complete modulo-linked publication geometry exists.
+};
+
+/**
+ * @brief Decide publication from actual producer ownership, never an M-based phase guess.
+ * @param live_rows Positive logical/physical producer rows admitted for this graph.
+ * @param layout Actual state shape after the canonical phase selects its weights.
+ * @return Whether a complete local-to-full publication is owed, including Prefill M=1.
+ *
+ * A terminal scalar prefill updates the local banks just like a larger chunk.
+ * Omitting publication preserves stale full history in both direct decode and
+ * serialized prefix-cache payloads. Full replicated producers already own the
+ * successor and must not collect another participant's copy of those bytes.
+ */
+[[nodiscard]] constexpr bool requiresPublication(std::size_t live_rows, ProducerLayout layout) noexcept
+{
+    return live_rows > 0 && layout == ProducerLayout::LinkedParticipant;
+}
 
 /** @brief Original local collective degree and model-owned linked-state layout. */
 struct Geometry

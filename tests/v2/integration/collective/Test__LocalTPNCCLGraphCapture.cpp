@@ -10,6 +10,9 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../utils/ObservedNativeReplayOwner.h"
+#include "utils/MPIContext.h"
+#include <set>
 
 #ifdef HAVE_CUDA
 
@@ -2847,7 +2850,9 @@ namespace
     {
         static constexpr int Guard = 16;
         static constexpr float Poison = -193.25f;
-        int ordinal;
+        int ordinal; ///< Physical backend ordinal from original owner selection.
+        int participant; ///< Independent ordered LocalTP coordinate.
+        int world_rank; ///< Original discovery owner used by its sole memory authority.
         cudaStream_t stream = nullptr;
         std::unique_ptr<CUDADeviceContext> context;
         std::shared_ptr<PhysicalMemoryAuthority> memory;
@@ -2861,9 +2866,14 @@ namespace
         std::string error;
         GDNLinkedLiveStateShape conv_shape, recurrence_shape;
 
-        /** @brief Construct only cold, typed owner/context metadata. */
-        explicit GDNHandoffParticipant(int device)
-            : ordinal(device), context(std::make_unique<CUDADeviceContext>(DeviceId::cuda(device), device)),
+        /**
+         * @brief Construct cold metadata on the selected original physical owner.
+         * @param device Original backend ordinal, independent of participant order.
+         * @param local_participant Ordered coordinate in this exact two-member clique.
+         * @param original_rank Actual discovery owner of every admitted allocation.
+         */
+        explicit GDNHandoffParticipant(int device, int local_participant, int original_rank)
+            : ordinal(device), participant(local_participant), world_rank(original_rank), context(std::make_unique<CUDADeviceContext>(DeviceId::cuda(device), device)),
               conv(device), recurrence(device) {}
 
         /** @brief Retire graphs before every embedded buffer/owner/stream. */
@@ -2910,7 +2920,7 @@ namespace
             GDNLiveStateAllGatherStage::Params params;
             params.device_id=DeviceId::cuda(ordinal);params.tp_ctx=&clique;
             params.conv_kernel=&conv;params.recurrence_kernel=&recurrence;
-            params.layer_idx=7;params.tp_device_idx=ordinal;params.geometry=geometry;
+            params.layer_idx=7;params.tp_device_idx=participant;params.geometry=geometry;
             // Collective names remain participant-invariant, as in production.
             params.stage_name="gdn_value_major_handoff_fixture";
             stage=std::make_unique<GDNLiveStateAllGatherStage>(params);
@@ -2923,12 +2933,12 @@ namespace
             const auto work_requirements=stage->getWorkspaceRequirements(1);
             const auto state_bytes=state_requirements.total_bytes_with_alignment();
             const auto work_bytes=work_requirements.total_bytes_with_alignment();
-            const PhysicalMemoryResource resource{.world_rank=0,.device=params.device_id,
+            const PhysicalMemoryResource resource{.world_rank=world_rank,.device=params.device_id,
                 .total_bytes=state_bytes+work_bytes,.admission_available_bytes=state_bytes+work_bytes};
             PhysicalMemoryPlanBuilder plan;
             plan.add(resource,PhysicalMemoryOwner::RecurrentLiveState,state_bytes);
             plan.add(resource,PhysicalMemoryOwner::ExecutionWorkspace,work_bytes);
-            memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+            memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),world_rank);
             states=std::make_unique<DeviceWorkspaceManager>(params.device_id,state_bytes,memory,PhysicalMemoryOwner::RecurrentLiveState);
             workspace=std::make_unique<DeviceWorkspaceManager>(params.device_id,work_bytes,memory);
             require(states->allocate(state_requirements)&&workspace->allocate(work_requirements),"allocate original GDN handoff banks");
@@ -2960,13 +2970,13 @@ namespace
             // key heads are modulo-sharded. Inner head coordinates stay opaque.
             const int keys=shape.global_key_heads,local_keys=shape.local_key_heads;
             for(int group=0;group<shape.prefix_group_count;++group)
-                for(int key=ordinal;key<keys;key+=2)
+                for(int key=participant;key<keys;key+=2)
                     std::copy_n(full.data()+(group*keys+key)*shape.key_elements_per_head,
                         shape.key_elements_per_head,local.data()+(group*local_keys+key/2)*shape.key_elements_per_head);
             const int full_prefix=shape.prefix_group_count*keys*shape.key_elements_per_head;
             const int local_prefix=shape.prefix_group_count*local_keys*shape.key_elements_per_head;
             for(int repeat=0;repeat<shape.repeat_factor;++repeat)
-                for(int key=ordinal;key<keys;key+=2)
+                for(int key=participant;key<keys;key+=2)
                     std::copy_n(full.data()+full_prefix+(repeat*keys+key)*shape.value_elements_per_head,
                         shape.value_elements_per_head,local.data()+local_prefix+(repeat*local_keys+key/2)*shape.value_elements_per_head);
             return {std::move(full),std::move(local)};
@@ -3022,25 +3032,51 @@ namespace
  */
 TEST(Test__LocalTPNCCLGraphCapture, GDNValueMajorColdPrepareCapturesReplaysAndRejectsForeignLayout)
 {
+    // Select one homogeneous ISA cohort from original MPI/NUMA ownership;
+    // physical ordinals are never communicator coordinates or socket aliases.
+    const auto mpi=MPIContextFactory::global();
+    ASSERT_NE(mpi,nullptr);ASSERT_NE(mpi->clusterInventory(),nullptr);
+    const auto& inventory=*mpi->clusterInventory();
+    // CUDAEnumeration publishes SM major/minor through compute_capability;
+    // native_isa is the ROCm target-string authority and can be empty on CUDA.
+    // Authenticate the exact first two endpoints that the existing selector
+    // will return using their original observed SM contract, without probes.
+    const std::array family{NativeReplayFamily{DeviceType::CUDA,2}};
+    const auto selected=selectObservedNativeReplayOwner(inventory,family,
+        [](const RankInventory& rank) {
+            std::optional<std::pair<int,int>> architecture;
+            int members=0;
+            for(const auto& gpu:rank.gpus)
+            {
+                if(gpu.type!=DeviceType::CUDA || !rankOwnsGPUDevice(rank,gpu))continue;
+                const std::pair observed{gpu.compute_capability_major,gpu.compute_capability_minor};
+                if(observed.first<=0 || observed.second<0 || (architecture && *architecture!=observed))
+                    return false;
+                architecture=observed;
+                if(++members==2)return true;
+            }
+            return false;
+        });
+    ASSERT_TRUE(selected)<<"Requires two homogeneous original rank-local CUDA participants";
+    if(mpi->rank()!=selected->discovery_owner)return; // Original idle peers stay represented.
     auto* backend=getCUDABackend();ASSERT_NE(backend,nullptr);
-    if(backend->deviceCount()<2)GTEST_SKIP()<<"Requires two CUDA devices";
     using Participant=GDNHandoffParticipant;using Layout=GDNRecurrenceStateLayout;
     for(const bool mismatch:{false,true})
     {
         SCOPED_TRACE(::testing::Message()<<"foreign_layout="<<mismatch);
-        auto clique=createLocalTPContext({GlobalDeviceAddress::cuda(0),GlobalDeviceAddress::cuda(1)}, {},CollectiveBackendType::NCCL);
+        auto clique=createLocalTPContext({GlobalDeviceAddress::cuda(selected->devices[0].ordinal),GlobalDeviceAddress::cuda(selected->devices[1].ordinal)}, {},CollectiveBackendType::NCCL);
         ASSERT_NE(clique,nullptr);
         std::array<std::unique_ptr<Participant>,2> participants;
         for(int rank=0;rank<2;++rank)
         {
-            participants[rank]=std::make_unique<Participant>(rank);
+            participants[rank]=std::make_unique<Participant>(selected->devices[rank].ordinal,rank,mpi->rank());
             participants[rank]->initialize(*clique,mismatch&&rank==1?Layout::KeyMajorValueContiguous:Layout::ValueMajorKeyContiguous);
             participants[rank]->dirty(0);
         }
         Barrier prepared(2),begun(2),recorded(2);
         const auto worker=[&](int rank){
             auto& p=*participants[rank];
-            try{Participant::native(cudaSetDevice(rank),"select cold worker");p.prepared=p.prepare(GraphLaunchPreparationPhase::Capture);}
+            try{Participant::native(cudaSetDevice(p.ordinal),"select cold worker");p.prepared=p.prepare(GraphLaunchPreparationPhase::Capture);}
             catch(const std::exception& e){p.error=e.what();clique->requestAbort();}
             prepared.arriveAndWait();
             if(!participants[0]->prepared||!participants[1]->prepared)return;
@@ -3061,7 +3097,7 @@ TEST(Test__LocalTPNCCLGraphCapture, GDNValueMajorColdPrepareCapturesReplaysAndRe
         for(int rank=0;rank<2;++rank)
         {
             auto& p=*participants[rank];ASSERT_TRUE(p.error.empty())<<p.error;
-            Participant::native(cudaSetDevice(rank),"inspect owning graph device");
+            Participant::native(cudaSetDevice(p.ordinal),"inspect owning graph device");
             EXPECT_EQ(p.preparations,1);
             if(mismatch){EXPECT_FALSE(p.prepared);EXPECT_EQ(p.capture_attempts,0);EXPECT_EQ(p.capture.graph,nullptr);EXPECT_EQ(p.capture.exec,nullptr);EXPECT_EQ(p.conv.imports,0);EXPECT_EQ(p.recurrence.imports,0);}
             else{
@@ -3073,14 +3109,21 @@ TEST(Test__LocalTPNCCLGraphCapture, GDNValueMajorColdPrepareCapturesReplaysAndRe
                 EXPECT_EQ(p.conv.imports,1);EXPECT_EQ(p.recurrence.imports,1);
             }
         }
-        for(int replay=0;replay<(mismatch?1:2);++replay)
+        // Reuse the actual captured copy/allgather/reassembly/import body on
+        // authored boundary-state snapshots: eight rows, terminal ninth row,
+        // independently restored ninth-row state, then the next successor.
+        // The two ninth-row replays prove 8+1 publication equals direct9 with
+        // dirty full/request banks; model graph tests separately prove that
+        // ExplicitPrefill1 actually contains this production handoff node.
+        const std::array boundary_versions{8,9,9,10};
+        for(int replay=0;replay<(mismatch?1:static_cast<int>(boundary_versions.size()));++replay)
         {
-            const int version=mismatch?0:replay+1;
+            const int version=mismatch?0:boundary_versions[static_cast<std::size_t>(replay)];
             if(!mismatch)
             {
                 for(auto& p:participants)p->dirty(version);
                 const auto launch=[&](int rank){auto& p=*participants[rank];
-                    try{Participant::native(cudaSetDevice(rank),"select retained worker");Participant::require(p.prepare(GraphLaunchPreparationPhase::Replay),"unexpected replay preparation failure");
+                    try{Participant::native(cudaSetDevice(p.ordinal),"select retained worker");Participant::require(p.prepare(GraphLaunchPreparationPhase::Replay),"unexpected replay preparation failure");
                         Participant::native(cudaGraphLaunch(p.capture.exec,p.stream),"replay original handoff graph");
                         Participant::native(cudaStreamSynchronize(p.stream),"retire retained handoff graph");}
                     catch(const std::exception& e){p.error=e.what();clique->requestAbort();}};

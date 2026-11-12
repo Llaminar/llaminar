@@ -1829,3 +1829,115 @@ TEST(PerfStatsCollector, OrdinaryCounterBatchesPreserveMultiplicityAndEpoch)
     EXPECT_DOUBLE_EQ(records[0].value, 5.0);
     PerfStatsCollector::reset();
 }
+
+/** @test Ordering publications alone cannot turn numerical model work into a generation loop. */
+TEST(Test__ProductionParityEvidence, ModelForwardPublicationsDoNotClaimGenerationExecution)
+{
+    const PerfStatRecord publication{
+        .kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+        .name = "device_generation_state_publications", .phase = "decode", .device = "ROCm:7",
+        .tags = {{"producer", "device_generation_parent_terminal"}, {"ordering", "event_wait"}}, .value = 2.0};
+    const auto evidence = collectProductionDeviceGenerationEvidence({publication});
+    EXPECT_FALSE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.model_forward_only_observed);
+    EXPECT_FALSE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(evidence.policy, ProductionDeviceGenerationPolicy::NotObserved);
+}
+
+/** @test Replay the original eight-device zero-output admission and authenticated parent completion schema. */
+TEST(Test__ProductionParityEvidence, ForwardOnlyRequiresEveryOriginalCapturedAndCompletedModelForward)
+{
+    std::vector<PerfStatRecord> records;
+    for (const int ordinal : {7, 6, 8, 9, 1, 3, 4, 2}) {
+        const auto device = "ROCm:" + std::to_string(ordinal);
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+            .name = "device_generation_admissions", .phase = "decode", .device = device,
+            .tags = {{"depth_policy_mode", std::to_string(static_cast<int>(sampling_math::DeviceGenerationPolicyMode::ForwardOnly))},
+                {"max_new_tokens", "0"}}, .value = 2.0});
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "forward_graph",
+            .name = "full_graph_capture_executable_nodes", .phase = "decode", .device = device,
+            .tags = {{"context", "main_decode"}}, .value = 1800.0});
+        records.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "forward_graph",
+            .name = "decode_graph_phase", .phase = "decode", .device = device,
+            .tags = {{"context", "main_decode"}, {"phase", "replay"},
+                {"source", "captured_generation_parent"}, {"observation", "authenticated_terminal"}}, .value = 2.0});
+    }
+    const auto certify = [](const auto &input) {
+        return collectProductionParityEvidence(input, true, ProductionParityExecutionTopology::HomogeneousGPU,
+            ProductionParityGraphContract::HomogeneousGPUCaptured, false, 1.0, 4500.0);
+    };
+    for (int replay = 0; replay < 3; ++replay) {
+        const auto evidence = certify(records);
+        EXPECT_TRUE(evidence.model_forward_only_observed);
+        EXPECT_TRUE(evidence.model_forward_only_certified);
+        EXPECT_FALSE(evidence.device_generation_controller);
+        EXPECT_FALSE(evidence.generation_loop_certified);
+        EXPECT_FALSE(evidence.native_generation_parent);
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence), ProductionParityGraphCertification::Certified);
+    }
+    // A single missing/foreign/partial completion or prefill-only witness must
+    // invalidate the original complete model-forward proof on every replay.
+    for (int defect = 0; defect < 7; ++defect) {
+        auto candidate = records;
+        switch (defect) {
+        case 0: candidate.pop_back(); break;
+        case 1: candidate.back().device = "ROCm:0"; break;
+        case 2: candidate.back().value = 1.0; break;
+        case 3: candidate.back().tags.erase("observation"); break;
+        case 4: candidate.back().tags["context"] = "prefill"; break;
+        case 5: candidate[candidate.size()-2].value = 0.0; break;
+        case 6: candidate[candidate.size()-2].device = "ROCm:0"; break;
+        }
+        const auto evidence = certify(candidate);
+        EXPECT_FALSE(evidence.model_forward_only_certified) << defect;
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph) << defect;
+    }
+    // Every new extent is a positive exact integer. Invalid observations must
+    // fail even beside a valid original capture/completion on the same device.
+    for (const std::size_t role : {0u, 1u, 2u}) {
+        for (const double value : {0.0, -1.0, 0.5, std::numeric_limits<double>::quiet_NaN(),
+                std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::max(), 9007199254740992.0}) {
+            auto candidate = records;
+            candidate[role].value = value;
+            const auto evidence = certify(candidate);
+            EXPECT_TRUE(evidence.model_forward_only_observed);
+            EXPECT_FALSE(evidence.model_forward_only_certified) << role << ":" << value;
+            EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+                ProductionParityGraphCertification::MissingNativeCapturedGraph);
+        }
+    }
+    // Individually representable observations must also fail closed when their
+    // sum leaves the exact integer range of the underlying PerfStats format.
+    for (const std::size_t role : {0u, 2u}) {
+        auto candidate = records;
+        candidate[0].value = 9007199254740991.0;
+        candidate[2].value = 9007199254740991.0;
+        auto extra = candidate[role];
+        extra.value = 1.0;
+        candidate.push_back(extra);
+        EXPECT_FALSE(certify(candidate).model_forward_only_certified) << role;
+        EXPECT_EQ(certifyProductionParityGraphExecution(certify(candidate)),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph);
+    }
+    // Supporting forward evidence never certifies an ordinary, malformed, or
+    // unknown generation request. Preserve the existing generation-policy gate.
+    for (int defect = 0; defect < 5; ++defect) {
+        auto candidate = records;
+        switch (defect) {
+        case 0: candidate.front().tags["depth_policy_mode"] = "3"; break;
+        case 1: candidate.front().tags["max_new_tokens"] = "1"; break;
+        case 2: candidate.front().tags.erase("max_new_tokens"); break;
+        case 3: candidate.front().tags["depth_policy_mode"] = "2"; break;
+        case 4: candidate.push_back({.kind = PerfStatRecord::Kind::Counter, .domain = "mtp",
+            .name = "device_generation_terminal_transactions", .phase = "decode", .device = "ROCm:7", .value = 1.0}); break;
+        }
+        const auto evidence = certify(candidate);
+        EXPECT_TRUE(evidence.device_generation_controller) << defect;
+        EXPECT_EQ(evidence.generation_execution_policy, ProductionDeviceGenerationPolicy::Unclassified) << defect;
+        EXPECT_FALSE(evidence.generation_loop_certified) << defect;
+        EXPECT_EQ(certifyProductionParityGraphExecution(evidence),
+            ProductionParityGraphCertification::MissingNativeCapturedGraph) << defect;
+    }
+}

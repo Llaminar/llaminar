@@ -4659,3 +4659,63 @@ TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillFamilyRejects
     EXPECT_EQ(host.build_forward_graph_calls,0);
     EXPECT_EQ(host.prefill_chunk_submission_begin_calls,0);
 }
+
+/**
+ * @test Completed-parent diagnostics retain exact source identity and stream across reset/repeated observations.
+ * @details Native snapshot bytes are qualified by pipeline parity; this device-free
+ * replay authenticates the real publication API and rejects foreign/stale sources
+ * without launching or constructing another capture.
+ */
+TEST_F(Test__ForwardExecutionEngine, ComposedForwardSnapshotsRetainOriginalCaptureAndProducer)
+{
+    auto engine=makeEngine(true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0),ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count=1;host.mock_compute_all_position_logits=true;
+    host.mock_capture_policy.allow_fast_decode=true;host.mock_capture_policy.allow_cached_graph_replay=true;
+    std::array<int,4> tokens{1,2,3,4},positions{9,10,11,12};
+    std::vector<ForwardGraphSignature> signatures;
+    std::vector<const IGPUGraphCapture*> captures;
+    for(const int rows:{2,4}) {
+        auto input=makeTestInput(rows,1,DeviceId::cuda(0),tokens.data(),positions.data());
+        input.token_ids_device=tokens.data();input.position_ids_device=positions.data();
+        input.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        input.execution_phase=ForwardExecutionPhase::Decode;
+        ForwardOutput output{};ASSERT_TRUE(engine.execute(input,output,host));
+        const auto last=engine.lastAllPositionVerifierForwardGraph();ASSERT_TRUE(last);
+        std::string error;const auto original=engine.deviceLoopGraphTemplate(last->signature,&error);
+        ASSERT_TRUE(original)<<error;signatures.push_back(original->signature);captures.push_back(original->capture);
+    }
+    const auto materializations=llaminar2::testing::sharedMockWorkerGPUContext().graphCaptureCreateCount();
+    int parent_stream=0;
+    std::string error;
+    // Publication can return to an older exact retained child even though the
+    // mutable last-executed selector currently names the other geometry.
+    for(int replay=0;replay<6;++replay) {
+        const auto index=static_cast<std::size_t>(replay%2);
+        ASSERT_TRUE(engine.publishComposedForwardSnapshots(signatures[index],captures[index],&parent_stream,&error))<<error;
+        const auto last=engine.lastExecutedForwardGraph();ASSERT_TRUE(last);
+        EXPECT_EQ(last->signature,signatures[index]);
+        EXPECT_EQ(last->stream,&parent_stream);
+    }
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[1],&parent_stream,&error));
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],nullptr,&parent_stream,&error));
+    for(const std::uintptr_t stream:{0u,1u,2u})
+        EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],reinterpret_cast<void*>(stream),&error));
+    auto absent=signatures[0];absent.seq_len=3;
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(absent,captures[0],&parent_stream,&error));
+    auto foreign_generation=signatures[0];++foreign_generation.moe_placement_epoch;
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(foreign_generation,captures[0],&parent_stream,&error));
+    const auto successful=engine.lastExecutedForwardGraph();ASSERT_TRUE(successful);
+    EXPECT_EQ(successful->signature,signatures[1]); // Partial/foreign publication never relabels the prior success.
+
+    // Selecting a different snapshot topology is not permission to publish
+    // the old captured manifest under the new epoch or silently recapture it.
+    executor_.setSnapshotStageFilter([](const std::string&,const StageDumpInfo&){return true;});
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],&parent_stream,&error));
+    EXPECT_NE(error.find("stale original snapshot configuration"),std::string::npos);
+    EXPECT_EQ(llaminar2::testing::sharedMockWorkerGPUContext().graphCaptureCreateCount(),materializations);
+    engine.invalidateAll();
+    EXPECT_FALSE(engine.publishComposedForwardSnapshots(signatures[0],captures[0],&parent_stream,&error));
+    EXPECT_FALSE(engine.lastExecutedForwardGraph());
+}

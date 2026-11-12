@@ -3228,6 +3228,166 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherWhenAva
 }
 
 /**
+ * @test Explicit scalar Prefill publishes linked state before replicated decode.
+ * Builds exact 8+1 and9 graph families across CPU/CUDA/ROCm without accelerator
+ * execution; captured native copy/collective replay is tested separately.
+ */
+TEST(Test__Qwen35MoEGraph, ExplicitPrefillTailPublishesGDNStateForReplicatedDecode)
+{
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto tp_ctx = std::make_unique<MockLocalTPContext>();
+        const auto address = [&](int rank) {
+            return device.is_cuda() ? GlobalDeviceAddress::cuda(rank) :
+                device.is_rocm() ? GlobalDeviceAddress::rocm(rank) : GlobalDeviceAddress::cpu(rank);
+        };
+        tp_ctx->setDevices({address(0), address(1)});
+        tp_ctx->setBackend(device.is_cuda() ? CollectiveBackendType::NCCL :
+            device.is_rocm() ? CollectiveBackendType::RCCL : CollectiveBackendType::HOST);
+
+        GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+        config.default_device = device;
+        config.dense_tp_enabled = true;
+        config.dense_tp_decode_replicated = true;
+        config.tp_device_idx = 0;
+
+        TensorArena arena;
+        LayerWeights base_layer = makeGDNTPLayerWeights(
+            arena, config, /*value_heads=*/1, /*row_parallel_out=*/true);
+        LayerWeights decode_layer = makeGDNTPLayerWeights(
+            arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
+
+        WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
+        WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
+        WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
+        WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
+        WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
+        WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
+        WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
+        WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
+        WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
+        WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
+
+        WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
+        WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
+        WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
+        WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
+        WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
+        WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
+        WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
+        WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
+        WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
+        WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
+
+        ModelWeightBindings base_bindings;
+        base_bindings.get_layer_weights = [&](int)
+        {
+            LayerWeightBindings layer;
+            layer.attn_norm = &base_attn_norm;
+            layer.attn_qkv = &base_qkv;
+            layer.attn_gate = &base_gate;
+            layer.ssm_alpha = &base_alpha;
+            layer.ssm_beta = &base_beta;
+            layer.ssm_conv1d = &base_conv;
+            layer.ssm_dt_bias = &base_dt;
+            layer.ssm_a = &base_a;
+            layer.ssm_norm = &base_norm;
+            layer.ssm_out = &base_out;
+            return layer;
+        };
+
+        ModelWeightBindings decode_bindings;
+        decode_bindings.get_layer_weights = [&](int)
+        {
+            LayerWeightBindings layer;
+            layer.attn_norm = &decode_attn_norm;
+            layer.attn_qkv = &decode_qkv;
+            layer.attn_gate = &decode_gate;
+            layer.ssm_alpha = &decode_alpha;
+            layer.ssm_beta = &decode_beta;
+            layer.ssm_conv1d = &decode_conv;
+            layer.ssm_dt_bias = &decode_dt;
+            layer.ssm_a = &decode_a;
+            layer.ssm_norm = &decode_norm;
+            layer.ssm_out = &decode_out;
+            return layer;
+        };
+
+        TestableQwen35MoEGraph graph_builder(config, nullptr);
+        graph_builder.setWeightBindings(base_bindings);
+        graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+        auto mpi = std::make_shared<MockMPIContext>(0, 1);
+        CPUHybridRingKVCacheFP32 cache(
+            makeGDNTPHybridConfig(config),
+            *mpi,
+            config.n_layers,
+            /*batch_size=*/1,
+            config.max_seq_len,
+            config.n_kv_heads,
+            config.head_dim,
+            DeviceId::cpu());
+
+        // Exact 8+1 and unsplit9 prefill graphs share the same local producer
+        // ownership. Inspect the actual model nodes and exact publication geometry,
+        // then enter ordinary replicated Decode1 under its independent typed phase.
+        for (const int rows : {8, 1, 9})
+        {
+            SCOPED_TRACE(rows);
+            auto buffers = makeGDNTPActivationBuffers(arena, rows, config, 1);
+            std::vector<int> positions(static_cast<std::size_t>(rows), 0);
+            auto graph = graph_builder.buildAttentionGraphForPhase(base_layer, buffers, 0,
+                rows, 1, &cache, positions.data(), device, ForwardExecutionPhase::Prefill);
+            const auto *node = graph.getNode("layer0_gdn_live_state_allgather");
+            if (device.is_cpu())
+            {
+                EXPECT_EQ(node, nullptr) << "CPU retains its canonical participant-local state";
+                continue;
+            }
+            ASSERT_NE(node, nullptr) << "Every TP-local producer, including terminal M=1, owes a full-bank successor";
+            const auto *handoff = dynamic_cast<const GDNLiveStateAllGatherStage *>(node->stage.get());
+            ASSERT_NE(handoff, nullptr);
+            const auto &params = handoff->getParams();
+            const auto conv = params.geometry.resolve(GDNLinkedLiveStateKind::ConvHistory, 2);
+            const auto recurrence = params.geometry.resolve(GDNLinkedLiveStateKind::Recurrence, 2);
+            ASSERT_TRUE(conv); ASSERT_TRUE(recurrence);
+            EXPECT_EQ(conv->local_state_floats, 18);
+            EXPECT_EQ(conv->full_state_floats, 36);
+            EXPECT_EQ(recurrence->local_state_floats, 4);
+            EXPECT_EQ(recurrence->full_state_floats, 8);
+            EXPECT_TRUE(hasDependency(graph, "layer0_gdn_live_state_allgather", "layer0_gdn_recurrence"));
+            EXPECT_TRUE(hasDependency(graph, "layer0_gated_norm", "layer0_gdn_live_state_allgather"));
+        }
+        auto decode_buffers = makeGDNTPActivationBuffers(arena, 1, config, 2);
+        int position = 9;
+        auto decode = graph_builder.buildAttentionGraphForPhase(decode_layer, decode_buffers,
+            0, 1, 1, &cache, &position, device, ForwardExecutionPhase::Decode);
+        EXPECT_EQ(decode.getNode("layer0_gdn_live_state_allgather"), nullptr)
+            << "A full replica writes its own successor; decode never gathers duplicate full banks";
+
+        // Explicit multi-row grouped Decode is not a prefill policy. Its complete
+        // mirrored state is already the serial-row verifier contract on native GPUs.
+        if (device.is_gpu())
+        {
+            auto grouped_config = config;
+            grouped_config.grouped_mtp_verifier = true;
+            grouped_config.compute_all_position_logits = true;
+            grouped_config.mtp.enabled = true;
+            grouped_config.mtp.draft_tokens = 1;
+            TestableQwen35MoEGraph grouped_builder(grouped_config, nullptr);
+            grouped_builder.setWeightBindings(base_bindings);
+            grouped_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+            auto grouped_buffers = makeGDNTPActivationBuffers(arena, 2, grouped_config, 2);
+            int positions[2] = {9, 10};
+            auto grouped = grouped_builder.buildAttentionGraphForPhase(decode_layer, grouped_buffers,
+                0, 2, 1, &cache, positions, device, ForwardExecutionPhase::Decode);
+            EXPECT_EQ(grouped.getNode("layer0_gdn_live_state_allgather"), nullptr);
+        }
+    }
+}
+
+/**
  * @brief MTP all-position verifier rows keep the mirrored GDN decode contract.
  *
  * LocalTP replicated dense decode avoids tiny GDN output allreduces by giving

@@ -7,6 +7,7 @@
  * count comes from the native receipt, and no host reads it during replay.
  */
 #include "Qwen4ExpFixedHeadPipelinePort.h"
+#include "execution/qwen4exp/Qwen4ExpPLEGatherSnapshot.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/DeviceCountedAllGather.h"
 #include "execution/compute_stages/stages/NativeAllGatherStage.h"
@@ -46,9 +47,11 @@ public:
     /** @brief Freeze the participant-local node and the original arena contract before capture. */
     FixedHeadPipelineStage(DeviceId device, std::string name, ComputeStageType type,
         std::uint64_t identity, std::vector<Operand> operands, std::function<void(void *)> record,
-        std::shared_ptr<const ResidentImmutableRowTable> table = {})
+        std::shared_ptr<const ResidentImmutableRowTable> table = {},
+        std::optional<Qwen4ExpPLEGatherSnapshot> gather_output = {})
         : IComputeStage(device), name_(std::move(name)), type_(type), identity_(identity),
-          operands_(std::move(operands)), record_(std::move(record)), table_(std::move(table))
+          operands_(std::move(operands)), record_(std::move(record)), table_(std::move(table)),
+          gather_output_(std::move(gather_output))
     {
         if (!device.is_gpu() || name_.empty() || !identity_ || !record_)
             throw std::invalid_argument("Fixed PLE pipeline stage lost its original operation");
@@ -142,8 +145,11 @@ public:
         }
         return signature ? signature : 1;
     }
-    /** @return No intermediate storage or mutable count is exposed through diagnostics. */
-    StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+    /** @return Only the terminal decoded model output; intermediate protocol storage stays private. */
+    StageDumpInfo buildDumpInfoImpl() const override
+    {
+        return gather_output_ ? gather_output_->describe() : StageDumpInfo{};
+    }
 
 private:
     /** @return The exact frozen native ABI after canonical arena preparation. */
@@ -166,6 +172,7 @@ private:
     const std::vector<Operand> operands_;
     const std::function<void(void *)> record_;
     const std::shared_ptr<const ResidentImmutableRowTable> table_;
+    const std::optional<Qwen4ExpPLEGatherSnapshot> gather_output_;
     std::optional<Qwen4ExpPreparedStorage> prepared_;
     std::uint64_t capture_identity_ = 0;
     std::optional<ImmutableNativeDeviceRead> read_;
@@ -203,9 +210,18 @@ Qwen4ExpFixedHeadPipelinePort::Qwen4ExpFixedHeadPipelinePort(
         throw std::invalid_argument("Fixed PLE pipeline port changed its actual stage/worker declaration");
     const auto source = participant_.model->resolvedImmutableRowTablePlacement();
     table_ = participant_.model->residentImmutableRowTable(participant_.device);
-    if (!source || *source != *placement_ || !table_ || table_->device() != participant_.device ||
-        table_->sourceRange() != placement_->fixedHeadSourceRangeFor(owner_.allocator))
-        throw std::invalid_argument("Fixed PLE pipeline port lost its original materialized native range");
+    const auto fail = [&](const char *reason) {
+        throw std::invalid_argument("Fixed PLE pipeline port " + participant_.device.toString() +
+            " stage=" + std::to_string(participant_.stage) +
+            " member=" + std::to_string(participant_.stage_member) +
+            " role=" + (consumesPLE() ? "ple_consumer" : "storage_only") + ": " + reason);
+    };
+    if (!source) fail("original shared model has no materialized placement");
+    if (*source != *placement_) fail("original shared model placement differs from admitted placement");
+    if (!table_) fail("original shared model has no materialized native range for this owner");
+    if (table_->device() != participant_.device) fail("materialized native range belongs to another device");
+    if (table_->sourceRange() != placement_->fixedHeadSourceRangeFor(owner_.allocator))
+        fail("materialized native source range differs from admitted owner range");
     auto &worker = GPUDeviceContextPool::instance().getContext(participant_.device);
     worker.submitAndWait([&] {
         kernels_ = q::createImmutableFixedHeadPipelineKernels(participant_.device, table_->rangeView(), policy,
@@ -458,13 +474,14 @@ void Qwen4ExpFixedHeadPipelinePort::appendConsumer(ComputeGraph &fragment, const
     };
     const auto add = [&](std::string name, std::vector<Operand> operands, std::function<void(void *)> record,
         ComputeStageType type = ComputeStageType::QWEN4EXP_NGRAM_LOOKUP, std::uint64_t identity = 0,
-        std::shared_ptr<const ResidentImmutableRowTable> table = {}) {
+        std::shared_ptr<const ResidentImmutableRowTable> table = {},
+        std::optional<Qwen4ExpPLEGatherSnapshot> gather_output = {}) {
         if (!identity) {
             identity = (query.captureIdentity() ^ reinterpret_cast<std::uintptr_t>(kernels_.get())) * 1099511628211ULL;
             for (const unsigned char byte : name) identity = (identity ^ byte) * 1099511628211ULL;
         }
         attach(name, std::make_unique<FixedHeadPipelineStage>(participant_.device, name, type, identity,
-            std::move(operands), std::move(record), std::move(table)));
+            std::move(operands), std::move(record), std::move(table), std::move(gather_output)));
     };
     if (query.isWorkspaceDeclaration()) fragment.markWorkspaceDeclaration();
     const auto addCountOperand = [&](std::vector<Operand> operands) {
@@ -591,6 +608,8 @@ void Qwen4ExpFixedHeadPipelinePort::appendConsumer(ComputeGraph &fragment, const
     add(terminal, std::move(decode_operands), [self, output_owner, decode](void *stream) mutable {
         decode.output = deviceAt<float>(output_owner);
         self->kernels_->decode(decode, stream);
-    });
+    }, ComputeStageType::QWEN4EXP_NGRAM_LOOKUP, 0, {},
+        Qwen4ExpPLEGatherSnapshot(*output_owner, capacity,
+            product(q::kNgramHeads, table_->rangeView().rowElements()), output.byteOffset));
 }
 } // namespace llaminar2

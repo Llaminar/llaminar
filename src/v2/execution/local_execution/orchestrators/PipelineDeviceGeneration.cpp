@@ -18,6 +18,7 @@
  */
 #include "execution/qwen4exp/QwenSparseFollowerCounters.h"
 #include "PipelineDeviceGeneration.h"
+#include "execution/qwen4exp/QwenSparseQueryProgramObservation.h"
 #include "PipelineMaintenanceAdmission.h"
 #include "execution/compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "PipelineForwardGraphEdges.h"
@@ -355,6 +356,7 @@ struct PipelineDeviceGeneration::RankTransactionCompletion final : IMoEOverlayIn
 
 void PipelineDeviceGeneration::prepareOriginalRankCompletionSlots(std::size_t slots)
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || !slots || !rank_completion_slots_.empty() || phase_ != Phase::Idle)
         throw std::logic_error("Original rank completion slots require one cold admitted owner");
     rank_completion_slots_.reserve(slots);
@@ -366,6 +368,7 @@ void PipelineDeviceGeneration::prepareOriginalRankCompletionSlots(std::size_t sl
 std::shared_ptr<IMoEOverlayInferenceCompletionFence>
 PipelineDeviceGeneration::recordOriginalRankTransaction(std::string *error)
 {
+    requireLiveParticipantBorrow();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
         collective_timeout_policy::effectiveCollectTimeoutMs(0));
     while (true)
@@ -396,6 +399,7 @@ PipelineDeviceGeneration::recordOriginalRankTransaction(std::string *error)
 
 bool PipelineDeviceGeneration::retireOriginalRankCompletions(std::string *error)
 {
+    requireLiveParticipantBorrow();
     // This is the outer terminal ownership boundary, never a per-transaction join.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
         collective_timeout_policy::effectiveCollectTimeoutMs(0));
@@ -956,6 +960,7 @@ bool PipelineDeviceGeneration::prepareCapturedDomainForwardOnlyFamily()
 bool PipelineDeviceGeneration::advanceOrdinaryCondition(
     const DeviceResidentLogicalSequenceStateHandle &logical_state, int request_index)
 {
+    requireLiveParticipantBorrow();
     // The retained one-shot uses an explicitly zero-output state transaction;
     // it contains no serial cadence publisher or maintenance-clock mutation.
     // Rank TP handles are aggregate ownership tokens, never device pointers.
@@ -975,6 +980,7 @@ bool PipelineDeviceGeneration::advanceOrdinaryCondition(
 
 bool PipelineDeviceGeneration::submitForwardOnly()
 {
+    requireLiveParticipantBorrow();
     if (phase_ != Phase::Admitted || !forwardOnlyFamilyCurrent()) return false;
     phase_ = Phase::Failed;
     // Join every old producer/observer before opening any replacement writer.
@@ -1079,8 +1085,13 @@ void publishFixedPLETerminal(const FixedPLETerminalWords &words, DeviceId device
 
 bool PipelineDeviceGeneration::finishForwardOnly()
 {
+    requireLiveParticipantBorrow();
     using namespace sampling_math;
     if (phase_ != Phase::Submitted || !forwardOnlyFamilyCurrent()) return false;
+    // Request retirement clears active controller state and can change the
+    // selector. Retain the exact executed family before retiring any child;
+    // all original completions and observations belong to that same owner.
+    auto *const completed_family = forwardOnlyFamily().get();
     phase_ = Phase::Failed;
     auto &tail = *stages_[hasLocalTail() ? terminalIndex() : stages_.size() - 1];
     std::vector<std::array<int, 3>> terminal(stages_.size());
@@ -1094,7 +1105,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
         try {
             for (size_t i = 0; i < stages_.size(); ++i)
             {
-                const auto &part = forwardOnlyFamily()->participants[i];
+                const auto &part = completed_family->participants[i];
                 if (!part.terminal_copies_pending) continue;
                 auto &stage = *stages_[i];
                 auto *backend = getBackendFor(part.device);
@@ -1104,7 +1115,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
             }
             for (size_t i = 0; i < stages_.size(); ++i)
             {
-                auto &part = forwardOnlyFamily()->participants[i];
+                auto &part = completed_family->participants[i];
                 if (!part.terminal_copies_pending) continue;
                 if (!getBackendFor(part.device)->waitForEvent(
                         stages_[i]->device_generation_terminal_host_ready_event_.get(), part.device.ordinal))
@@ -1122,11 +1133,11 @@ bool PipelineDeviceGeneration::finishForwardOnly()
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        const auto &part = forwardOnlyFamily()->participants[i];
+        const auto &part = completed_family->participants[i];
         auto *backend = getBackendFor(part.device);
         if (!stage.consumeDeviceGenerationStateReady(part.stream, DeviceTimelineRole::HostResultBridge,
                 1, "pipeline_forward_only_terminal")) return false;
-        forwardOnlyFamily()->participants[i].terminal_copies_pending = true;
+        completed_family->participants[i].terminal_copies_pending = true;
         const std::array<const int *, 3> sources{
             stage.state_.kv_cache->deviceSequenceCachedTokenCountPtr(0),
             stage.device_generation_storage_.control_device + kDeviceGenerationControlOk,
@@ -1192,7 +1203,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &part = forwardOnlyFamily()->participants[i];
+        auto &part = completed_family->participants[i];
         std::string error;
         if (!stage.forward_engine_->observeComposedForwardCompletion(part.forward->signature,
                 part.forward->native()->capture, 1, &error) ||
@@ -1205,7 +1216,7 @@ bool PipelineDeviceGeneration::finishForwardOnly()
     for (size_t i = terminalIndex(); i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        auto &part = forwardOnlyFamily()->participants[i];
+        auto &part = completed_family->participants[i];
         TransferEngine::publishDeviceWrite(stage.state_.logits.get(), stage.state_.device_id, part.stream);
         ForwardOutput output;
         output.logits = stage.state_.logits.get();
@@ -1220,8 +1231,30 @@ bool PipelineDeviceGeneration::finishForwardOnly()
             rank->retirePipelineForwardOnlyDomain();
     for (std::size_t i = 0; i < fixed_ple_terminal.size(); ++i)
         publishFixedPLETerminal(fixed_ple_terminal[i], stages_[i]->state_.device_id);
+    // The composed native parents bypass direct forward dispatch, including
+    // its diagnostic callback boundary. Acquire only their already-written
+    // original snapshot manifests after every terminal has completed.
+    for (size_t i = 0; i < stages_.size(); ++i) {
+        auto &stage = *stages_[i];
+        const auto &part = completed_family->participants[i];
+        std::string error;
+        if (!stage.forward_engine_->publishComposedForwardSnapshots(
+                part.forward->signature, part.forward->native()->capture, part.stream, &error)) {
+            LOG_ERROR("Pipeline ForwardOnly snapshot publication failed on " << stage.state_.device_id.toString()
+                << ": " << error);
+            return false;
+        }
+    }
+    // Every original parent has completed and published successfully. Direct
+    // executeForward is bypassed by these composed parents; count this logical
+    // model forward exactly once on each original child, never at capture time.
+    for (size_t i = 0; i < stages_.size(); ++i)
+        if (stages_[i]->sparseQueryProgramCount() > 1u)
+            recordQwenSparseQueryDecodeForward(stages_[i]->state_.device_id,
+                completed_family->participants[i].forward->signature.sparse_query_execution_program,
+                ForwardExecutionRole::MainInference, 1);
     PerfStatsCollector::addCounter("generation", "pipeline_forward_only_completed_transactions", 1.0,
-        "decode", "rank", {{"sparse_query_program", tail.sparseQueryForwardProgram(ForwardExecutionPhase::Decode) ==
+        "decode", "rank", {{"sparse_query_program", completed_family->participants[hasLocalTail() ? terminalIndex() : stages_.size() - 1].forward->signature.sparse_query_execution_program ==
             SparseQueryExecutionProgram::ProvenNoRanking ? "proven_no_ranking" : "ranking_possible"},
          {"sampler", "absent"}, {"response_tokens", "0"}, {"model_commits", "1"},
          {"transport", transport_ == Transport::CapturedDomains ? "captured_domains" : "native_pipeline"}});
@@ -1237,6 +1270,8 @@ PipelineDeviceGeneration::~PipelineDeviceGeneration()
 
 void PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease() noexcept
 {
+    if (participant_borrow_lifecycle_ == ParticipantBorrowLifecycle::Retired)
+        return;
     // Native events outlive every async service return, including command abort.
     // Teardown joins these leases before either graph or workspace owners die.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
@@ -1300,6 +1335,18 @@ void PipelineDeviceGeneration::retireForwardOnlyBeforeStageRelease() noexcept
         forward_edges_.clear();
         maintenance_admission_.reset();
     }
+    // All native completion proofs and graph/source retirements succeeded.
+    // Revoke raw participant references now: Rank deliberately retains this
+    // transport owner beyond stage destruction, and our destructor re-enters.
+    stages_.clear();
+    domains_.clear();
+    participant_borrow_lifecycle_ = ParticipantBorrowLifecycle::Retired;
+}
+
+void PipelineDeviceGeneration::requireLiveParticipantBorrow() const
+{
+    if (participant_borrow_lifecycle_ != ParticipantBorrowLifecycle::Live)
+        throw std::logic_error("Pipeline participant borrow has retired");
 }
 
 bool PipelineDeviceGeneration::isGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages)
@@ -1319,6 +1366,7 @@ size_t PipelineDeviceGeneration::terminalIndex() const noexcept
 
 const PipelineDeviceGeneration::Domain &PipelineDeviceGeneration::tailDomain() const
 {
+    requireLiveParticipantBorrow();
     for (const auto &domain : domains_)
         if (domain.tail) return domain;
     throw std::logic_error("Pipeline operation requires its original local terminal owner");
@@ -1326,12 +1374,14 @@ const PipelineDeviceGeneration::Domain &PipelineDeviceGeneration::tailDomain() c
 
 const std::optional<DeviceGenerationAdmissionRequest> &PipelineDeviceGeneration::originalAdmission() const
 {
+    requireLiveParticipantBorrow();
     if (rank_topology_) return rank_admission_;
     return stages_[terminalIndex()]->active_device_generation_admission_;
 }
 
 const PipelineDeviceGeneration::Domain &PipelineDeviceGeneration::domainFor(size_t participant) const
 {
+    requireLiveParticipantBorrow();
     for (const auto &domain : domains_)
         if (participant >= domain.first && participant - domain.first < domain.count) return domain;
     throw std::out_of_range("Pipeline participant is outside its frozen domains");
@@ -1339,12 +1389,14 @@ const PipelineDeviceGeneration::Domain &PipelineDeviceGeneration::domainFor(size
 
 void PipelineDeviceGeneration::abortParticipants()
 {
+    requireLiveParticipantBorrow();
     if (collective_) collective_->requestAbort();
     for (const auto &domain : domains_) if (domain.context) domain.context->requestAbort();
 }
 
 bool PipelineDeviceGeneration::supportsMTPPublication() const
 {
+    requireLiveParticipantBorrow();
     return prefillPrepared() && (!hasLocalTail() || tailDomain().runner->supportsDeviceResidentMTPSpecStatePublication()) &&
         std::all_of(stages_.begin(), stages_.begin() + terminalIndex(), [](const auto *stage) {
             return stage->supportsDeviceResidentMTPSpecStatePublication();
@@ -1395,6 +1447,7 @@ void PipelineDeviceGeneration::prepareDomainBoundaries()
 
 bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializationPlan &plan)
 {
+    requireLiveParticipantBorrow();
     if (phase_ != Phase::Idle || !plan.valid()) return false;
     phase_ = Phase::Failed;
     if (forward_edges_.empty())
@@ -1648,6 +1701,7 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
 bool PipelineDeviceGeneration::prefill(const int *tokens, int count,
     const PrefillChunkSchedulerPolicy &policy, int pad_token, bool allow_padding)
 {
+    requireLiveParticipantBorrow();
     if (phase_ != Phase::Idle || !prefillPrepared() || !tokens || count <= 0) return false;
     phase_ = Phase::Failed;
     workers_->dispatch([&, this](size_t index) {
@@ -1662,11 +1716,13 @@ bool PipelineDeviceGeneration::prefill(const int *tokens, int count,
 bool PipelineDeviceGeneration::forwardMTPCondition(MTPConditionForwardPurpose purpose,
     const std::function<bool(IInferenceRunner &)> &terminal)
 {
+    requireLiveParticipantBorrow();
     return forwardMTP(purpose, terminal);
 }
 
 bool PipelineDeviceGeneration::forwardDecodeInput(int32_t token_id)
 {
+    requireLiveParticipantBorrow();
     const int token = token_id;
     return forwardMainInput([&](IInferenceRunner &runner) { return runner.forward(&token, 1); });
 }
@@ -1674,6 +1730,7 @@ bool PipelineDeviceGeneration::forwardDecodeInput(int32_t token_id)
 bool PipelineDeviceGeneration::restoredPrefixMTPDecodeBridge(
     const RestoredPrefixMTPDecodeBridgeRequest &request)
 {
+    requireLiveParticipantBorrow();
     return request.valid() && forwardMainInput([&](IInferenceRunner &runner) {
         return runner.forwardRestoredPrefixMTPDecodeBridge(request);
     });
@@ -1722,6 +1779,7 @@ bool PipelineDeviceGeneration::forwardOriginalRankFollowerVerifier(int physical_
 bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
     const std::function<bool(IInferenceRunner &)> &terminal)
 {
+    requireLiveParticipantBorrow();
     if (!hasLocalTail())
         throw std::logic_error("Logical verifier-width selection belongs to the original terminal stage");
     auto &tail = *stages_[terminalIndex()];
@@ -1749,6 +1807,7 @@ bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
 bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
     const std::function<bool(IInferenceRunner &)> &terminal)
 {
+    requireLiveParticipantBorrow();
     const bool original_rank_follower = rank_topology_ && !hasLocalTail() &&
         (phase_ == Phase::Materialized || phase_ == Phase::Submitted);
     if ((!original_rank_follower && phase_ != Phase::Idle && phase_ != Phase::Admitted) || !prefillPrepared() ||
@@ -1858,6 +1917,7 @@ bool PipelineDeviceGeneration::admitOriginalFollower(
 
 bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &request)
 {
+    requireLiveParticipantBorrow();
     if (phase_ != Phase::Idle || !request.valid() || request.request_count != 1)
         return false;
     for (size_t i = 0; i < stages_.size(); ++i)
@@ -2220,6 +2280,7 @@ bool PipelineDeviceGeneration::composeParticipants()
 
 bool PipelineDeviceGeneration::prepareContinuation(DeviceGenerationSamplingMode sampling)
 {
+    requireLiveParticipantBorrow();
     using namespace sampling_math;
     const auto &admission = originalAdmission();
     const auto depths = admission ? deviceGenerationSpeculativeDepthRange(admission->depth_policy) : std::nullopt;
@@ -2328,6 +2389,7 @@ bool PipelineDeviceGeneration::prepareContinuation(DeviceGenerationSamplingMode 
 bool PipelineDeviceGeneration::materialize(int requests, int depth,
     DeviceGenerationLoopTopology topology, DeviceGenerationSamplingMode sampling)
 {
+    requireLiveParticipantBorrow();
     if (phase_ != Phase::Admitted || requests != 1 || depth < 0 ||
         !isValidDeviceGenerationSamplingMode(sampling))
         return false;
@@ -2376,6 +2438,7 @@ bool PipelineDeviceGeneration::materialize(int requests, int depth,
 
 bool PipelineDeviceGeneration::launch()
 {
+    requireLiveParticipantBorrow();
     if (!hasLocalTail() || phase_ != Phase::Materialized) return false;
     phase_ = Phase::Failed;
     if (execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)
@@ -2529,6 +2592,7 @@ bool PipelineDeviceGeneration::launchHostedDomainTransactions()
 
 bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
 {
+    requireLiveParticipantBorrow();
     if (!hasLocalTail() || phase_ != Phase::Submitted || !result) return false;
     phase_ = Phase::Failed;
     *result = {};
@@ -2668,6 +2732,7 @@ bool PipelineDeviceGeneration::beginOriginalRankFollowerCommand(
     const DeviceGenerationAdmissionRequest &request,
     DeviceGenerationSamplingMode sampling, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (error) error->clear();
     if (!rank_topology_ || hasLocalTail() || !isValidDeviceGenerationSamplingMode(sampling) ||
         !begin(request))
@@ -2702,6 +2767,7 @@ bool PipelineDeviceGeneration::beginOriginalRankFollowerCommand(
 
 bool PipelineDeviceGeneration::joinOriginalRankTransaction(std::string *error)
 {
+    requireLiveParticipantBorrow();
     const auto reject = [&](const char *message) {
         phase_ = Phase::Failed;
         if (error) *error = message;
@@ -2758,6 +2824,7 @@ bool PipelineDeviceGeneration::joinOriginalRankTransaction(std::string *error)
 
 bool PipelineDeviceGeneration::submitOriginalRankFollowerBody(int physical_rows, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || hasLocalTail() || !rank_sampling_ ||
         (phase_ != Phase::Materialized && phase_ != Phase::Submitted)) return false;
     // Authenticate every local branch before the first distributed enqueue.
@@ -2817,6 +2884,7 @@ bool PipelineDeviceGeneration::submitOriginalRankFollowerBody(int physical_rows,
 bool PipelineDeviceGeneration::executeMoEOverlayInferenceTransaction(
     const MoEOverlayInferenceTransactionTicket &, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (error) *error = "Original GPU rank transactions require typed asynchronous submission";
     return false;
 }
@@ -2824,6 +2892,7 @@ bool PipelineDeviceGeneration::executeMoEOverlayInferenceTransaction(
 MoEOverlayInferenceAsyncSubmission PipelineDeviceGeneration::submitMoEOverlayInferenceTransaction(
     const MoEOverlayInferenceTransactionTicket &ticket, std::string *error)
 {
+    requireLiveParticipantBorrow();
     using Progress = MoEOverlayInferenceCompletionFenceProgress;
     if (!enqueueOriginalRankTransaction(ticket, error)) return {.progress = Progress::Failed};
     if (ticket.graph_role == MoEOverlayInferenceGraphRole::GenerationAdmission ||
@@ -2837,6 +2906,7 @@ MoEOverlayInferenceAsyncSubmission PipelineDeviceGeneration::submitMoEOverlayInf
 bool PipelineDeviceGeneration::enqueueOriginalRankTransaction(
     const MoEOverlayInferenceTransactionTicket &ticket, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (error) error->clear();
     if (!rank_topology_ || hasLocalTail() ||
         ticket.action != MoEOverlayInferenceTransactionAction::Execute ||
@@ -2946,6 +3016,7 @@ bool PipelineDeviceGeneration::enqueueOriginalRankTransaction(
 bool PipelineDeviceGeneration::finishOriginalRankFollowerCommand(
     int source_terminal_commit_count, int expected_source_cached_tokens, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (error) error->clear();
     if (rank_topology_ && !hasLocalTail() && rank_admission_ &&
         rank_admission_->depth_policy.isForwardOnly() && phase_ == Phase::Idle)
@@ -3084,6 +3155,7 @@ bool PipelineDeviceGeneration::finishOriginalRankFollowerCommand(
 
 std::optional<int> PipelineDeviceGeneration::observeOriginalRankKVTerminal(std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || phase_ != Phase::Idle) return std::nullopt;
     std::vector<int> cached(stages_.size(), -1);
     std::vector<void *> streams(stages_.size(), nullptr);
@@ -3131,6 +3203,7 @@ void PipelineDeviceGeneration::bindOriginalRankTransactionCallbacks(
     std::function<bool(MoEOverlayInferenceGraphRole, int, int)> publish,
     std::function<bool(uint64_t)> retire)
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || !hasLocalTail() || phase_ != Phase::Idle || !publish || !retire ||
         rank_publish_transaction_ || rank_retire_transaction_)
         throw std::invalid_argument("Original rank transaction publication requires one cold source owner");
@@ -3140,6 +3213,7 @@ void PipelineDeviceGeneration::bindOriginalRankTransactionCallbacks(
 
 uint64_t PipelineDeviceGeneration::originalRankRequestGeneration() const
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || !hasLocalTail())
         throw std::logic_error("Only the real original terminal owns request generation");
     return stages_[terminalIndex()]->session_epoch_;
@@ -3147,6 +3221,7 @@ uint64_t PipelineDeviceGeneration::originalRankRequestGeneration() const
 
 MoEOverlayInferenceCommandIdentity PipelineDeviceGeneration::originalRankCommandIdentity(uint64_t command_id) const
 {
+    requireLiveParticipantBorrow();
     using Kind = MoEOverlayInferencePlacementIdentityKind;
     MoEOverlayInferenceCommandIdentity command{
         .request_generation = originalRankRequestGeneration(), .command_id = command_id,
@@ -3184,6 +3259,7 @@ MoEOverlayInferenceCommandIdentity PipelineDeviceGeneration::originalRankCommand
 bool PipelineDeviceGeneration::completeOriginalRankSourceTransaction(
     MoEOverlayInferenceGraphRole role, std::string *error)
 {
+    requireLiveParticipantBorrow();
     if (!rank_topology_ || !hasLocalTail()) return false;
     for (size_t i = 0; i < stages_.size(); ++i)
     {

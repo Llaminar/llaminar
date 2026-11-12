@@ -2576,6 +2576,8 @@ namespace llaminar2
     {
         if (!config_.snapshot_callback)
             return true;
+        if (producer_stream_override && reinterpret_cast<std::uintptr_t>(producer_stream_override) <= 2)
+            throw std::invalid_argument("Graph snapshot publication requires an exact non-default producer stream");
 
         const auto &order = graph.getExecutionOrder();
         if (order.empty())
@@ -2623,15 +2625,20 @@ namespace llaminar2
                     continue;
 
                 found_gpu_snapshot_producer = true;
-                void *const stage_stream = node->stage->gpuStream();
-                if (!arena_producer_stream)
-                    arena_producer_stream = stage_stream;
-                if (!producer_stream_override &&
-                    stage_stream != arena_producer_stream)
+                // A composed parent's explicit producer owns the recorded
+                // snapshot writes. Its child stages may have withdrawn their
+                // cold-recording stream; never query that obsolete authority.
+                if (!producer_stream_override)
                 {
-                    LOG_ERROR(
-                        "[DeviceGraphExecutor] Graph snapshot arena has multiple producer streams without an explicit graph-stream override");
-                    return false;
+                    void *const stage_stream = node->stage->gpuStream();
+                    if (!arena_producer_stream)
+                        arena_producer_stream = stage_stream;
+                    if (stage_stream != arena_producer_stream)
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphExecutor] Graph snapshot arena has multiple producer streams without an explicit graph-stream override");
+                        return false;
+                    }
                 }
             }
             if (!found_gpu_snapshot_producer || !arena_producer_stream)

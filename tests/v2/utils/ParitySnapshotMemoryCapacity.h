@@ -487,10 +487,8 @@ namespace llaminar2::test::parity
                 const auto scalar = bytes / rows + (bytes % rows != 0u);
                 main_scalar_sources[key] = std::max(main_scalar_sources[key], scalar);
             }
-            std::size_t scalar = 0u;
             for (const auto &[key, bytes] : main_scalar_sources)
             {
-                scalar = detail::paritySnapshotCheckedAdd(scalar, bytes, "scalar source union");
                 // The captured filter is a union across observations. A source
                 // absent from a prefill observation still needs its admitted
                 // wide-row geometry; never substitute max(phase totals).
@@ -498,12 +496,45 @@ namespace llaminar2::test::parity
                     static_cast<std::size_t>(retained_graph_rows), "wide scalar-source projection");
                 main_prefill_sources[key] = std::max(main_prefill_sources[key], wide);
             }
-            std::size_t wide = 0u;
-            for (const auto &[key, bytes] : main_prefill_sources)
-                wide = detail::paritySnapshotCheckedAdd(wide, bytes, "wide source union");
-            evidence.capacity.main_phase_payload = MainSnapshotPhasePayload{
-                .wide_main_bytes = wide, .scalar_main_bytes = scalar,
+            MainSnapshotPhasePayload payload{
                 .separate_reference_bytes = other_reference_bytes};
+            std::map<int, MainSnapshotPhasePayload::LayerPayload> layer_payloads;
+            for (const auto &[key, bytes] : main_prefill_sources)
+            {
+                // Canonical layerN_ keys carry the same global layer identity
+                // used by the participant-local graph. Keep that identity until
+                // the planner knows the actual PP interval; row widening and
+                // collective-alias accounting above remain unchanged.
+                std::optional<int> layer;
+                if (std::string_view(key).starts_with("layer"))
+                {
+                    const auto separator = key.find('_', 5);
+                    if (separator != std::string::npos)
+                    {
+                        const auto digits = std::string_view(key).substr(5, separator - 5);
+                        int parsed_layer = -1;
+                        const auto parsed = std::from_chars(digits.data(), digits.data()+digits.size(), parsed_layer);
+                        if (!digits.empty() && (digits.size() == 1 || digits.front() != '0') &&
+                            parsed.ec == std::errc{} && parsed.ptr == digits.data()+digits.size() && parsed_layer >= 0)
+                            layer = parsed_layer;
+                    }
+                }
+                const auto scalar_bytes = main_scalar_sources.at(key);
+                if (layer)
+                {
+                    auto &entry = layer_payloads.try_emplace(*layer,
+                        MainSnapshotPhasePayload::LayerPayload{*layer, 0u, 0u}).first->second;
+                    entry.wide_bytes = detail::paritySnapshotCheckedAdd(entry.wide_bytes, bytes, "layer wide union");
+                    entry.scalar_bytes = detail::paritySnapshotCheckedAdd(entry.scalar_bytes, scalar_bytes, "layer scalar union");
+                }
+                else
+                {
+                    payload.wide_main_bytes = detail::paritySnapshotCheckedAdd(payload.wide_main_bytes, bytes, "unscoped wide union");
+                    payload.scalar_main_bytes = detail::paritySnapshotCheckedAdd(payload.scalar_main_bytes, scalar_bytes, "unscoped scalar union");
+                }
+            }
+            for (const auto &[layer, entry] : layer_payloads) payload.layers.push_back(entry);
+            evidence.capacity.main_phase_payload = std::move(payload);
         }
 
         {

@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <cstddef>
+#include <vector>
 #include "kernels/common/SparseQueryExecutionProgram.h"
 #include <limits>
 #include <stdexcept>
@@ -88,16 +89,52 @@ private:
  */
 struct MainSnapshotPhasePayload
 {
-    std::size_t wide_main_bytes = 0u;
-    std::size_t scalar_main_bytes = 0u;
-    std::size_t separate_reference_bytes = 0u;
-    /** @brief Project ordinary payloads over real roles without repricing native state banks. */
-    std::size_t bytesFor(const ServingSnapshotArenaInventory &inventory) const
+    /** @brief Reference payload owned by one canonical main-model decoder layer. */
+    struct LayerPayload
     {
-        const auto wide = snapshotPopulationProduct(wide_main_bytes, inventory.wideMainOwners());
+        int layer;
+        std::size_t wide_bytes;
+        std::size_t scalar_bytes;
+        friend bool operator==(const LayerPayload &, const LayerPayload &) = default;
+    };
+    /** Non-layer reference producers retain their original wide-row envelope. */
+    std::size_t wide_main_bytes = 0u;
+    /** Non-layer reference producers retained in each scalar owner. */
+    std::size_t scalar_main_bytes = 0u;
+    /** Predictor/reference payloads outside the ordinary main-phase union. */
+    std::size_t separate_reference_bytes = 0u;
+    /** Layer-local payloads are disjoint from the unscoped totals above. */
+    std::vector<LayerPayload> layers;
+    /**
+     * @brief Project ordinary payloads over actual resident layers and serving roles.
+     * @param inventory Exact retained arena sharing inventory.
+     * @param first_layer First resident main layer (inclusive).
+     * @param last_layer Last resident main layer (inclusive).
+     * @return Physical payload bytes; non-layer outputs keep their original envelope.
+     * @throws std::invalid_argument for malformed layer ownership.
+     * @throws std::overflow_error for unrepresentable payload geometry.
+     */
+    std::size_t bytesFor(const ServingSnapshotArenaInventory &inventory,
+        int first_layer = 0, int last_layer = std::numeric_limits<int>::max()) const
+    {
+        if (first_layer < 0 || last_layer < first_layer)
+            throw std::invalid_argument("Snapshot payload requires a valid resident layer interval");
+        auto wide_bytes = wide_main_bytes;
+        auto scalar_bytes = scalar_main_bytes;
+        int previous = -1;
+        for (const auto &payload : layers)
+        {
+            if (payload.layer <= previous)
+                throw std::invalid_argument("Snapshot layer payloads must have unique ordered nonnegative owners");
+            previous = payload.layer;
+            if (payload.layer < first_layer || payload.layer > last_layer) continue;
+            wide_bytes = snapshotPopulationSum(wide_bytes, payload.wide_bytes);
+            scalar_bytes = snapshotPopulationSum(scalar_bytes, payload.scalar_bytes);
+        }
+        const auto wide = snapshotPopulationProduct(wide_bytes, inventory.wideMainOwners());
         const auto scalar_rows = snapshotPopulationSum(inventory.scalarMainOwners(),
             snapshotPopulationProduct(inventory.conditionMainOwners(), inventory.conditionRows()));
-        const auto scalar = snapshotPopulationProduct(scalar_main_bytes, scalar_rows);
+        const auto scalar = snapshotPopulationProduct(scalar_bytes, scalar_rows);
         return snapshotPopulationSum(snapshotPopulationSum(wide, scalar), separate_reference_bytes);
     }
     friend bool operator==(const MainSnapshotPhasePayload &, const MainSnapshotPhasePayload &) = default;

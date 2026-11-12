@@ -194,7 +194,76 @@ def omission_fixture():
     return rows
 
 
+def prefill_omission_fixture(prompt=9, devices=("ROCm:7", "ROCm:6", "ROCm:8", "ROCm:9")):
+    """Describe one original full-width prefill and its independently acquired path records."""
+    rows = omission_fixture()
+    for values in rows[1:]:
+        row = dict(zip(rows[0], values, strict=True))
+        row.update(history_prompt_rows=str(prompt), history_live_rows=str(prompt),
+            reference_rows=str(prompt), reference_first_row=str(prompt))
+        witness = json.loads(row["query_program_observation"])
+        tags = {"program": "proven_no_ranking", "role": "0", "physical_rows": str(prompt),
+            "logical_rows": str(prompt), "logical_begin": "0", "width_policy": "exact_retained",
+            "observation": "successful_forward_submission_not_native_replay_count"}
+        witness["expected_devices"] = list(devices)
+        witness["before"] = [{"device": device, "phase": "prefill", "kind": 0, "count": 7,
+            "tags": tags.copy()} for device in devices]
+        witness["after"] = [{"device": device, "phase": "prefill", "kind": 0, "count": 8,
+            "tags": tags.copy()} for device in devices]
+        row["query_program_observation"] = json.dumps(witness)
+        values[:] = [row[column] for column in rows[0]]
+    # Prefill has no Decode ordinal in the actual native schema.
+    ordinal = rows[0].index("step")
+    for values in rows:
+        del values[ordinal]
+    return rows
+
+
 class ProgramOmissionCSV(unittest.TestCase):
+    def test_prefill_proves_original_prompt_and_all_actual_participants(self):
+        """A completed exact request may consist of several retained chunks."""
+        check = pure_validators()["validate_stage_checkpoint_evidence"]
+        for prompt in (1, 9, 512, 2051):
+            for devices in (("CPU",), ("CUDA:0", "CUDA:1"),
+                            tuple(f"ROCm:{ordinal}" for ordinal in (7, 6, 8, 9, 1, 3, 4, 2))):
+                with self.subTest(prompt=prompt, devices=devices):
+                    self.assertIsNone(check(prefill_omission_fixture(prompt, devices), decode=False))
+        self.assertIsNotNone(check(prefill_omission_fixture(2052), decode=False))
+
+    def test_prefill_rejects_stale_padded_partial_and_cross_phase_proofs(self):
+        """Empty query outputs receive no invented numerical equality or fake native coordinates."""
+        check = pure_validators()["validate_stage_checkpoint_evidence"]
+        for mutate in (
+            lambda w: w["after"].pop(),
+            lambda w: w["after"][0].update(count=7),
+            lambda w: w["after"][0].update(phase="decode"),
+            lambda w: w["after"][0].update(device="ROCm:99"),
+            lambda w: w["after"][0]["tags"].update(physical_rows="512"),
+            lambda w: w["after"][0]["tags"].update(logical_rows="8"),
+            lambda w: w["after"][0]["tags"].update(logical_begin="1"),
+            lambda w: w["after"][0]["tags"].update(width_policy="retained_padding"),
+            lambda w: w["after"][0]["tags"].update(program="ranking_possible"),
+            lambda w: w["after"][0]["tags"].update(role="1"),
+        ):
+            rows = prefill_omission_fixture()
+            for values in rows[1:]:
+                index = rows[0].index("query_program_observation")
+                witness = json.loads(values[index])
+                mutate(witness)
+                values[index] = json.dumps(witness)
+            self.assertIsNotNone(check(rows, decode=False))
+        for field, value in (("history_live_rows", "8"), ("history_decode_rows_before", "1"),
+                             ("reference_rows", "1"), ("reference_first_row", "0"),
+                             ("observed_payload_elements", "0"), ("cosine", "1"),
+                             ("passed", "1"), ("canonical_passed", "1")):
+            rows = prefill_omission_fixture()
+            for values in rows[1:]:
+                values[rows[0].index(field)] = value
+            self.assertIsNotNone(check(rows, decode=False))
+        rows = prefill_omission_fixture()
+        self.assertIsNotNone(check(rows[:-1], decode=False))
+        self.assertIsNotNone(check(rows + [rows[1][:]], decode=False))
+
     def test_admitted_cuda_rocm_and_mixed_participant_sets_are_exact(self):
         """Every actual participant witness needs one fresh matching path record."""
         check = pure_validators()["validate_stage_checkpoint_evidence"]

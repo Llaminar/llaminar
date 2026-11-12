@@ -103,9 +103,10 @@ protected:
         const auto output=Base::getResultsDir()/"observed-pipeline"/("rank-"+std::to_string(observed_->discoveryRank()));
         std::filesystem::create_directories(output);
         ASSERT_NO_FATAL_FAILURE(observed_->writeReceipt(output,"parity_work_succeeded",complete));
-        if(active && complete) {
-            // Reuse the canonical lossless configuration exporter only after
-            // actual original binding and the ordinary numerical lifecycle.
+        if(observed_->mayExportConfiguration()) {
+            // Preserve the authenticated configuration even when numerical
+            // work failed. Original terminal retirement owns export eligibility;
+            // the receipt above retains the independent failed work verdict.
             std::ostringstream declaration,configuration;
             PrintTo(ModelParityCaseParameter::modelParityCase(),&declaration);
             PrintTo(observed_->boundCase(),&configuration);

@@ -19,6 +19,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <charconv>
+#include <cmath>
 #include <array>
 #include <algorithm>
 #include <cstddef>
@@ -81,6 +82,8 @@ namespace llaminar2::test::parity
     struct ProductionDeviceGenerationEvidence
     {
         bool controller_observed = false;
+        bool model_forward_only_observed = false; ///< Zero-output admissions are model transactions, never generation loops.
+        bool model_forward_only_certified = false; ///< Every admitted device has original capture and authenticated completion.
         ProductionDeviceGenerationPolicy policy =
             ProductionDeviceGenerationPolicy::NotObserved;
         bool hosted_ticket_boundary_certified = false;
@@ -264,6 +267,8 @@ namespace llaminar2::test::parity
         bool decode_graph_capture = false;
         bool decode_graph_replay = false;
         bool device_generation_controller = false;
+        bool model_forward_only_observed = false; ///< A distinct zero-output model-forward proof was required.
+        bool model_forward_only_certified = false; ///< Every original admitted participant completed its captured forward.
         ProductionDeviceGenerationPolicy generation_execution_policy =
             ProductionDeviceGenerationPolicy::NotObserved;
         bool native_generation_parent = false;
@@ -391,6 +396,8 @@ namespace llaminar2::test::parity
     inline bool productionParityHasRequiredGenerationGraph(
         const ProductionParityEvidence &evidence)
     {
+        if (evidence.model_forward_only_observed && !evidence.model_forward_only_certified)
+            return false;
         if (evidence.device_generation_controller &&
             evidence.generation_execution_policy ==
                 ProductionDeviceGenerationPolicy::
@@ -1145,10 +1152,12 @@ namespace llaminar2::test::parity
     /**
      * @brief Infer outer-loop ownership from request-local MTP PerfStats.
      *
-     * Every positive request-lifecycle `mtp.device_generation_*` counter proves
-     * that the device generation controller participated. Setup-only stream and
-     * storage initialization is deliberately excluded: ordinary MTP-off decode
-     * may construct persistent infrastructure without admitting a controller.
+     * Positive request-lifecycle `mtp.device_generation_*` counters identify
+     * controller participation except shared event publications and exact
+     * zero-output ForwardOnly admissions. Those admissions require a separate
+     * per-device captured/completed model-forward proof with integral extents;
+     * they never certify a generation loop. Setup-only initialization is also
+     * excluded: ordinary MTP-off decode may construct dormant infrastructure.
      * Materialization, reuse, launch, and terminal-reduction records publish an
      * `execution`, `execution_policy`, or `policy` tag. All observed
      * policy-bearing records must agree. A future producer that omits or invents
@@ -1156,7 +1165,7 @@ namespace llaminar2::test::parity
      * evidence becomes `Inconsistent`; neither state can accidentally certify a
      * homogeneous production campaign.
      *
-     * @param records PerfStats snapshot containing the `mtp` domain.
+     * @param records PerfStats snapshot containing `mtp` and `forward_graph` evidence.
      * @return Typed controller-presence and outer-loop authority evidence.
      */
     inline ProductionDeviceGenerationEvidence
@@ -1166,16 +1175,45 @@ namespace llaminar2::test::parity
         bool native_policy_observed = false;
         bool hosted_policy_observed = false;
         ProductionDeviceGenerationEvidence evidence;
+        std::map<std::string, std::uint64_t> model_forward_admissions;
+        bool model_forward_extents_valid = true;
+        // PerfStats stores extents as doubles. Stay inside the consecutive
+        // integer range and accumulate as checked integers, never rounded sums.
+        constexpr std::uint64_t maximum_exact_extent = (std::uint64_t{1} << 53) - 1;
+        const auto addExtent = [](double value, std::uint64_t &total) {
+            if (!std::isfinite(value) || value <= 0.0 || std::trunc(value) != value ||
+                value > static_cast<double>(maximum_exact_extent)) return false;
+            const auto count = static_cast<std::uint64_t>(value);
+            if (count > maximum_exact_extent - total) return false;
+            total += count;
+            return true;
+        };
 
         for (const PerfStatRecord &record : records)
         {
             if (record.kind != PerfStatRecord::Kind::Counter ||
-                record.domain != "mtp" || record.value <= 0.0 ||
+                record.domain != "mtp" ||
                 !std::string_view(record.name).starts_with("device_generation_") ||
                 record.phase == "initialization")
             {
                 continue;
             }
+            // Event publication orders both zero-output model forwards and
+            // generation. It proves neither execution nor a sampling policy.
+            if (record.name == "device_generation_state_publications")
+                continue;
+            if (record.name == "device_generation_admissions" &&
+                detail::tagEquals(record, "depth_policy_mode", std::to_string(
+                    static_cast<int>(sampling_math::DeviceGenerationPolicyMode::ForwardOnly))) &&
+                detail::tagEquals(record, "max_new_tokens", "0") &&
+                !record.device.empty())
+            {
+                evidence.model_forward_only_observed = true;
+                if (!addExtent(record.value, model_forward_admissions[record.device]))
+                    model_forward_extents_valid = false;
+                continue;
+            }
+            if (record.value <= 0.0) continue;
             evidence.controller_observed = true;
 
             // Different lifecycle records use one of these three typed tag
@@ -1206,10 +1244,43 @@ namespace llaminar2::test::parity
             }
         }
 
+        if (evidence.model_forward_only_observed)
+        {
+            evidence.model_forward_only_certified = model_forward_extents_valid;
+            for (const auto &[device, admitted] : model_forward_admissions)
+            {
+                bool original_capture = false;
+                std::uint64_t completed = 0;
+                for (const auto &record : records)
+                {
+                    if (record.kind != PerfStatRecord::Kind::Counter || record.domain != "forward_graph" ||
+                        record.device != device || record.phase != "decode" ||
+                        !detail::tagEquals(record, "context", "main_decode")) continue;
+                    if (record.name == "full_graph_capture_executable_nodes") {
+                        std::uint64_t nodes = 0;
+                        if (!addExtent(record.value, nodes)) evidence.model_forward_only_certified = false;
+                        else original_capture = true;
+                    }
+                    // This producer authenticates the exact cached, complete
+                    // one-segment executable before reporting its terminal.
+                    if (record.name == "decode_graph_phase" &&
+                        detail::tagEquals(record, "phase", "replay") &&
+                        detail::tagEquals(record, "source", "captured_generation_parent") &&
+                        detail::tagEquals(record, "observation", "authenticated_terminal"))
+                    {
+                        if (!addExtent(record.value, completed)) evidence.model_forward_only_certified = false;
+                    }
+                }
+                if (!original_capture || completed < admitted)
+                    evidence.model_forward_only_certified = false;
+            }
+        }
         if (!evidence.controller_observed)
         {
             evidence.policy = ProductionDeviceGenerationPolicy::NotObserved;
-            evidence.certification_detail = "not_observed";
+            evidence.certification_detail = !evidence.model_forward_only_observed ? "not_observed" :
+                evidence.model_forward_only_certified ? "model_forward_only_captured_completed" :
+                    "model_forward_only_missing_capture_or_completion";
         }
         else if (native_policy_observed && hosted_policy_observed)
         {
@@ -1352,6 +1423,8 @@ namespace llaminar2::test::parity
             collectProductionDeviceGenerationEvidence(records);
         evidence.device_generation_controller =
             generation_evidence.controller_observed;
+        evidence.model_forward_only_observed = generation_evidence.model_forward_only_observed;
+        evidence.model_forward_only_certified = generation_evidence.model_forward_only_certified;
         evidence.generation_execution_policy = generation_evidence.policy;
         evidence.native_generation_parent =
             generation_evidence.hasNativeParent();
@@ -1366,8 +1439,8 @@ namespace llaminar2::test::parity
         // the inner-forward fields for diagnosis and make the established
         // full-graph fields describe the complete request as their name claims.
         const bool complete_generation_parent =
-            !evidence.device_generation_controller ||
-            evidence.native_generation_parent;
+            (!evidence.model_forward_only_observed || evidence.model_forward_only_certified) &&
+            (!evidence.device_generation_controller || evidence.native_generation_parent);
         evidence.full_graph_capture =
             evidence.forward_full_graph_capture && complete_generation_parent;
         evidence.full_graph_replay =

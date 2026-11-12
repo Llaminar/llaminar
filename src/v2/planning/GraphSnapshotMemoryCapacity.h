@@ -78,7 +78,7 @@ namespace llaminar2
         {
             return per_accelerator_bytes != 0u || !authored_source_outputs.empty() ||
                 (main_phase_payload && (main_phase_payload->wide_main_bytes != 0u ||
-                                        main_phase_payload->scalar_main_bytes != 0u));
+                                        main_phase_payload->scalar_main_bytes != 0u || !main_phase_payload->layers.empty()));
         }
 
         friend constexpr bool operator==(

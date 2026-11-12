@@ -25,6 +25,7 @@
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "DeviceGraphOrchestrator.h"
+#include "execution/qwen4exp/QwenSparseQueryProgramObservation.h"
 #include "loaders/ModelContext.h"
 #include "MTPGraphPolicyScopes.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
@@ -8628,12 +8629,21 @@ namespace llaminar2
         if (effective_input.execution_phase == ForwardExecutionPhase::Decode &&
             effective_input.graph_submission_intent == ForwardGraphSubmissionIntent::Execute &&
             sparseQueryProgramCount() > 1u)
+            recordQwenSparseQueryDecodeForward(state_.device_id, effective_input.sparse_query_execution_program,
+                effective_input.execution_role, effective_input.seq_len);
+        if (effective_input.execution_phase == ForwardExecutionPhase::Prefill &&
+            effective_input.graph_submission_intent == ForwardGraphSubmissionIntent::Execute &&
+            sparseQueryProgramCount() > 1u && effective_input.sparse_query_prefill_proof &&
+            effective_input.sparse_query_prefill_proof->namesRange(effective_input.position_offset, effective_input.seq_len))
             PerfStatsCollector::addCounter("qsa", "query_program_forward_submissions", 1.0,
-                "decode", state_.device_id.toString(),
-                {{"program", effective_input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking ?
-                    "proven_no_ranking" : "ranking_possible"},
+                "prefill", state_.device_id.toString(),
+                {{"program", effective_input.sparse_query_prefill_proof->program(qwen4exp::QwenSparseFirstRankingLogicalRow)==
+                    SparseQueryExecutionProgram::ProvenNoRanking?"proven_no_ranking":"ranking_possible"},
                  {"role", std::to_string(static_cast<int>(effective_input.execution_role))},
                  {"physical_rows", std::to_string(effective_input.seq_len)},
+                 {"logical_rows", std::to_string(effective_input.seq_len)},
+                 {"logical_begin", std::to_string(effective_input.position_offset)},
+                 {"width_policy", "exact_retained"},
                  {"observation", "successful_forward_submission_not_native_replay_count"}});
         /*
          * Expert maintenance is a decode-transaction operation, not a raw
@@ -19589,6 +19599,21 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule execution failed");
             return false;
         }
+        // One completed request witness covers its actual retained chunk
+        // composition (for example 8+1), never warmup or cold materialization.
+        // Original request admission chooses the program, not observed outputs.
+        if (sparseQueryProgramCount() > 1u && input.sparse_query_prefill_proof &&
+            input.sparse_query_prefill_proof->namesRange(input.position_offset, seq_len))
+            PerfStatsCollector::addCounter("qsa", "query_program_forward_submissions", 1.0,
+                "prefill", state_.device_id.toString(),
+                {{"program", input.sparse_query_prefill_proof->program(qwen4exp::QwenSparseFirstRankingLogicalRow)==
+                    SparseQueryExecutionProgram::ProvenNoRanking?"proven_no_ranking":"ranking_possible"},
+                 {"role", std::to_string(static_cast<int>(input.execution_role))},
+                 {"physical_rows", std::to_string(physical_rows)},
+                 {"logical_rows", std::to_string(seq_len)},
+                 {"logical_begin", std::to_string(input.position_offset)},
+                 {"width_policy", policy.width_policy==PrefillChunkWidthPolicy::ExactRetained?"exact_retained":"retained_padding"},
+                 {"observation", "successful_forward_submission_not_native_replay_count"}});
         if (input.rehydrate_prefix_runtime_on_device)
         {
             graph_builder_->completePrefixCacheRuntimeStateDeviceRehydration();

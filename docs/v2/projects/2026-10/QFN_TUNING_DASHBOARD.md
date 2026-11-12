@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated 2026-11-11. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-12. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
@@ -14,8 +14,9 @@ memory-bandwidth limits; no throughput target is substituted for profiling.
 backend and the full 32-case EP4/EP4 preparation/lifecycle matrix. Parent
 interruption prevented a whole-run receipt; user requested checkpointing the
 passing slice and skipping the redundant repeat. Numerical/model gates next.
-**Implementation:** published-capacity ownership and retained-request ordering
-repaired; original MPI/source authority preserved.
+**Implementation:** checkpoint `d1fd0a077` pushed. Native prefill passes:
+KL **0.0129**, top-1/top-5 **100%**. Scalar-prefill GDN handoff is repaired; Decode mean KL **0.198** remains red under diagnosis.
+[Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
 **Performance:** the exact eight-GPU model cell has no qualified baseline yet.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
@@ -67,7 +68,7 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission / SDK10.1 | **Full Unit/preflight is next, before more tuning.** Prior focused host 53/53, RCCL 9/9, HIP 19/19 per ISA, NUMA 13/13 and inventory 4/4 pass. Fresh full-backend Integration build must qualify the complete current inventory; prior results do not replace it. [SDK evidence](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md). |
+| Admission / SDK10.1 | **Passing CTest slice checkpointed; redundant full rerun waived by user.** Focused post-checkpoint repairs pass. Next: original eight-GPU numerical replay, paired panel and matched Release measurement; no complete whole-run receipt is claimed. [Current inference work](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
 | Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
 | Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 | Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
@@ -97,7 +98,7 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
-| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | ⚪ model parity pending | — | — | — | — | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | Prefill 🟢 KL0.0129; Decode 🔴 KL0.198; panel ⚪ | — | — | — | — | — | — |
 
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
 Small C0/C64 row-cache fixtures force movement; performance uses useful admitted
