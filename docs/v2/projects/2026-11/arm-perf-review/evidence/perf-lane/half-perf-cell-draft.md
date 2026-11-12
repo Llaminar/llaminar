@@ -916,3 +916,17 @@ the row selection but not the FMLAL evidence scan. FIX = fixture-only;
 DO NOT relax the production domain guard. The in-flight native runs may
 confirm empirically (P4 failing on I8MM); the reviewer's final verdict
 waits for the fixed fixture + runtime handoffs.
+
+### FMLAL LOOP BROKEN (~04:28Z): direct .80 iteration granted to addon
+
+Reviewer 249: P1–P5 use the (F,F) template domain (excluded from FMLAL
+by production) + no probe enabled → P4 will fail on I8MM; the gate
+re-pins to the next tip. **Main's loop-breaking suggestion adopted: a
+short .80 slot is GRANTED to the addon for DIRECT iteration** — build
+v2_test_cpu_half_operands at their fix tip(s) on aarch64 Linux, run,
+fix, rebuild, rerun until GREEN under BOTH envelopes (NEON + I8MM),
+then push the green tip + hand back. No seals for the iterations; the
+formal gate runs (Main I8MM-canonical #8 + the station re-run) pin to
+the green tip after handback. The fixture-only constraint stands (the
+production domain guard stays). This kills the push→validate round-trip
+latency that five fixture rounds have paid.
