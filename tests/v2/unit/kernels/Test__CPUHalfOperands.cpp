@@ -11,6 +11,7 @@
  * or timing threshold belongs in these correctness regressions.
  */
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "kernels/common/ProjectionRowWork.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #if defined(__aarch64__)
 #include "utils/ARMCPUFeatures.h"
@@ -525,61 +526,70 @@ TEST(CPUHalfOperands, FmlalLeafSelectionMatchesEnvelope){
 /** @test The route probe discriminates on/off, zero-N, invalid pointers,
  *        zero rows and positive live work — resolved-route semantics only. */
 TEST(CPUHalfOperands, FmlalRouteProbeDiscrimination){
-#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_FML)
-    FmlalProbe probe;
+    // The route probe is evidence-only: enabled, it counts one admitted live
+    // FMLAL dispatch on the resolved route; a scalar or leaf-less route
+    // counts zero. The no-op probe and the zero-count interface make this a
+    // real control on every build, never a skipped body. Public-rejection
+    // checks and primitive-count controls are asserted separately.
     FP16Tensor weight({size_t(1),size_t(65)},weightWords(1,65));
     FP32Tensor a65({size_t(1),size_t(65)}),c1({size_t(1),size_t(1)});
     std::fill_n(a65.mutable_data(),65,1.f);
-    // (1) Probe off: a valid multiply counts nothing.
+    // (1) Probe off (the default): a valid FP16RNE multiply counts nothing.
     {
         Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
         const long long before=fmlalLeafInvocations();
         ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,0);
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"probe-off";
     }
-    // (2) Probe on, positive live work: exactly one admitted dispatch.
-    long long after_on=0;
+    // (2-4) Probe enabled: the resolved route decides, and the public
+    // rejections never reach the primitive.
+    long long live_count=0;
     {
+        FmlalProbe probe;
         Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        // (2) Positive live work: exactly one admitted dispatch on the
+        // resolved FMLAL route; zero on any other resolved route.
         const long long before=fmlalLeafInvocations();
         ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
-        after_on=fmlalLeafInvocations()-before;
-        EXPECT_EQ(after_on,fmlalRouteResolved()?1:0);
-    }
-    // (3) Zero N: the schedule runs zero columns; no FMLAL work, no count.
-    {
-        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
-        const long long before=fmlalLeafInvocations();
-        ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,0,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"zero-N";
-    }
-    // (4) Invalid pointer: rejected before any route work; no count.
-    {
-        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
-        const long long before=fmlalLeafInvocations();
+        live_count=fmlalLeafInvocations()-before;
+        EXPECT_EQ(live_count,fmlalRouteResolved()?1:0)<<"positive-live";
+        // (3) Zero N: the public admission rejects before the primitive;
+        // nothing counts.
+        const long long before_n=fmlalLeafInvocations();
+        EXPECT_FALSE(engine.multiply_tensor(&a65,&c1,1,0,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before_n,0)<<"zero-N";
+        // (4) Null activation: the public admission rejects; nothing counts.
+        const long long before_null=fmlalLeafInvocations();
         EXPECT_FALSE(engine.multiply_tensor(nullptr,&c1,1,1,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"null-A";
+        EXPECT_EQ(fmlalLeafInvocations()-before_null,0)<<"null-A";
     }
-    // (5) Zero rows: no row tiles; no FMLAL work, no count.
-    {
-        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
-        FP32Tensor a0({size_t(1),size_t(65)});
-        std::fill_n(a0.mutable_data(),65,1.f);
-        const long long before=fmlalLeafInvocations();
-        ASSERT_TRUE(engine.multiply_tensor(&a0,&c1,0,1,65));
-        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"zero-M";
-    }
-    // (6) Probe restored off: the count holds still.
+    // (5) Probe restored off: the count holds still.
     {
         Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
         const long long before=fmlalLeafInvocations();
         ASSERT_TRUE(engine.multiply_tensor(&a65,&c1,1,1,65));
         EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"restored-off";
     }
-    EXPECT_GT(after_on,0);
-#else
-    GTEST_SKIP() << "FMLAL route evidence is AArch64+FP16FML only";
-#endif
+    // (6) Positive capacity, all-inactive span: the work-scoped route
+    // returns before any schedule runs; nothing counts even with the probe
+    // enabled.
+    {
+        FmlalProbe probe;
+        Engine engine(&weight,Engine::NumericalPolicy::BackendNative,Mode::FP16RNE);
+        std::int32_t live_rows=0;
+        ProjectionRowWorkScope scope(ProjectionRowWork::fromPrefix(
+            DeviceRowRange::deviceCounted(1,&live_rows)));
+        FP32Tensor input({size_t(1),size_t(65)});
+        std::fill_n(input.mutable_data(),65,1.f);
+        const long long before=fmlalLeafInvocations();
+        ASSERT_TRUE(engine.multiply_tensor(&input,&c1,1,1,65));
+        EXPECT_EQ(fmlalLeafInvocations()-before,0)<<"all-inactive";
+    }
+    // The positive-live control asserts only where the route resolved; a
+    // non-native or leaf-less route legitimately counts zero and is never
+    // claimed as FMLAL coverage.
+    if(fmlalRouteResolved())
+        EXPECT_EQ(live_count,1);
 }
 /** @test Explicit preflight scaling sweep; excluded from the fast Unit alias. */
 TEST(CPUHalfOperands, EveryPositiveWorkerBudget){
