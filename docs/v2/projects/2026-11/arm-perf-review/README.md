@@ -1978,3 +1978,21 @@ upstream test adapted to assert unbound requests are rejected.
 Integration NEON_I8MM); the M=1 window waits; the M=1 re-anchor follows
 Main's new-tip announcement (not 7a4790c77 — the base changed).**
 Lanes rebase onto the announced tip after validation.
+
+### BRANCH CLEANUP EXECUTED (~09:55Z): three merged-and-confirmed branches deleted
+
+Per the branch-lifecycle rule (removed once content merged + confirmed):
+- codex/arm-fmlal-half-leaf DELETED (content = PR #43's 0ad09600b, FF'd);
+- codex/arm-b4-vocab-budget DELETED (content = PR #43's 7a4790c77, FF'd);
+- codex/arm-idea26-openmp-wakeup DELETED (merged in the counter
+  collection; deletion queued since the campaign).
+KEPT: codex/arm-perf-review (PERMANENT tracker); codex/arm-b1-fused-
+fork-pooling (9f96536a6 — the B1 pooling WIP, in Main's structural
+pass); codex/arm-idea16-moe-decode (5c2cef47a — the W2/B1 bench chain,
+window material); codex/arm-b9-strengthening (108bce2e — closed/
+benched, the preserved artifact per the operator); codex/arm-s4-
+nibble-witness (7501904e8 — frozen unmerged tooling per Main); codex/
+bundle1-perf-harness (5d606a108 — the Bundle-1 final hop pending);
+codex/arm-half-perf-cell (b512e25a — frozen, superseded by the landed
+FMLAL leaf; deletion candidate awaiting an operator call since the
+content is unmerged-obsolete, not merged).
