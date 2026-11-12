@@ -2074,3 +2074,16 @@ the handover docs are intact; sparks executes the M=1 window from that
 script + their own corrected m1.sh fixes.** Work routing: implementation
 → Main; host execution → sparks; verdicts → the reviewer; station ops →
 the station; analysis packages → the coordinator or a future re-spawn.
+
+### OPERATOR CLARIFICATION (~10:27Z): performance changes are ALSO critical — the bar is same-or-better
+
+"performances changes are also critical. we need stablility, once this
+is ok, then we need same or better performance, anything worse will get
+rejected!" — REFRAMES the stabilize-only directive: (1) **B1 pooling
+proceeds NOW** (the "B1 authorize" grant + this clarification; the
+landing timing follows the evidence — pre-merge if the validation
+completes with same-or-better evidence, else immediately post-merge);
+(2) **the acceptance bar for everything: same-or-better performance,
+anything worse REJECTED** — the M=1 signal, the B1 non-regression, all
+future changes; (3) the stability-first ordering stands (correctness
+gates → performance evidence).
