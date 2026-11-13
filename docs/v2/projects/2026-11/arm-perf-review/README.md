@@ -3893,3 +3893,30 @@ gates = the bypass backstop. Gates: 12/12 + 297/297 + 4/4 + 5/5 +
 probes. ROUTED to Main: review request + Stage-A gate sequencing
 (strict-tip note: A2/A3 seals still fire at their tips + the gate at
 569de492b incl. the WSL x86 leg; cost call Main's).
+
+### A4 REVIEW: F1+F2 ROUTED; STAGE-A GATE SEQUENCING SET (12:55Z)
+
+Main @ 569de492b: A3-B1 right (pre-allocation, both paths), A4-2/
+A4-3 OK. TWO FIXES pre-pin: F1 kInventoryVersion stays 7 while A4-1
+adds an inventory-record byte -> bump to 8 + comment + regression
+(v7-shaped record rejected BY VERSION). F2 ExplicitPreparedSections-
+ForTest = process-global mutable fn-pointer consulted by production
+deserialize/allocate (test override reachable from production
+validation; non-atomic across threads) -> replace with DI: internal
+admission helpers take the sections resolver as a parameter (internal
+overload); public paths use the production authority only; tests
+use the internal overload; same regression shape. ONE fixup on
+569de492b. SEQUENCING (Main): (1) sparks A2 2-cell rerun at
+1f92dca1c -> A2 pin on green; (2) A3 pin to reviewer NOW on source
+at 17789eb05 (patch-identical to 848030067; only the 2 expected
+shared-.inc reds; NO separate A3 binding run — the Stage-A gate on
+the descendant covers it); (3) F1+F2 fixup; (4) STAGE-A GATE ONCE
+at the fixed tip: sparks = Linux Integration NEON_I8MM + HAVE_CUDA=
+ON cu13, full Unit + ProductionTestPreflight via run_production_
+prerequisites.py, CUDA expert-tier native set, JUnit + ARM prepared-
+byte identity vs d5e04fdce; WSL = x86 Integration CPU-only, Unit +
+preflight, x86 prepared-byte identity vs d5e04fdce; (5) A4 pin with
+gate evidence -> Gate-A reviewer pass on the full Stage-A range
+d5e04fdce..fixed tip. Sparks re-dispatched (a3b diagnostic + A3
+binding run superseded/skipped); WSL leg dispatches with the fixup
+SHA. Main routes the A3 pin now.
