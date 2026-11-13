@@ -235,6 +235,67 @@ namespace llaminar2
         std::uint32_t cpu_block_stride = 0;
         std::uint32_t unit_count = 0;
         std::uint32_t maximum_units_per_chunk = 0;
+        // Wire section planes for the GPU conversion kernels, derived ONCE on
+        // the admission host from the CPU ENDPOINT layout's section tables —
+        // never from the compiler host and never from a hardcoded encoding
+        // family. Each plane is the section's unit offset divided by 64 (the
+        // live-column wire quotient); zero means the endpoint layout has no
+        // such section. valid() re-derives and compares, so a hand-built or
+        // stale layout fails closed before any kernel consumes a plane.
+        // Plane quotients are bounded by the unit stride (≤ 64 columns), so
+        // one byte each keeps the fixed MappedTransfer work ABI within its
+        // word budget while the derivation stays authoritative.
+        std::uint8_t cpu_wire_payload_per_column = 0;
+        std::uint8_t cpu_wire_compensation_plane = 0;
+        std::uint8_t cpu_wire_scales_plane = 0;
+        std::uint8_t cpu_wire_mins_plane = 0;
+        std::uint8_t cpu_wire_emins_plane = 0;
+
+        /**
+         * @brief Derive the wire planes from the CPU endpoint layout's tables.
+         * @details Fail-closed: an unimplemented prepared layout (zero-stride
+         * sentinel) and any section not aligned to the 64-column wire
+         * quotient never reach a conversion kernel through this contract.
+         * @return Whether the endpoint layout yields a complete plane set.
+         */
+        [[nodiscard]] constexpr bool deriveCpuEndpointWirePlanes() noexcept
+        {
+            const auto *const cpu_source =
+                native_quantised_formats::forSourceIdentity(
+                    cpu_codebook_id, cpu_is_superblock != 0);
+            if (cpu_source == nullptr)
+                return false;
+            const auto sections = cpu::native_quantised::preparedUnitSections(
+                cpu_layout, cpu_encoding, cpu_is_asymmetric != 0, *cpu_source);
+            if (!sections.isValid())
+                return false;
+            if ((sections.payload_stride % 64u) != 0u ||
+                (sections.scales_offset % 64u) != 0u ||
+                (sections.has_compensation &&
+                    (sections.compensation_offset % 64u) != 0u) ||
+                (sections.has_secondary && (sections.mins_offset % 64u) != 0u) ||
+                (sections.has_emins && (sections.emins_offset % 64u) != 0u))
+                return false;
+            const std::uint32_t payload_per_column = sections.payload_stride / 64u;
+            const std::uint32_t compensation_plane =
+                sections.has_compensation ? sections.compensation_offset / 64u : 0u;
+            const std::uint32_t scales_plane = sections.scales_offset / 64u;
+            const std::uint32_t mins_plane =
+                sections.has_secondary ? sections.mins_offset / 64u : 0u;
+            const std::uint32_t emins_plane =
+                sections.has_emins ? sections.emins_offset / 64u : 0u;
+            if (payload_per_column > 255u || compensation_plane > 255u ||
+                scales_plane > 255u || mins_plane > 255u || emins_plane > 255u)
+                return false;
+            cpu_wire_payload_per_column =
+                static_cast<std::uint8_t>(payload_per_column);
+            cpu_wire_compensation_plane =
+                static_cast<std::uint8_t>(compensation_plane);
+            cpu_wire_scales_plane = static_cast<std::uint8_t>(scales_plane);
+            cpu_wire_mins_plane = static_cast<std::uint8_t>(mins_plane);
+            cpu_wire_emins_plane = static_cast<std::uint8_t>(emins_plane);
+            return true;
+        }
 
         /** @return Original CPU-only physical storage projection of this GPU-edge contract. */
         [[nodiscard]] constexpr ExpertTierWeightCPUStorageLayout cpuStorage() const noexcept
@@ -303,6 +364,23 @@ namespace llaminar2
                 expected_units > std::numeric_limits<std::uint32_t>::max() ||
                 unit_count != expected_units || maximum_units_per_chunk == 0 ||
                 maximum_units_per_chunk > unit_count)
+            {
+                return false;
+            }
+            // The wire planes must be exactly the CPU endpoint layout's
+            // section quotients: re-derive and compare so stale, foreign or
+            // hand-built planes fail closed before any kernel launch. A GPU
+            // source with effective minima additionally requires an endpoint
+            // plane that can represent them (explicit conversion contract,
+            // never a silent drop).
+            ExpertTierWeightDeviceLayout rederived = *this;
+            if (!rederived.deriveCpuEndpointWirePlanes() ||
+                rederived.cpu_wire_payload_per_column != cpu_wire_payload_per_column ||
+                rederived.cpu_wire_compensation_plane != cpu_wire_compensation_plane ||
+                rederived.cpu_wire_scales_plane != cpu_wire_scales_plane ||
+                rederived.cpu_wire_mins_plane != cpu_wire_mins_plane ||
+                rederived.cpu_wire_emins_plane != cpu_wire_emins_plane ||
+                (gpu_has_emins != 0 && cpu_wire_emins_plane == 0))
             {
                 return false;
             }

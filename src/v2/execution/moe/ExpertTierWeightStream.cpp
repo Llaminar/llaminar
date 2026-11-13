@@ -603,18 +603,23 @@ namespace llaminar2
         if (!cpu::native_quantised::isKnownPreparedEncoding(cpu_encoding))
             return reject(error, "Tier stream CPU encoding is invalid");
         // Re-derive strides rather than accepting redundant wire fields on
-        // trust. The wire carries no prepared-layout field until its
-        // versioned A3 update, so the canonical host layout is the section
-        // authority for this arithmetic (never the encoding family alone).
-        // The tables must be complete BEFORE any comparison: an unknown
-        // source or an unimplemented layout never yields a zero that a
-        // zero-stride field could match.
+        // trust. The carried layout contract (reserved identity byte zero)
+        // is the section authority for this arithmetic — never the encoding
+        // family alone and never the receiving host's own layout. The
+        // tables must be complete BEFORE any comparison: an unknown source,
+        // an unknown layout byte, or an unimplemented layout never yields a
+        // zero that a zero-stride field could match.
         const auto *const wire_source = native_quantised_formats::forSourceIdentity(
             cpu_codebook_id, cpu_is_superblock != 0);
         if (wire_source == nullptr)
             return reject(error, "Tier stream CPU source identity is not cataloged");
+        const auto wire_layout = static_cast<
+            cpu::native_quantised::CPUNativeQuantisedLayout>(
+            reserved_identity[0]);
+        if (!cpu::native_quantised::isKnownPreparedLayout(wire_layout))
+            return reject(error, "Tier stream carries an unknown CPU layout");
         const auto wire_sections = cpu::native_quantised::preparedUnitSections(
-            cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
+            wire_layout, cpu_encoding,
             cpu_is_asymmetric != 0, *wire_source);
         if (!wire_sections.isValid() ||
             cpu_data_stride != wire_sections.payload_stride ||
@@ -657,7 +662,7 @@ namespace llaminar2
     ExpertTierWeightDeviceLayout
     ExpertTierWeightStreamManifest::deviceLayout() const noexcept
     {
-        return ExpertTierWeightDeviceLayout{
+        ExpertTierWeightDeviceLayout layout{
             .direction =
                 source_packing ==
                         ExpertTierWeightPacking::GpuSeparatedNativeQuantised
@@ -685,11 +690,27 @@ namespace llaminar2
             .gpu_is_asymmetric = gpu_is_asymmetric,
             .gpu_has_emins = gpu_has_emins,
             .cpu_encoding = cpu_encoding,
+            // Reserved identity byte zero carries the CPU endpoint layout
+            // contract — the layout the sender derived the strides from
+            // (destination for GPU-to-CPU demotion, source for CPU-to-GPU
+            // promotion), never the projecting host or the compiler host.
+            // Canonical is zero and the byte sits outside the v3 seal;
+            // A3's versioned wire promotes it to a hashed, named field.
+            .cpu_layout = static_cast<
+                cpu::native_quantised::CPUNativeQuantisedLayout>(
+                reserved_identity[0]),
             .cpu_data_stride = cpu_data_stride,
             .cpu_block_stride = cpu_block_stride,
             .unit_count = unit_count,
             .maximum_units_per_chunk = maximum_units_per_chunk,
         };
+        // The GPU conversion contract derives its wire planes from the CPU
+        // endpoint layout's tables once, here on the admission host. An
+        // endpoint layout without complete tables yields an empty layout
+        // that fails every consumer's valid() gate.
+        if (!layout.deriveCpuEndpointWirePlanes())
+            return ExpertTierWeightDeviceLayout{};
+        return layout;
     }
 
     ExpertTierWeightCPUStorageLayout cpuExpertTierStorageLayoutForIntersection(
@@ -1093,6 +1114,7 @@ namespace llaminar2
     ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
         const NativeQuantisedFormatInfo &source_format,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         int N,
         int K,
         uint64_t residency_epoch,
@@ -1148,17 +1170,39 @@ namespace llaminar2
             canonicalDeviceVnniFormat(source_format).is_asymmetric ? 1u : 0u;
         manifest.gpu_has_emins = source_format.has_emins ? 1u : 0u;
         manifest.cpu_encoding = cpu_encoding;
-        manifest.cpu_data_stride =
-            cpu::native_quantised::preparedDataStride(cpu_encoding);
-        manifest.cpu_block_stride = static_cast<uint32_t>(
-            cpu::native_quantised::preparedInterleavedBlockStride(
-                cpu_encoding, source_format.is_asymmetric));
+        // The CPU byte contract derives from the RECEIVING endpoint's layout
+        // — never the compiler host. Callers on the endpoint itself pass its
+        // own layout; the A4 inventory threads the recorded layout for
+        // remote builds. An unimplemented layout fails closed here.
+        const auto *const destination_source =
+            native_quantised_formats::forSourceIdentity(
+                source_format.codebook_id, source_format.is_superblock);
+        const auto destination_sections =
+            destination_source != nullptr
+                ? cpu::native_quantised::preparedUnitSections(
+                      destination_layout, cpu_encoding,
+                      source_format.is_asymmetric, *destination_source)
+                : cpu::native_quantised::PreparedUnitSections{};
+        if (!destination_sections.isValid())
+            throw std::invalid_argument(
+                "GPU-to-CPU tier stream requires a destination layout with "
+                "implemented section tables");
+        manifest.cpu_data_stride = destination_sections.payload_stride;
+        manifest.cpu_block_stride = destination_sections.block_stride;
+        // The manifest carries the target-layout contract: reserved identity
+        // byte zero names the CPU endpoint layout that produced these
+        // strides. Canonical is zero, so today's wire bytes are unchanged;
+        // the byte sits outside the v3 seal, and A3's versioned wire
+        // promotes it to a hashed, named field.
+        manifest.reserved_identity[0] =
+            static_cast<uint8_t>(destination_layout);
         return sealManifest(manifest, maximum_units_per_chunk);
     }
 
     ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
         const NativeQuantisedFormatInfo &source_format,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         const GpuExpertPackedDescriptor &gpu_source,
         uint64_t residency_epoch,
         int layer_idx,
@@ -1172,6 +1216,7 @@ namespace llaminar2
 
         auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
             source_format,
+            destination_layout,
             gpu_source.n,
             gpu_source.k,
             residency_epoch,
@@ -1287,6 +1332,13 @@ namespace llaminar2
             static_cast<uint32_t>(cpu_weights.data_stride);
         manifest.cpu_block_stride =
             static_cast<uint32_t>(cpu_weights.interleaved_block_stride);
+        // CPU-to-GPU names the SOURCE layout: the packed weights carry
+        // their own prepared layout, never the compiler host and never a
+        // receiver guess. Canonical is zero, so today's wire bytes are
+        // unchanged; A3's versioned wire promotes the byte to a hashed,
+        // named field.
+        manifest.reserved_identity[0] =
+            static_cast<uint8_t>(cpu_weights.layout);
         return sealManifest(manifest, maximum_units_per_chunk);
     }
 

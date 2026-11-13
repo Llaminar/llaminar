@@ -88,7 +88,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPhysical
 
 add_v2_test(V2_Integration_ExpertTierDirectCPUProjection
     COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-        --gtest_filter=ExpertTierWeightStream.DirectCPUOriginalRootsAllFormatsPreserveIndependentStridesAndDirtyNeighbours:ExpertTierWeightStream.DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossReset:ExpertTierWeightStream.TierCopySectionPresenceDrivesMixedMultiScaleStrides
+        --gtest_filter=ExpertTierWeightStream.DirectCPUOriginalRootsAllFormatsPreserveIndependentStridesAndDirtyNeighbours:ExpertTierWeightStream.DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossReset:ExpertTierWeightStream.TierCopySectionPresenceDrivesMixedMultiScaleStrides:ExpertTierWeightStream.EndpointLayoutContractSelectsGpuConversionAndRejectsMismatch
         --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Contract;Transfer;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30

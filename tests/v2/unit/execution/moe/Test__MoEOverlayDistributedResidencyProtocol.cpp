@@ -731,6 +731,8 @@ namespace llaminar2::test
         const auto canonical_stream =
             makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::
+                    InterleavedCanonical,
                 cpu_bytes.N,
                 cpu_bytes.K,
                 identity.expected_epoch,

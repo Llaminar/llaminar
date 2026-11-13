@@ -305,7 +305,7 @@ namespace llaminar2
                 EXPECT_EQ(cpu.blockMin(n / 64, kb, n % 64), 0.0f);
             }
             const auto demote = makeGpuToCpuExpertTierWeightStreamManifest(
-                native_quantised_formats::IQ4_XS, source.N, source.K, 101, 2, 7,
+                native_quantised_formats::IQ4_XS, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, source.N, source.K, 101, 2, 7,
                 ExpertTierWeightProjection::Down, 2);
             const auto promote = makeCpuToGpuExpertTierWeightStreamManifest(
                 cpu, 101, 2, 7, ExpertTierWeightProjection::Down, 2);
@@ -401,6 +401,7 @@ namespace llaminar2
             const auto manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                 source.N,
                 source.K,
                 41,
@@ -501,6 +502,7 @@ namespace llaminar2
             ASSERT_NE(source_format, nullptr);
             auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                 source.N,
                 source.K,
                 2,
@@ -529,6 +531,7 @@ namespace llaminar2
                 const auto manifest =
                     makeGpuToCpuExpertTierWeightStreamManifest(
                         *entry.metadata,
+                        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                         70,
                         256,
                         101,
@@ -565,7 +568,7 @@ namespace llaminar2
                     continue;
                 SCOPED_TRACE(std::string(entry.quant_type));
                 auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                    *entry.metadata, 70, 256, 101, 3, 7,
+                    *entry.metadata, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, 70, 256, 101, 3, 7,
                     ExpertTierWeightProjection::Gate, 4).deviceLayout();
                 ASSERT_TRUE(layout.valid());
                 layout.cpu_encoding = cpu::native_quantised::CPUNativeQuantisedEncoding::ExpandedInt8;

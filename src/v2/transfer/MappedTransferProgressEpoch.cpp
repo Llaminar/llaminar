@@ -352,7 +352,8 @@ namespace llaminar2
     {
         if (!valid() || pending_ || !epoch_->device().is_cuda())
             throw std::logic_error("Packed transfer requires an idle CUDA service slot");
-        if (!source.validFor(layout) ||
+        if (!layout.valid() ||
+            !source.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::GpuToCpu ||
             !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
@@ -385,7 +386,8 @@ namespace llaminar2
     {
         if (!valid() || pending_ || !epoch_->device().is_cuda())
             throw std::logic_error("Packed transfer requires an idle CUDA service slot");
-        if (!destination.validFor(layout) ||
+        if (!layout.valid() ||
+            !destination.validFor(layout) ||
             layout.direction != ExpertTierWeightConversionDirection::CpuToGpu ||
             !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||

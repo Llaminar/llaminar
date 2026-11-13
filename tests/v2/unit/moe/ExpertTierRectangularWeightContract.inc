@@ -44,7 +44,7 @@ TEST(ExpertTierWeightStream, RectangularEncodedColumnsAllFormatsPreserveNeighbou
         P{R::ParticipantInputSlice,256,256,72,160,64,128});
     for(const auto& format:native_quantised_formats::kAllSourceFormats) {
         SCOPED_TRACE(format.quant_type);
-        const auto full=makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata,128,96,17,0,9,ExpertTierWeightProjection::Down,2);
+        const auto full=makeGpuToCpuExpertTierWeightStreamManifest(*format.metadata,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,128,96,17,0,9,ExpertTierWeightProjection::Down,2);
         const auto manifest=full.forIntersection(intersection);
         const auto source_layout=manifest.deviceLayout();ASSERT_TRUE(source_layout.valid());
         // In this demotion contract CPU is the destination; use the same exact

@@ -92,20 +92,31 @@ namespace llaminar2
                 else
                     destination.payload[linear * payload_bytes + byte] = cpu_source[cpu_offset];
             }
-            const size_t metadata = offset + (layout.cpu_data_stride/64)*columns;
+            // Endpoint wire planes: the CPU endpoint layout's section
+            // quotients, derived once on the admission host.
             if constexpr (ToCpu)
             {
-                reinterpret_cast<uint16_t *>(cpu_destination + metadata)[column] = source.scales[linear];
-                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 2*columns)[column] = source.mins[linear];
-                if (layout.gpu_has_emins)
-                    reinterpret_cast<uint32_t *>(cpu_destination + metadata + 4*columns)[column] = source.emins[linear];
+                if (layout.cpu_wire_scales_plane)
+                    reinterpret_cast<uint16_t *>(cpu_destination + offset +
+                        size_t(layout.cpu_wire_scales_plane)*columns)[column] = source.scales[linear];
+                if (layout.cpu_wire_mins_plane)
+                    reinterpret_cast<uint16_t *>(cpu_destination + offset +
+                        size_t(layout.cpu_wire_mins_plane)*columns)[column] = source.mins[linear];
+                if (layout.gpu_has_emins && layout.cpu_wire_emins_plane)
+                    reinterpret_cast<uint32_t *>(cpu_destination + offset +
+                        size_t(layout.cpu_wire_emins_plane)*columns)[column] = source.emins[linear];
             }
             else
             {
-                destination.scales[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata)[column];
-                destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 2*columns)[column];
-                if (layout.gpu_has_emins)
-                    destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + metadata + 4*columns)[column];
+                if (layout.cpu_wire_scales_plane)
+                    destination.scales[linear] = reinterpret_cast<const uint16_t *>(cpu_source + offset +
+                        size_t(layout.cpu_wire_scales_plane)*columns)[column];
+                if (layout.cpu_wire_mins_plane)
+                    destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + offset +
+                        size_t(layout.cpu_wire_mins_plane)*columns)[column];
+                if (layout.gpu_has_emins && layout.cpu_wire_emins_plane)
+                    destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + offset +
+                        size_t(layout.cpu_wire_emins_plane)*columns)[column];
             }
         }
 
@@ -549,13 +560,17 @@ namespace llaminar2
                 compensation += decodeNibbleForCompensationROCm<Codebook>(
                     static_cast<std::uint8_t>(packed >> 4));
             }
-            reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
-                static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
+            if (layout.cpu_wire_compensation_plane)
+                reinterpret_cast<std::int16_t *>(unit +
+                    size_t(layout.cpu_wire_compensation_plane)*columns)[local_column] =
+                    static_cast<std::int16_t>(compensation);
+            reinterpret_cast<std::uint16_t *>(unit +
+                size_t(layout.cpu_wire_scales_plane)*columns)[local_column] =
                 scales[linear];
             if constexpr (HasSecondaryMetadata)
             {
-                reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
+                reinterpret_cast<std::uint16_t *>(unit +
+                    size_t(layout.cpu_wire_mins_plane)*columns)[local_column] =
                     mins[linear];
             }
         }
@@ -654,16 +669,19 @@ namespace llaminar2
                 compensation += static_cast<std::int8_t>(
                     unit[interleavedValueOffsetROCm(local_column, value, columns)]);
             }
-            reinterpret_cast<std::int16_t *>(unit + (2048u/64)*columns)[local_column] =
-                static_cast<std::int16_t>(compensation);
-            reinterpret_cast<std::uint16_t *>(unit + (2176u/64)*columns)[local_column] =
+            if (layout.cpu_wire_compensation_plane)
+                reinterpret_cast<std::int16_t *>(unit +
+                    size_t(layout.cpu_wire_compensation_plane)*columns)[local_column] =
+                    static_cast<std::int16_t>(compensation);
+            reinterpret_cast<std::uint16_t *>(unit +
+                size_t(layout.cpu_wire_scales_plane)*columns)[local_column] =
                 scales[linear];
             if constexpr (
                 Codebook == 7 || Codebook == 11 || Codebook == 16 ||
                 Codebook == kNativeQuantisedExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(
-                    unit + (2304u/64)*columns)[local_column] =
+                    unit + size_t(layout.cpu_wire_mins_plane)*columns)[local_column] =
                     mins[linear];
             }
         }
@@ -728,10 +746,10 @@ namespace llaminar2
                     converted|=((original>>(2*index))&1)<<index;
                     converted|=((original>>(2*index+1))&1)<<(4+index);
                 }
-                unit[16*columns+group*columns+column]=static_cast<uint8_t>(converted);
+                unit[size_t(layout.cpu_wire_payload_per_column)*columns+group*columns+column]=static_cast<uint8_t>(converted);
             }
-            reinterpret_cast<uint16_t*>(unit+24*columns)[column]=scales[linear];
-            reinterpret_cast<uint16_t*>(unit+26*columns)[column]=secondary_scales[linear];
+            reinterpret_cast<uint16_t*>(unit+size_t(layout.cpu_wire_scales_plane)*columns)[column]=scales[linear];
+            reinterpret_cast<uint16_t*>(unit+size_t(layout.cpu_wire_mins_plane)*columns)[column]=secondary_scales[linear];
         }
 
         /**
@@ -772,11 +790,12 @@ namespace llaminar2
                     unit[interleavedValueOffsetROCm(local_column, value, columns)];
             }
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit +
+                    size_t(layout.cpu_wire_scales_plane)*columns)[local_column];
             if constexpr (HasSecondaryMetadata)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + (1280u/64)*columns)[local_column];
+                    unit + size_t(layout.cpu_wire_mins_plane)*columns)[local_column];
             }
         }
 
@@ -825,7 +844,8 @@ namespace llaminar2
             if constexpr (SourceCodebook == 11)
             {
                 static_assert(!Asymmetric, "IQ3_S raw source nibble is not an additive minimum");
-                const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit + (2304u/64)*columns)[local_column];
+                const std::uint16_t raw = reinterpret_cast<const std::uint16_t *>(unit +
+                    size_t(layout.cpu_wire_mins_plane)*columns)[local_column];
                 if (!native_quantised_iq3s_scale::valid(raw)) __builtin_trap();
                 std::uint8_t low[8]{};
                 std::uint8_t high = 0;
@@ -851,7 +871,8 @@ namespace llaminar2
                 destination[8] = high;
 #pragma unroll
                 for (unsigned byte = 0; byte < 4; ++byte) destination[9 + byte] = signs[byte];
-                scales[linear] = reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
+                scales[linear] = reinterpret_cast<const std::uint16_t *>(unit +
+                    size_t(layout.cpu_wire_scales_plane)*columns)[local_column];
                 mins[linear] = raw;
                 return;
             }
@@ -863,11 +884,12 @@ namespace llaminar2
                     unit[interleavedValueOffsetROCm(local_column, value, columns)];
             }
             scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (2176u/64)*columns)[local_column];
+                reinterpret_cast<const std::uint16_t *>(unit +
+                    size_t(layout.cpu_wire_scales_plane)*columns)[local_column];
             if constexpr (Asymmetric)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
-                    unit + (2304u/64)*columns)[local_column];
+                    unit + size_t(layout.cpu_wire_mins_plane)*columns)[local_column];
             }
         }
 
@@ -910,7 +932,7 @@ namespace llaminar2
                     const auto* planes=reinterpret_cast<const uint64_t*>(unit+1024+group*64+(column/16)*16);
                     const auto bit=(column%16)*4;
                     original=static_cast<unsigned>(((planes[0]>>bit)&15)|(((planes[1]>>bit)&15)<<4));
-                } else original=unit[16*columns+group*columns+column];
+                } else original=unit[size_t(layout.cpu_wire_payload_per_column)*columns+group*columns+column];
                 unsigned converted=0;
                 for(unsigned index=0;index<4;++index) {
                     converted|=((original>>index)&1)<<(2*index);
@@ -918,8 +940,8 @@ namespace llaminar2
                 }
                 payload[linear*24+16+group]=static_cast<uint8_t>(converted);
             }
-            scales[linear]=reinterpret_cast<const uint16_t*>(unit+24*columns)[column];
-            secondary_scales[linear]=reinterpret_cast<const uint16_t*>(unit+26*columns)[column];
+            scales[linear]=reinterpret_cast<const uint16_t*>(unit+size_t(layout.cpu_wire_scales_plane)*columns)[column];
+            secondary_scales[linear]=reinterpret_cast<const uint16_t*>(unit+size_t(layout.cpu_wire_mins_plane)*columns)[column];
         }
 
         /**

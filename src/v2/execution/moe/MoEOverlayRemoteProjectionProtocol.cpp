@@ -200,10 +200,11 @@ namespace llaminar2
                 source_identity.is_superblock ? 1u : 0u;
             manifest.cpu_encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
-            // Wire strides derive from the host's canonical layout tuple
-            // (the wire carries no prepared-layout field until its versioned
-            // A3 update); the section authority, not the encoding family,
-            // owns the arithmetic.
+            // Wire strides derive from the CPU endpoint's canonical layout
+            // tuple (the protocol carries no prepared-layout field until its
+            // versioned A3 update, so the endpoint's layout is canonical by
+            // version statement); the section authority, not the encoding
+            // family, owns the arithmetic.
             manifest.cpu_data_stride =
                 cpu::native_quantised::preparedDataStride(
                     cpu::native_quantised::kHostPreparedLayout,
@@ -886,13 +887,21 @@ namespace llaminar2
             .gpu_is_asymmetric = manifest.gpu_is_asymmetric,
             .gpu_has_emins = manifest.gpu_has_emins,
             .cpu_encoding = manifest.cpu_encoding,
+            // Remote-manifest wire semantics: the protocol's CPU bytes are
+            // canonical (a versioned statement; the A3 protocol update
+            // carries the endpoint layout explicitly).
+            .cpu_layout =
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
             .cpu_data_stride = manifest.cpu_data_stride,
             .cpu_block_stride = manifest.cpu_block_stride,
             .unit_count = static_cast<std::uint32_t>(units),
             .maximum_units_per_chunk =
                 static_cast<std::uint32_t>(maximum_units),
         };
-        if (!layout.valid())
+        // Derive the GPU conversion contract's wire planes from the CPU
+        // endpoint layout's tables once, here; an endpoint layout without
+        // complete tables fails closed before any repack kernel runs.
+        if (!layout.deriveCpuEndpointWirePlanes() || !layout.valid())
         {
             throw std::invalid_argument(
                 "Remote CPU/GPU projection fields do not form a supported device repack layout");

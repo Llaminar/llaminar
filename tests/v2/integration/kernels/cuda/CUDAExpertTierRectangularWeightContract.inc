@@ -24,7 +24,7 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(source_tensor.get(),cpu));
         const auto* originalFormat=native_quantised_formats::forSourceIdentity(source.source_codebook_id,source.is_superblock);
         ASSERT_NE(originalFormat,nullptr);
-        const auto demotionManifest=makeGpuToCpuExpertTierWeightStreamManifest(*originalFormat,N,K,81,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
+        const auto demotionManifest=makeGpuToCpuExpertTierWeightStreamManifest(*originalFormat,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,N,K,81,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
         const auto down=demotionManifest.deviceLayout();
         auto cpuOracle=down;cpuOracle.cpu_N=N;cpuOracle.cpu_K=K;cpuOracle.cpu_first_row=23;cpuOracle.cpu_first_column=96;
         TestCUDABuffer<uint8_t> input(source.payload.size());TestCUDABuffer<uint16_t> scales(source.scales.size()),mins(source.mins.size());TestCUDABuffer<uint32_t> emins(source.emins.size());

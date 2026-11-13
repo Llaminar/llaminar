@@ -892,6 +892,7 @@ namespace llaminar2
             const ExpertTierWeightStreamManifest manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                     *source_format,
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                     source.N,
                     source.K,
                     17,

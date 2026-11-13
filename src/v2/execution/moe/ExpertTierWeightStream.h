@@ -68,6 +68,12 @@ namespace llaminar2
         int32_t expert_id = -1;
         ExpertTierWeightProjection projection =
             ExpertTierWeightProjection::Gate;
+        // Byte zero carries the CPU endpoint layout contract — the layout
+        // the sender derived `cpu_data_stride`/`cpu_block_stride` from
+        // (destination layout for GPU-to-CPU, source layout for CPU-to-GPU).
+        // Canonical is zero, so canonical streams are byte-identical to
+        // their pre-layout form; the byte sits outside the v3 seal and A3's
+        // versioned wire promotes it to a hashed, named field.
         uint8_t reserved_identity[3]{};
 
         // CPU pads N to 64; K must contain complete 32-value quant blocks.
@@ -319,6 +325,7 @@ namespace llaminar2
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
         const NativeQuantisedFormatInfo &source_format,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         int N,
         int K,
         uint64_t residency_epoch,
@@ -337,6 +344,10 @@ namespace llaminar2
      * arbitrary promotion/demotion cycles remain lossless.
      *
      * @param source_format Original catalogued GGUF format identity.
+     * @param destination_layout Prepared layout of the RECEIVING CPU
+     *        endpoint — the conversion contract's authority, never the
+     *        compiler host's. Callers running on the endpoint pass its own
+     *        layout; A4 threads the inventory-recorded layout remotely.
      * @param gpu_source Exact live separated GPU descriptor.
      * @param residency_epoch Immutable source residency epoch.
      * @param layer_idx Logical transformer layer.
@@ -350,6 +361,7 @@ namespace llaminar2
     [[nodiscard]] ExpertTierWeightStreamManifest
     makeGpuToCpuExpertTierWeightStreamManifest(
         const NativeQuantisedFormatInfo &source_format,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         const GpuExpertPackedDescriptor &gpu_source,
         uint64_t residency_epoch,
         int layer_idx,

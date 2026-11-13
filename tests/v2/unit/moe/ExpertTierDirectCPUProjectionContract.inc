@@ -305,5 +305,194 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
     EXPECT_FALSE(copyExpertTierCPUWeightChunk(source, bytes, foreign, result, 0, 1));
     EXPECT_EQ(result, before);
 }
+
+/**
+ * @test The endpoint layout contract selects GPU conversion and rejects
+ *        mismatched layout contracts.
+ *
+ * GPU-to-CPU demotion names the DESTINATION CPU endpoint layout; the
+ * manifest carries it in reserved identity byte zero and derives its
+ * strides and wire planes from that layout's section tables — never from
+ * the compiler host and never from the encoding family alone. CPU-to-GPU
+ * promotion names the SOURCE layout from the packed weights themselves.
+ * The DeviceLayout wire planes are exactly the endpoint layout's section
+ * quotients, so the conversion kernels and the host reference consume one
+ * geometry (the reference round trip reproduces the separated data
+ * byte-exactly). Mismatched or unknown carried layouts are typed
+ * rejections: manifest validity and the device layout both fail closed,
+ * and an unimplemented destination layout is rejected by the builder
+ * before any stride work — never a silent canonical fallback.
+ */
+TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndRejectsMismatch)
+{
+    using cpu::native_quantised::CPUNativeQuantisedEncoding;
+    using cpu::native_quantised::CPUNativeQuantisedLayout;
+    using cpu::native_quantised::CPUNativeQuantisedPackedWeights;
+    using cpu::native_quantised::preparedEncodingForSource;
+    using cpu::native_quantised::preparedUnitSections;
+    const auto canonical = CPUNativeQuantisedLayout::InterleavedCanonical;
+    const auto compact = CPUNativeQuantisedLayout::InterleavedCompactA64;
+
+    // Adversarial separated GPU data mirroring one cataloged source's
+    // canonical device representation (host reference input only).
+    const auto hostProjection = [](const NativeQuantisedFormatInfo &source) {
+        const auto physical = canonicalDeviceVnniFormat(source);
+        HostGpuExpertPackedProjection projection;
+        projection.N = 70;
+        projection.K = 96;
+        projection.blocks_per_row = 3;
+        projection.source_codebook_id = source.codebook_id;
+        projection.codebook_id = physical.codebook_id;
+        projection.payload_bytes_per_block =
+            physical.payload_bytes_per_block;
+        projection.is_asymmetric = physical.is_asymmetric;
+        projection.is_superblock = source.is_superblock;
+        projection.has_emins = physical.has_emins;
+        const size_t blocks = 70u * 3u;
+        projection.payload.resize(blocks * physical.payload_bytes_per_block);
+        projection.scales.resize(blocks);
+        if (physical.is_asymmetric)
+            projection.mins.resize(blocks);
+        if (physical.has_emins)
+            projection.emins.assign(blocks, 0xac002c00u);
+        for (size_t block = 0; block < blocks; ++block)
+        {
+            for (size_t byte = 0;
+                 byte < physical.payload_bytes_per_block; ++byte)
+            {
+                uint8_t value = static_cast<uint8_t>(
+                    (block * 37u + byte * 19u + 11u) & 0xffu);
+                if (projection.codebook_id == 19 ||
+                    projection.codebook_id ==
+                        kNativeQuantisedExpandedInt8MinCodebook)
+                {
+                    value = static_cast<uint8_t>(static_cast<int8_t>(
+                        static_cast<int>(
+                            (block * 13u + byte * 7u) % 127u) -
+                        63));
+                }
+                projection.payload[
+                    block * physical.payload_bytes_per_block + byte] = value;
+            }
+            projection.scales[block] =
+                static_cast<uint16_t>(0x2400u + (block % 0x0800u));
+            if (physical.is_asymmetric)
+            {
+                projection.mins[block] = static_cast<uint16_t>(
+                    projection.codebook_id ==
+                            kNativeQuantisedIQ4XSSourceScaleCodebook
+                        ? block % 64u
+                        : 0xa000u + (block % 0x0800u));
+            }
+        }
+        // IQ3_S raw source words and IQ2_S grid bytes must stay inside
+        // their decoder domains for the reference to accept them.
+        if (physical.codebook_id == 11 || physical.codebook_id == 13)
+            for (size_t block = 0; block < projection.mins.size(); ++block)
+                projection.mins[block] = static_cast<uint16_t>(
+                    block & (physical.codebook_id == 11 ? 15u : 255u));
+        return projection;
+    };
+
+    // Representative sources covering every GPU conversion kernel family.
+    const NativeQuantisedFormatInfo *const families[] = {
+        &native_quantised_formats::Q4_0,   // NibbleLUT
+        &native_quantised_formats::Q8_0,   // ExpandedInt8
+        &native_quantised_formats::Q6_K,   // Q6KNativeDualScale
+        &native_quantised_formats::Q2_K,   // CompactMultiScale with emins
+        &native_quantised_formats::IQ4_XS, // NibbleLUTSourceScale
+        &native_quantised_formats::IQ3_S,  // IQ3SExpandedSourceScale
+    };
+    for (const NativeQuantisedFormatInfo *format : families)
+    {
+        SCOPED_TRACE(format->codebook_id);
+        const auto encoding = preparedEncodingForSource(*format);
+        const auto sections = preparedUnitSections(
+            canonical, encoding, format->is_asymmetric, *format);
+        ASSERT_TRUE(sections.isValid());
+
+        // GPU-to-CPU names the destination endpoint layout.
+        const auto stream = makeGpuToCpuExpertTierWeightStreamManifest(
+            *format, canonical, 70, 96, 5, 0, 1,
+            ExpertTierWeightProjection::Down, 2);
+        std::string error;
+        ASSERT_TRUE(stream.valid(&error)) << error;
+        EXPECT_EQ(stream.reserved_identity[0],
+            static_cast<uint8_t>(canonical));
+        EXPECT_EQ(stream.cpu_data_stride, sections.payload_stride);
+        EXPECT_EQ(stream.cpu_block_stride, sections.block_stride);
+        const auto device = stream.deviceLayout();
+        ASSERT_TRUE(device.valid());
+        EXPECT_EQ(device.cpu_layout, canonical);
+        EXPECT_EQ(device.cpu_wire_payload_per_column,
+            sections.payload_stride / 64u);
+        EXPECT_EQ(device.cpu_wire_compensation_plane,
+            sections.has_compensation ? sections.compensation_offset / 64u
+                                      : 0u);
+        EXPECT_EQ(device.cpu_wire_scales_plane,
+            sections.scales_offset / 64u);
+        EXPECT_EQ(device.cpu_wire_mins_plane,
+            sections.has_secondary ? sections.mins_offset / 64u : 0u);
+        EXPECT_EQ(device.cpu_wire_emins_plane,
+            sections.has_emins ? sections.emins_offset / 64u : 0u);
+
+        // An unimplemented destination layout is rejected by the builder
+        // before any stride work — never a silent canonical fallback.
+        EXPECT_THROW(
+            static_cast<void>(makeGpuToCpuExpertTierWeightStreamManifest(
+                *format, compact, 70, 96, 5, 0, 1,
+                ExpertTierWeightProjection::Down, 2)),
+            std::invalid_argument);
+
+        // A carried layout that disagrees with the strides is a typed
+        // rejection: manifest validity and the device layout both fail.
+        auto mismatched = stream;
+        mismatched.reserved_identity[0] = static_cast<uint8_t>(compact);
+        EXPECT_FALSE(mismatched.valid(&error));
+        EXPECT_FALSE(mismatched.deviceLayout().valid());
+        auto unknown = stream;
+        unknown.reserved_identity[0] = 7;
+        EXPECT_FALSE(unknown.valid(&error));
+        EXPECT_FALSE(unknown.deviceLayout().valid());
+
+        // CPU-to-GPU names the source layout from the weights themselves,
+        // and the reference round trip reproduces the same sections the
+        // wire planes describe: one geometry for kernels and reference.
+        auto gpu = hostProjection(*format);
+        ASSERT_TRUE(gpu.valid(&error)) << error;
+        CPUNativeQuantisedPackedWeights cpu;
+        ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error))
+            << error;
+        const auto cpu_sections = cpu.preparedSections();
+        ASSERT_TRUE(cpu_sections.isValid());
+        const auto promote = makeCpuToGpuExpertTierWeightStreamManifest(
+            cpu, 5, 0, 1, ExpertTierWeightProjection::Down, 2);
+        ASSERT_TRUE(promote.valid(&error)) << error;
+        EXPECT_EQ(promote.reserved_identity[0],
+            static_cast<uint8_t>(cpu.layout));
+        const auto promotion = promote.deviceLayout();
+        ASSERT_TRUE(promotion.valid());
+        EXPECT_EQ(promotion.cpu_layout, cpu.layout);
+        EXPECT_EQ(promotion.cpu_wire_payload_per_column,
+            cpu_sections.payload_stride / 64u);
+        EXPECT_EQ(promotion.cpu_wire_scales_plane,
+            cpu_sections.scales_offset / 64u);
+        EXPECT_EQ(promotion.cpu_wire_emins_plane,
+            cpu_sections.has_emins ? cpu_sections.emins_offset / 64u : 0u);
+        HostGpuExpertPackedProjection returned;
+        ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, returned, &error))
+            << error;
+        EXPECT_EQ(returned.codebook_id, gpu.codebook_id);
+        EXPECT_EQ(returned.payload_bytes_per_block,
+            gpu.payload_bytes_per_block);
+        EXPECT_EQ(returned.is_asymmetric, gpu.is_asymmetric);
+        EXPECT_EQ(returned.is_superblock, gpu.is_superblock);
+        EXPECT_EQ(returned.has_emins, gpu.has_emins);
+        EXPECT_EQ(returned.payload, gpu.payload);
+        EXPECT_EQ(returned.scales, gpu.scales);
+        EXPECT_EQ(returned.mins, gpu.mins);
+        EXPECT_EQ(returned.emins, gpu.emins);
+    }
+}
 }
 }

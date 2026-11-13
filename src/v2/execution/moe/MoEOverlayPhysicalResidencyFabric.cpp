@@ -6120,9 +6120,20 @@ namespace llaminar2
                                     if (!source_format)
                                         throw std::runtime_error(
                                             "ExpertOverlay remote GPU source lost catalogued provenance");
+                                    // The CPU destination is remote: v3
+                                    // wire semantics keep the byte contract
+                                    // canonical until the A3 protocol
+                                    // version carries the recorded endpoint
+                                    // layout. This is a versioned protocol
+                                    // statement, never a compiler-host probe;
+                                    // the receiver's Exact manifest match
+                                    // rejects any disagreement.
                                     const auto probe =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
+                                            cpu::native_quantised::
+                                                CPUNativeQuantisedLayout::
+                                                    InterleavedCanonical,
                                             source.gpu_packed,
                                             expected_epoch,
                                             migration.layer_idx,
@@ -6136,6 +6147,9 @@ namespace llaminar2
                                     const auto stream =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
+                                            cpu::native_quantised::
+                                                CPUNativeQuantisedLayout::
+                                                    InterleavedCanonical,
                                             source.gpu_packed,
                                             expected_epoch,
                                             migration.layer_idx,
@@ -6267,9 +6281,17 @@ namespace llaminar2
                                     if (!source_format)
                                         throw std::runtime_error(
                                             "ExpertOverlay remote CPU destination lost source provenance");
+                                    // The receiving CPU endpoint's own
+                                    // recorded layout — exported from the
+                                    // destination engine, never the compiler
+                                    // host — drives the stream's byte
+                                    // contract. A sender that assumed a
+                                    // different layout fails the Exact
+                                    // manifest match below.
                                     const auto probe =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
+                                            destination_packed->layout,
                                             piece.intersection.source().rows,
                                             piece.intersection.source().columns,
                                             expected_epoch,
@@ -6284,6 +6306,7 @@ namespace llaminar2
                                     const auto stream =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
+                                            destination_packed->layout,
                                             piece.intersection.source().rows,
                                             piece.intersection.source().columns,
                                             expected_epoch,
@@ -6585,9 +6608,12 @@ namespace llaminar2
                             if (!source_format)
                                 throw std::runtime_error(
                                     "ExpertOverlay GPU source lost catalogued provenance");
+                            // The receiving CPU endpoint's own recorded
+                            // layout drives the stream's byte contract.
                             const auto probe =
                                 makeGpuToCpuExpertTierWeightStreamManifest(
                                     *source_format,
+                                    destination_packed->layout,
                                     source.gpu_packed,
                                     expected_epoch,
                                     migration.layer_idx,
@@ -6600,6 +6626,7 @@ namespace llaminar2
                             const auto manifest =
                                 makeGpuToCpuExpertTierWeightStreamManifest(
                                     *source_format,
+                                    destination_packed->layout,
                                     source.gpu_packed,
                                     expected_epoch,
                                     migration.layer_idx,

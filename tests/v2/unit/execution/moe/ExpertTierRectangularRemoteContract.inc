@@ -42,7 +42,7 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, RectangularCpuGpuSourcesUseOr
     ASSERT_TRUE(sender.acknowledgeChunkSent(chunk.header,&error));
 
     const auto downIdentity=remoteProjectionIdentity(fixture.transaction,DeviceId::cuda(0),DeviceId::cpu());
-    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q4_0,50,64,
+    const auto down=makeGpuToCpuExpertTierWeightStreamManifest(native_quantised_formats::Q4_0,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,50,64,
         downIdentity.expected_epoch,downIdentity.layer_idx,downIdentity.expert_id,downIdentity.projection,1)
         .forIntersection(ExpertTierWeightProjectionIntersection::between(originalGPU,originalCPU));
     const auto incoming=makeMoEOverlayRemoteCpuProjectionManifest(downIdentity,down,4096);

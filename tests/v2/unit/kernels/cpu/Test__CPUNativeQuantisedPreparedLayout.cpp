@@ -393,6 +393,13 @@ TEST(CPUNativeQuantisedPreparedLayout,
         candidate.cpu_block_stride = sections.block_stride;
         candidate.unit_count = 1;
         candidate.maximum_units_per_chunk = 1;
+        // The wire-plane contract derives the endpoint planes from the same
+        // section tables; unimplemented layouts leave the zero sentinel,
+        // which validity rejects exactly like the zero strides.
+        if (!candidate.deriveCpuEndpointWirePlanes())
+        {
+            EXPECT_FALSE(sections.isValid());
+        }
         if (direction == Direction::CpuToGpu)
         {
             switch (tuple.encoding)
