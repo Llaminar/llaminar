@@ -3424,3 +3424,32 @@ growing; hardened pattern). Lane re-pinged to resume A3 on 433e84632
 A2 pin ACKs; A3 = the gate that unlocks compact tables). Main idle
 with A2 fixup review pending (21m) — within threshold after the
 04:59Z ping. PR 43 OPEN. .80 sealed/idle.
+
+### A3 IDENTITY BINDING LANDED c7afb6eae (06:09Z): all three versioned surfaces sealed
+
+14 files +819/-96 on 433e84632 (verified: v8 prepared_layout sealed
+field @ PackedWeightsSerialization.h:86; exactly-v8/v7 admitted, v6-
+global). Tier stream v4: layout in manifest hash; receivers re-derive
+strides from carried tables; NEW seal control — compact byte with
+correct hash still rejects on unimplemented tables (no hash/stride
+substitution for layout identity). Remote projection ABI 5: sealed
+byte inherited (no drop); derivation from carried byte (canonical
+force removed); unimplemented -> zero strides -> validity rejects;
+requireCanonicalCpuRoot = CPU root must BE the sealed layout (no
+CPU<->CPU repacker; mismatch typed-rejected); wire 244B unchanged.
+Archive v8: reserved[18]->[17] promoted + sealed; one fixture
+canonicalized 512/640->1024/1280 (non-canonical unrepresentable);
+all others stride-probe-verified. Carried offsets landed (Q6
+quotient static-assert-tied; CMS demotion absolute; chunk arithmetic
+preparedSections() + chunkMins guard; requireCompatibleCpuWeights
+includes layout). Regressions: ArchiveLayoutIdentity (Unit+
+preflight), RemoteProjectionIdentitySeals, OwnerMetadataAccessors.
+COMPACT TABLES INVALID/UNADMITTED per sequencing rule; stride tables
+unlocked but HELD for Main's A2 pin ACK. Mac 297/297 + 11/11 + 5/5;
+archive suite Linux-only; protocol TU Mac-uncompilable. A3 BOUNDARY
+BUILD DISPATCHED at c7afb6eae (queued behind A2 tests on .79;
+extended set incl. full Unit gate + new archive TU + distributed-
+residency; K14-A3CUDAB-C7AFB6EAE). Main unresponsive 48m re A1
+acceptance + A2 review (two pings) — momentum dispatch under
+standing authorization; pin routing stays Main's; morning flag if
+still silent.
