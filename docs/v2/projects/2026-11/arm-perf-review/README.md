@@ -4469,3 +4469,30 @@ Main); at T' sparks reruns incrementally (build + full Unit +
 preflight + CUDA expert-tier set) and WSL reruns x86 CPU-only
 incremental; Gate-A pins bind to T'. WSL order: aa842a1be leg ->
 develop-control (118930745) -> T' x86 incremental.
+
+### A2 FINAL verdict (17:10Z): ONE open item (A2-R1); T' authorized
+
+Reviewer A2 FINAL @ 1f92dca1c: SOURCE HOLD on exactly A2-R1;
+CLOSED = Q6 16C origin (CUDA/ROCm), destination_layout migration,
+presence ordering, view-state correction, both Q6 contracts. Lane
+authorized to land ONE A2 fixup on 91e0437c6 = T':
+(1) A2-R1 (bool/error contract; validation-or-catch BEFORE
+configureCpuFromGpu; no allocation/output mutation on reject;
+existing-catch hint: ~:1780 covers only sealPublication; tests in
+the EXISTING preflight filter: canonical + compact/unknown negatives
++ pre-filled output preserved; sibling noexcept helper audit).
+(2) DOC TRUTHFULNESS (reviewer verbatim): design §A2 describes the
+ACTUAL source-data presence contract (NOT the removed
+"compensation iff…/emins iff CMS" table); do NOT present the five
+fixup groups as five reviewer findings; Q6 static_asserts pin LOCAL
+ARITHMETIC only (no packer-binding claim); the focused native Q6
+test = DIRECT-KERNEL coverage (live wire bytes + inactive destination
+cells) — it does not prove staging-capacity sentinels or a
+production transport counter, and is NOT graph capture; device-free
+geometry/partial-Q6 tests = Unit members, NOT preflight; remove any
+remaining archive "hashed identity" wording. (3) NOTHING ELSE.
+A3 R1-R5 + A3-B1 already in 609638aba/aa842a1be -> pins with A4
+at T'. SEQUENCING LOCKED: sparks 91e0437c6 early-surface NOW (sa-
+gated.sh D1-D3 pending) -> T' incremental (build + Unit + preflight
++ CUDA set); WSL x86 incremental at T'; pins A2-fixup/A3-fixup/A4
+at T' with evidence -> reviewer Gate-A over d5e04fdce..T'.
