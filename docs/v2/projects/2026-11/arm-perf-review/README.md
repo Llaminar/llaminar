@@ -4791,3 +4791,22 @@ to correct at the same later touch (A2-R1 scope = prepared-payload
 allocation). State: code tip 03480d07e (gate binding), docs/review
 tip bba1eafe5, worktree clean, lane idle until the gates' evidence
 flow (post-verdict rebase prep parked per Main).
+
+### A2 PIN COMPLETE — reviewer ACKs both sides (20:47Z)
+
+Reviewer bounded DOCS ACK @ bba1eafe5: c848 docs HOLD CLOSED
+(append-only; historical HOLD retained). Verified parent
+03480d07e + sole changed path (design doc +11/-7); full-doc
+search for <<<<<<< / ======= / >>>>>>> = no matches; §8:684-697
+names 74104b6b6 prime + accurate ancestry (91 -> ee66 docs ->
+741 code/tests/prose -> c848 docs -> 03480 -> repair); both docs
+commits ancestors, no rewrite. Scope: verifies the requested
+document (not the broader tree-wide marker claim — coordinator's
+tree-wide verification covers that; both on record). A2-R1 SOURCE
+ACK @ 74104b6b6 stays exact; NO ACK of 03480 timeout changes /
+A3/A4 / wholeStageA/GateA / artifact/runtime/economy/activation/
+application. #212/#213 docs item closed; #212 in_progress, #213
+pending for the wider A3/A4. Gate pin/binding/execution = Main-
+owned; no retarget/grant. NEXT REVIEWER INPUTS: A3-fixup + A4 pins
+with the sealed-gate evidence (sparks 03480D07E + WSL x86 03480D07E)
+— both gates in flight.
