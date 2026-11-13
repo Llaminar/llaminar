@@ -3634,3 +3634,15 @@ base 3/3/2; if base 5/5/4 = stale budgets = base-owner item, STOP.
 Witness fix BEFORE the A2 pin (fixup on bc91b0d71, A3 rebases, A2
 boundary at the FIXED tip). Sparks re-dispatched: census routes;
 hold boundaries for tip update either way.
+
+### CENSUS CONFIRMED (09:08Z): base 3/3/2 vs tip 5/5/4 — accounting artifact verified; witness fix GO
+
+Container g++-14 census on .79: base d5e04fdce = 3/3/2 (the budgets
+exactly) vs tip b37537145 = 5/5/4 — the lane's stp/ldp-pair-split
+prediction confirmed instruction-for-instruction. NOT a base gap.
+Evidence: /home/factory/idea25/{base-d5e,tip-a2c}/{census.log,
+build-census.log}. Option-(a) witness fixup GO on bc91b0d71 (restore
+base tile-captured object/frame layout; fold members or cold-
+accessor resolution); acceptance = census 3/3/2 at fixed tip + tile
+proof green on shipped arches (sparks re-runs the census leg at the
+fixed tip). A3 rebases; both boundaries re-fire at the fixed tips.
