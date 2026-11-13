@@ -3182,3 +3182,23 @@ with reviewer. Binding handback GO at d8eff03bd (JUnit scope per Main:
 V2_Integration_ExpertTierDirectCPUProjection 3 cases + prepared-layout
 10 + expert-tier stream unit, all --no-tests=error); 94679834d run =
 environment-only label.
+
+### A1 SECOND FIXUP DISPATCHED (03:16Z): reviewer closed A1-1/A1-2; narrow test-only HOLD
+
+At d8eff03bd: A1-1 + A1-2 SOURCE-CLOSED, doc corrections accepted.
+Remaining (test-only): (1) wrong-section control (Contract.inc:217-245)
+reads wrong coordinates/width — equality copies n=76 (col 12, K1) but
+the control uses K0/col17 and reads the u32 emins plane as u16 col*2
+(high half of emins col 8 vs secondary col 17 — neither is the copied
+word). Fix: bind to the exact copied unit/K/column with real element
+widths (memcpy byte slices; CMS = copied 4B emins word vs same-column
+4B FIRST PAYLOAD GROUP word = the old 1280/period-256 alias witness;
+2B metadata = 2B slices); fix the :250-253 "trimmed-unit" mislabel
+(canonical units, emins present). (2) The 19-promotion-formats note is
+INVENTED — remove it: the loop covers ALL 21 formats both directions
+(CMS = codebooks 9/10/13/14/17 all asymmetric; IQ2_XXS 15 / IQ3_XXS 12
+= ExpandedInt8 normalizing to codebook 19 at :426-433); promotion_
+admitted true for every entry; the duplicated-demotion branch (:454)
+is dead — remove the exclusion + comment, do not advertise a support
+gap. Binding handback retargets the NEW tip; sparks informed (stop/
+rerun pattern; 94679834d env-only label stands).
