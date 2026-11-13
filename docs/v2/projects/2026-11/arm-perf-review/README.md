@@ -3468,3 +3468,22 @@ boundary at rebased tip (ccache makes it cheap); queued c7afb6eae
 build SUPERSEDED (carries the same defect). A1 completion sealed
 green stands. Sparks holds, no source edits (correct); a2b logs =
 defect evidence for the reviewer.
+
+### VERBATIM CORRECTS DIAGNOSIS (06:40-06:50Z): 4 errors, 2 classes; EQ fix insufficient; mis-paraphrase on record
+
+Direct a2b-build.log extraction: Class 1 (x2) = defaulted operator==
+'only available with -std=c++20 or -std=gnu++20' — std-mode mismatch
+in 2 TUs (others build -std=gnu++23); NOT member comparability (the
+relayed "member lacks equality" note = mis-paraphrase, corrected on
+record; container = aarch64 g++-14 not x86-64). Lane's explicit
+member-wise comparison at 40cfbaf3e resolves it (C++17-compatible).
+Class 2 (x2, NOT covered): CUDAExpertTierRectangularWeightContract
+.inc:103 'const auto* q6=nullptr' deduction failure + :161 'bytes'
+not declared — TYPE/SCOPE errors in the A2-5 registration body
+(name-verification cannot catch these). Lane fixing: both .inc
+errors on the A2 line (real A2 tip = follow-up on 40cfbaf3e), ROCm
+counterpart swept for the same pattern, A3 rebases, full type/scope
+sweep of the new Q6 bodies. Sparks holds; a2b logs = evidence;
+verbatim + corrected diagnosis go to the reviewer with the A2 pin.
+Relayed-diagnosis verification rule vindicated again (error text,
+not just test results).
