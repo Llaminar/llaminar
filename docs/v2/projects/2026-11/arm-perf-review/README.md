@@ -3557,3 +3557,30 @@ a g++-14 leg to the tile gate). Plus local Homebrew-g++-14 repro with
 exact ninja flags. Sparks: a2c resume HELD; no envelope reconfigure,
 no witness/budget edits. Disk event closed: pruned to 77-80G free,
 seal evidence preserved (a2b logs kept as reviewer evidence).
+
+### MILESTONE: A1 HANDED BACK (08:25Z); A2-3 design-defect fixup routed
+
+MAIN FORMALLY ACCEPTED A1 at 9222e9c7a (basis: reviewer bounded ACK
++ named-scope green + completion 5/5 junit-completion.xml + amended
+honest seal with disclosure). STAGE A's FIRST STAGE CLOSED.
+
+A2 source review @ b37537145 (Main): Q6 static-assert fix OK,
+caller migration OK, field-tamper controls OK, EQ fix OK. ONE DESIGN
+DEFECT before the pin: A2-3 validators hard-code CANONICAL presence
+(comp == !(Q6||CMS); emins == CMS) — would reject Stage B's compact
+layout (drops comp on ARM; drops non-Q2_K emins); reintroduces
+encoding-only presence logic A1 removed; tautological today which is
+why nothing failed. CORRECT = DATA-requirement contract: has_
+secondary == required secondary (keep); emins: source->has_emins =>
+has_emins (Q2_K) + !CMS => !has_emins (canonical zero-filled emins
+for other CMS stays allowed); compensation = derived x86-kernel aid,
+presence belongs to LAYOUT TABLES not validators (GPU conversion
+touches it only if the endpoint plane exists; x86 admission already
+requires canonical). Regression: synthetic table without comp +
+without non-Q2_K emins via explicit layout arg must PASS; missing
+Q2_K emins or required secondary must FAIL. Fixup routed to lane
+(b37537145, A3 rebases); pin = fixup + sparks A2 boundary result.
+A2 boundary at b37537145 SUPERSEDED (a2c held ccache-warm, no test
+phase); re-fires at fixed tip + witness-discriminator resolution.
+Main reviews A3 after the A2 fixup (it rebases); wants both boundary
+results (build OK/fail + JUnit counts) when sealed.
