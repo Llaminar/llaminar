@@ -4555,3 +4555,19 @@ phase — confirm the HEAD check passes and the script reaches
 FOCUS inner redirect still present) — holding for sparks' re-post;
 then re-verify + diff (expected delta = exactly D3 literal + FOCUS
 line), then the pre-launch check, then resume.
+
+### sa-gated.sh VERIFY PASSED — sparks cleared (17:47Z)
+
+On-disk verify of sparks' re-posted sa-gated.sh (3254B 18:47Z):
+bash -n OK; D3 full literal single occurrence; FOCUS inner redirect
+removed, --output-junit + JUnit assert kept, 0 lowercase body refs;
+diff vs the checked file = exactly the two lines, nothing else
+changed. Per Main's delegation: sparks may resume. RESUME PROTOCOL
+(dispatched): dry first phase — confirm HEAD check passes + "--
+phase CFG start" within the first minute (die at WRONG HEAD/DIRTY
+TREE => stop+report; /w/tip-stagea must be 91e0437c6 + clean); then
+early-surface gate at 91e0437c6 (NOT binding; T' = + A2 fixup),
+per-phase exit+artifact reporting, DONE RC_ line, every red =
+Main's classification from JUnit, seal K14-STAGEAGATE-91E0437C6
+with discriminator+install3 evidence. Awaiting the gate result;
+lane's T' fixup in parallel (A2-R1 + doc truthfulness).
