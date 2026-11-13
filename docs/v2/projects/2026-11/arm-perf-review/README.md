@@ -3796,3 +3796,16 @@ A2CUDAB-1F92DCA1C) -> A3 binding at 17789eb05 (K14-A3CUDAB-
 17789EB05); strict-tip rule both. Pin asks to Main: spec-conformance
 OK on 1f92dca1c + mechanical-rebase confirm for 17789eb05; pins fire
 on green + OKs. A4/A3-B1 continues on the new tip.
+
+### PIN CONFIRMATIONS (11:51Z): A2/A3 pins fire on sparks' green seals
+
+Main: (a) 1f92dca1c conforms to the A2-B2 spec (target/root mirrored
+CUDA+ROCm, assertion kept; the device-free mirror = good addition);
+(b) A3 17789eb05 = mechanical rebase (range-diff: 848030067 =
+17789eb05 patch-identical; tree delta = exactly the 1f92dca1c fixup;
+0a80edd6a docs-only). BOTH PINS FIRE on sparks' green seals at
+1f92dca1c + 17789eb05. A3's pin carries A3-B1 (receiver executability
+before allocation) as a KNOWN ITEM — A4 or a fixup must close it
+before compact tables are unlocked. Board: sparks on the two binding
+re-runs; lane on A4/A3-B1; reviewer loaded with pre-staged packages;
+PR 43 OPEN.
