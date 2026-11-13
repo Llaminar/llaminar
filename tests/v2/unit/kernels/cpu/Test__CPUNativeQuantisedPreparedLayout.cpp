@@ -441,18 +441,12 @@ TEST(CPUNativeQuantisedPreparedLayout,
     {
         const NativeQuantisedFormatInfo &source = *entry.metadata;
         const PreparedTuple tuple{source, false};
-        // The promotion contract admits every encoding family except
-        // symmetric CompactMultiScale sources, whose CPU-to-GPU
-        // normalization is not representable; the sweep asserts over the
-        // admitted directions for each format.
-        const bool promotion_admitted =
-            !(tuple.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
-              !source.is_asymmetric);
-        const std::array<Direction, 2> directions =
-            promotion_admitted
-                ? std::array{Direction::GpuToCpu, Direction::CpuToGpu}
-                : std::array{Direction::GpuToCpu, Direction::GpuToCpu};
-        for (const Direction direction : directions)
+        // Every cataloged format promotes: CompactMultiScale sources are
+        // asymmetric by construction, and symmetric ExpandedInt8 sources
+        // (IQ2_XXS, IQ3_XXS) normalize to codebook 19 exactly as the
+        // promotion contract specifies.
+        for (const Direction direction :
+             {Direction::GpuToCpu, Direction::CpuToGpu})
         {
             for (const CPUNativeQuantisedLayout layout :
                  {CPUNativeQuantisedLayout::InterleavedCanonical,

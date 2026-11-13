@@ -214,43 +214,49 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
             ASSERT_EQ(expected.size(), wrong_origin.size());
             EXPECT_NE(expected, wrong_origin);
         }
-        // Wrong-section control: two present metadata sections must
-        // disagree at the same column, so a copy that confuses section
-        // planes cannot satisfy the column equality above.
+        // Wrong-section control at the exact copied coordinate: source
+        // n = 76 (local column 12), K block 1 — the same unit and column
+        // the effective-minima check below copies. Slices use each
+        // section's real element width. For multi-scale units the witness
+        // is the copied 4-byte effective-minima word against the same
+        // column's first 4-byte payload-group word (the historical
+        // 1280/period-256 alias class); two-byte metadata units compare
+        // their compensation and scale words at the same coordinate.
         {
-            const size_t present_sections[] = {sections.emins_offset,
-                sections.mins_offset, sections.scales_offset,
-                sections.compensation_offset};
-            size_t first_section = 0, second_section = 0;
-            for (size_t offset : present_sections)
-                if (offset != 0)
-                {
-                    if (first_section == 0)
-                        first_section = offset;
-                    else if (offset != first_section)
-                    {
-                        second_section = offset;
-                        break;
-                    }
-                }
-            ASSERT_NE(first_section, 0u);
-            ASSERT_NE(second_section, 0u);
-            const size_t column = 17;
-            const size_t unit = ((59 + column) / 64) * (source.cpu_K / 32) *
+            const size_t source_n = 59 + 17;
+            const size_t local_column = source_n % 64;
+            const size_t source_unit =
+                ((source_n / 64) * (source.cpu_K / 32) + 1) *
                 source.cpu_block_stride;
-            const uint16_t first_word = *reinterpret_cast<const uint16_t *>(
-                bytes.data() + unit + first_section + column * 2);
-            const uint16_t second_word = *reinterpret_cast<const uint16_t *>(
-                bytes.data() + unit + second_section + column * 2);
-            EXPECT_NE(first_word, second_word);
+            const auto wordAt = [&](size_t offset, size_t width) {
+                std::vector<uint8_t> word(width);
+                std::memcpy(word.data(),
+                    bytes.data() + source_unit + offset + local_column * width,
+                    width);
+                return word;
+            };
+            if (multi_scale)
+            {
+                ASSERT_TRUE(sections.has_emins);
+                EXPECT_NE(wordAt(sections.emins_offset, 4), wordAt(0, 4));
+            }
+            else
+            {
+                ASSERT_TRUE(sections.has_compensation);
+                EXPECT_NE(wordAt(sections.compensation_offset, 2),
+                          wordAt(sections.scales_offset, 2));
+            }
         }
 
         if (multi_scale)
         {
-            // Effective minima are section data, not family trivia: both live
-            // payload widths must carry their packed word byte-exactly. This
-            // is the regression for the encoding-only emins access that read
-            // outside a trimmed unit on partial/rectangular paths.
+            // Effective minima are section data, not family trivia: on these
+            // canonical units the emins section is present, and both live
+            // payload widths must carry their packed word byte-exactly. The
+            // check pins the section-driven read against the encoding-only
+            // access class (a fixed tail offset regardless of the unit's
+            // actual sections); the trimmed-unit case joins when Stage A
+            // introduces explicit compact tables.
             for (size_t row : {size_t{0}, size_t{17}, size_t{68}})
                 for (size_t block : {size_t{0}, size_t{1}})
                 {
