@@ -4708,3 +4708,17 @@ lane's flag: tracker-docs commits in the range — keep, no rewrite
 unless Main wants; reviewer exact-pin pre-staged offer out; pins
 A2-fixup/A3-fixup/A4 at T' -> Gate-A d5e04fdce..03480d07e).
 HANG LESSON recorded (vi-editor probe rule).
+
+### Main T' review OK + GO; A2-fixup pin pre-staged to reviewer (20:40Z)
+
+Main @ 03480d07e: A2-R1 catch = exactly std::invalid_argument,
+no allocation before, cpu on success only; regression into the
+existing CPUWire filter; 6ceae8219 cherry-pick CMake-only; docs
+commits ee66b1ed6/c848e4061 = KEEP (no rewrite; named docs-only
+in the Gate-A request). GO: (1) sparks early-surface unsealed ->
+2-edit sa-gated (full 03480d07e SHA + OUT) -> coord re-verify ->
+SEALED gate at 03480d07e; (2) WSL incremental x86 at 03480d07e
+then develop-control; (3) A2-fixup pin PRE-STAGED to the reviewer
+NOW (74104b6b6 source-bounded + c848e4061 prose; gate evidence
+follows). Pins A3-fixup + A4 at 03480d07e with the sealed gate
+evidence -> Gate-A over d5e04fdce..03480d07e.
