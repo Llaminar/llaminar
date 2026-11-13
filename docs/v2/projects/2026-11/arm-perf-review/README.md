@@ -4588,3 +4588,26 @@ reference; OOM = infra note); (4) T=91e0437c6 acceptance record;
 (5) develop-control @118930745. Audit watch closed (answered —
 was mid-job, no silent failure). .79 early-surface gate + lane T'
 run in parallel. Main not waiting on WSL.
+
+### WSL: seals 1+4 DONE; aa842a1be head gate building (19:26Z)
+
+WSL artifact-backed: (1) K14-STAGEAGATE-X86-609638ABA-BLOCKED
+sealed (armq/evidence/...BLOCKED.txt, sha256 bb99f676…; verbatim
+g++ arity diagnostic; retained 2.1G/440-object tree; root cause
+569de492b 20-member struct/MEMBERS 19 names; .79 convergence).
+(4) K14-STAGEAGATE-X86-T-ACCEPTANCE sealed (sha256 cdda8eb9…):
+diff aa842a1be..91e0437c6 == exactly progress_replay.py; CMake
+consumption proof = the ONLY target consuming it is added inside
+if((HAVE_CUDA AND HAVE_NCCL) OR (HAVE_ROCM AND HAVE_RCCL)) at
+V2NativeCompletedBroadcastProofTests.cmake:18-20 (false in CPU-only
+=> no CPU-only x86 target reads it); other grep hits = local C++
+CapturedProgressReplay class (Test__ExpertTierGpuBlobTransfer
+Integration.cpp), not the script. No rerun at T — accepted by proof.
+IN PROGRESS: aa842a1be head gate (armq-a512-aa842a1be; CPU-only
+Integration, SHARED_CORE, default x86 ISA, -j5, oneDNN v3.11.3
+pinned; configure done, build 392/2779, no arity error — the fix
+compiles; watcher armed). Base d5e04fdce retry AFTER the head gate
+(both at -j5 would exceed the 31G host; base tree resumes at 440+
+objects). Develop-control @118930745 queued last. Order note: WSL
+ran (4) before (2) — static evidence, harmless. Sparks audit
+probe still out (.79 gate-launch absence).
