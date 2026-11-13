@@ -2979,3 +2979,20 @@ Reviewer idle (#212 delivered+absorbed into the cleared plan). Sparks
 idle, hosts free (.79 0 perf procs; .80 0 containers/0 runs — Q1 seal
 verified+closed earlier). Main idle post-start-report. Next expected
 events: lane A0 checkpoint push -> Main review -> reviewer pin.
+
+### STAGE-A A0 COMPLETE + VERIFIED (01:04Z): 12fa7b2dd — S1 fail-closed + doc corrections; A1 started
+
+Single-writer checkpoint on 3b00c69d7. Code: admitStructure derives
+PreparedUnitSections once, rejects unimplemented layout with precise
+diagnostic BEFORE any division (:453 before :466 block_stride
+consumption); seal/fromPublished route through the one admission
+(:261/:278); overflow guard consumes the validated sections.block_
+stride. Regression UnimplementedLayoutIsRejectedByViewAndSealAdmission
+calls real admission (pre-fix SIGFPE -> post-fix std::invalid_argument,
+6 encoding representatives). Docs (same push): gate-based x86 claims,
+capacity -33%/+50%/+34-35%, typed-conversion cross-ISA, L2-in-plan,
+§10.10 premise correction, §8 consolidated plan. Evidence: layout 8/8,
+portability 297/297, register proof 64/64, zero byte change. Diff 3
+files +291/-93. --no-verify on Mac per Phase-0 practice (Linux
+pre-commit applies at CI). Forwarded to Main (review + reviewer pin);
+lane started A1.
