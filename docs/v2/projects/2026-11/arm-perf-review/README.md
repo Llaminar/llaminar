@@ -3680,3 +3680,13 @@ census then check compact ADDRESSES, not object-layout drift.
 Witness budgets unchanged; any Stage-B delta explained instruction-
 by-instruction. Pins go out on green boundaries at d0b43d81b +
 848030067.
+
+### Lane §8 record confirmed (09:55Z): 0607ca73a, boundary-neutral, left in place
+
+Stage-B hot-accessor rule recorded VERBATIM in §8 (commit 0607ca73a
+on 848030067, --no-verify Mac checkpoint per standing rule) with the
+witness provenance (A1 per-view members -> object growth -> spill-
+frame shift -> stp/ldp split) so the constraint carries its reason.
+Chain: d0b43d81b (A2 tip) -> 848030067 (A3) -> 0607ca73a (doc,
+boundary-neutral — seals unaffected; left above the tips, no rebase
+churn). Next: census acceptance + both boundaries -> pins on green.
