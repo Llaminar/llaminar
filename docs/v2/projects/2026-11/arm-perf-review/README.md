@@ -4637,3 +4637,23 @@ FOCUS/CUDA only). Sparks: continue per script (RC_DRIVER recorded),
 NO seal, no self-fix; driver re-runs at Main's chosen tip.
 Audit flag CLOSED (sparks answered; .79 gate RUNNING, tree
 91e0437c6 clean; D2 mkdir note resolved).
+
+### Main's ruling (A): T' scope amended with the preflight TIMEOUT fix (19:48Z)
+
+Driver block = PR #43's own 889d59ccd (Main confirmed, his defect);
+guard unchanged. FIXED ON PR: 6ceae8219 (verified on origin) —
+"test(cuda): bound the residual and padding invocation-contract
+preflight timeouts", TIMEOUT 60 on both, CMake-only, HAVE_CUDA-
+gated (invisible in CPU-only builds; .80/WSL CPU evidence
+unaffected), lease from 873cf4f2b. RULING (A): T' = 91e0437c6 +
+6ceae8219 (lane cherry-pick, verbatim) + A2 fixup (A2-R1 +
+docs); NOTHING ELSE. SPARKS: current 91e0437c6 run finishes =
+EARLY SURFACE with RC_DRIVER=timeout abort, NO seal; at T' update
+sa-gated.sh with ONLY the full-SHA literal + OUT dir (2 edits;
+coordinator re-verifies only those), then the SEALED gate at T'
+(K14-STAGEAGATE-T'). WSL: after aa842a1be gate -> T' x86
+incremental (diff = progress_replay + HAVE_CUDA-only CMake +
+A2 fixup; A2 fixup = CPU code => run, NOT proof-by-diff) ->
+develop-control -> base retry last. MERGE WINDOW: 6ceae8219 must
+be in the merged tree for any CUDA-enabled canonical gate (already
+on the PR branch).
