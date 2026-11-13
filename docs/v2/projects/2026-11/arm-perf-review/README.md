@@ -3266,3 +3266,25 @@ check. OPEN at Main: (1) A2 Linux boundary (CUDA compile .80; ROCm
 A2 review — manifest-seam coupling). Lane stages A3 design (v8
 promotion + hash inputs + receiver stride re-derivation + carried
 identity items). A1 binding handback at 9222e9c7a running in parallel.
+
+### A2 MAIN REVIEW OK + DECISIONS (03:48Z): CUDA boundary on .79 cu13; ROCm compile-only; A3 DISPATCHED
+
+Main checkpoint OK at design level (planes derived fail-closed, valid()
+re-derives+compares, emins never silently dropped). Reviewer pin routed
+with 3 focus questions: remaining codebook-based presence decisions in
+GPU kernels; plane quotient vs rectangle/partial-tail addresses;
+unhashed reserved byte before v8. A2 LINUX BOUNDARY: CUDA = sparks on
+.79 with cu13 image (llaminar-arm-engine-sdk-cu13), Integration
+HAVE_CUDA=ON sm_121 native + HAVE_ROCM=OFF at 85ddd8572 + cnpy; NATIVE
+GB10 GPU run of Test__CUDAExpertTierWeightKernels + CUDA rectangular
+contract + CPU tier contract (4 cases) + prepared-layout suite; JUnit
+--no-tests=error; spill guard at compile; queued AFTER the A1 binding
+seal (K14-A2CUDAB-85DDD8572). ROCm = no AMD GPU: compile-only
+ROCmExpertTierWeightKernels.hip on WSL if SDK present (inventory
+requested); runtime ROCm = hardware-ineligible on our side, owned by
+CI companions at the fast-follow PR, NOT claimed. x86 CPU = WSL at the
+Stage-A gate. SEQUENCING = momentum: A3 DISPATCHED on 85ddd8572 (wire
+v8 hashed field + receiver stride re-derivation + carried identity
+offsets + ResidencyFabric layout) with Main's constraint: nothing
+hard-coded beyond the v8 promotion until the A2 pin ACKs; A3 rebases
+if the reserved-byte seam changes.
