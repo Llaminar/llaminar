@@ -3744,3 +3744,21 @@ refusal (planning refuses; receivers fail closed if bypassed).
 MAIN PIN PACKAGES PRE-STAGED (A2: d0b43d81b lineage + census + std-
 mode/auto-nullptr bundle; A3: + A3-B1 flagged carried) — both go out
 on green boundaries. A4 (+A3-B1) in flight on the lane.
+
+### A2 BOUNDARY SEALED (11:16Z): witness CLOSED; 2/18 fail -> fix-forward loop
+
+K14-A2CUDAB-D0B43D81B-20261113: FULLBUILD=0, witness PASS 176 at
+base counts, re-census 3/3/2 — WITNESS-FIX ACCEPTANCE CONFIRMED (all
+3 criteria). Tests 16/18 green (CPU tier/layout/stream/distributed-
+residency + Captured Replays + RectangularWeights). 2 FAIL (one
+root, shared .inc): CUDA_ExpertTierWeightKernels + CUDA_ExpertTier-
+PartialQ6PayloadPlane @ CUDAExpertTierRectangularWeightContract.inc:
+121 — forward.columns() 128 vs 64 (CUDA forward view reports 128
+where the contract case constructs 64). TWO-READING diagnosis routed
+to lane: (a) padded/aligned granularity vs constructed-live = test-
+expectation fix (likely — both binaries share the new Q6 body), or
+(b) A2 made columns() report allocation width = REAL live-extent
+regression = source fix. Fix on the A2 line; A3 (boundary running,
+will show the same 2 = expected) + A4/A3-B1 rebase. A2 pin waits on
+the green re-run; census/witness/full-build seal portions stand; pin
+packages pre-staged.
