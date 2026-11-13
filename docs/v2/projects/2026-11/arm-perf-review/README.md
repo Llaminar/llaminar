@@ -2996,3 +2996,13 @@ portability 297/297, register proof 64/64, zero byte change. Diff 3
 files +291/-93. --no-verify on Mac per Phase-0 practice (Linux
 pre-commit applies at CI). Forwarded to Main (review + reviewer pin);
 lane started A1.
+
+### A0 MAIN REVIEW OK (01:05Z): routed to reviewer as the S1 pin; boundary-gate clarification
+
+Main checkpoint review passed (admission-before-guard, shared
+admission, real-seal regression, minimal +13/+29). Reviewer holds the
+S1 fix pin with the #212 disposition + plan summary. RECORD NOTE:
+--no-verify Mac commits are accepted for lane checkpoints; the Stage-A
+BOUNDARY gate supplies the Linux coverage (Main-run Linux Integration
+build + Unit + preflight on sparks ARM + WSL x86, byte identity both
+ISAs) — hook coverage supplied there, not skipped. Lane continues A1.
