@@ -3349,3 +3349,16 @@ level before handback; next A2 pin routed only after sparks cu13
 HAVE_CUDA=ON compiles everything. A0/A1 ACK922 preserved; #212 in
 progress; #213 Main-owned. A3 dispatch folds the expanded identity
 scope; A3 rebases onto the A2 fixup.
+
+### Reviewer boundary clarification (04:23Z): source vs execution scopes stay separate
+
+Reviewer awaits Main's fresh exact successor request post-build-
+sequencing; no autonomous review; 85ddd8572 SOURCE HOLD + A0/A1
+ACK922 unchanged. CLARIFICATION (recorded as standing): native/CI
+registrations and successful compilation ALONE do not close native
+GPU execution coverage or establish partial-unit correctness — the
+successor source and any supplied execution reports retain their
+SEPARATE review/evidence scopes. No execution, scheduling,
+application or activation grant implied. (Consistent with prior
+bounded-ACK discipline: ACK is source-scope; runs are sealed
+separately.)
