@@ -5055,3 +5055,17 @@ result, then VM -> qual lane's serial queue. PLAN UPDATE: if the
 surviving run completes = the x86 triage CONFIRMATION (same code/
 suites); qual T' -j4 rerun = the full T' gate evidence; .80 ARM
 triage = primary. Main informed; stronger two-ISA provenance.
+
+### Main's WSL acceptance + dockerd protocol (22:02Z)
+
+Main: no relaunch/poll-only/harvest bind-mounts confirmed. (1) The
+surviving run = x86 triage confirmation ONLY IF artifacts show a
+clean completion: prerequisites.json fresh after run start + JUnit
+present + terminal rc recorded by the gated script. (2) Orphans +
+dockerd down can be OOM-killed/reaped silently -> absent receipt
+or truncated log = "INCONCLUSIVE", never "green". (3) AFTER the run,
+BEFORE the qual T' rerun: restore dockerd cleanly (no orphaned
+build processes remain, then restart the daemon); never stack a new
+container on a broken daemon. (4) .80 focused ARM triage stays
+PRIMARY. Relayed: lane (criteria + restore duty), qual (dockerd-up
+pre-launch check before the T' -j4 rerun).
