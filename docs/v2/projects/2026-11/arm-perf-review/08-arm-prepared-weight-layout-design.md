@@ -833,7 +833,13 @@ canonical arm is a lane defect and blocks landing.
   - **Stage B — activation** (the production selector moves to compact on
     AArch64; packer compact placement `kHostPreparedLayout`-driven;
   view/seal/NEON admission require it): held behind the reviewer's
-  **Gate A**, fed by Stage-A per-checkpoint evidence.
+  **Gate A**, fed by Stage-A per-checkpoint evidence. Activation surfaces
+  listed by the A4 record above (the runtime fabric's plan→pool layout
+  thread is redundant while plan layout ≡ local build for every pool
+  owner, but re-verify that equivalence when Stage B changes either
+  side; the `CpuExpertSlotPool` root payload_bytes switch is canonical
+  data keyed by encoding and must move to section-derived values when
+  compact tables become real).
 - **Phase 1 — entry item 0 (reviewer spine finding, Main-confirmed
   2026-11-13, seq 45): fail-closed admission before any division.** At
   `d3e936fbd`, `admitStructure` (`CPUNativeQuantisedWeightView.h:456-459`)
@@ -928,6 +934,78 @@ canonical arm is a lane defect and blocks landing.
   becomes representable when the compact stride tables exist as pure-data
   entries (test-only via the explicit layout argument, after the A2 pin
   ACK per Main's constraint).
+- **A4 + A3-B1 — planning/inventory/PMA + executable receive (seq 121/122
+  dispatch, landed after the Q6 window fix 1f92dca1c).** Stage A's final
+  implementation stage; both halves reported together per the dispatch.
+  - **A3-B1 (Main's A3 review finding): receiver EXECUTABILITY at
+    admission.** Both archive receive paths are execution-bound by
+    construction (surveyed: `KernelFactory::createExpertGemmFromTransferBlob`
+    deserializes into a CPU-executing GEMM view; `ExpertWeightTransfer`'s
+    `allocateTransferTarget` allocates final NUMA-bound direct-receive
+    storage; no byte-preserving relay or conversion path consumes packed
+    archives — the tier stream path is separately layout-gated). The gap:
+    a table-valid foreign layout (the Stage-B world) would pass stride
+    re-derivation and be ADOPTED by a host that cannot execute it.
+    Fix: `requireHostExecutablePreparedLayout` gates `deserialize` and
+    `allocateTransferTarget` after stride re-derivation, BEFORE any
+    allocation/adoption, with a typed diagnostic naming both layouts.
+    The regression proof required compact tables to be VALID in the test
+    only: `resolveArchivePreparedUnitSections` (cold archive path) resolves
+    through the sole section authority, and the typed RAII
+    `ExplicitPreparedSectionsForTest` installs an explicit resolver for one
+    scope (double-install refused, canonical passthrough pinned,
+    auto-restore asserted). `ExecutableReceiveRejectsTableValidForeignLayout
+    BeforeAllocation` proves a compact Q4_0 archive (payload 1024 / unit
+    1152, §2.1) whose strides DO validate under the hook is rejected on
+    both paths by the executability gate, plus an unhooked control.
+  - **A4-1 — typed inventory publication.** `RankInventory` gains
+    `cpu_prepared_layout` (build property observed from `kHostPreparedLayout`
+    at `makeRankInventory`, never probed); the byte crosses the inventory
+    wire with the rank record and an unknown value is FATAL (a defaulted
+    layout would defeat cross-ISA refusal by making foreign observations
+    look canonical). Regression: round-trip for both known layouts
+    (a Stage-B AArch64 rank publishes compact), gatherer-publishes-build
+    pin, and differential single-byte tamper → `std::invalid_argument`.
+  - **A4-2 — topology-time cross-ISA refusal.**
+    `bindMoEExpertOverlayPlanToClusterInventory` collects every CPU
+    participant of every bound domain (continuation/base/shared/tiers all
+    resolve through the same domains), requires overlay-wide uniformity of
+    the owning ranks' published layouts, refuses mixed layouts with a typed
+    diagnostic naming domain, ranks and both layout names BEFORE any
+    allocation, capacity search or weight wire, and records the one
+    uniform value as `resolved_cpu_prepared_layout` on the plan (absent for
+    GPU-only overlays). Auto and authored placements both flow through this
+    binder. Regression `CrossLayoutCpuPairingIsRefusedAtPlanningTime`:
+    uniform canonical binds + records; uniform compact (homogeneous
+    Stage-B cluster) binds + records; mixed refuses with the message
+    pinned; GPU-only publishes no observation.
+  - **A4-3 — PMA sole ledger.** CPU prepared-expert pricing derives from
+    the SAME section authority the kernels execute:
+    `cpuProjectionBytes(N, K, format, prepared_layout)` (and
+    `resolveExpertPreparedProjectionMemoryGeometry`) price through
+    `preparedUnitSections` — canonical sections reproduce the scalar
+    tables byte for byte (pinned by the existing all-21-format
+    `EveryCataloguedCodebookHasExactCpuAndGpuFootprint` sweep, which now
+    exercises the sections-derived path), and an unimplemented layout
+    fails closed with a typed error instead of under-admitting.
+    `MoEOverlayCapacityResolverInput.cpu_prepared_layout` carries the
+    layout as a typed BOM input; `buildResolverInput` threads the bound
+    plan's `resolved_cpu_prepared_layout` and REFUSES a CPU resource whose
+    plan lacks the resolved observation (never price an assumed layout).
+    `CpuExpertSlotPool::Config.cpu_prepared_layout` threads the same value
+    into slot-capacity pricing and the slot-root metadata (root declares
+    the layout; strides derived through sections; no parallel stride
+    arithmetic). The runtime fabric does NOT re-thread the plan value:
+    every pool owner is a CPU participant, so A4-2 uniformity already
+    makes plan layout ≡ local build for every pool; the Stage-B activation
+    flips `kHostPreparedLayout` itself and every default follows. This
+    deferral is an explicit unlock-surface decision, not an omission.
+    Regressions: `PreparedLayoutIsTheSoleCpuFootprintAuthority`
+    (canonical ≡ build-default pricing for four encoding families; compact
+    throws through the pricing API) and
+    `CpuResourcesPriceOnlyTheBoundOverlayLayout` (unbound CPU resource
+    refuses; compact-bound plan fails closed at the section authority;
+    canonical-bound input threads and prices build-default bytes).
 - **Gate-A evidence (former Phase 3) — bench + focused preflight
   regressions.** The §7 bench in the
   performance namespace (non-regression reading); focused regressions

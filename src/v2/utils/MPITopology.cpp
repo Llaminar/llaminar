@@ -240,6 +240,9 @@ namespace llaminar2
         // Write CPU info
         writeValue(buffer, static_cast<int32_t>(inventory.cpu_cores));
         writeValue(buffer, static_cast<int32_t>(inventory.cpu_worker_threads));
+        // The prepared-layout observation is one build-owned byte per rank;
+        // the gatherer publishes kHostPreparedLayout from this executable.
+        writeValue(buffer, static_cast<uint8_t>(inventory.cpu_prepared_layout));
         writeValue(buffer, static_cast<int32_t>(inventory.cpu_sockets));
         writeValue(buffer, static_cast<int32_t>(inventory.numa_nodes));
         writeValue(buffer, static_cast<uint64_t>(inventory.cpu_memory_bytes));
@@ -306,6 +309,17 @@ namespace llaminar2
         inventory.cpu_worker_threads = readValue<int32_t>(ptr, end);
         if (inventory.cpu_worker_threads < 0)
             throw std::invalid_argument("MPI inventory contains a negative CPU worker budget");
+        // An unknown prepared-layout byte is a fatal wire defect: the layout
+        // vocabulary is sealed by the shared table, never guessed remotely.
+        const auto cpu_prepared_layout_byte = readValue<uint8_t>(ptr, end);
+        if (!cpu::native_quantised::isKnownPreparedLayout(
+                static_cast<cpu::native_quantised::CPUNativeQuantisedLayout>(
+                    cpu_prepared_layout_byte)))
+            throw std::invalid_argument(
+                "MPI inventory contains an unknown CPU prepared layout");
+        inventory.cpu_prepared_layout =
+            static_cast<cpu::native_quantised::CPUNativeQuantisedLayout>(
+                cpu_prepared_layout_byte);
         inventory.cpu_sockets = readValue<int32_t>(ptr, end);
         inventory.numa_nodes = readValue<int32_t>(ptr, end);
         inventory.cpu_memory_bytes = readValue<uint64_t>(ptr, end);

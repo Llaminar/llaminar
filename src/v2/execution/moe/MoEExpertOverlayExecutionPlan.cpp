@@ -685,6 +685,17 @@ namespace llaminar2
             };
         }
 
+        /** @brief Exact inventory record of one world rank, or null. */
+        const RankInventory *rankById(
+            const ClusterInventory &inventory, int world_rank)
+        {
+            const auto observed = std::find_if(
+                inventory.ranks.begin(), inventory.ranks.end(),
+                [world_rank](const auto &candidate)
+                { return candidate.rank == world_rank; });
+            return observed == inventory.ranks.end() ? nullptr : &*observed;
+        }
+
         ResolvedParticipantBinding resolveParticipantBinding(
             const GlobalDeviceAddress &participant,
             const ClusterInventory &inventory,
@@ -1063,6 +1074,7 @@ namespace llaminar2
             throw std::invalid_argument("MoE route diagnostic cannot be Unresolved");
 
         auto bound = std::make_shared<MoERoutedExpertPlacementPlan>(plan);
+        std::vector<std::pair<std::string, int>> cpu_endpoint_owners;
         for (auto &domain : bound->domains)
         {
             if (domain.participants.empty())
@@ -1111,6 +1123,18 @@ namespace llaminar2
                 domain.participants[participant_index] =
                     std::move(binding.address);
                 resolved_ranks.push_back(binding.world_rank);
+            }
+
+            // Overlay CPU endpoints exchange prepared NativeQuantised bytes;
+            // each participant's owning rank publishes its build's layout.
+            for (size_t participant_index = 0;
+                 participant_index < domain.participants.size();
+                 ++participant_index)
+            {
+                if (domain.participants[participant_index].device_type ==
+                    DeviceType::CPU)
+                    cpu_endpoint_owners.push_back(
+                        {domain.name, resolved_ranks[participant_index]});
             }
 
             const auto distinct = uniqueSortedRanks(resolved_ranks);
@@ -1192,6 +1216,46 @@ namespace llaminar2
                 if (domain.owner_rank < 0)
                     domain.owner_rank = domain.world_ranks.front();
             }
+        }
+
+        // Every CPU endpoint of the bound overlay must execute one prepared
+        // layout. Pairing endpoints whose builds prepare and execute
+        // different layouts (a cross-ISA CPU topology) is refused here, at
+        // planning time, before any allocation, capacity search or weight
+        // wire exists: a receiver cannot execute foreign prepared bytes, and
+        // discovering that after payload exchange would be a runtime
+        // correctness failure instead of a typed admission rejection.
+        if (!cpu_endpoint_owners.empty())
+        {
+            const RankInventory *first_owner = rankById(
+                inventory, cpu_endpoint_owners.front().second);
+            if (!first_owner)
+                throw std::invalid_argument(
+                    "MoE overlay CPU endpoint references an unobserved owner rank");
+            const auto uniform_layout = first_owner->cpu_prepared_layout;
+            for (const auto &endpoint : cpu_endpoint_owners)
+            {
+                const RankInventory *owner =
+                    rankById(inventory, endpoint.second);
+                if (!owner)
+                    throw std::invalid_argument(
+                        "MoE overlay CPU endpoint references an unobserved owner rank");
+                if (owner->cpu_prepared_layout != uniform_layout)
+                    throw std::invalid_argument(
+                        "MoE overlay domain '" + endpoint.first +
+                        "' pairs CPU rank " + std::to_string(endpoint.second) +
+                        " executing prepared layout '" +
+                        cpu::native_quantised::preparedLayoutName(
+                            owner->cpu_prepared_layout) +
+                        "' with CPU rank " +
+                        std::to_string(cpu_endpoint_owners.front().second) +
+                        " executing '" +
+                        cpu::native_quantised::preparedLayoutName(uniform_layout) +
+                        "'; cross-layout CPU endpoint pairing is refused at "
+                        "planning time before any allocation or prepared-weight "
+                        "transfer");
+            }
+            bound->resolved_cpu_prepared_layout = uniform_layout;
         }
 
         // Scope and exact rank ownership now come from observed inventory.

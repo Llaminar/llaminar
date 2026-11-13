@@ -190,6 +190,97 @@ inline cpu::native_quantised::CPUNativeQuantisedLayout admittedPreparedLayout(
 }
 
 /**
+ * @brief Cold-path section resolution for archive and transfer validation.
+ *
+ * Production resolves the sealed layout through the sole section-table
+ * authority. Tests proving receive-side gates against layouts whose tables
+ * are not yet implemented (the compact AArch64 unit) install an explicit
+ * resolver for the lifetime of one assertion; the archive cold path is the
+ * only consumer, so no hot-path table lookup gains an indirection.
+ */
+using PreparedSectionsResolver = cpu::native_quantised::PreparedUnitSections (*)(
+    cpu::native_quantised::CPUNativeQuantisedLayout,
+    cpu::native_quantised::CPUNativeQuantisedEncoding,
+    bool,
+    const NativeQuantisedFormatInfo &);
+
+namespace detail
+{
+    inline PreparedSectionsResolver explicit_prepared_sections_for_test = nullptr;
+}
+
+/**
+ * @brief Scoped explicit-layout section source for receive-gate regressions.
+ *
+ * Installs one resolver for the enclosing scope and removes it on
+ * destruction; a second concurrent installation is a hard error because two
+ * live overrides would disagree about the same sealed layout. The default
+ * (production) resolution always remains the section tables.
+ */
+class ExplicitPreparedSectionsForTest
+{
+public:
+    explicit ExplicitPreparedSectionsForTest(PreparedSectionsResolver resolver)
+    {
+        if (!resolver || detail::explicit_prepared_sections_for_test)
+            throw std::invalid_argument(
+                "One explicit prepared-section resolver may be active at a time");
+        detail::explicit_prepared_sections_for_test = resolver;
+    }
+    ExplicitPreparedSectionsForTest(const ExplicitPreparedSectionsForTest &) = delete;
+    ExplicitPreparedSectionsForTest &operator=(
+        const ExplicitPreparedSectionsForTest &) = delete;
+    ~ExplicitPreparedSectionsForTest() noexcept
+    {
+        detail::explicit_prepared_sections_for_test = nullptr;
+    }
+};
+
+/** @brief Resolve validation sections from the authority or the active test override. */
+inline cpu::native_quantised::PreparedUnitSections
+resolveArchivePreparedUnitSections(
+    cpu::native_quantised::CPUNativeQuantisedLayout layout,
+    cpu::native_quantised::CPUNativeQuantisedEncoding encoding,
+    bool is_asymmetric,
+    const NativeQuantisedFormatInfo &source)
+{
+    if (const auto override = detail::explicit_prepared_sections_for_test)
+        return override(layout, encoding, is_asymmetric, source);
+    return cpu::native_quantised::preparedUnitSections(
+        layout, encoding, is_asymmetric, source);
+}
+
+/**
+ * @brief Require the admitted layout to be executable by this build's CPU.
+ *
+ * Receive paths that adopt bytes into CPU-executable packed weights
+ * (deserialization and direct-transfer allocation) must execute what they
+ * adopt: every build prepares, admits and executes `kHostPreparedLayout`.
+ * A known, table-valid foreign layout would otherwise allocate and adopt
+ * bytes this host can never execute, surfacing only later at view admission.
+ * Planning refuses cross-layout CPU pairings before any wire exists; this
+ * gate is the fail-closed backstop when planning is bypassed.
+ *
+ * @throws std::invalid_argument naming the sealed layout whenever it is not
+ *         this build's executable prepared layout.
+ */
+inline void requireHostExecutablePreparedLayout(
+    cpu::native_quantised::CPUNativeQuantisedLayout admitted_layout)
+{
+    if (admitted_layout != cpu::native_quantised::kHostPreparedLayout)
+        throw std::invalid_argument(
+            "Packed-weight receive targets CPU execution, which admits the "
+            "prepared layout '" +
+            std::string(cpu::native_quantised::preparedLayoutName(
+                cpu::native_quantised::kHostPreparedLayout)) +
+            "' only; the archive sealed '" +
+            std::string(cpu::native_quantised::preparedLayoutName(
+                admitted_layout)) +
+            "'. Cross-layout CPU endpoints are refused at planning time; "
+            "this receive fails closed when planning is bypassed");
+}
+
+/**
  * @brief Re-derive both strides from the admitted layout before adoption.
  *
  * The receiver never trusts the header's strides alone: the section tables
@@ -211,7 +302,7 @@ inline void requirePreparedLayoutStrides(
     if (!source)
         throw std::invalid_argument(
             "Packed-weight transfer received an uncataloged source identity");
-    const auto sections = cpu::native_quantised::preparedUnitSections(
+    const auto sections = resolveArchivePreparedUnitSections(
         layout,
         decodePreparedEncoding(header.prepared_encoding),
         header.is_asymmetric != 0,
@@ -433,6 +524,10 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     // before any receive buffer is adopted.
     const auto admitted_layout = admittedPreparedLayout(header);
     requirePreparedLayoutStrides(header, admitted_layout);
+    // Execution-bound receive: the allocated target adopts bytes this host's
+    // CPU executes, so a table-valid foreign layout is rejected before the
+    // first receive buffer exists.
+    requireHostExecutablePreparedLayout(admitted_layout);
     if (header.N <= 0 || header.K <= 0 || header.N_padded < header.N ||
         header.blocks_per_row <= 0 || header.data_stride <= 0 ||
         header.interleaved_block_stride <= 0)
@@ -649,6 +744,9 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         // globally, never per-format.
         admitted_layout = admittedPreparedLayout(header);
         requirePreparedLayoutStrides(header, admitted_layout);
+        // Execution-bound receive: reject a table-valid foreign layout before
+        // the archive's storage is adopted, not at view admission later.
+        requireHostExecutablePreparedLayout(admitted_layout);
     }
     catch (const std::invalid_argument &error)
     {

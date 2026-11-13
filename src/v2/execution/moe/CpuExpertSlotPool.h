@@ -133,6 +133,14 @@ namespace llaminar2
             std::vector<ProjectionSpec> projections;
             MemoryPlacement memory_placement;
             std::string perf_device;
+            /**
+             * Prepared NativeQuantised layout this endpoint's build executes.
+             * Defaults to the build's own layout; the overlay fabric supplies
+             * the inventory-bound uniform value so slot roots and capacity
+             * admission price the same physical stream the kernels run.
+             */
+            cpu::native_quantised::CPUNativeQuantisedLayout
+                cpu_prepared_layout = cpu::native_quantised::kHostPreparedLayout;
         };
 
         /**

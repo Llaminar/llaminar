@@ -233,4 +233,117 @@ TEST(PackedWeightsArchiveLayoutIdentity, DirectTransferDescriptorSealsAndReDeriv
         std::invalid_argument);
 }
 
+
+/** @test Receive paths reject a table-valid foreign layout before allocation.
+ *
+ * The archive receive surfaces are execution-bound: `deserialize` adopts
+ * bytes into CPU-executable packed weights and `allocateTransferTarget`
+ * allocates the final direct-receive storage. Once the compact AArch64 unit
+ * has valid section tables (Stage B), a known-layout archive would pass
+ * stride re-derivation and be adopted by a host that can never execute it.
+ * The explicit-layout test hook installs the compact Q4_0 sections (design
+ * §2.1: payload 1024, unit 1152, scales inline, compensation dropped) so the
+ * strides DO validate in this test, proving the executability gate — not a
+ * stride mismatch — is what rejects the foreign layout before allocation.
+ */
+TEST(PackedWeightsArchiveLayoutIdentity, ExecutableReceiveRejectsTableValidForeignLayoutBeforeAllocation)
+{
+    using Layout = cpu::native_quantised::CPUNativeQuantisedLayout;
+    // Faithful Stage-B-world resolution: canonical keeps the production
+    // tables; compact returns the design unit for the fixture's Q4_0 source.
+    const packed_weights_serialization::PreparedSectionsResolver compact_sections =
+        [](Layout layout,
+           cpu::native_quantised::CPUNativeQuantisedEncoding encoding,
+           bool is_asymmetric,
+           const NativeQuantisedFormatInfo &source)
+        -> cpu::native_quantised::PreparedUnitSections {
+        if (layout == Layout::InterleavedCanonical)
+            return cpu::native_quantised::preparedUnitSections(
+                layout, encoding, is_asymmetric, source);
+        if (layout != Layout::InterleavedCompactA64)
+            return {};
+        cpu::native_quantised::PreparedUnitSections sections{};
+        sections.payload_stride = 1024;
+        sections.block_stride = 1152;
+        sections.has_compensation = false;
+        sections.has_secondary = false;
+        sections.has_emins = false;
+        sections.scales_offset = 1024;
+        sections.mins_offset = 0;
+        sections.emins_offset = 0;
+        sections.compensation_offset = 0;
+        return sections;
+    };
+
+    const auto packed = canonicalQ4_0Owner();
+    const auto blob = blobOf(packed);
+    ASSERT_FALSE(blob.empty());
+
+    {
+        const packed_weights_serialization::ExplicitPreparedSectionsForTest
+            compact_installed(compact_sections);
+
+        // Control: with the override active, the canonical archive still
+        // round-trips — the hook never changes canonical admission.
+        EXPECT_NE(packed_weights_serialization::deserialize(
+                      blob.data(), blob.size()),
+                  nullptr);
+
+        // A compact archive whose strides the (overridden) tables reproduce
+        // exactly: rejected before adoption, by the executability gate.
+        auto compact = blob;
+        const uint8_t compact_byte =
+            static_cast<uint8_t>(Layout::InterleavedCompactA64);
+        std::memcpy(compact.data() + offsetof(PackedWeightsHeader, prepared_layout),
+            &compact_byte, sizeof(compact_byte));
+        const int32_t compact_data_stride = 1024;
+        const int32_t compact_block_stride = 1152;
+        std::memcpy(compact.data() + offsetof(PackedWeightsHeader, data_stride),
+            &compact_data_stride, sizeof(compact_data_stride));
+        std::memcpy(compact.data() + offsetof(PackedWeightsHeader, interleaved_block_stride),
+            &compact_block_stride, sizeof(compact_block_stride));
+        EXPECT_EQ(packed_weights_serialization::deserialize(
+                      compact.data(), compact.size()),
+                  nullptr);
+
+        // Direct-transfer allocation: the same table-valid compact header is
+        // rejected with the typed executability diagnostic before any
+        // receive buffer is allocated.
+        PackedWeightsTransferDescriptor descriptor;
+        PackedWeightsConstSectionViews views;
+        ASSERT_TRUE(packed_weights_serialization::describeTransfer(
+            packed, descriptor, views));
+        descriptor.header.prepared_layout = compact_byte;
+        descriptor.header.data_stride = compact_data_stride;
+        descriptor.header.interleaved_block_stride = compact_block_stride;
+        try
+        {
+            static_cast<void>(
+                packed_weights_serialization::allocateTransferTarget(descriptor));
+            FAIL() << "table-valid compact allocation must be refused";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("CPU execution"),
+                      std::string::npos);
+            EXPECT_NE(std::string(error.what()).find("interleaved-compact-a64"),
+                      std::string::npos);
+        }
+    }
+
+    // The RAII hook removed itself: canonical admission is unchanged and the
+    // production compact tables still fail closed at stride re-derivation.
+    EXPECT_NE(packed_weights_serialization::deserialize(
+                  blob.data(), blob.size()),
+              nullptr);
+    auto unhooked_compact = blob;
+    const uint8_t compact_byte =
+        static_cast<uint8_t>(Layout::InterleavedCompactA64);
+    std::memcpy(unhooked_compact.data() + offsetof(PackedWeightsHeader, prepared_layout),
+        &compact_byte, sizeof(compact_byte));
+    EXPECT_EQ(packed_weights_serialization::deserialize(
+                  unhooked_compact.data(), unhooked_compact.size()),
+              nullptr);
+}
+
 } // namespace llaminar2::test

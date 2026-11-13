@@ -137,6 +137,10 @@ namespace llaminar2
         rank.cpu_socket_info = hardware.cpu_sockets;
         rank.cpu_execution = hardware.cpu_execution;
         rank.cpu_worker_threads = location.cpu_worker_threads;
+        // The prepared NativeQuantised layout is a build property of this
+        // executable, observed from kHostPreparedLayout rather than probed:
+        // the rank prepares, admits and executes exactly this layout.
+        rank.cpu_prepared_layout = cpu::native_quantised::kHostPreparedLayout;
         const auto cpu = hardware.cpuDevice(location.cpu_numa_node.value_or(-1));
         rank.cpu.memory_bytes = cpu.total_memory_bytes;
         rank.cpu.free_memory_bytes = cpu.free_memory_bytes;

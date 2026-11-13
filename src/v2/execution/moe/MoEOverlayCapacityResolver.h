@@ -238,6 +238,16 @@ namespace llaminar2
         std::vector<MoEOverlayLayerWeightManifest> layer_weight_manifest;
         std::vector<MoEOverlayPhysicalMemoryBudget> physical_budgets;
         std::vector<MoEOverlayTierCapacityRequest> tiers;
+        /**
+         * Overlay-uniform prepared NativeQuantised layout of the CPU endpoints,
+         * sourced from the inventory-bound plan's `resolved_cpu_prepared_layout`.
+         * CPU expert bytes in this resolver are priced through the same section
+         * tables the endpoints execute, so admission and materialization share
+         * one footprint authority. The default remains the build's canonical
+         * layout for callers without a bound overlay plan.
+         */
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout =
+            cpu::native_quantised::kHostPreparedLayout;
     };
 
     /**
@@ -559,6 +569,8 @@ namespace llaminar2
         [[nodiscard]] static std::vector<MoEOverlayPreparedExpertFootprint>
         preparedFootprints(
             const std::vector<MoEOverlayLayerWeightManifest> &manifest,
-            DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
+            DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert,
+            cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout =
+                cpu::native_quantised::kHostPreparedLayout);
     };
 } // namespace llaminar2

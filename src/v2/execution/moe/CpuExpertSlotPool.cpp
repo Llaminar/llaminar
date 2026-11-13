@@ -125,7 +125,8 @@ namespace llaminar2
         CpuPacked makePackedMetadata(
             const CpuExpertSlotPool::ProjectionSpec &spec,
             std::size_t allocation_alignment,
-            bool requires_dedicated_mapping)
+            bool requires_dedicated_mapping,
+            cpu::native_quantised::CPUNativeQuantisedLayout prepared_layout)
         {
             const NativeQuantisedFormatInfo *source =
                 validateProjectionSpec(spec);
@@ -143,12 +144,25 @@ namespace llaminar2
             /* Preserve provenance even when execution expands source blocks. */
             packed.is_superblock = source->is_superblock;
             packed.encoding = cpu::native_quantised::preparedEncodingForSource(*source);
-            packed.data_stride = static_cast<int>(
-                cpu::native_quantised::preparedDataStride(packed.encoding));
+            // The slot root declares the endpoint's prepared layout and derives
+            // its unit sections from the same authority that priced the slot:
+            // one physical stream, no parallel stride arithmetic. Canonical
+            // sections reproduce the scalar tables byte for byte.
+            packed.layout = prepared_layout;
+            const auto sections = cpu::native_quantised::preparedUnitSections(
+                prepared_layout, packed.encoding,
+                packed.is_asymmetric, *source);
+            if (!sections.isValid())
+                throw std::invalid_argument(
+                    "CPU expert slot pool requires an implemented prepared "
+                    "layout '" +
+                    std::string(cpu::native_quantised::preparedLayoutName(
+                        prepared_layout)) +
+                    "'");
+            packed.data_stride =
+                static_cast<int>(sections.payload_stride);
             packed.interleaved_block_stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    packed.encoding,
-                    packed.is_asymmetric);
+                static_cast<int>(sections.block_stride);
 
             switch (packed.encoding)
             {
@@ -386,7 +400,9 @@ namespace llaminar2
             bytes_per_slot = checkedByteAdd(
                 bytes_per_slot,
                 resolveExpertPreparedProjectionMemoryGeometry(
-                    spec.N, spec.K, spec.format)
+                    spec.N, spec.K, spec.format,
+                    GPUPreparedWeightPoolLayout::MigrationReusable,
+                    config.cpu_prepared_layout)
                     .cpu_bytes,
                 "CPU expert slot");
         }
@@ -480,7 +496,8 @@ namespace llaminar2
                 CpuPacked packed = makePackedMetadata(
                     spec,
                     allocation_alignment,
-                    requires_dedicated_mapping);
+                    requires_dedicated_mapping,
+                    config.cpu_prepared_layout);
                 /* Slot bytes are never sealed here: each acquisition opens a
                  * new generation and arrival admits it before publication. */
                 const std::span<std::uint8_t> slot_bytes =

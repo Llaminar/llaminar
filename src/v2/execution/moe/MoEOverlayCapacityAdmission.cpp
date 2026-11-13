@@ -568,8 +568,22 @@ namespace llaminar2
 
         std::map<PhysicalKey, std::size_t> budget_by_key;
         std::map<std::string, std::size_t> budget_by_id;
+        // CPU expert bytes price through the overlay's inventory-bound
+        // uniform layout. A CPU resource without a resolved observation means
+        // the plan was never hardware-bound through the refusal gate; admit
+        // nothing rather than pricing an assumed layout.
+        const bool has_cpu_resource = std::any_of(
+            physical_budgets.begin(), physical_budgets.end(),
+            [](const MoEOverlayBoundPhysicalMemoryBudget &budget)
+            { return budget.device().is_cpu(); });
+        if (has_cpu_resource && !plan.resolved_cpu_prepared_layout)
+            throw std::invalid_argument(
+                "ExpertOverlay capacity admission requires the inventory-bound "
+                "uniform CPU prepared layout for every CPU resource");
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;
+        input.cpu_prepared_layout = plan.resolved_cpu_prepared_layout.value_or(
+            cpu::native_quantised::kHostPreparedLayout);
         input.initial_residency_policy =
             policy.migrationEnabled()
                 ? MoEOverlayInitialResidencyPolicy::

@@ -28,6 +28,7 @@
 #pragma once
 #include "backends/CPUExecutionGeometry.h"
 #include "backends/PhysicalMemoryBacking.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
 
 #include "../../backends/DeviceType.h"
 #include "../../backends/CPUSocketInfo.h"
@@ -188,6 +189,21 @@ namespace llaminar2
         int cpu_sockets = 0;         ///< CPU sockets
         int numa_nodes = 0;          ///< NUMA nodes
         size_t cpu_memory_bytes = 0; ///< System RAM
+        /**
+         * @brief Prepared NativeQuantised layout this rank's build executes.
+         *
+         * A build property observed from the executable itself, never from
+         * hardware probing: every rank prepares, admits and executes
+         * `kHostPreparedLayout`. Publishing it as typed inventory data lets
+         * planning refuse a topology that would pair CPU endpoints whose
+         * builds execute different prepared layouts BEFORE any allocation or
+         * weight wire exists, instead of discovering the mismatch when a
+         * receiver fails to execute foreign bytes. Cross-ISA clusters carry
+         * one observation per rank; the byte crosses the inventory wire with
+         * the rank record and fails closed on unknown values.
+         */
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout =
+            cpu::native_quantised::kHostPreparedLayout;
 
         /**
          * @return Exact rank-local execution budget published after startup thread policy.

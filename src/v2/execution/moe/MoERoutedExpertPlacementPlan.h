@@ -19,6 +19,7 @@
 #include "execution/moe/MoEOverlayAuthorityExecution.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "execution/moe/MoEOverlayReplicaCacheCapacity.h"
+#include "kernels/cpu/gemm/CPUNativeQuantisedPreparedFootprint.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -413,6 +414,22 @@ namespace llaminar2
 
         /** Static whole-expert owner ordering within each routed tier. */
         RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+
+        /**
+         * @brief Overlay-uniform prepared NativeQuantised layout of every CPU endpoint.
+         *
+         * Installed by inventory binding, never user-authored: the binder
+         * resolves every CPU participant of every domain to its owning rank's
+         * published `cpu_prepared_layout` observation, refuses a topology that
+         * would pair endpoints whose builds execute different prepared
+         * layouts (cross-ISA CPU pairing), and records the one uniform value
+         * here for BOM pricing and runtime preparation. Absent when the bound
+         * overlay declares no CPU participant. Consumers that price or move
+         * CPU prepared bytes read this single typed field instead of
+         * re-deriving a layout from hardware or ambient build state.
+         */
+        std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>
+            resolved_cpu_prepared_layout;
 
         /// Generic dense execution domains for continuation/base/shared model flow.
         /// These may use SINGLE, LOCAL, NODE_LOCAL, or GLOBAL scope and are

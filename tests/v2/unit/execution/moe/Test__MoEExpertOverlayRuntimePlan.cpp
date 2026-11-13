@@ -1039,6 +1039,81 @@ namespace llaminar2::test
             OverlayRankRole::CpuFallbackParticipant));
     }
 
+    TEST(Test__MoEExpertOverlayRuntimePlan, CrossLayoutCpuPairingIsRefusedAtPlanningTime)
+    {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
+        const auto requested = rankAgnosticThreeTierPlan();
+
+        // Uniform canonical overlay: binds and records the one layout every
+        // CPU endpoint executes; later BOM pricing reads that typed field.
+        {
+            const auto inventory = syntheticTwoSocketInventory(0, 1);
+            const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(
+                *requested, inventory);
+            ASSERT_NE(resolved, nullptr);
+            ASSERT_TRUE(resolved->resolved_cpu_prepared_layout.has_value());
+            EXPECT_EQ(*resolved->resolved_cpu_prepared_layout,
+                CPUNativeQuantisedLayout::InterleavedCanonical);
+        }
+
+        // Uniform compact overlay (a homogeneous Stage-B AArch64 cluster):
+        // one layout still binds; nothing about the pairing changed.
+        {
+            auto inventory = syntheticTwoSocketInventory(0, 1);
+            for (auto &rank : inventory.ranks)
+                rank.cpu_prepared_layout =
+                    CPUNativeQuantisedLayout::InterleavedCompactA64;
+            const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(
+                *requested, inventory);
+            ASSERT_NE(resolved, nullptr);
+            ASSERT_TRUE(resolved->resolved_cpu_prepared_layout.has_value());
+            EXPECT_EQ(*resolved->resolved_cpu_prepared_layout,
+                CPUNativeQuantisedLayout::InterleavedCompactA64);
+        }
+
+        // Mixed prepared layouts across the CPU tier's ranks: a cross-ISA
+        // pairing is a typed planning refusal before allocation or wire, not
+        // a runtime execution failure after foreign bytes arrive.
+        {
+            auto inventory = syntheticTwoSocketInventory(0, 1);
+            inventory.ranks[1].cpu_prepared_layout =
+                CPUNativeQuantisedLayout::InterleavedCompactA64;
+            try
+            {
+                static_cast<void>(bindMoEExpertOverlayPlanToClusterInventory(
+                    *requested, inventory));
+                FAIL() << "mixed-layout CPU pairing must be refused";
+            }
+            catch (const std::invalid_argument &error)
+            {
+                EXPECT_NE(std::string(error.what())
+                              .find("cross-layout CPU endpoint pairing"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what())
+                              .find("interleaved-compact-a64"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what())
+                              .find("interleaved-canonical"),
+                          std::string::npos);
+                EXPECT_NE(std::string(error.what()).find("cpu_cold"),
+                          std::string::npos);
+            }
+        }
+
+        // A GPU-only overlay publishes no CPU layout observation.
+        {
+            auto gpu_only = rankAgnosticThreeTierPlan();
+            gpu_only->domains.pop_back();
+            gpu_only->routed_tiers.pop_back();
+            gpu_only->placements.front().routed_expert_tier = {0, 1, 1};
+            const auto inventory = syntheticTwoSocketInventory(0, 1);
+            const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(
+                *gpu_only, inventory);
+            ASSERT_NE(resolved, nullptr);
+            EXPECT_FALSE(resolved->resolved_cpu_prepared_layout.has_value());
+        }
+    }
+
     TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingUsesObservedAffinityForBothGPUVendors)
     {
         auto requested = rankAgnosticThreeTierPlan();

@@ -156,7 +156,9 @@ namespace llaminar2
                             static_cast<int>(tier.participants.size()));
                         const auto slice = ownership.projection(WeightRole::MoEExpertDown);
                         const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
-                            slice.rows, slice.source_columns, down.format);
+                            slice.rows, slice.source_columns, down.format,
+                            GPUPreparedWeightPoolLayout::MigrationReusable,
+                            input.cpu_prepared_layout);
                         const auto bytes = checkedMultiply(
                             ownership.residentExperts(WeightRole::MoEExpertDown, 0),
                             geometry.gpu_live_bytes, "fixed down projection bank");
@@ -505,7 +507,8 @@ namespace llaminar2
     std::vector<MoEOverlayPreparedExpertFootprint>
     MoEOverlayCapacityResolver::preparedFootprints(
         const std::vector<MoEOverlayLayerWeightManifest> &manifest,
-        DeviceMoEProjectionSet projections)
+        DeviceMoEProjectionSet projections,
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout)
     {
         if (manifest.empty() || !deviceMoEProjectionSetValid(projections))
             throw std::invalid_argument("ExpertOverlay capacity resolver requires a layer manifest and a valid projection family");
@@ -544,7 +547,9 @@ namespace llaminar2
                     resolveExpertPreparedProjectionMemoryGeometry(
                         projection.N,
                         projection.K,
-                        projection.format);
+                        projection.format,
+                        GPUPreparedWeightPoolLayout::MigrationReusable,
+                        cpu_prepared_layout);
                 footprint.cpu_live_bytes = checkedAdd(
                     footprint.cpu_live_bytes,
                     geometry.cpu_bytes,
@@ -602,7 +607,8 @@ namespace llaminar2
                     "ExpertOverlay capacity received an unknown initial-residency policy");
             }
             auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
-                input.layer_weight_manifest);
+                input.layer_weight_manifest, DeviceMoEProjectionSet::CompleteExpert,
+                input.cpu_prepared_layout);
             const std::size_t layer_count = footprints.size();
             if (input.physical_budgets.empty() || input.tiers.empty())
             {
@@ -687,7 +693,8 @@ namespace llaminar2
                 TierState state;
                 state.request = &request;
                 state.movable_footprints = MoEOverlayCapacityResolver::preparedFootprints(
-                    input.layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
+                    input.layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy),
+                    input.cpu_prepared_layout);
                 state.output.tier_index = request.tier_index;
                 state.output.tier_name = request.tier_name;
                 state.output.priority = request.priority;
@@ -712,7 +719,9 @@ namespace llaminar2
                             if(member.participant_id!=endpoint.participant_id || !resource.device.is_cpu() ||
                                resource.world_rank!=member.world_rank)
                                 throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources");
-                            state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints({cohort->localManifest(p)}).front());
+                            state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints(
+                                {cohort->localManifest(p)}, DeviceMoEProjectionSet::CompleteExpert,
+                                input.cpu_prepared_layout).front());
                         }
                     }
                 }else if(!request.shard_cohorts.empty())

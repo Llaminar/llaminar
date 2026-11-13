@@ -151,6 +151,23 @@ namespace llaminar2::cpu::native_quantised
         return false;
     }
 
+/** @brief Stable diagnostic name of one prepared layout.
+ * @param layout Known layout value.
+ * @return Short lowercase name for typed refusal messages; never null.
+ */
+[[nodiscard]] constexpr const char *preparedLayoutName(
+    CPUNativeQuantisedLayout layout) noexcept
+{
+    switch (layout)
+    {
+    case CPUNativeQuantisedLayout::InterleavedCanonical:
+        return "interleaved-canonical";
+    case CPUNativeQuantisedLayout::InterleavedCompactA64:
+        return "interleaved-compact-a64";
+    }
+    return "unknown-prepared-layout";
+}
+
     /**
      * @brief Layout this build's production packer, owner and kernels execute.
      *

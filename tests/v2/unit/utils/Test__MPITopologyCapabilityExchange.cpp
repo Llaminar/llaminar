@@ -139,6 +139,8 @@ protected:
         EXPECT_EQ(a.cpu_sockets, b.cpu_sockets) << "cpu_sockets mismatch";
         EXPECT_EQ(a.numa_nodes, b.numa_nodes) << "numa_nodes mismatch";
         EXPECT_EQ(a.cpu_memory_bytes, b.cpu_memory_bytes) << "cpu_memory_bytes mismatch";
+        EXPECT_EQ(a.cpu_prepared_layout, b.cpu_prepared_layout)
+            << "CPU prepared layout mismatch";
         EXPECT_EQ(a.cpu_execution, b.cpu_execution) << "CPU execution geometry mismatch";
 
         expectDeviceInfoEqual(a.cpu, b.cpu, "CPU");
@@ -169,6 +171,60 @@ TEST_F(Test__MPITopologyCapabilityExchange, SerializeDeserialize_CPUOnly)
 
     // Verify
     expectInventoryEqual(original, restored);
+}
+
+/** @test The prepared-layout observation crosses the inventory wire as typed data.
+ *
+ * A rank publishes its build's prepared NativeQuantised layout with its rank
+ * record: today every build reports canonical, and a Stage-B AArch64 build
+ * would report the compact layout its packer and kernels execute. The byte
+ * must round-trip without reinterpretation for every known layout, and an
+ * unknown byte is a fatal wire defect rather than a silently defaulted
+ * layout — a defaulted layout would defeat planning-time cross-ISA refusal
+ * by making a foreign observation look canonical.
+ */
+TEST_F(Test__MPITopologyCapabilityExchange, SerializeDeserialize_CPUPreparedLayoutObservation)
+{
+    for (const auto layout : {
+             cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
+             cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64,
+         })
+    {
+        RankInventory original = createTestInventory(0, "layout-node", 0, 0);
+        original.cpu_prepared_layout = layout;
+        std::vector<uint8_t> data = MPITopology::serializeRankInventory(original);
+        RankInventory restored = MPITopology::deserializeRankInventory(data.data(), data.size());
+        ASSERT_EQ(restored.cpu_prepared_layout, layout);
+        expectInventoryEqual(original, restored);
+    }
+
+    // The gatherer publishes the build property, never a hardware guess.
+    RankInventory observed;
+    observed.cpu_prepared_layout = cpu::native_quantised::kHostPreparedLayout;
+    EXPECT_EQ(observed.cpu_prepared_layout,
+        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical);
+
+    // Unknown layout byte: fatal, not defaulted. Locate the layout byte
+    // differentially so the wire probe owns no hand-computed field offsets.
+    RankInventory canonical = createTestInventory(0, "layout-node", 0, 0);
+    RankInventory compact = canonical;
+    compact.cpu_prepared_layout =
+        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
+    const std::vector<uint8_t> canonical_wire =
+        MPITopology::serializeRankInventory(canonical);
+    const std::vector<uint8_t> compact_wire =
+        MPITopology::serializeRankInventory(compact);
+    ASSERT_EQ(canonical_wire.size(), compact_wire.size());
+    std::vector<size_t> differing;
+    for (size_t byte = 0; byte < canonical_wire.size(); ++byte)
+        if (canonical_wire[byte] != compact_wire[byte])
+            differing.push_back(byte);
+    ASSERT_EQ(differing.size(), 1u) << "the layout observation is exactly one wire byte";
+    auto tampered = canonical_wire;
+    tampered[differing.front()] = 7;
+    EXPECT_THROW(
+        static_cast<void>(MPITopology::deserializeRankInventory(tampered.data(), tampered.size())),
+        std::invalid_argument);
 }
 
 TEST_F(Test__MPITopologyCapabilityExchange, SerializeDeserialize_SingleCUDAGPU)

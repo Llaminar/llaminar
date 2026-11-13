@@ -126,11 +126,22 @@ namespace llaminar2
             return left + right;
         }
 
-        /** @brief Resolve final CPU storage for quantized or floating weights. */
+        /**
+         * @brief Resolve final CPU storage for quantized or floating weights.
+         *
+         * The prepared-layout argument is the receiving CPU endpoint's typed
+         * observation (inventory-published, overlay-uniform): NativeQuantised
+         * bytes derive from the same section tables the packer, view and
+         * movement links execute, so capacity admission can never price a
+         * second, parallel footprint arithmetic. An unimplemented layout
+         * fails closed here instead of under-admitting foreign bytes.
+         */
         [[nodiscard]] inline std::size_t cpuProjectionBytes(
             int N,
             int K,
-            const ExpertWeightFormat &format)
+            const ExpertWeightFormat &format,
+            cpu::native_quantised::CPUNativeQuantisedLayout prepared_layout =
+                cpu::native_quantised::kHostPreparedLayout)
         {
             if (N <= 0 || K <= 0 || !format.valid())
             {
@@ -178,9 +189,21 @@ namespace llaminar2
             }
             const auto encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
-            const std::size_t stride =
-                cpu::native_quantised::preparedInterleavedBlockStride(
-                    encoding, source->is_asymmetric);
+            // Sole layout authority: unit sections price the same physical
+            // stream every kernel and movement link will execute. Canonical
+            // sections reproduce the scalar stride tables exactly (pinned by
+            // the all-format layout sweep); an unimplemented layout yields
+            // invalid sections and fails closed before any arithmetic.
+            const auto sections = cpu::native_quantised::preparedUnitSections(
+                prepared_layout, encoding, source->is_asymmetric, *source);
+            if (!sections.isValid())
+                throw std::invalid_argument(
+                    "CPU expert projection pricing requires an implemented "
+                    "prepared layout '" +
+                    std::string(cpu::native_quantised::preparedLayoutName(
+                        prepared_layout)) +
+                    "'");
+            const std::size_t stride = sections.block_stride;
             const std::size_t padded_n =
                 checkedAdd(static_cast<std::size_t>(N), 63u, "CPU padded N") &
                 ~std::size_t{63u};
@@ -262,7 +285,9 @@ namespace llaminar2
         int K,
         const ExpertWeightFormat &format,
         GPUPreparedWeightPoolLayout layout =
-            GPUPreparedWeightPoolLayout::MigrationReusable)
+            GPUPreparedWeightPoolLayout::MigrationReusable,
+        cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout =
+            cpu::native_quantised::kHostPreparedLayout)
     {
         switch (layout)
         {
@@ -274,7 +299,7 @@ namespace llaminar2
         }
         using namespace expert_prepared_memory_detail;
         ExpertPreparedProjectionMemoryGeometry result;
-        result.cpu_bytes = cpuProjectionBytes(N, K, format);
+        result.cpu_bytes = cpuProjectionBytes(N, K, format, cpu_prepared_layout);
 
         if (format.isFloating())
         {

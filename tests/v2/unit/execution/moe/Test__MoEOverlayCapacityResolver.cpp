@@ -786,6 +786,106 @@ namespace llaminar2
         }
     }
 
+    TEST(MoEOverlayCapacityResolver, PreparedLayoutIsTheSoleCpuFootprintAuthority)
+    {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
+        // One representative catalogued source per encoding family is enough
+        // to pin the authority switch; the all-21 sweep above already proves
+        // canonical sections price identically to the sealed scalar tables.
+        for (const auto &[label, metadata] : std::array<std::pair<const char *, const NativeQuantisedFormatInfo *>, 4>{
+                 std::pair{"Q4_0", &native_quantised_formats::Q4_0},
+                 std::pair{"Q6_K", &native_quantised_formats::Q6_K},
+                 std::pair{"IQ3_S", &native_quantised_formats::IQ3_S},
+                 std::pair{"Q2_K", &native_quantised_formats::Q2_K},
+             })
+        {
+            SCOPED_TRACE(::testing::Message() << label);
+            const auto model_manifest = manifest(1, *metadata);
+            const auto canonical =
+                MoEOverlayCapacityResolver::preparedFootprints(
+                    model_manifest,
+                    DeviceMoEProjectionSet::CompleteExpert,
+                    CPUNativeQuantisedLayout::InterleavedCanonical);
+            const auto build_default =
+                MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            ASSERT_EQ(canonical.size(), 1u);
+            ASSERT_EQ(build_default.size(), 1u);
+            // The build default IS the canonical layout today; both routes
+            // through the section authority price identical bytes.
+            EXPECT_EQ(canonical[0].cpu_live_bytes,
+                build_default[0].cpu_live_bytes);
+            EXPECT_EQ(canonical[0].cpu_shadow_bytes,
+                build_default[0].cpu_shadow_bytes);
+
+            // An unimplemented layout fails closed instead of under-admitting
+            // foreign bytes the receiving endpoints cannot execute.
+            EXPECT_THROW(
+                static_cast<void>(MoEOverlayCapacityResolver::preparedFootprints(
+                    model_manifest,
+                    DeviceMoEProjectionSet::CompleteExpert,
+                    CPUNativeQuantisedLayout::InterleavedCompactA64)),
+                std::invalid_argument);
+        }
+    }
+
+    TEST(MoEOverlayCapacityAdmission, CpuResourcesPriceOnlyTheBoundOverlayLayout)
+    {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
+        constexpr int experts = 8;
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "cpu";
+        RoutedExpertDomain domain;
+        domain.name = "cpu";
+        domain.scope = ExecutionDomainScope::SINGLE;
+        domain.backend = CollectiveBackendType::UPI;
+        domain.participants = {GlobalDeviceAddress::cpu(0)};
+        domain.owner_rank = 0;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        plan.domains = {domain};
+        plan.routed_tiers = {RoutedExpertTier{.name = "tier", .domain = "cpu", .priority = 0, .fallback = true}};
+        const auto policy = MoEOverlayCapacityAdmissionPolicy{
+            .migration_storage = MoEOverlayMigrationStorageKind::Disabled,
+            .overlay_world_size = 1};
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> budgets{
+            boundBudget(0, physicalBudget("cpu", DeviceId::cpu(), 1u << 30, 4096, 0))};
+
+        // A CPU resource whose plan was never inventory-bound has no uniform
+        // layout observation: admission refuses to price an assumed layout.
+        EXPECT_THROW(
+            static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
+                plan, experts, model_manifest, budgets, policy)),
+            std::invalid_argument);
+
+        // The bound overlay's layout is the sole pricing input; compact
+        // tables are not implemented, so a compact-bound plan fails closed
+        // at the section authority rather than under-admitting.
+        plan.resolved_cpu_prepared_layout =
+            CPUNativeQuantisedLayout::InterleavedCompactA64;
+        EXPECT_THROW(
+            static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
+                plan, experts, model_manifest, budgets, policy)),
+            std::invalid_argument);
+
+        // The canonical bound layout prices exactly the build-default bytes.
+        plan.resolved_cpu_prepared_layout =
+            CPUNativeQuantisedLayout::InterleavedCanonical;
+        const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
+            plan, experts, model_manifest, budgets, policy);
+        EXPECT_EQ(input.cpu_prepared_layout,
+            CPUNativeQuantisedLayout::InterleavedCanonical);
+        const auto priced = MoEOverlayCapacityResolver::preparedFootprints(
+            input.layer_weight_manifest,
+            DeviceMoEProjectionSet::CompleteExpert, input.cpu_prepared_layout);
+        const auto build_default = MoEOverlayCapacityResolver::preparedFootprints(
+            input.layer_weight_manifest);
+        ASSERT_EQ(priced.size(), 1u);
+        ASSERT_EQ(build_default.size(), 1u);
+        EXPECT_EQ(priced[0].cpu_live_bytes, build_default[0].cpu_live_bytes);
+    }
+
     TEST(MoEOverlayCapacityAdmission, ReplicaGrantRejectsDisabledOrStalePolicy)
     {
         EXPECT_THROW((MoEOverlayReplicaCacheCapacity{8, 0}), std::invalid_argument);
