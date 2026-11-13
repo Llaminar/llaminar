@@ -234,10 +234,6 @@ namespace llaminar2::cpu::native_quantised
         const bool is_asymmetric; ///< Published metadata/stride property.
         const bool is_superblock; ///< Original source block geometry.
         const CPUNativeQuantisedEncoding encoding; ///< Validated physical encoding.
-        const CPUNativeQuantisedLayout layout; ///< Validated physical unit layout.
-        const int metadata_delta; ///< Bytes between the payload end and the primary scale vector (0 or 128).
-        const bool metadata_secondary_; ///< Section authority: secondary words exist (resolved once at admission).
-        const bool metadata_emins_; ///< Section authority: packed effective minima exist (resolved once at admission).
         const CPUProjectionNumericalPolicy numerical_policy; ///< Immutable arithmetic identity.
         const int data_stride; ///< Weight data bytes before inline metadata.
         const int interleaved_block_stride; ///< Total physical bytes per 64-column/K block.
@@ -306,15 +302,25 @@ namespace llaminar2::cpu::native_quantised
         /** @return Whether a compact multi-scale source payload is retained. */
         [[nodiscard]] bool usesCompactMultiScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::CompactMultiScale; }
+        /**
+         * @return The physical unit layout this view executes.
+         *
+         * CPU execution reads the canonical layout only: admission rejects
+         * every other layout before a view exists, so this is the admitted
+         * layout of the publication, not a second captured state. Compact
+         * CPU kernels arrive with their own execution surface in Stage B.
+         */
+        [[nodiscard]] CPUNativeQuantisedLayout layout() const noexcept
+        { return kHostPreparedLayout; }
         /** @return Whether inline signed weight-sum compensation precedes primary scales.
-         * Resolved from the unit sections once at admission through the stored
-         * metadata delta. Hot decode kernels branch on it per K block, and the
-         * multi-scale tile programs hold their committed register ratchet only
-         * while this stays a single load. The compact AArch64 unit stores no
-         * compensation, so its decoders can never read a section that does not
-         * exist. */
+         * CPU execution reads the canonical layout only, whose section tables
+         * carry compensation exactly when this encoding predicate holds (pinned
+         * by the canonical presence sweep); the layout-aware resolution happens
+         * once at admission, never inside the tile-captured state. Hot decode
+         * kernels branch on it per K block, so it stays the single compare
+         * chain over members the tile already carries. */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
-        { return metadata_delta != 0; }
+        { return !usesQ6KNativeDualScale() && !usesCompactMultiScale(); }
         /** @return Borrowed canonical byte root; no source-order mirror exists. */
         [[nodiscard]] const std::uint8_t *interleavedBase() const noexcept { return bytes_.data(); }
         /** @return Exact borrowed publication extent. */
@@ -326,7 +332,7 @@ namespace llaminar2::cpu::native_quantised
          * @return Sixty-four primary half words in original column order.
          */
         [[nodiscard]] const std::uint16_t *chunkScales(int chunk, int block) const
-        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + metadata_delta); }
+        { return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 128 : 0)); }
 
         /** @brief Borrow the second source coefficient/scale/minimum vector.
          * @param chunk Physical 64-column chunk.
@@ -336,9 +342,13 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint16_t *chunkMins(int chunk, int block) const
         {
-            if (!metadata_secondary_)
+            // The canonical section tables store secondary words exactly for
+            // these encodings and asymmetric sources (pinned by the canonical
+            // presence sweep); admission already rejected every other layout.
+            if (!is_asymmetric && !usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale() &&
+                !usesQ6KNativeDualScale() && !usesCompactMultiScale())
                 throw std::logic_error("Native CPU weight encoding has no secondary metadata");
-            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + 128 + metadata_delta);
+            return reinterpret_cast<const std::uint16_t *>(unit(chunk, block) + data_stride + (usesInlineCompensation() ? 256 : 128));
         }
 
         /**
@@ -367,8 +377,8 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] const std::uint32_t *chunkEffectiveMins(int chunk, int block) const
         {
-            if (!metadata_emins_)
-                throw std::logic_error("Effective minima require a prepared layout with an effective-minimum section");
+            if (!usesCompactMultiScale())
+                throw std::logic_error("Effective minima require compact CPU weights");
             return reinterpret_cast<const std::uint32_t *>(unit(chunk, block) + data_stride + 256);
         }
 
@@ -442,6 +452,12 @@ namespace llaminar2::cpu::native_quantised
                 (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
                  descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
                 throw std::invalid_argument("Native CPU weight view requires a known source, encoding, layout and numerical policy");
+            // CPU execution reads the canonical layout only. The gate is
+            // explicit, not an artifact of missing tables: a future layout
+            // with implemented sections still needs its own kernel surface
+            // before any view can execute it.
+            if (descriptor.layout != kHostPreparedLayout)
+                throw std::invalid_argument("Native CPU weight view executes the canonical layout only");
             // A layout whose section tables are not implemented fails closed
             // HERE, before any division or extent work: the zero stride is a
             // sentinel for unimplemented pricing/admission tables, never a
@@ -491,13 +507,6 @@ namespace llaminar2::cpu::native_quantised
                   d.encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ? 32 : source.payload_bytes),
               source_payload_bytes(source.payload_bytes), codebook_id(source.codebook_id),
               is_asymmetric(d.is_asymmetric), is_superblock(source.is_superblock), encoding(d.encoding),
-              layout(d.layout),
-              metadata_delta(preparedUnitSections(
-                  d.layout, d.encoding, d.is_asymmetric, source).has_compensation ? 128 : 0),
-              metadata_secondary_(preparedUnitSections(
-                  d.layout, d.encoding, d.is_asymmetric, source).has_secondary),
-              metadata_emins_(preparedUnitSections(
-                  d.layout, d.encoding, d.is_asymmetric, source).has_emins),
               numerical_policy(d.numerical_policy),
               data_stride(preparedDataStride(d.layout, d.encoding, d.is_asymmetric, source)),
               interleaved_block_stride(preparedInterleavedBlockStride(d.layout, d.encoding, d.is_asymmetric, source)),

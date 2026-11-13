@@ -240,7 +240,7 @@ namespace llaminar2::cpu::native_quantised
             const bool payload_matches = payload_bytes == view.source_payload_bytes ||
                 (view.usesExpandedInt8() && payload_bytes == view.payload_bytes);
             if (view.N_padded != N_padded || view.blocks_per_row != blocks_per_row ||
-                !payload_matches || view.layout != layout || view.data_stride != data_stride ||
+                !payload_matches || view.layout() != layout || view.data_stride != data_stride ||
                 view.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU prepared owner and resident publication geometry disagree");
             return view;

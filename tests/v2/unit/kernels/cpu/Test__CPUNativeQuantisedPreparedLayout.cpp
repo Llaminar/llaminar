@@ -398,7 +398,7 @@ TEST(CPUNativeQuantisedPreparedLayout, PackedStreamThreadsCanonicalLayoutIntoVie
         SCOPED_TRACE(traceSource(*source));
         const NativeQuantisedPreparedByteFixture fixture(*source);
         const CPUNativeQuantisedWeightView view = fixture.view();
-        EXPECT_EQ(view.layout, kHostPreparedLayout);
+        EXPECT_EQ(view.layout(), kHostPreparedLayout);
         // The hot metadata delta is exactly the canonical compensation
         // presence the encoding family implies.
         const PreparedTuple tuple(*source, false);
