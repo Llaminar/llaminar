@@ -4167,3 +4167,21 @@ tip still 609638aba; guidance arrived 14:39Z — in progress, not
 drift). Gate re-target to the fixup SHA now mandatory BOTH legs.
 Main relayed for the Gate-A narrative (convergent boundary catch;
 report-integrity note recorded).
+
+### Main's audit ruling (15:01Z): pre-resume conditions extended
+
+(1) .79 block = TWO layers on the record (NCCL staleness; the head
+RECORD-arity defect, in .79's log BEFORE WSL's report — both legs
+caught it, .79's report omitted it). (2) The DONE-with-failures run
+INVALID as evidence beyond the two failures; sa.sh must gate every
+phase on exit code AND artifact existence, abort at first non-zero,
+DONE only after — and MAIN REVIEWS THE sa.sh DIFF BEFORE THE RESUME
+(one-time gate-logic check; no resume until passed). (3) CUDA=127 +
+the focus ctest include failure: sparks diagnoses both VERBATIM (no
+inferred explanations — even mine; possibly script defects of the
+same kind; must be clean on the resumed run). (4) NCCL DNS =
+environment accepted; install2 legitimate; receipt-prefix proof
+seals with the gate. Sparks' next report = omission ack + reason,
+the sa.sh diff, both verbatim diagnoses, install2 result +
+discriminator; then HOLD for Main's script pass -> resume at the
+lane's RECORD-fixup SHA. Gate-A range carries both block records.
