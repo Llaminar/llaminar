@@ -340,9 +340,11 @@ question ("which topologies does 26.6 GB block that 20.6 GB admits?"):**
   (`PhysicalMemoryAuthority`, `--expert-tier … memory-mb /
   max-experts-per-layer`): −6.0 GB (−22.6% of prepared; −25% of
   expert-routed) ⇒ **≈ +34–35% more routed experts resident per admitted
-  tier** (§2.3 arithmetic), i.e. fewer cross-tier migrations per token
-  window on the same hardware — a capacity/steady-state effect, **not** a
-  per-token speedup claim; (ii) KV/context headroom (+6 GB) on UMA hosts
+  tier at the same byte budget** (§2.3 arithmetic). How headroom converts
+  into resident experts and movement is decided by `PhysicalMemoryAuthority`
+  admission, migration policy and live demand — **no change in migration
+  count or residency is guaranteed by the layout alone**; this is a
+  capacity/steady-state effect, **not** a per-token speedup claim; (ii) KV/context headroom (+6 GB) on UMA hosts
   where KV, weights and GPU workspaces share one pool (idea 2's
   live-admission gap is the complementary piece); (iii) multi-model
   packing headroom.
@@ -575,18 +577,20 @@ repaired-after-the-fact condition.
    Exactly **v7 is handled explicitly**: v7 predates the field and its bytes
    are canonical, so a v7 archive is admitted as canonical with the same
    versioned semantics it has today. **Pre-v7 archives stay rejected exactly
-   as now** (`PackedWeightsSerialization.h:48-57` — v5-and-earlier rejected
-   before any section is adopted; the v6/v7 gates are per-format). On
+   as now**: exactly v7 is admitted, globally — the archive version gate is
+   not per-format (`PackedWeightsSerialization.h:325-327`, `:540-544`). On
    AArch64, loading v7 (or v8-canonical) CPU prepared weights fails admission
    with a precise re-prepare diagnostic; on x86 they load as today (canonical
    is x86's *current* layout, not a replaced one). No on-load conversion, no
    dual-reader period.
 2. **Tier-stream manifest / remote-projection protocol**: layout field added
    to the manifest identity and hash inputs; receivers re-derive their own
-   layout's strides and reject mismatches. The **CPU↔GPU** demotion/promotion
-   conversion targets the receiving CPU endpoint's layout (manifest carries
-   it; conversion kernels parameterized by the layout scalars) — this
-   conversion is required and part of A2. It is not a CPU↔CPU repacker
+   layout's strides and reject mismatches. The **CPU↔GPU** conversion carries
+   a direction-precise layout contract: GPU→CPU demotion selects the
+   **destination** CPU endpoint's layout, CPU→GPU promotion selects the
+   **source** CPU layout (manifest names it; conversion kernels are
+   parameterized by the layout scalars) — this conversion is required and
+   part of A2. It is not a CPU↔CPU repacker
    (§6.3: none exists, none authorized).
 3. **Cross-ISA CPU tier movement** (x86 rank ↔ AArch64 rank exchanging
    prepared CPU experts) is a typed rejection **as direct prepared-byte
@@ -793,6 +797,21 @@ canonical arm is a lane defect and blocks landing.
   fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
   comp write (CMS kernels already parameterized); cross-layout rejection
   regressions; estimator/BOM byte-equality per-ISA in preflight.
+- **Carried into A3/later (recorded by reviewer #212, not fixed in the A1
+  fixup):** the remaining non-authority offsets — copier payload group
+  ordinal offsets (`ExpertTierWeightStream.cpp:781-800`), the CMS host
+  demotion `data_stride+0/+128/+256` relative metadata arithmetic
+  (`:1582-1587`), the Q6 reference 1536/1664 constants (`:1496`, `:1501`),
+  and `PackedWeights` `chunkScales/chunkMins/chunkComp` arithmetic plus the
+  owner `chunkMins` accessor without an absence guard — become
+  section-offset-driven (or guarded) when the compact tables make them
+  layout-variant. `ResidencyFabric::requireCompatibleCpuWeights`
+  (`MoEOverlayPhysicalResidencyFabric.cpp:3264-3275`) omits the prepared
+  layout from its compatibility set; the layout joins that check in A3 when
+  the wire carries it. Also carried: the absent-emins trimmed-unit control
+  for the tier-copy regression, which becomes representable when Stage A
+  introduces explicit compact tables (test-only via the explicit layout
+  argument, before Gate A).
 - **Gate-A evidence (former Phase 3) — bench + focused preflight
   regressions.** The §7 bench in the
   performance namespace (non-regression reading); focused regressions
@@ -887,7 +906,7 @@ the source-scale form's program is family-dependent:
 |---|---|---|---|
 | (a) canonical (today) | 26.62 GB | A per family: CMS/NLSS decode the native payload inline (grid/LUT); IQ3S/ExpandedInt8 families serve pre-decoded planes | X (measured baseline) |
 | (b) Phase-1 compact (§2) | 20.6 GB | A unchanged — dead bytes never loaded (§2.1 read-set proof) | ≈X claimed, Phase-3 bench-gated |
-| (c) source-scale (~source bytes) | ≈15.3 GB | **inline-decode families (CMS, NLSS)**: same program A, load-shape changes only. **expanded-baseline families are not one class**: IQ3S would need inline grid-decode (program B); Q5_K/Q4_1-class ExpandedInt8 sources would need planar/nibble decode; **Q8_0/Q8_1 are native-int8 sources whose compact unit (2176 B) already equals source bytes — no decode program exists to change** | CMS/NLSS: no sealed penalty (the tournament did not price this class). IQ3S: X/7.0–8.6 sealed for that family. Other families: **unmeasured hypotheses; the IQ3_S timing does not transfer across families** |
+| (c) source-scale (~source bytes) | ≈15.3 GB | **inline-decode families (CMS, NLSS)**: same program A, load-shape changes only. **expanded-baseline families are not one class**: IQ3S would need inline grid-decode (program B); Q5_K-class ExpandedInt8 sources would need planar/nibble decode, and Q4_1 is NibbleLUT, not ExpandedInt8; **Q8_0 is the native-int8 source whose compact unit (2176 B) already equals its source bytes — no decode program exists to change. Q8_1 is not in that class: its 36-byte source blocks (`BlockStructures.h:69-76`) do not equal a 2176 B compact unit** | CMS/NLSS: no sealed penalty (the tournament did not price this class). IQ3S: X/7.0–8.6 sealed for that family. Other families: **unmeasured hypotheses; the IQ3_S timing does not transfer across families** |
 
 The tiered option holds (b) or (c) at rest and expands to (a) on promotion:
 

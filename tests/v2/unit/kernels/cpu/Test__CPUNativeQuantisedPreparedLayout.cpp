@@ -14,6 +14,7 @@
  * of real packing through the spine is owned by the admission/packing suites;
  * the packed end-to-end checks here only pin packer-to-view layout threading.
  */
+#include "execution/moe/ExpertTierWeightDeviceLayout.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedEncoding.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedPackedWeights.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightView.h"
@@ -328,5 +329,172 @@ TEST(CPUNativeQuantisedPreparedLayout, PackedStreamThreadsCanonicalLayoutIntoVie
         EXPECT_EQ(view.data_stride, static_cast<int>(sections.payload_stride));
         EXPECT_EQ(view.interleaved_block_stride, static_cast<int>(sections.block_stride));
     }
+}
+
+/**
+ * @test Device-layout validity is section-authoritative in both directions.
+ *
+ * The zero-stride sentinel of an unimplemented layout is never a value a
+ * stride comparison may match: an otherwise-valid layout that declares the
+ * compact CPU layout with both strides zero must be rejected by the
+ * device-layout validator exactly as by the storage-layout validator, in
+ * both conversion directions. For every cataloged format and both prepared
+ * layouts, DeviceLayout::valid() is exactly section completeness (when all
+ * other contract fields are consistent) and agrees with cpuStorage().valid()
+ * — one authority, the A0/S1 principle applied to the device-layout
+ * validator. CUDA/ROCm host chunk admission trusts this validator, so the
+ * regression covers both launch directions.
+ */
+TEST(CPUNativeQuantisedPreparedLayout,
+     DeviceLayoutValidityRequiresSectionsAndAgreesWithStorageAuthority)
+{
+    using Direction = ExpertTierWeightConversionDirection;
+    using native_quantised_formats::kAllSourceFormats;
+
+    // Build the complete production field contract for one format, prepared
+    // layout, and conversion direction. Demotion mirrors the canonical VNNI
+    // source representation; promotion mirrors the per-encoding destination
+    // normalization the kernel contract requires.
+    const auto build = [](const NativeQuantisedFormatInfo &source,
+                          CPUNativeQuantisedLayout layout,
+                          Direction direction) {
+        const PreparedTuple tuple{source, false};
+        const PreparedUnitSections sections =
+            preparedUnitSections(layout, tuple.encoding, tuple.is_asymmetric, source);
+        const NativeQuantisedMigrationStableDeviceFormat gpu_format =
+            canonicalDeviceVnniFormat(source);
+        ExpertTierWeightDeviceLayout candidate{};
+        candidate.direction = direction;
+        candidate.N = 64;
+        candidate.K = 32;
+        candidate.N_padded = 64;
+        candidate.blocks_per_row = 1;
+        candidate.cpu_N = 64;
+        candidate.cpu_K = 32;
+        candidate.cpu_first_row = 0;
+        candidate.cpu_first_column = 0;
+        candidate.gpu_N = 64;
+        candidate.gpu_K = 32;
+        candidate.gpu_first_row = 0;
+        candidate.gpu_first_column = 0;
+        candidate.cpu_codebook_id = source.codebook_id;
+        candidate.gpu_source_codebook_id = source.codebook_id;
+        candidate.gpu_source_is_superblock = source.is_superblock ? 1u : 0u;
+        candidate.gpu_codebook_id = gpu_format.codebook_id;
+        candidate.gpu_payload_bytes_per_block =
+            gpu_format.payload_bytes_per_block;
+        candidate.cpu_is_asymmetric = tuple.is_asymmetric ? 1u : 0u;
+        candidate.cpu_is_superblock = source.is_superblock ? 1u : 0u;
+        candidate.gpu_is_asymmetric = gpu_format.is_asymmetric ? 1u : 0u;
+        candidate.gpu_has_emins = gpu_format.has_emins ? 1u : 0u;
+        candidate.cpu_encoding = tuple.encoding;
+        candidate.cpu_layout = layout;
+        candidate.cpu_data_stride = sections.payload_stride;
+        candidate.cpu_block_stride = sections.block_stride;
+        candidate.unit_count = 1;
+        candidate.maximum_units_per_chunk = 1;
+        if (direction == Direction::CpuToGpu)
+        {
+            switch (tuple.encoding)
+            {
+            case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
+                candidate.gpu_payload_bytes_per_block = 13;
+                candidate.gpu_is_asymmetric = 1;
+                candidate.gpu_has_emins = 0;
+                break;
+            case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
+                candidate.gpu_codebook_id =
+                    kNativeQuantisedIQ4XSSourceScaleCodebook;
+                candidate.gpu_payload_bytes_per_block = 16;
+                candidate.gpu_is_asymmetric = 1;
+                candidate.gpu_has_emins = 0;
+                break;
+            case CPUNativeQuantisedEncoding::NibbleLUT:
+                candidate.gpu_payload_bytes_per_block = 16;
+                candidate.gpu_is_asymmetric = candidate.cpu_is_asymmetric;
+                candidate.gpu_has_emins = 0;
+                break;
+            case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
+                candidate.gpu_payload_bytes_per_block = 24;
+                candidate.gpu_is_asymmetric = 1;
+                candidate.gpu_has_emins = 0;
+                break;
+            case CPUNativeQuantisedEncoding::CompactMultiScale:
+                candidate.gpu_is_asymmetric = 1;
+                candidate.gpu_has_emins = source.has_emins ? 1u : 0u;
+                break;
+            case CPUNativeQuantisedEncoding::ExpandedInt8:
+                candidate.gpu_payload_bytes_per_block = 32;
+                candidate.gpu_codebook_id =
+                    candidate.cpu_is_asymmetric
+                        ? kNativeQuantisedExpandedInt8MinCodebook
+                        : static_cast<std::uint8_t>(19);
+                candidate.gpu_is_asymmetric = candidate.cpu_is_asymmetric;
+                candidate.gpu_has_emins = 0;
+                break;
+            }
+        }
+        return candidate;
+    };
+
+    for (const auto &entry : kAllSourceFormats)
+    {
+        const NativeQuantisedFormatInfo &source = *entry.metadata;
+        const PreparedTuple tuple{source, false};
+        // The promotion contract admits every encoding family except
+        // symmetric CompactMultiScale sources, whose CPU-to-GPU
+        // normalization is not representable; the sweep asserts over the
+        // admitted directions for each format.
+        const bool promotion_admitted =
+            !(tuple.encoding == CPUNativeQuantisedEncoding::CompactMultiScale &&
+              !source.is_asymmetric);
+        const std::array<Direction, 2> directions =
+            promotion_admitted
+                ? std::array{Direction::GpuToCpu, Direction::CpuToGpu}
+                : std::array{Direction::GpuToCpu, Direction::GpuToCpu};
+        for (const Direction direction : directions)
+        {
+            for (const CPUNativeQuantisedLayout layout :
+                 {CPUNativeQuantisedLayout::InterleavedCanonical,
+                  CPUNativeQuantisedLayout::InterleavedCompactA64})
+            {
+                SCOPED_TRACE(traceSource(source) + " " +
+                             (direction == Direction::GpuToCpu ? "demotion"
+                                                               : "promotion") +
+                             " layout=" +
+                             std::to_string(static_cast<int>(layout)));
+                const auto candidate = build(source, layout, direction);
+                const PreparedUnitSections sections = preparedUnitSections(
+                    layout, tuple.encoding, tuple.is_asymmetric, source);
+                EXPECT_EQ(candidate.valid(), sections.isValid());
+                EXPECT_EQ(candidate.valid(), candidate.cpuStorage().valid());
+                auto zeroed = candidate;
+                zeroed.cpu_data_stride = 0;
+                zeroed.cpu_block_stride = 0;
+                EXPECT_FALSE(zeroed.valid());
+                EXPECT_FALSE(zeroed.cpuStorage().valid());
+            }
+        }
+    }
+
+    // The named regression: an otherwise-valid Q8_0 demotion that declares
+    // the compact CPU layout with zero strides must fail both authorities —
+    // the sentinel is not a value a stride comparison may match.
+    const auto attack = build(native_quantised_formats::Q8_0,
+                              CPUNativeQuantisedLayout::InterleavedCompactA64,
+                              Direction::GpuToCpu);
+    ASSERT_EQ(attack.cpu_encoding, CPUNativeQuantisedEncoding::ExpandedInt8);
+    auto sentinel = attack;
+    sentinel.cpu_data_stride = 0;
+    sentinel.cpu_block_stride = 0;
+    EXPECT_FALSE(sentinel.valid());
+    EXPECT_FALSE(sentinel.cpuStorage().valid());
+    // Canonical positive control: implemented tables with their exact
+    // strides validate on both authorities.
+    const auto canonical = build(native_quantised_formats::Q8_0,
+                                 CPUNativeQuantisedLayout::InterleavedCanonical,
+                                 Direction::GpuToCpu);
+    EXPECT_TRUE(canonical.valid());
+    EXPECT_TRUE(canonical.cpuStorage().valid());
 }
 } // namespace llaminar2::test

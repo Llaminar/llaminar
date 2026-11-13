@@ -606,20 +606,19 @@ namespace llaminar2
         // trust. The wire carries no prepared-layout field until its
         // versioned A3 update, so the canonical host layout is the section
         // authority for this arithmetic (never the encoding family alone).
+        // The tables must be complete BEFORE any comparison: an unknown
+        // source or an unimplemented layout never yields a zero that a
+        // zero-stride field could match.
         const auto *const wire_source = native_quantised_formats::forSourceIdentity(
             cpu_codebook_id, cpu_is_superblock != 0);
-        const uint32_t expected_data_stride = wire_source != nullptr
-            ? cpu::native_quantised::preparedDataStride(
-                  cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
-                  cpu_is_asymmetric != 0, *wire_source)
-            : 0u;
-        const uint32_t expected_block_stride = wire_source != nullptr
-            ? static_cast<uint32_t>(cpu::native_quantised::preparedInterleavedBlockStride(
-                  cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
-                  cpu_is_asymmetric != 0, *wire_source))
-            : 0u;
-        if (cpu_data_stride != expected_data_stride ||
-            cpu_block_stride != expected_block_stride)
+        if (wire_source == nullptr)
+            return reject(error, "Tier stream CPU source identity is not cataloged");
+        const auto wire_sections = cpu::native_quantised::preparedUnitSections(
+            cpu::native_quantised::kHostPreparedLayout, cpu_encoding,
+            cpu_is_asymmetric != 0, *wire_source);
+        if (!wire_sections.isValid() ||
+            cpu_data_stride != wire_sections.payload_stride ||
+            cpu_block_stride != wire_sections.block_stride)
         {
             return reject(error, "Tier stream CPU stride is inconsistent with its encoding");
         }

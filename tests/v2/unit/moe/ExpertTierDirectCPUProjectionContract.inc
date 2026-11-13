@@ -120,11 +120,16 @@ TEST(ExpertTierWeightStream, DirectCPUParallelPiecesPreserveSharedQ6WordsAcrossR
  * @test Mixed multi-scale strides side by side move exactly the section set.
  *
  * IQ2_S (live payload width 9) and Q2_K (width 8) share the CompactMultiScale
- * payload region with different live widths; Q8_0 contrasts with inline
- * compensation and no effective minima. Section presence — derived from the
- * layout tables, never the encoding family name — must decide which bytes
- * move for each, and an unimplemented prepared layout must fail closed at
- * the storage layout before any encoded-column arithmetic runs.
+ * payload region with different live widths; both carry effective minima in
+ * the canonical layout, so this is canonical-preservation coverage for every
+ * present section. Q8_0 contrasts with inline compensation and no effective
+ * minima. Section presence — derived from the layout tables, never the
+ * encoding family name — must decide which bytes move for each, and an
+ * unimplemented prepared layout must fail closed at the storage layout
+ * before any encoded-column arithmetic runs. An absent-emins trimmed-unit
+ * control becomes representable when Stage A introduces the explicit compact
+ * tables (test-only via the explicit layout argument; the production
+ * selector stays canonical) and must land before Gate A.
  */
 TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides)
 {
@@ -163,22 +168,33 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
             traits.cpu_encoding != cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale);
 
         std::vector<uint8_t> bytes(source.cpuStorageBytes());
+        // Non-periodic per-position content: every stride and section
+        // offset here is 256-byte aligned, so a linear byte pattern with a
+        // 256-byte period could alias a wrong-origin read exactly. A byte's
+        // value must depend on its absolute position.
+        const auto positionByte = [](size_t index) {
+            uint64_t mixed = index * 0x9E3779B97F4A7C15ull + 0x517cc1b727220a95ull;
+            mixed ^= mixed >> 29;
+            return uint8_t((mixed * 0xC2B2AE3D27D4EB4Full) >> 56);
+        };
         for (size_t index = 0; index < bytes.size(); ++index)
-            bytes[index] = uint8_t(index * 41 + 7);
+            bytes[index] = positionByte(index);
         std::vector<uint8_t> result(destination.cpuStorageBytes(), 0x5c);
         const auto untouched = result;
-        size_t live_bytes = 0;
+        size_t quoted_chunk_bytes = 0;
         for (uint32_t first = 0; first < source.unit_count; )
         {
             const auto count = std::min({2u, source.unit_count - first,
                 source.maximum_units_per_chunk, destination.maximum_units_per_chunk});
             ASSERT_TRUE(copyExpertTierCPUWeightChunk(source, bytes, destination, result, first, count));
-            live_bytes += source.chunkBytes(count, first);
+            quoted_chunk_bytes += source.chunkBytes(count, first);
             first += count;
         }
-        // Communication extent: exactly the live columns of each unit, one
-        // full column slice (payload region plus present sections) each.
-        EXPECT_EQ(live_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
+        // Expected chunk-byte quotes: the layout's own quote function prices
+        // exactly the live columns of each unit (payload region plus present
+        // sections). These are expected extents, not an observed
+        // communication-volume measurement of the copier.
+        EXPECT_EQ(quoted_chunk_bytes, size_t(69 * 2) * (traits.cpu_block_stride / 64));
 
         for (size_t row = 0; row < 192; ++row)
             for (size_t block = 0; block < 4; ++block)
@@ -187,6 +203,47 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
                         encodedTierColumn(bytes, source, 59 + row, 1 + block));
                 else EXPECT_EQ(encodedTierColumn(result, destination, row, block),
                         encodedTierColumn(untouched, destination, row, block));
+
+        // Wrong-K-origin control: the expected column must differ from the
+        // same row in a non-copied source-local K block. If these could be
+        // equal, the byte equality above would not detect an origin bug.
+        for (size_t row : {size_t{0}, size_t{17}, size_t{68}})
+        {
+            const auto expected = encodedTierColumn(bytes, source, 59 + row, 1);
+            const auto wrong_origin = encodedTierColumn(bytes, source, 59 + row, 0);
+            ASSERT_EQ(expected.size(), wrong_origin.size());
+            EXPECT_NE(expected, wrong_origin);
+        }
+        // Wrong-section control: two present metadata sections must
+        // disagree at the same column, so a copy that confuses section
+        // planes cannot satisfy the column equality above.
+        {
+            const size_t present_sections[] = {sections.emins_offset,
+                sections.mins_offset, sections.scales_offset,
+                sections.compensation_offset};
+            size_t first_section = 0, second_section = 0;
+            for (size_t offset : present_sections)
+                if (offset != 0)
+                {
+                    if (first_section == 0)
+                        first_section = offset;
+                    else if (offset != first_section)
+                    {
+                        second_section = offset;
+                        break;
+                    }
+                }
+            ASSERT_NE(first_section, 0u);
+            ASSERT_NE(second_section, 0u);
+            const size_t column = 17;
+            const size_t unit = ((59 + column) / 64) * (source.cpu_K / 32) *
+                source.cpu_block_stride;
+            const uint16_t first_word = *reinterpret_cast<const uint16_t *>(
+                bytes.data() + unit + first_section + column * 2);
+            const uint16_t second_word = *reinterpret_cast<const uint16_t *>(
+                bytes.data() + unit + second_section + column * 2);
+            EXPECT_NE(first_word, second_word);
+        }
 
         if (multi_scale)
         {
@@ -222,15 +279,23 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
                      unimplemented, from, overlap, 65536)), std::invalid_argument);
 
     // A destination that disagrees with the source's prepared layout is
-    // rejected without mutation (the invalid layout fails valid() first;
-    // the copy never reaches encoded-column arithmetic).
+    // rejected without mutation. Isolate the layout as the only cause:
+    // first prove the identical geometry copies successfully with
+    // all-valid inputs (destination sized from its own extent), then flip
+    // only the destination's prepared layout field and observe rejection
+    // without mutation — the unimplemented layout fails its section-derived
+    // validity, the layout-equality authority for layouts without
+    // implemented tables, before any encoded-column arithmetic runs.
     const auto traits = directCPUFormat(native_quantised_formats::IQ2_S, 64);
     const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
-    auto foreign = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+    const auto valid_destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+    auto foreign = valid_destination;
     foreign.cpu_layout = cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCompactA64;
     std::vector<uint8_t> bytes(source.cpuStorageBytes(), 0x33);
-    std::vector<uint8_t> result(source.cpuStorageBytes(), 0x77);
+    std::vector<uint8_t> result(valid_destination.cpuStorageBytes(), 0x77);
     const auto before = result;
+    ASSERT_TRUE(copyExpertTierCPUWeightChunk(source, bytes, valid_destination, result, 0, 1));
+    result = before;
     EXPECT_FALSE(copyExpertTierCPUWeightChunk(source, bytes, foreign, result, 0, 1));
     EXPECT_EQ(result, before);
 }

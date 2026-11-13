@@ -281,16 +281,17 @@ namespace llaminar2
             {
                 return false;
             }
-            // Redundant wire strides must agree with the layout tuple's one
-            // section authority; an unimplemented layout fails closed here.
-            if (cpu_data_stride !=
-                    cpu::native_quantised::preparedDataStride(
-                        cpu_layout, cpu_encoding, cpu_is_asymmetric != 0,
-                        *cpu_source) ||
-                cpu_block_stride !=
-                    cpu::native_quantised::preparedInterleavedBlockStride(
-                        cpu_layout, cpu_encoding, cpu_is_asymmetric != 0,
-                        *cpu_source))
+            // Section authority: derive the layout tuple's tables once and
+            // require them complete BEFORE any stride comparison — the
+            // zero-stride sentinel of an unimplemented layout is never a
+            // value a comparison may match (a zero-stride compact layout
+            // with both strides zero must not validate). This keeps
+            // DeviceLayout::valid() and cpuStorage().valid() one authority.
+            const auto sections = cpu::native_quantised::preparedUnitSections(
+                cpu_layout, cpu_encoding, cpu_is_asymmetric != 0, *cpu_source);
+            if (!sections.isValid() ||
+                cpu_data_stride != sections.payload_stride ||
+                cpu_block_stride != sections.block_stride)
             {
                 return false;
             }
