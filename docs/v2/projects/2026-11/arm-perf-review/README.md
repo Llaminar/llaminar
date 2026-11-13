@@ -3834,3 +3834,23 @@ Relayed to Main; current compliance verified clean (PR branch
 d5e04fdce pushed; compaction chain lane-pushed through 0a80edd6a;
 today's reviews were report-based with the lane holding commits).
 Recorded in program memory (project.llaminar.arm.main_always_pushes).
+
+### TRANSPARENCY SWEEP COMPLETE (12:37-12:50Z): always-push adopted; unpushed state fully dispositioned
+
+Main adopted the operator's always-push directive (every apply/rebase/
+integration pushed immediately; reports cite pushed SHAs). Main's
+compliance check: clean (checkout = d5e04fdce = origin; no Main-local
+commits; one stray debris file removed). COORDINATOR PUSHES (standing
+handover-cleanup rule, on the lanes' behalf): six completed local-only
+branches pushed to origin — codex/arm-addon 8fcc0fe0b, arm-b9-
+strengthening 825fe8deb, arm-s4-nibble-witness a16591eed, arm-decode-
+team-placement c3060d607 (96-commit lineage), i8mm-typed-placement
+ea5402a54 (also the ideas-25/7 base), arm-idea26-openmp-wakeup
+3b9f0cad0. OPERATOR DECISION on the two KEEP items (arm-witness-post-
+index c4536cf3c, arm-half-perf-cell b512e25a3): KEEP LOCAL ONLY —
+stays local-only as preserved; no push. HELD: bundle1-perf-harness
+(successor re-rebase plan + force-with-lease from 5d606a108).
+UNPUSHED SUPERSEDED (content in the PR): arm-b1-fused-fork-pooling,
+arm-b4-vocab-budget, arm-idea23-hc-classification. Repo's entire
+unpushed state = exactly the four dispositioned categories; nothing
+completed is local-only anymore.
