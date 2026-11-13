@@ -4810,3 +4810,20 @@ pending for the wider A3/A4. Gate pin/binding/execution = Main-
 owned; no retarget/grant. NEXT REVIEWER INPUTS: A3-fixup + A4 pins
 with the sealed-gate evidence (sparks 03480D07E + WSL x86 03480D07E)
 — both gates in flight.
+
+### T' script re-verify CLEAR; 3-line delta recorded; sealed gate launched (20:47Z)
+
+On-disk verify: bash -n OK; line6 OUT=/w/sa-results-03480d07e;
+line9 full SHA 03480d07e33b815ac8a146bcac333273d07ab73c (1 occ);
+old-SHA 0. TRANSPARENCY: vs sagated3.b64 (18:47Z, 3254B) the delta
+= THREE lines: the 2 SHA edits + `mkdir -p $OUT` REMOVED (sparks'
+earlier-disclosed "now-removed mkdir"; EMPIRICALLY VALIDATED at the
+91e0437c6 run — the driver started + reached inventory validation
+after the FileExistsError; without mkdir the driver's exist_ok=false
+doesn't trip; post-DRIVER receipt check covers creation). "Two
+edits" accurate vs the 91e0437c6-run baseline. SPARKS CLEARED:
+sealed gate at 03480d07e (K14-STAGEAGATE-03480D07E; every red =
+Main's classification; discriminator+install3 in the narrative;
+the 6ceae8219 TIMEOUT fix is in this tree -> driver should pass
+inventory validation). Pending: sparks seal + WSL x86 03480D07E ->
+pins A3-fixup/A4 -> Gate-A.
