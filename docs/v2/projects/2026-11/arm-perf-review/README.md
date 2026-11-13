@@ -3033,3 +3033,26 @@ self-match; verified empty). .80 idle (old exited containers only).
 All sessions in expected states (reviewer/sparks/Main idle post-A0
 ACK; CB lead 90% ctx — their program). A2 rider exports landed
 (verified earlier). Next event: A1 checkpoint push.
+
+### STAGE-A A1 COMPLETE + VERIFIED (02:06Z): 94679834d — section-presence authority; A2 dispatched
+
+11 files +537/-187 (Stream 165, Packer 121, WindowPacking, View/
+PackedWeights, remote-projection + residency fabric + device layout,
+new ExpertTierDirectCPUProjectionContract.inc 119, test +49).
+Producers/copiers/accessors all derive from PreparedUnitSections
+(encoding-only logic eliminated incl. the :755-762 out-of-unit emins
+read — wire-byte-identical for canonical); presence equivalence proven
+all 21 formats x 2 rotation modes vs legacy predicates; mixed-stride
+tier-copy regression (IQ2_S+Q2_K+Q8_0, partial columns, rectangular K,
+exact live-byte accounting, foreign-layout rejection); host reference
+conversions section-derived (8 sites: 2 cited + 6 found); hot path
+untouched (admission-time presence resolution; tile proof 64/64);
+portability 297/297, layout 9/9. CAVEAT (Main-review attention): the
+mixed-stride regression needs the Linux moe build — lane ran it via a
+minimal linked runner against the real implementation + syntax-verify;
+real execution at Linux CI/boundary gate. All 5 reviewer doc fixes
+folded. Routed to Main (review + pin, parallel with A2). A2 DISPATCHED
+(02:10Z): endpoint-layout GPU conversion (CUDA :267-274/:376-385/
+:502-506/:557-585; ROCm :552-558/:657-666/:775-779/:828-870 incl. IQ3_S
+absolute offset; manifest target-layout contract; typed conversion not
+fallback; CPU<->CPU mismatch rejects).
