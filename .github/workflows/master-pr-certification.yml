@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   source:
+    if: ${{ !github.event.pull_request.draft }}
     name: Admit exact develop image source
     runs-on: ubuntu-24.04
     timeout-minutes: 300
@@ -46,6 +47,7 @@ jobs:
             --repository "$REPOSITORY" --revision "$HEAD_SHA"
 
   e2e:
+    if: ${{ !github.event.pull_request.draft }}
     name: Published E2E (AVX512 and AVX2)
     needs: source
     runs-on: [llaminar-xeon-host]
@@ -127,6 +129,7 @@ jobs:
           retention-days: 90
 
   coding_matrix:
+    if: ${{ !github.event.pull_request.draft }}
     name: Admit post-benchmark coding matrix
     needs: benchmarks
     runs-on: ubuntu-24.04
@@ -159,6 +162,7 @@ jobs:
             --output "$RUNNER_TEMP/coding-matrix.json" --github-output "$GITHUB_OUTPUT"
 
   coding_cells:
+    if: ${{ !github.event.pull_request.draft }}
     name: OpenCode ${{ matrix.cpu_isa }} — ${{ matrix.case }}
     needs: coding_matrix
     runs-on: [llaminar-xeon-host]
@@ -230,7 +234,7 @@ jobs:
   coding:
     name: Published OpenCode (AVX512 and AVX2)
     needs: [coding_matrix, coding_cells]
-    if: always()
+    if: ${{ always() && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -273,6 +277,7 @@ jobs:
           retention-days: 90
 
   benchmarks:
+    if: ${{ !github.event.pull_request.draft }}
     name: Published benchmarks (AVX512 and AVX2)
     needs: e2e
     runs-on: [llaminar-xeon-host]

@@ -24,7 +24,12 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. Separate self-hosted runners build AVX2 and AVX512 full-backend
+`develop` only when they are not drafts. Both its caller and protected reusable
+gate skip drafts before allocating runners. Marking a draft ready for review
+triggers the required checks through `ready_for_review`. The master PR jobs,
+branch-policy check and PR-triggered Copilot setup use the same draft policy.
+GitHub can still show a skipped workflow entry for a draft event; no PR job runs.
+Separate self-hosted runners build AVX2 and AVX512 full-backend
 `model-free` test images in parallel. Each image executes complete device-free
 `Unit` plus the
 production-preflight `host` lane. The canonical production scheduler owns
@@ -417,7 +422,7 @@ used `[skip ci]`, explicitly run
 its published pair before opening the release PR. This executes the same
 complete image gate as a develop push; it does not replace any master PR check.
 
-A same-repository PR from `develop` to `master` triggers
+A non-draft same-repository PR from `develop` to `master` triggers
 `.github/workflows/master-pr-certification.yml`. Its first job waits for the
 successful develop push or manual image gate at the PR's **exact head SHA**.
 It never substitutes the mutable `develop` tag. The required E2E check pulls that

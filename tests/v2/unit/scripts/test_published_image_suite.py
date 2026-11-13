@@ -1080,7 +1080,12 @@ class PublishedImageSuiteTests(unittest.TestCase):
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow["on"]), {"pull_request"})
         self.assertEqual(workflow["on"]["pull_request"]["branches"], ["master"])
+        self.assertIn("ready_for_review", workflow["on"]["pull_request"]["types"])
         jobs = workflow["jobs"]
+        for name, job in jobs.items():
+            expected = ("${{ always() && !github.event.pull_request.draft }}" if name == "coding"
+                        else "${{ !github.event.pull_request.draft }}")
+            self.assertEqual(job["if"], expected, name)
         self.assertEqual(jobs["e2e"]["needs"], "source")
         self.assertEqual(jobs["benchmarks"]["needs"], "e2e")
         for job, subcommand in (("e2e", "e2e"), ("benchmarks", "benchmarks")):

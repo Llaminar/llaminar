@@ -11,8 +11,10 @@ permissions:
 
 jobs:
   unit:
-    # Preserve the existing same-repository PR admission policy.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Drafts allocate no runner; ready_for_review starts the normal gate.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
     name: Develop PR
     # A pinned reusable workflow lets PR merge refs use the restricted group.
     uses: Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop

@@ -9,6 +9,7 @@ name: Branch policy — master merges only from develop
 on:
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ permissions:
 
 jobs:
   enforce-source-branch:
+    if: ${{ !github.event.pull_request.draft }}
     name: Only develop may merge to master
     runs-on: ubuntu-24.04
     steps:

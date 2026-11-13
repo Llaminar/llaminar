@@ -33,8 +33,10 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-Feature PRs into `develop` use `.github/workflows/develop-pr.yml` through the
-protected `develop-pr-tests.yml@develop` reusable workflow. The dedicated
+Non-draft feature PRs into `develop` use `.github/workflows/develop-pr.yml` through the
+protected `develop-pr-tests.yml@develop` reusable workflow. Both the caller and
+reusable job reject drafts before allocating runners; `ready_for_review` starts
+the checks when a draft becomes ready. The dedicated
 `llaminar-develop-108` runner (label `llaminar-develop-avx2`) builds the AVX2
 companion; the repository runner labeled `llaminar-avx512` builds AVX512. These
 full-backend `model-free` transactions run in parallel. Each runs complete

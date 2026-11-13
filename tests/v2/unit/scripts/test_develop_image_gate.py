@@ -325,9 +325,10 @@ class DevelopImageGateTests(unittest.TestCase):
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],
                          "Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop")
-        # Preserve the established same-repository PR admission policy.
+        # Drafts allocate no runner, while ready_for_review enters this gate.
         self.assertEqual(job["if"],
-                         "github.event.pull_request.head.repo.full_name == github.repository")
+                         "github.event.pull_request.head.repo.full_name == github.repository && "
+                         "!github.event.pull_request.draft")
         reusable = yaml.load((ROOT / ".github/workflows/develop-pr-tests.yml").read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(reusable["on"]), {"workflow_call"})
@@ -348,6 +349,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])
+        self.assertIn("!github.event.pull_request.draft", job["if"])
         steps = job["steps"]
         actions = {step["uses"] for step in steps if "uses" in step}
         self.assertEqual(actions, {"actions/checkout@v6", "docker/setup-buildx-action@v4",

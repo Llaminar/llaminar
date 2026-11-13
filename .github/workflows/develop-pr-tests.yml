@@ -12,10 +12,11 @@ permissions:
 
 jobs:
   unit:
-    # Only same-repository PRs into develop may use the dedicated hosts.
+    # Recheck draft state here so older callers also allocate no matrix runners.
     if: >-
       github.event_name == 'pull_request' && github.base_ref == 'develop' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
     strategy:
       fail-fast: false
       max-parallel: 2

@@ -338,7 +338,8 @@ Conventional Commits: `<type>(<optional-scope>): <description>`, for example
 `feat(planning): add explicit topology selection` or
 `perf(cuda): improve prefill projection dispatch`.
 
-Push the feature branch and open a PR into `develop`. Same-repository,
+Push the feature branch and open a PR into `develop`. Draft PRs skip PR jobs;
+marking a PR ready for review starts its required checks. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
 required gate, owner approval and an up-to-date merge candidate. The canonical
 PR workflow builds AVX2 and AVX512 full-backend model-free test images in
