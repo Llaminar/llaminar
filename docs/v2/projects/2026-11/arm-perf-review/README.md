@@ -3665,3 +3665,18 @@ CAUGHT a 30-min dispatch gap (lane report verified but sparks re-
 fire unsent) — closed at 09:50Z: re-census acceptance -> A2
 boundary K14-A2CUDAB-D0B43D81B -> A3 boundary K14-A3CUDAB-848030067;
 pins await the runs.
+
+### WITNESS FIX Main-OK (09:52Z); Stage-B design note routed to lane §8
+
+Main OK @ d0b43d81b pending the container census (3/3/2 = acceptance
+authority). DESIGN NOTE (Main, verbatim, into lane §8 now): Stage B
+must NOT reintroduce per-view runtime layout state in hot accessors —
+view admission accepts exactly kHostPreparedLayout, so hot accessors
+(chunkScales/chunkMins/chunkComp/emins offsets) compute offsets from
+CONSTEXPR host-layout tables (compact on aarch64, canonical
+elsewhere): zero new members, no per-call branching on stored
+layout, compile-time constants per encoding. Stage-B tile proof +
+census then check compact ADDRESSES, not object-layout drift.
+Witness budgets unchanged; any Stage-B delta explained instruction-
+by-instruction. Pins go out on green boundaries at d0b43d81b +
+848030067.
