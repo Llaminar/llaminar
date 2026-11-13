@@ -3994,3 +3994,34 @@ bytes NOT identical (fix comment); copier offsets claim overstated
 transaction layout — check 569de492b coverage or list. Reviewer:
 A3-fixup pin + A4 pin then Stage-A gate on the combined tip; #212/
 #213 updated; bounded ACKs preserved; no grants.
+
+### COMBINED FIXUP 609638aba (13:32Z): full scope landed; BOTH GATE LEGS DISPATCHED
+
+11 files +557/-185 on 569de492b (verified on origin; kInventoryVersion
+= 8 confirmed). F1 v7-shaped byte-exact rejection-by-version (word
+verified at wire position). F2 global resolver GONE -> detail::
+admitReceiveLayout takes the resolver param; public = production
+authority only; A3-B1 regression via internal boundary; Mac DI
+probe. R1 sections-once-before-strides both builders + guard.
+R2 sealed-sections valid(); EXPECT_FALSE chain device+storage BOTH
+endpoints -> cursor :1238/:1271 -> destination admission. R3 tuple
+semantics kept; admitted sections own strides. R4 chunkComp guarded;
+codebook-255 vs valid-Q6-absence separated + pinned. R5 existing
+preflight selection (no new gate); hash-discrimination complete
+(tamper-without-reseal invalid; resealed-layout hash differs +
+content-invalid; structural independent; 244B wire round-trip +
+in-wire tamper rejected); archive allocateTransferTarget POSITIVE +
+v7/v6/v9 NEGATIVES (typed: direct descriptor requires exactly
+current version; v7 deserialize-compat alone). 10 sealed/hash
+wordings removed; v3->v4 comment corrected; copier offsets = L1-
+true + carried. CARRIED DETERMINATION: 569de492b does NOT cover
+fabric demotion :6137/:6153 (hard-coded canonical) + zero-default
+transaction layout — listed in §8 as carried A4 (participant-
+observed endpoint selection). Mac: 12/12 + 297/297 + 4/4 + 5/5 +
+probes. STAGE-A GATE DISPATCHED both legs at 609638aba: sparks
+(K14-STAGEAGATE-609638ABA: Integration NEON_I8MM + cu13 + full
+Unit/preflight via run_production_prerequisites.py + CUDA native
+set w/ filtered UNQUALIFIED naming + ARM byte identity vs d5e04fdce)
++ WSL x86 (K14-STAGEAGATE-X86-609638ABA: Integration CPU-only +
+Unit/preflight + x86 byte identity). Then A3-fixup + A4 pins ->
+Gate-A reviewer pass d5e04fdce..609638aba.
