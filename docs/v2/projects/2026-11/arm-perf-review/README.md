@@ -4523,3 +4523,20 @@ invocation + UNQUALIFIED record); ROCm compile-only not runtime.
 A3 HOLD 177 R1-R5 + B1; A4/StageA 91 / GateA / B / L2 / economy
 separate and unclosed. No reviewer execution/edit/authentication/
 scheduling/grant. #212 in_progress, #213 pending.
+
+### D1-D3 verify = NOT PASSED: two deviations (17:20Z)
+
+Coordinator on-disk verify of sparks' corrected sa-gated.sh found
+TWO defects (Main informed per the deviation rule; sparks re-post
+required, no resume):
+DEV-1 D3 literal "91e0437c61" (10 chars) vs rev-parse HEAD full
+40-char SHA (verified: 91e0437c6198ca500ca2f6e0156b325a09730bed)
+=> check always FALSE => "WRONG HEAD" exit before any phase.
+DEV-2 FOCUS phase: ctest output redirected INSIDE bash -c to
+lowercase /w/sa-focus.log => outer phase log /w/sa-FOCUS.log always
+EMPTY => test -s "MISSING/EMPTY" exit even when ctest+JUnit fine.
+Both = the stale/masked-artifact class. Everything else matches
+Main's spec (phase_rc DRIVER/FOCUS/CUDA + RC_* recorded,
+phase_fatal CFG/BUILD, OUT=/w/sa-results-91e0437c6 + wipe, trap
+ERR, DONE RC_ line). Full T SHA pinned: 91e0437c6198ca500ca2f6e0156
+b325a09730bed.
