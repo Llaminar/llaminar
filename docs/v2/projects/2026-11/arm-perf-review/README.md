@@ -3646,3 +3646,22 @@ base tile-captured object/frame layout; fold members or cold-
 accessor resolution); acceptance = census 3/3/2 at fixed tip + tile
 proof green on shipped arches (sparks re-runs the census leg at the
 fixed tip). A3 rebases; both boundaries re-fire at the fixed tips.
+
+### WITNESS FIX d0b43d81b (09:17Z): option (ii) whole-object restoration; boundaries dispatched
+
+Fixup 3 files +34/-25 on bc91b0d71 (verified on origin: the four A1
+view members GONE from the view; sizeof 56 == base). Option (ii):
+hot accessors = canonical predicates over tile-carried members
+(= canonical section tables by the pinned sweep — authority
+preserved); layout-aware authority in COLD paths only — fromPublished
+derives tables at admission + EXPLICITLY rejects non-canonical (the
+gate is explicit, not a missing-tables artifact); cold layout()
+accessor for owner/publication agreement (PackedWeights rerouted,
+no other consumers). Acceptance local: probe object instruction-
+IDENTICAL to base (0/322 symbols, 5929=5929 spills, all 176 programs
+at base counts). No budget/witness edits. Gates: 11/11+12/12,
+297/297, 5/5, probes 0 errors. A3 rebased -> 848030067. WATCH
+CAUGHT a 30-min dispatch gap (lane report verified but sparks re-
+fire unsent) — closed at 09:50Z: re-census acceptance -> A2
+boundary K14-A2CUDAB-D0B43D81B -> A3 boundary K14-A3CUDAB-848030067;
+pins await the runs.
