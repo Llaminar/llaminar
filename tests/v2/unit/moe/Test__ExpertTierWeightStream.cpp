@@ -148,6 +148,56 @@ namespace llaminar2
             }
         }
 
+        /** @test The host reference honours its bool/error contract for every destination layout. */
+        TEST(ExpertTierWeightStream, GpuToCpuReferenceRejectsUnimplementedLayoutsWithoutThrowing)
+        {
+            // Q4_0 (codebook 0) and Q8_0 (codebook 19) are valid GPU fixtures;
+            // the canonical destination layout is the positive control.
+            const std::array<std::pair<uint8_t, const NativeQuantisedFormatInfo *>, 2>
+                fixtures{std::pair{uint8_t{0}, &native_quantised_formats::Q4_0},
+                         std::pair{uint8_t{19}, &native_quantised_formats::Q8_0}};
+            for (const auto &[codebook, format] : fixtures)
+            {
+                SCOPED_TRACE(static_cast<int>(codebook));
+                auto gpu = makeProjection(codebook, format->payload_bytes,
+                    format->is_asymmetric, format->is_superblock);
+                std::string error;
+                cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu,
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
+                    cpu, &error))
+                    << error;
+
+                // Snapshot the pre-filled CPU bytes and metadata: a rejection
+                // must leave the caller-visible output byte-identical.
+                const auto before_bytes = std::vector<uint8_t>(
+                    cpu.native_interleaved.begin(), cpu.native_interleaved.end());
+                const auto before_N = cpu.N;
+                const auto before_layout = cpu.layout;
+
+                // Compact and an unknown layout byte must be typed rejections,
+                // never exceptions escaping the noexcept bool/error contract.
+                for (const auto layout : {
+                         cpu::native_quantised::CPUNativeQuantisedLayout::
+                             InterleavedCompactA64,
+                         static_cast<cpu::native_quantised::
+                             CPUNativeQuantisedLayout>(0xFF)})
+                {
+                    SCOPED_TRACE(static_cast<int>(
+                        static_cast<std::uint8_t>(layout)));
+                    error.clear();
+                    EXPECT_FALSE(gpuToCpuExpertPackedReference(
+                        gpu, layout, cpu, &error));
+                    EXPECT_FALSE(error.empty());
+                    EXPECT_EQ(cpu.N, before_N);
+                    EXPECT_EQ(cpu.layout, before_layout);
+                    EXPECT_EQ(cpu.native_interleaved.size(), before_bytes.size());
+                    EXPECT_TRUE(std::equal(cpu.native_interleaved.begin(),
+                        cpu.native_interleaved.end(), before_bytes.begin()));
+                }
+            }
+        }
+
         TEST(ExpertTierWeightStream, SingleScaleNativeGridsExpandWithoutRequantization)
         {
             for (const uint8_t codebook : {11, 12, 15, 16})

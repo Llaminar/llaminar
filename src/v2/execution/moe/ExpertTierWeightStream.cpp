@@ -1621,8 +1621,20 @@ namespace llaminar2
                 "Host reference requires production source-format transcoding for this GPU codebook");
         }
 
+        // This public oracle is a noexcept bool/error contract: an
+        // unimplemented or unknown destination layout must be a typed
+        // rejection, never an exception escaping into std::terminate.
+        // `output` is a local and `cpu` is written only on success below, so
+        // a rejection leaves the caller's pre-filled CPU bytes untouched.
         CPUWeights output;
-        configureCpuFromGpu(gpu, destination_layout, output);
+        try
+        {
+            configureCpuFromGpu(gpu, destination_layout, output);
+        }
+        catch (const std::invalid_argument &exception)
+        {
+            return reject(error, exception.what());
+        }
         // One section authority for every metadata write below: presence and
         // offsets derive from the receiving layout tuple, never the family.
         const auto output_sections = output.preparedSections();

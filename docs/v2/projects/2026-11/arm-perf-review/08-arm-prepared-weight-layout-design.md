@@ -734,17 +734,20 @@ canonical arm is a lane defect and blocks landing.
   - **A2 — endpoint-layout GPU conversion**; **A3 — identity/transport/wire
     v8**; **A4 — planning/inventory/PMA**. Same dispatch pattern, after
     A0+A1; A3's detail is the former Phase-2 bullet below.
-  - **A2 fixup (reviewer's consolidated set, seq 85; landed as one push on
-    top of `85ddd8572`).** Five items beyond the checkpoint body:
+  - **A2 fixup (seq 85; one push on top of `85ddd8572`).** The landing
+    bundle covered these implementation areas:
     (1) **Q6 high-plane origin** is a NAMED subplane quotient
-    (`kQ6LowPlaneBytesPerColumn = 32*4/8 = 16`), static_assert-tied to the
-    packer geometry in both kernel files — the high plane begins at the
-    LOW-NIBBLE payload end inside the 24-column-byte payload, never at the
-    payload-end section boundary (Stream.cpp `:779/:794` + the CPU oracle
+    (`kQ6LowPlaneBytesPerColumn = 32*4/8 = 16`); its static_asserts pin the
+    LOCAL arithmetic only (the quotient is 16, and 16 ≠ 24 so the high
+    plane is not at the payload section boundary) — they make NO claim
+    about packer binding, which the shared-oracle tests verify, not these
+    asserts. The high plane begins at the LOW-NIBBLE payload end inside
+    the 24-column-byte payload (Stream.cpp `:779/:794` + the CPU oracle
     remain the reference); a device-free partial-unit regression
-    (`PartialUnitQ6TransfersCarryTheHighPlaneInsideThePayload`) pins the
-    section math (payload 24 / scales 24 / mins 26 column-bytes, 16+8=24)
-    and both-direction host-reference round trips for N∈{12,37}.
+    (`PartialUnitQ6TransfersCarryTheHighPlaneInsideThePayload` — a Unit
+    member, NOT preflight) pins the section math (payload 24 / scales 24 /
+    mins 26 column-bytes, 16+8=24) and both-direction host-reference
+    round trips for N∈{12,37}.
     (2) **API migration is total**: `makeGpuToCpuExpertTierWeightStreamManifest`
     carries a REQUIRED `destination_layout` at every call site (37 sites,
     repo-wide grep, no default argument, no compatibility overload), and
@@ -758,14 +761,21 @@ canonical arm is a lane defect and blocks landing.
     plane-driven" overstated this and is corrected here. What is now
     enforced — the fail-closed option — is admission: both layout
     validators (`ExpertTierWeightDeviceLayout::valid()` and the CPU
-    storage layout's) require the section tables to satisfy the encoding's
-    metadata presence contract EXACTLY (compensation iff not
-    Q6-dual-scale/CMS; secondary iff asymmetric or
-    NLSS/IQ3S/Q6/CMS; emins iff CMS), so a layout that drops a plane a
-    kernel requires, or invents one it forbids, is rejected before launch
-    — the kernels never skip silently. Canonical satisfies this
-    tautologically; compact tables are bound to the same section
-    semantics.
+    storage layout's) require the section tables to satisfy the ACTUAL
+    source-data presence contract — `sectionPresenceSatisfiesSourceContract`:
+    the secondary plane must be present exactly when the tuple is
+    asymmetric or the encoding is NibbleLUTSourceScale /
+    IQ3SExpandedSourceScale / Q6KNativeDualScale / CompactMultiScale; an
+    effective-minima plane is REQUIRED only for a CompactMultiScale
+    source whose data embeds minima, is ABSENT outside CompactMultiScale,
+    and for other compact sources either presence stays admitted
+    (canonical zero-filled planes remain admissible). Compensation has no
+    presence predicate here: it is the layout tables' own derived plane
+    (absent for Q6KNativeDualScale and CompactMultiScale). A layout that
+    drops a plane a kernel requires, or invents one it forbids, is
+    rejected before launch — the kernels never skip silently. Canonical
+    satisfies this tautologically; compact tables are bound to the same
+    section semantics.
     (4) **Field-tamper controls**: each of the five derived wire-plane
     fields, mutated independently on an otherwise-valid device layout,
     fails validity (re-derivation mismatch); the carried-layout rejection
@@ -778,8 +788,12 @@ canonical arm is a lane defect and blocks landing.
     widths, guarded live extents against 0xa5, live-row-exact moved-byte
     counts) registered per backend as
     `V2_Integration_${backend}_ExpertTierPartialQ6PayloadPlane` in
-    `V2ExpertTierRectangularWeightTests.cmake`. CUDA runs natively in the
-    GB10 boundary build; the ROCm registration compiles in PR CI.
+    `V2ExpertTierRectangularWeightTests.cmake`. This is DIRECT-KERNEL
+    coverage — live wire bytes plus inactive destination cells, with the
+    dirty-replay width controls — it does NOT prove staging-capacity
+    sentinels or a production transport counter, and it is NOT graph
+    capture. CUDA runs natively in the GB10 boundary build; the ROCm
+    registration compiles in PR CI.
   - **A3 landed (seq 94 dispatch, one push on top of `433e84632`): the
     layout enters every versioned identity.** (1) **Tier stream v4**:
     `cpu_endpoint_layout` is a named, hashed manifest field (canonical is
@@ -797,14 +811,16 @@ canonical arm is a lane defect and blocks landing.
     `requireCanonicalCpuRoot` requires the CPU root to BE the sealed
     layout — no CPU↔CPU repacker, mismatch is a typed rejection. (3)
     **PackedWeights archive v8**: the header's `prepared_layout`
-    (promoted from reserved) is sealed into the versioned identity;
-    receivers decode it and re-derive both strides from its section
-    tables before adopting any payload; exactly v7 remains admissible as
-    an explicitly canonical archive; v6 and earlier reject globally, not
-    per-format. (4) **Carried identity offsets landed**: the copier's Q6
-    payload subplane quotient is named and static_assert-tied
-    (`kQ6LowPlaneBytesPerColumn`, shared semantics with the CUDA/ROCm
-    kernels — 16 and the 1024 bitplane window derive from it); the CMS
+    (promoted from reserved) is a versioned header tag with stride
+    validation — the archive carries NO hash or seal. Receivers decode
+    the tag and re-derive both strides from its section tables before
+    adopting any payload; exactly v7 remains admissible as an explicitly
+    canonical archive; v6 and earlier reject globally, not per-format. (4) **Carried identity offsets landed**: the copier's Q6
+    payload subplane quotient is named (`kQ6LowPlaneBytesPerColumn`); the
+    static_asserts pin the LOCAL quotient arithmetic only (16, and not 24)
+    — the shared semantics with the CUDA/ROCm kernels and the derivation
+    of the 1024-byte bitplane window are a test-verified contract, not a
+    static_assert claim; the CMS
     host demotion addresses scales/secondary/emins through the receiving
     layout's absolute section offsets (no `+0/+128/+256` family
     arithmetic); the Q6 reference moves both dual-scale words and the
@@ -814,7 +830,7 @@ canonical arm is a lane defect and blocks landing.
     `chunkMins` (an absent secondary section is a typed rejection, never
     a family-guessed offset); `requireCompatibleCpuWeights` includes the
     prepared layout in the compatibility set. Focused regressions:
-    `V2_Unit_PackedWeightsArchiveLayoutIdentity` (v8 seal, exactly-v7
+    `V2_Unit_PackedWeightsArchiveLayoutIdentity` (v8 tag, exactly-v7
     explicit, global pre-v7 reject, unknown byte, stride tamper, compact-
     byte unadmitted, direct-descriptor path) registered Unit +
     ProductionTestPreflight; `RemoteProjectionIdentitySealsEndpointLayout
@@ -836,8 +852,8 @@ canonical arm is a lane defect and blocks landing.
     manifest (`MoEOverlayRemoteProjectionProtocol.cpp:709-727`) currently
     DROPS the layout, and `remoteCpuProjectionDeviceLayout`
     (`:890-894`) forces canonical — both become layout-carrying; (c) the
-    `PackedWeights` archive promotes to v8 with the layout in the hashed
-    identity. **Sequencing rule: compact section tables stay INVALID and
+    `PackedWeights` archive promotes to v8 carrying the layout as a
+    versioned header tag. **Sequencing rule: compact section tables stay INVALID and
     unadmitted until A3's identity binding lands; only after that may
     tests introduce compact tables via the explicit layout argument.**
   - **Stage B — activation** (the production selector moves to compact on
