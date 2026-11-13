@@ -4777,3 +4777,17 @@ Reviewer to close the docs HOLD at bba1eafe5. A2 code closed;
 remaining: docs closure + gates (sparks sealed @ 03480d07e, WSL
 x86 incremental) -> pins A3-fixup/A4 @ 03480d07e -> Gate-A
 d5e04fdce..bba1eafe5 (docs named).
+
+### Lane ack (20:46Z): hardening queued; wording correction queued
+
+Lane verified Test__ExpertTierWeightStream.cpp:193-196: EXPECT_EQ
+(size, nonfatal) + 3-iterator std::equal -> overread risk on future
+enlargement; hardening (ASSERT_EQ size / 4-iterator equal) QUEUED
+for a later fixup, with the commit recording: not docs-only, gate
+binding tip changes (03480d07e -> new code tip), WSL/sparks 1-test
+incremental rerun required. Wording rule accepted; lane notes the
+CURRENT commit's "allocates nothing" phrasing = the overstatement
+to correct at the same later touch (A2-R1 scope = prepared-payload
+allocation). State: code tip 03480d07e (gate binding), docs/review
+tip bba1eafe5, worktree clean, lane idle until the gates' evidence
+flow (post-verdict rebase prep parked per Main).
