@@ -5146,3 +5146,22 @@ evidence of the affected targets — Mac probe NO LONGER ACCEPTABLE**
 (3 failures on record: RECORD arity, Linux-only TUs, ClusterInventory).
 Triage-tip gate rerun on .79 after the focused greens; diff vs the
 base; ONLY the delta ours.
+
+### Build-break fixup a8beee811 verified; .80 re-pinned; WSL orphan = known-broken (23:52Z)
+
+Lane: a8beee811 on ba2811e4c (1 file +4/-1: MoEOverlayCapacity
+Admission.h — global `struct ClusterInventory;` moved INSIDE
+namespace llaminar2, Main's option 3; blame = ba2811e4c-introduced;
+semantics untouched). Standalone include-compile (a) + transitive
+TU compile (b) + Linux compile evidence (c) = the .80 build at this
+SHA (only Linux env with libnuma; WSL no numaif.h; Mac not
+acceptable); Mac-side shows only the 2 known platform blockers on
+the fixed TUs. WSL NOTE: the surviving triage container compiles
+ba2811e4c (known-broken) -> cannot produce green; harvest per
+protocol (likely INCONCLUSIVE) then orphan check + dockerd restore
+before the qual queue; .80 run = primary/definitive. RE-PIN SENT:
+sparks .80 @ a8beee811 (same bucket-(b) filter; build log = the
+Linux compile evidence; PASS = triage tip; red = verbatim to lane);
+then Main's sequencing: .79 d5e04fdce CUDA-ON base control
+(budgeted) + .79 triage-tip rerun w/ failed-set diff; per-host
+serialization.
