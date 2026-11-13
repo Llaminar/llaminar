@@ -5069,3 +5069,19 @@ build processes remain, then restart the daemon); never stack a new
 container on a broken daemon. (4) .80 focused ARM triage stays
 PRIMARY. Relayed: lane (criteria + restore duty), qual (dockerd-up
 pre-launch check before the T' -j4 rerun).
+
+### Qual probe #2 = still down (22:16Z); sparks hosts verified progressing
+
+Qual: probe #2 shell still down (both tries); host shell path down
+since ~21:10Z; broker-side OK (consistent with coordinator cross-
+check); probe #3 re-armed 22:36Z (20-min gap — load-minimizing
+rationale accepted); no host commands since the crash; dockerd
+protocol on recovery (free/uptime + docker ps -a + orphan scan +
+docker info clean THEN launch; T' -j4 sole -> byte-identity ->
+develop-control; each reported). COORDINATOR HOST CHECK (22:16Z):
+.79 = stagea-seal-03480d07e/ dir CREATED (23:15Z host) + sa-FOCUS.
+log 84KB + sa-focus-junit.xml 102KB + sa-CUDA.log + sa-cuda-
+filtered.xml (22:59Z) => the sealed gate at 03480d07e has
+COMPLETED (seal dir on disk; sparks report imminent). .80 =
+llaminar-i8mm tree updated 23:15Z => focused ARM triage setup
+active. Both sparks legs healthy.
