@@ -1523,7 +1523,7 @@ namespace
                 MappedTransferPackedWork description{};
                 description.kind = MappedTransferWorkKind::PackedGpuToCpu;
                 description.layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                    native_quantised_formats::Q8_0, 64, 32, 1, 0, 0,
+                    native_quantised_formats::Q8_0, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, 64, 32, 1, 0, 0,
                     ExpertTierWeightProjection::Gate, 1).deviceLayout();
                 description.scales = reinterpret_cast<std::uintptr_t>(storage->deviceData()) + 4096u;
                 description.device_staging = description.scales + 128u;

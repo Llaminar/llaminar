@@ -340,6 +340,7 @@ namespace llaminar2
          */
         void configureCpuFromGpu(
             const HostGpuExpertPackedProjection &gpu,
+            cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
             CPUWeights &cpu)
         {
             // Start from a clean object so no stale optional buffer survives.
@@ -394,9 +395,10 @@ namespace llaminar2
                 cpu.is_superblock = gpu.is_superblock;
             }
             // Strides and section presence come from the receiving endpoint's
-            // layout tuple — today the host's canonical selector; A2 makes the
-            // endpoint's layout explicit — never from the encoding alone.
-            cpu.layout = cpu::native_quantised::kHostPreparedLayout;
+            // layout tuple, never from the encoding alone. The caller names
+            // the destination layout explicitly; unimplemented section
+            // tables fail closed below.
+            cpu.layout = destination_layout;
             const auto *const demotion_source = native_quantised_formats::forSourceIdentity(
                 cpu.codebook_id, cpu.is_superblock);
             const auto demotion_sections = demotion_source != nullptr
@@ -1574,6 +1576,7 @@ namespace llaminar2
      */
     bool gpuToCpuExpertPackedReference(
         const HostGpuExpertPackedProjection &gpu,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         CPUWeights &cpu,
         std::string *error) noexcept
     {
@@ -1592,7 +1595,7 @@ namespace llaminar2
         }
 
         CPUWeights output;
-        configureCpuFromGpu(gpu, output);
+        configureCpuFromGpu(gpu, destination_layout, output);
         // One section authority for every metadata write below: presence and
         // offsets derive from the receiving layout tuple, never the family.
         const auto output_sections = output.preparedSections();

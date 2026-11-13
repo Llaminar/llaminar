@@ -42,6 +42,12 @@ foreach(backend IN ITEMS CUDA ROCm)
             LABELS "V2;Integration;ProductionTestPreflight;${backend};ExpertOverlay;ByteExact;ExplicitStream;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 30)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${backend}_ExpertTierRectangularWeights)
+        add_v2_test(V2_Integration_${backend}_ExpertTierPartialQ6PayloadPlane
+            COMMAND $<TARGET_FILE:${rectangular_target}>
+                --gtest_filter=${backend}ExpertTierWeightKernelsTest.PartialQ6UnitsCarryTheHighPlaneInsideThePayloadBothDirections
+            LABELS "V2;Integration;ProductionTestPreflight;${backend};ExpertOverlay;ByteExact;ExplicitStream;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${backend}_ExpertTierPartialQ6PayloadPlane)
     endif()
 endforeach()
 

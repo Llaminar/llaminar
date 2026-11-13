@@ -32,6 +32,21 @@ namespace llaminar2
     namespace
     {
         constexpr int kColumnsPerUnit = 64;
+        // Q6 payload geometry: one 32-value block carries 24 payload bytes
+        // per column — the 32 values' four low bits (16 bytes) followed by
+        // their two high bits (8 bytes). The high-bit plane starts at 16
+        // bytes per column INSIDE the payload region; the payload END (24
+        // column-bytes, the scales section) is a section boundary and must
+        // never address the high plane. Partial units address the high
+        // plane proportionally; full 64-column units use the packed
+        // bitplane window instead.
+        constexpr int kQ6LowPlaneBytesPerColumn = 32 * 4 / 8;
+        static_assert(
+            kQ6LowPlaneBytesPerColumn == 16,
+            "Q6 low plane is the 32-value block's four low bits");
+        static_assert(
+            kQ6LowPlaneBytesPerColumn != 24,
+            "the Q6 high plane is not at the payload section boundary");
 
         __device__ __constant__ __align__(16) std::int8_t kTierIQ4ValuesCUDA[16] = {
             -127, -104, -83, -65, -49, -35, -22, -10,
@@ -465,7 +480,7 @@ namespace llaminar2
                     converted|=((original>>(2*index))&1)<<index;
                     converted|=((original>>(2*index+1))&1)<<(4+index);
                 }
-                unit[size_t(layout.cpu_wire_payload_per_column)*columns+group*columns+column]=static_cast<uint8_t>(converted);
+                unit[size_t(kQ6LowPlaneBytesPerColumn)*columns+group*columns+column]=static_cast<uint8_t>(converted);
             }
             reinterpret_cast<uint16_t*>(unit+size_t(layout.cpu_wire_scales_plane)*columns)[column]=scales[linear];
             reinterpret_cast<uint16_t*>(unit+size_t(layout.cpu_wire_mins_plane)*columns)[column]=secondary_scales[linear];
@@ -650,7 +665,7 @@ namespace llaminar2
                     const auto* planes=reinterpret_cast<const uint64_t*>(unit+1024+group*64+(column/16)*16);
                     const auto bit=(column%16)*4;
                     original=static_cast<unsigned>(((planes[0]>>bit)&15)|(((planes[1]>>bit)&15)<<4));
-                } else original=unit[size_t(layout.cpu_wire_payload_per_column)*columns+group*columns+column];
+                } else original=unit[size_t(kQ6LowPlaneBytesPerColumn)*columns+group*columns+column];
                 unsigned converted=0;
                 for(unsigned index=0;index<4;++index) {
                     converted|=((original>>index)&1)<<(2*index);

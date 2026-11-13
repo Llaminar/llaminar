@@ -168,6 +168,22 @@ namespace llaminar2
             if(!sections.isValid() ||
                cpu_data_stride!=sections.payload_stride ||
                cpu_block_stride!=sections.block_stride)return false;
+            // Presence honesty for the copier's authority: the layout's
+            // section tables must satisfy the encoding's metadata contract
+            // exactly (the device-layout validator enforces the identical
+            // contract before kernel admission).
+            if(sections.has_compensation!=
+                (cpu_encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale &&
+                 cpu_encoding!=cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale) ||
+               sections.has_secondary!=
+                (cpu_is_asymmetric!=0 ||
+                 cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::NibbleLUTSourceScale ||
+                 cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale ||
+                 cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::Q6KNativeDualScale ||
+                 cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale) ||
+               sections.has_emins!=
+                (cpu_encoding==cpu::native_quantised::CPUNativeQuantisedEncoding::CompactMultiScale))
+                return false;
             const uint64_t expected=((uint64_t(N)+wire_columns_per_unit-1)/wire_columns_per_unit)*blocks_per_row;
             const uint64_t root_units=((uint64_t(cpu_N)+63)/64)*(cpu_K/32);
             return root_units<=std::numeric_limits<size_t>::max()/cpu_block_stride && expected<=std::numeric_limits<uint32_t>::max() && unit_count==expected &&
@@ -353,6 +369,42 @@ namespace llaminar2
             if (!sections.isValid() ||
                 cpu_data_stride != sections.payload_stride ||
                 cpu_block_stride != sections.block_stride)
+            {
+                return false;
+            }
+            // Presence honesty: the endpoint layout's section tables must
+            // satisfy the CPU encoding's metadata contract exactly. A
+            // layout that drops a plane the encoding's kernels require
+            // would make their secondary accesses skip silently; one that
+            // invents a forbidden plane desynchronizes the wire geometry.
+            // Canonical tables derive this presence tautologically; any
+            // future compact tables are bound to the same section
+            // semantics before a kernel launch can admit them.
+            if (sections.has_compensation !=
+                    (cpu_encoding !=
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             Q6KNativeDualScale &&
+                     cpu_encoding !=
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             CompactMultiScale) ||
+                sections.has_secondary !=
+                    (cpu_is_asymmetric != 0 ||
+                     cpu_encoding ==
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             NibbleLUTSourceScale ||
+                     cpu_encoding ==
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             IQ3SExpandedSourceScale ||
+                     cpu_encoding ==
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             Q6KNativeDualScale ||
+                     cpu_encoding ==
+                         cpu::native_quantised::CPUNativeQuantisedEncoding::
+                             CompactMultiScale) ||
+                sections.has_emins !=
+                    (cpu_encoding ==
+                     cpu::native_quantised::CPUNativeQuantisedEncoding::
+                         CompactMultiScale))
             {
                 return false;
             }

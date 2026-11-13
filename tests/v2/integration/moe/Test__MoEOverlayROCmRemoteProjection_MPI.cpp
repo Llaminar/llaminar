@@ -363,7 +363,7 @@ namespace llaminar2::test
              ++projection)
         {
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
-                expected_gpu[projection], cpu_weights[projection], &error))
+                expected_gpu[projection], cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu_weights[projection], &error))
                 << error;
             HostGpuExpertPackedProjection round_trip_gpu;
             ASSERT_TRUE(cpuToGpuExpertPackedReference(
@@ -547,6 +547,7 @@ namespace llaminar2::test
                     const auto demotion_stream =
                         makeGpuToCpuExpertTierWeightStreamManifest(
                             *source_format,
+                            cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                             expected_gpu[projection].N,
                             expected_gpu[projection].K,
                             demotion_identities[projection].expected_epoch,

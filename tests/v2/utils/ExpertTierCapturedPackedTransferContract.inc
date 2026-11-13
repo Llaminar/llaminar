@@ -68,7 +68,7 @@
                     source.source_codebook_id, source.is_superblock);
                 ASSERT_NE(metadata, nullptr);
                 auto downManifest=makeGpuToCpuExpertTierWeightStreamManifest(*metadata,
-                    N,K,901,2,5,ExpertTierWeightProjection::Down,chunk_units);
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,N,K,901,2,5,ExpertTierWeightProjection::Down,chunk_units);
                 if(rectangle)downManifest=downManifest.forIntersection(
                     ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget));
                 const auto down=downManifest.deviceLayout();

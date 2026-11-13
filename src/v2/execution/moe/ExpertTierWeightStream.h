@@ -415,12 +415,17 @@ namespace llaminar2
      * Source-codebook transcoding for other formats is owned by the backend
      * GPU conversion kernels and is deliberately not guessed here.
      * @param gpu_weights Valid common separated GPU-format bytes.
+     * @param destination_layout Layout the receiving CPU endpoint executes;
+     *     there is no implicit default — every caller states the endpoint's
+     *     layout so the host reference never silently canonicalizes a
+     *     non-canonical destination.
      * @param cpu_weights Receives final padded CPU execution bytes.
      * @param error Optional exact rejection reason.
      * @return `true` when the conversion completed byte-exactly.
      */
     [[nodiscard]] bool gpuToCpuExpertPackedReference(
         const HostGpuExpertPackedProjection &gpu_weights,
+        cpu::native_quantised::CPUNativeQuantisedLayout destination_layout,
         cpu::native_quantised::CPUNativeQuantisedPackedWeights &cpu_weights,
         std::string *error = nullptr) noexcept;
 

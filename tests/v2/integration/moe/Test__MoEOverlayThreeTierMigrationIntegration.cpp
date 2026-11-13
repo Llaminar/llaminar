@@ -672,6 +672,7 @@ namespace llaminar2
                             if (!flow->expected_gpu.valid(&conversion_error) ||
                                 !gpuToCpuExpertPackedReference(
                                     flow->expected_gpu,
+                                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                                     flow->expected_cpu,
                                     &conversion_error))
                             {
@@ -681,6 +682,7 @@ namespace llaminar2
                             flow->gpu_to_cpu_layout =
                                 makeGpuToCpuExpertTierWeightStreamManifest(
                                     *source_format,
+                                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                                     spec.n,
                                     spec.k,
                                     2,
@@ -1362,6 +1364,7 @@ namespace llaminar2
                             if (!flow->expected_gpu.valid(&conversion_error) ||
                                 !gpuToCpuExpertPackedReference(
                                     flow->expected_gpu,
+                                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                                     flow->expected_cpu,
                                     &conversion_error))
                             {
@@ -1371,6 +1374,7 @@ namespace llaminar2
                             flow->gpu_to_cpu_layout =
                                 makeGpuToCpuExpertTierWeightStreamManifest(
                                     *source_format,
+                                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                                     spec.n,
                                     spec.k,
                                     2,

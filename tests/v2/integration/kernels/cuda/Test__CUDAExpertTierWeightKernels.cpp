@@ -884,7 +884,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
-                source, expected_cpu, &error)) << error;
+                source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, expected_cpu, &error)) << error;
             const NativeQuantisedFormatInfo *source_format =
                 native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id, source.is_superblock);
@@ -1061,6 +1061,7 @@ namespace llaminar2
                 const auto manifest =
                     makeGpuToCpuExpertTierWeightStreamManifest(
                         *source_format,
+                        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                         N,
                         K,
                         301,
@@ -1163,7 +1164,7 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
-                source, expected_cpu, &error)) << error;
+                source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, expected_cpu, &error)) << error;
 
             const auto *source_format =
                 native_quantised_formats::forSourceIdentity(19, false);
@@ -1171,6 +1172,7 @@ namespace llaminar2
             const auto demotion_manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                     *source_format,
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                     source.N,
                     source.K,
                     701,
@@ -1328,6 +1330,7 @@ namespace llaminar2
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                 N,
                 K,
                 /*epoch=*/7701,
@@ -1883,6 +1886,7 @@ namespace llaminar2
             const auto demotion_stream =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                     *source_format,
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                     destination_descriptor,
                     demotion_identity.expected_epoch,
                     demotion_identity.layer_idx,
@@ -2174,6 +2178,7 @@ namespace llaminar2
             const auto redemotion_manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                     *source_format,
+                    cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                     promoted_descriptor,
                     7301,
                     2,
@@ -2675,12 +2680,13 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
-                source, expected_cpu, &error)) << error;
+                source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, expected_cpu, &error)) << error;
             const auto *source_format =
                 native_quantised_formats::forSourceIdentity(0, false);
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                 source.N,
                 source.K,
                 801,
@@ -2886,12 +2892,13 @@ namespace llaminar2
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expected_cpu;
             std::string error;
             ASSERT_TRUE(gpuToCpuExpertPackedReference(
-                source, expected_cpu, &error)) << error;
+                source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, expected_cpu, &error)) << error;
             const auto *source_format =
                 native_quantised_formats::forSourceIdentity(0, false);
             ASSERT_NE(source_format, nullptr);
             const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
                 *source_format,
+                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
                 source.N,
                 source.K,
                 811,
@@ -3116,7 +3123,7 @@ namespace llaminar2
             constexpr std::uint32_t first_unit = 1;
             const auto *format = native_quantised_formats::forSourceIdentity(11,true);
             ASSERT_NE(format,nullptr);
-            const auto probe = makeGpuToCpuExpertTierWeightStreamManifest(*format,N,K,405,3,7,ExpertTierWeightProjection::Down,capacity_units);
+            const auto probe = makeGpuToCpuExpertTierWeightStreamManifest(*format,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,N,K,405,3,7,ExpertTierWeightProjection::Down,capacity_units);
             const auto demotion = probe.deviceLayout();
             const auto promotion = makeCpuToGpuExpertTierWeightStreamManifest(cpu,406,3,7,ExpertTierWeightProjection::Down,capacity_units).deviceLayout();
             ASSERT_TRUE(demotion.valid());ASSERT_TRUE(promotion.valid());

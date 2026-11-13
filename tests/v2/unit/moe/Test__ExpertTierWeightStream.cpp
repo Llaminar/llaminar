@@ -135,7 +135,7 @@ namespace llaminar2
 
                 cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
                 std::string error;
-                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error)) << error;
                 const auto view = cpu.readView();
                 EXPECT_EQ(view.interleavedBase(), cpu.native_interleaved.data());
                 EXPECT_EQ(view.bytes().size(), cpu.native_interleaved.size());
@@ -168,7 +168,7 @@ namespace llaminar2
                 }
                 cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
                 std::string error;
-                ASSERT_TRUE(gpuToCpuExpertPackedReference(original, cpu, &error)) << error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(original, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error)) << error;
                 HostGpuExpertPackedProjection expanded;
                 ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, expanded, &error)) << error;
                 EXPECT_EQ(expanded.source_codebook_id, codebook);
@@ -198,7 +198,7 @@ namespace llaminar2
                                           values.size()), 0);
                 }
                 cpu::native_quantised::CPUNativeQuantisedPackedWeights returned;
-                ASSERT_TRUE(gpuToCpuExpertPackedReference(expanded, returned, &error)) << error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(expanded, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, returned, &error)) << error;
                 ASSERT_EQ(returned.native_interleaved.size(), cpu.native_interleaved.size());
                 EXPECT_EQ(std::memcmp(returned.native_interleaved.data(),
                     cpu.native_interleaved.data(), cpu.native_interleaved.size()), 0);
@@ -293,7 +293,7 @@ namespace llaminar2
             ASSERT_TRUE(source.valid());
             CPUNativeQuantisedPackedWeights cpu;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error)) << error;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error)) << error;
             EXPECT_EQ(cpu.encoding, CPUNativeQuantisedEncoding::NibbleLUTSourceScale);
             EXPECT_EQ(cpu.codebook_id, 4); EXPECT_TRUE(cpu.is_superblock);
             EXPECT_FALSE(cpu.is_asymmetric); EXPECT_EQ(cpu.interleaved_block_stride, 1408);
@@ -333,7 +333,7 @@ namespace llaminar2
             auto plain = makeProjection(19, 32, false, false);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights expanded;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(plain, expanded, &error)) << error;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(plain, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, expanded, &error)) << error;
             expanded.codebook_id = 4; expanded.is_superblock = true;
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
                 expanded, 101, 2, 7, ExpertTierWeightProjection::Down, 2);
@@ -356,7 +356,7 @@ namespace llaminar2
 
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error))
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error))
                 << error;
             EXPECT_EQ(cpu.N, source.N);
             EXPECT_EQ(cpu.K, source.K);
@@ -391,7 +391,7 @@ namespace llaminar2
             const auto source = makeProjection(5, 16, true, true);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu, &error))
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error))
                 << error;
 
             const NativeQuantisedFormatInfo *source_format =
@@ -449,7 +449,7 @@ namespace llaminar2
         {
             const auto source = makeProjection(19, 32, false, false);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu));
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu));
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
                 cpu,
                 9,
@@ -495,7 +495,7 @@ namespace llaminar2
         {
             const auto source = makeProjection(8, 24, true, true);
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu));
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(source, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu));
             const NativeQuantisedFormatInfo *source_format =
                 native_quantised_formats::forSourceIdentity(
                     source.source_codebook_id, source.is_superblock);
@@ -599,7 +599,7 @@ namespace llaminar2
             gpu.source_codebook_id = native_quantised_formats::Q8_K.codebook_id;
             cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error))
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error))
                 << error;
             EXPECT_EQ(
                 cpu.encoding,
@@ -901,7 +901,7 @@ namespace llaminar2
             if (physical.has_emins)
                 gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
             std::string error;
-            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error)) << error;
             ASSERT_TRUE(cpu.publicationSealed());
             const auto copy = cpu;
             EXPECT_NE(copy.native_interleaved.data(), cpu.native_interleaved.data());

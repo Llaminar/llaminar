@@ -1219,7 +1219,7 @@ namespace llaminar2
             /** @param units Existing bounded lane population. @return Original GPU→CPU manifest or explicit fixture overlap. */
             [[nodiscard]] ExpertTierWeightStreamManifest makeDemotionManifest(uint32_t units) const
             {
-                auto result=makeGpuToCpuExpertTierWeightStreamManifest(source_format_,shape_.N,shape_.K,
+                auto result=makeGpuToCpuExpertTierWeightStreamManifest(source_format_,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,shape_.N,shape_.K,
                     1,0,0,ExpertTierWeightProjection::Gate,checkedChunkUnits(units));
                 return shape_.rectangle?result.forIntersection(rectangle()):result;
             }

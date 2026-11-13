@@ -307,6 +307,168 @@ TEST(ExpertTierWeightStream, TierCopySectionPresenceDrivesMixedMultiScaleStrides
 }
 
 /**
+ * @test Partial-unit Q6 transfers carry the high-bit plane inside the
+ *        payload region.
+ *
+ * Q6's payload format splits one 32-value block's 24 bytes per column into
+ * the values' four low bits (16 bytes) and their two high bits (8 bytes).
+ * The high-bit plane therefore starts at 16 bytes per column, strictly
+ * INSIDE the payload region — the payload end (24 column-bytes, the scales
+ * section) is a section boundary and must never address it. A partial-unit
+ * regression addressed the high plane through the payload-end quotient,
+ * landing on scales/mins and past the unit end; full 64-column units take
+ * the packed bitplane path and mask the defect. Every unit below is
+ * partial (12, 37, and a 64+5 crossing), the CPU column mapper is the
+ * address reference, and the host reference round-trips partial-width Q6
+ * matrices byte-exactly in both directions.
+ */
+TEST(ExpertTierWeightStream, PartialUnitQ6TransfersCarryTheHighPlaneInsideThePayload)
+{
+    using cpu::native_quantised::CPUNativeQuantisedEncoding;
+    using cpu::native_quantised::CPUNativeQuantisedLayout;
+    using cpu::native_quantised::CPUNativeQuantisedPackedWeights;
+    using cpu::native_quantised::preparedEncodingForSource;
+    using cpu::native_quantised::preparedUnitSections;
+    const auto &format = native_quantised_formats::Q6_K;
+    const auto sections = preparedUnitSections(
+        CPUNativeQuantisedLayout::InterleavedCanonical,
+        preparedEncodingForSource(format), format.is_asymmetric, format);
+    ASSERT_TRUE(sections.isValid());
+    // Address contract the conversion kernels and the column mapper share:
+    // scales follow the payload, the secondary words follow scales, and the
+    // 16-column-byte high plane lies strictly inside the payload.
+    ASSERT_EQ(sections.payload_stride / 64u, 24u);
+    ASSERT_EQ(sections.scales_offset / 64u, 24u);
+    ASSERT_EQ(sections.mins_offset / 64u, 26u);
+    ASSERT_EQ(16u + 8u, sections.payload_stride / 64u);
+    ASSERT_LT(16u, sections.scales_offset / 64u);
+
+    using P = MoEExpertProjectionOwnership::Projection;
+    using R = MoEProjectionResidence;
+    for (const int live_rows : {12, 37, 69})
+    {
+        SCOPED_TRACE(live_rows);
+        // Source rows [13, 13+rows) intersect the destination window
+        // [72, 232) in exactly the requested live width.
+        const int from_rows = live_rows - 13 + 72;
+        const P from{R::ParticipantOutputSlice, 256, 256, 13, from_rows, 32, 96};
+        const P to{R::ParticipantInputSlice, 256, 256, 72, 160, 64, 128};
+        const auto overlap = ExpertTierWeightProjectionIntersection::between(from, to);
+        ASSERT_EQ(overlap.rows(), live_rows);
+        ASSERT_EQ(overlap.columns(), 64);
+
+        const auto traits = directCPUFormat(format, 64);
+        const auto source = cpuExpertTierStorageLayoutForIntersection(traits, from, overlap, 65536);
+        const auto destination = cpuExpertTierStorageLayoutForIntersection(traits, to, overlap, 65536);
+        std::vector<uint8_t> bytes(source.cpuStorageBytes());
+        const auto positionByte = [](size_t index) {
+            uint64_t mixed = index * 0x9E3779B97F4A7C15ull + 0x517cc1b727220a95ull;
+            mixed ^= mixed >> 29;
+            return uint8_t((mixed * 0xC2B2AE3D27D4EB4Full) >> 56);
+        };
+        for (size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = positionByte(index);
+        std::vector<uint8_t> result(destination.cpuStorageBytes(), 0x5c);
+        const auto untouched = result;
+        size_t quoted_chunk_bytes = 0;
+        for (uint32_t first = 0; first < source.unit_count; )
+        {
+            const auto count = std::min({2u, source.unit_count - first,
+                source.maximum_units_per_chunk, destination.maximum_units_per_chunk});
+            ASSERT_TRUE(copyExpertTierCPUWeightChunk(source, bytes, destination, result, first, count));
+            quoted_chunk_bytes += source.chunkBytes(count, first);
+            first += count;
+        }
+        // Expected chunk-byte quotes: live columns only, payload plus both
+        // dual-scale sections per unit.
+        const size_t units = ((size_t(live_rows) + 63) / 64) * 2;
+        ASSERT_EQ(source.unit_count, units);
+        EXPECT_EQ(quoted_chunk_bytes,
+            size_t(live_rows) * 2u * (traits.cpu_block_stride / 64));
+
+        // Every live column is oracle-equal through the section-driven
+        // column mapper (the kernel address reference); neighbours stay
+        // untouched. Source row origin is 59 = 72 - 13.
+        const int source_rows = live_rows;
+        for (size_t row = 0; row < 192; ++row)
+            for (size_t block = 0; block < 4; ++block)
+                if (row < size_t(source_rows) && block < 2)
+                    EXPECT_EQ(encodedTierColumn(result, destination, row, block),
+                        encodedTierColumn(bytes, source, 59 + row, 1 + block));
+                else EXPECT_EQ(encodedTierColumn(result, destination, row, block),
+                        encodedTierColumn(untouched, destination, row, block));
+
+        // Byte-exact dual-scale words at the section offsets, for both
+        // partial widths and the crossing tail.
+        for (const size_t row : {size_t{0}, size_t{5}, size_t{11},
+                 size_t{36}, size_t{68}})
+        {
+            if (row >= size_t(source_rows))
+                continue;
+            for (const size_t block : {size_t{0}, size_t{1}})
+            {
+                const size_t source_n = 59 + row, destination_n = row;
+                const size_t source_unit =
+                    ((source_n / 64) * (source.cpu_K / 32) + 1 + block) * source.cpu_block_stride;
+                const size_t destination_unit =
+                    ((destination_n / 64) * (destination.cpu_K / 32) + block) * destination.cpu_block_stride;
+                for (const size_t section : {sections.scales_offset, sections.mins_offset})
+                {
+                    const uint16_t source_word = *reinterpret_cast<const uint16_t *>(
+                        bytes.data() + source_unit + section + (source_n % 64) * 2);
+                    const uint16_t destination_word = *reinterpret_cast<const uint16_t *>(
+                        result.data() + destination_unit + section + (destination_n % 64) * 2);
+                    EXPECT_EQ(source_word, destination_word);
+                }
+            }
+        }
+    }
+
+    // The host reference round-trips partial-width Q6 matrices byte-exactly
+    // in both directions: a 12- and a 37-column GPU projection demote to
+    // final CPU bytes and promote back without one payload, scale, or
+    // coefficient bit changing.
+    for (const int N : {12, 37})
+    {
+        SCOPED_TRACE(N);
+        const auto physical = canonicalDeviceVnniFormat(format);
+        HostGpuExpertPackedProjection gpu;
+        gpu.N = N;
+        gpu.K = 96;
+        gpu.blocks_per_row = 3;
+        gpu.source_codebook_id = format.codebook_id;
+        gpu.codebook_id = physical.codebook_id;
+        gpu.payload_bytes_per_block = physical.payload_bytes_per_block;
+        gpu.is_asymmetric = physical.is_asymmetric;
+        gpu.is_superblock = format.is_superblock;
+        gpu.has_emins = physical.has_emins;
+        const size_t blocks = size_t(N) * 3u;
+        gpu.payload.resize(blocks * physical.payload_bytes_per_block);
+        gpu.scales.resize(blocks);
+        gpu.mins.resize(blocks);
+        for (size_t block = 0; block < blocks; ++block)
+        {
+            for (size_t byte = 0; byte < physical.payload_bytes_per_block; ++byte)
+                gpu.payload[block * physical.payload_bytes_per_block + byte] =
+                    uint8_t((block * 37u + byte * 19u + 11u) & 0xffu);
+            gpu.scales[block] = uint16_t(0x2400u + (block % 0x0800u));
+            gpu.mins[block] = uint16_t(0xa000u + (block % 0x0800u));
+        }
+        std::string error;
+        ASSERT_TRUE(gpu.valid(&error)) << error;
+        CPUNativeQuantisedPackedWeights cpu;
+        ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error)) << error;
+        EXPECT_EQ(cpu.N_padded, 64);
+        HostGpuExpertPackedProjection returned;
+        ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, returned, &error)) << error;
+        EXPECT_EQ(returned.codebook_id, gpu.codebook_id);
+        EXPECT_EQ(returned.payload, gpu.payload);
+        EXPECT_EQ(returned.scales, gpu.scales);
+        EXPECT_EQ(returned.mins, gpu.mins);
+    }
+}
+
+/**
  * @test The endpoint layout contract selects GPU conversion and rejects
  *        mismatched layout contracts.
  *
@@ -436,6 +598,37 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         EXPECT_EQ(device.cpu_wire_emins_plane,
             sections.has_emins ? sections.emins_offset / 64u : 0u);
 
+        // Field-tamper controls: every derived plane field is independently
+        // load-bearing. Mutating any one of them on an otherwise-valid
+        // device layout must fail validity — the plane re-derivation is a
+        // comparison against the carried layout's section tables, never a
+        // pass-through of the stored field.
+        {
+            auto tampered = device;
+            tampered.cpu_wire_payload_per_column += 1u;
+            EXPECT_FALSE(tampered.valid());
+        }
+        {
+            auto tampered = device;
+            tampered.cpu_wire_compensation_plane += 1u;
+            EXPECT_FALSE(tampered.valid());
+        }
+        {
+            auto tampered = device;
+            tampered.cpu_wire_scales_plane += 1u;
+            EXPECT_FALSE(tampered.valid());
+        }
+        {
+            auto tampered = device;
+            tampered.cpu_wire_mins_plane += 1u;
+            EXPECT_FALSE(tampered.valid());
+        }
+        {
+            auto tampered = device;
+            tampered.cpu_wire_emins_plane += 1u;
+            EXPECT_FALSE(tampered.valid());
+        }
+
         // An unimplemented destination layout is rejected by the builder
         // before any stride work — never a silent canonical fallback.
         EXPECT_THROW(
@@ -444,12 +637,15 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
                 ExpertTierWeightProjection::Down, 2)),
             std::invalid_argument);
 
-        // A carried layout that disagrees with the strides is a typed
-        // rejection: manifest validity and the device layout both fail.
-        auto mismatched = stream;
-        mismatched.reserved_identity[0] = static_cast<uint8_t>(compact);
-        EXPECT_FALSE(mismatched.valid(&error));
-        EXPECT_FALSE(mismatched.deviceLayout().valid());
+        // A known-but-unimplemented carried layout is a typed rejection —
+        // not a disagreement between two valid layouts. Compact tables are
+        // not admitted yet, so validity fails on the section-table lookup
+        // itself, for the manifest and the device layout alike.
+        auto unimplementedCarried = stream;
+        unimplementedCarried.reserved_identity[0] =
+            static_cast<uint8_t>(compact);
+        EXPECT_FALSE(unimplementedCarried.valid(&error));
+        EXPECT_FALSE(unimplementedCarried.deviceLayout().valid());
         auto unknown = stream;
         unknown.reserved_identity[0] = 7;
         EXPECT_FALSE(unknown.valid(&error));
@@ -461,7 +657,7 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         auto gpu = hostProjection(*format);
         ASSERT_TRUE(gpu.valid(&error)) << error;
         CPUNativeQuantisedPackedWeights cpu;
-        ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error))
+        ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, cpu, &error))
             << error;
         const auto cpu_sections = cpu.preparedSections();
         ASSERT_TRUE(cpu_sections.isValid());

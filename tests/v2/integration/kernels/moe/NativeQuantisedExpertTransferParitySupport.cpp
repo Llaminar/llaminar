@@ -217,7 +217,7 @@ namespace llaminar2::test::native_quantised_transfer_parity_detail
         {
             const auto &descriptor = descriptors[i];
             const auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
-                *source_format, descriptor.n, descriptor.k,
+                *source_format, cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical, descriptor.n, descriptor.k,
                 /*residency_epoch=*/1, /*layer_idx=*/0, /*expert_id=*/0,
                 roles[i], /*maximum_units_per_chunk=*/16).deviceLayout();
             const size_t blocks = static_cast<size_t>(layout.N) * layout.blocks_per_row;

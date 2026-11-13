@@ -84,4 +84,107 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
         }
     }
 }
+
+/**
+ * @brief Focused Q6_K partial-unit dual-scale payload movement, both directions.
+ *
+ * The Q6 prepared payload keeps its high-bit plane strictly inside the
+ * per-column payload bytes (16 low-nibble bytes followed by the packed
+ * high plane), never at the payload-end section boundary. Live widths 12
+ * and 37 exercise partial 64-row units through the actual conversion
+ * kernels; 64 is the exact full-unit control. Every replay re-dirties the
+ * destination, alternates chunk widths, and proves the guarded extents
+ * stay untouched through an independent CPU oracle round trip.
+ */
+TEST_F(CUDAExpertTierWeightKernelsTest, PartialQ6UnitsCarryTheHighPlaneInsideThePayloadBothDirections)
+{
+    using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
+    TestCUDAStream transfer_stream;
+    const auto* q6=nullptr;
+    for(const auto& candidate:test::quantizedVerifierFormats())
+        if(candidate.label=="Q6_K"){q6=&candidate;break;}
+    ASSERT_NE(q6,nullptr);
+    for(const int live_rows:{12,37,64})
+    {
+        SCOPED_TRACE(live_rows);
+        // Source rows [13,13+rows) against the destination window [72,232)
+        // intersect in exactly live_rows rows; columns [64,128) cover two
+        // whole 32-column blocks so both dual-scale words and the complete
+        // 24-column-byte payload — high plane included — move per unit.
+        const int from_rows=live_rows-13+72;
+        constexpr int K=512;
+        const P originalSource{R::ParticipantOutputSlice,256,1024,13,from_rows,32,K};
+        const P originalTarget{R::ParticipantInputSlice,256,1024,72,160,64,128};
+        const auto forward=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
+        const auto backward=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
+        ASSERT_EQ(forward.rows(),live_rows);
+        ASSERT_EQ(forward.columns(),64);
+        auto source_tensor=q6->create({size_t(from_rows),size_t(K)},static_cast<uint32_t>(40500+live_rows));
+        auto source=packProductionGpuProjection(*source_tensor);
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights cpu;
+        ASSERT_TRUE(cpu::native_quantised::packWeightsCPUNativeQuantised(source_tensor.get(),cpu));
+        const auto* originalFormat=native_quantised_formats::forSourceIdentity(source.source_codebook_id,source.is_superblock);
+        ASSERT_NE(originalFormat,nullptr);
+        const auto demotionManifest=makeGpuToCpuExpertTierWeightStreamManifest(*originalFormat,cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,from_rows,K,82,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
+        const auto down=demotionManifest.deviceLayout();
+        auto cpuOracle=down;cpuOracle.cpu_N=from_rows;cpuOracle.cpu_K=K;cpuOracle.cpu_first_row=59;cpuOracle.cpu_first_column=32;
+        TestCUDABuffer<uint8_t> input(source.payload.size());TestCUDABuffer<uint16_t> scales(source.scales.size()),mins(source.mins.size());TestCUDABuffer<uint32_t> emins(source.emins.size());
+        ASSERT_EQ(input.upload(source.payload),cudaSuccess);ASSERT_EQ(scales.upload(source.scales),cudaSuccess);
+        ASSERT_EQ(mins.upload(source.mins),cudaSuccess);ASSERT_EQ(emins.upload(source.emins),cudaSuccess);
+        const ExpertTierGpuConstProjectionView in{input.data(),scales.data(),mins.data(),emins.data(),input.bytes(),scales.bytes(),mins.bytes(),emins.bytes()};
+        ASSERT_TRUE(in.validFor(down));
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
+        destinationCPU.N=160;destinationCPU.K=128;destinationCPU.N_padded=192;destinationCPU.blocks_per_row=4;
+        destinationCPU.payload_bytes=cpu.payload_bytes;destinationCPU.codebook_id=cpu.codebook_id;destinationCPU.is_superblock=cpu.is_superblock;destinationCPU.is_asymmetric=cpu.is_asymmetric;
+        destinationCPU.encoding=cpu.encoding;destinationCPU.data_stride=cpu.data_stride;destinationCPU.interleaved_block_stride=cpu.interleaved_block_stride;
+        destinationCPU.native_interleaved.resize_uninitialized(down.cpuStorageBytes());
+        auto finalCPU=destinationCPU.native_interleaved.unsealedGenerationBytes();
+        const auto promotionManifest=makeCpuToGpuExpertTierWeightStreamManifest(destinationCPU,83,0,7,ExpertTierWeightProjection::Down,2).forIntersection(backward);
+        const auto up=promotionManifest.deviceLayout();
+        HostGpuExpertPackedProjection expected;
+        ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu,expected));
+        TestCUDABuffer<uint8_t> output(expected.payload.size());TestCUDABuffer<uint16_t> outputScales(expected.scales.size()),outputMins(expected.mins.size());TestCUDABuffer<uint32_t> outputEmins(expected.emins.size());
+        const ExpertTierGpuMutableProjectionView out{output.data(),outputScales.data(),outputMins.data(),outputEmins.data(),output.bytes(),outputScales.bytes(),outputMins.bytes(),outputEmins.bytes()};
+        ASSERT_TRUE(out.validFor(up));
+        TestCUDABuffer<uint8_t> chunk(std::max(down.chunkBytes(2),up.chunkBytes(2)));
+        for(unsigned replay=0;replay<3;++replay)
+        {
+            const unsigned perChunk=replay==1?1:2;size_t bytesMoved=0;
+            ASSERT_EQ(cudaMemsetAsync(output.data(),0xa5,output.bytes(),transfer_stream.native()),cudaSuccess);
+            ASSERT_EQ(cudaMemsetAsync(outputScales.data(),0xa5,outputScales.bytes(),transfer_stream.native()),cudaSuccess);
+            if(outputMins.bytes())ASSERT_EQ(cudaMemsetAsync(outputMins.data(),0xa5,outputMins.bytes(),transfer_stream.native()),cudaSuccess);
+            if(outputEmins.bytes())ASSERT_EQ(cudaMemsetAsync(outputEmins.data(),0xa5,outputEmins.bytes(),transfer_stream.native()),cudaSuccess);
+            std::fill(finalCPU.begin(),finalCPU.end(),0xa5);
+            for(uint32_t first=0;first<down.unit_count;first+=perChunk)
+            {
+                const auto count=std::min(perChunk,down.unit_count-first),bytes=static_cast<uint32_t>(down.chunkBytes(count,first));
+                std::vector<uint8_t> observed(bytes);
+                ASSERT_TRUE(launchGpuToCpuExpertTierChunkCUDA(in,down,first,count,chunk.data(),chunk.bytes(),transfer_stream.opaque()));
+                ASSERT_EQ(cudaMemcpyAsync(observed.data(),chunk.data(),bytes,cudaMemcpyDeviceToHost,transfer_stream.native()),cudaSuccess);
+                ASSERT_EQ(transfer_stream.synchronize(),cudaSuccess);
+                EXPECT_EQ(observed,test::expertTierWireOracle(cpuOracle,cpu.native_interleaved,first,count));
+                ASSERT_TRUE(scatterExpertTierCPUWeightChunk(down,observed,first,count,finalCPU));
+                const auto promoteBytes=test::expertTierWireOracle(up,finalCPU,first,count);
+                ASSERT_EQ(cudaMemcpyAsync(chunk.data(),promoteBytes.data(),promoteBytes.size(),cudaMemcpyHostToDevice,transfer_stream.native()),cudaSuccess);
+                ASSERT_TRUE(launchCpuToGpuExpertTierChunkCUDA(chunk.data(),chunk.bytes(),up,first,count,out,transfer_stream.opaque()));
+                ASSERT_EQ(transfer_stream.synchronize(),cudaSuccess);bytesMoved+=bytes;
+            }
+            // Live rows only — a partial final unit quotes exactly its live
+            // rows, never the padded 64-row capacity.
+            EXPECT_EQ(bytesMoved,static_cast<size_t>(live_rows)*2u*(down.cpu_block_stride/64));
+            std::vector<uint8_t> observed;std::vector<uint16_t> observedScales,observedMins;std::vector<uint32_t> observedEmins;
+            ASSERT_EQ(output.download(observed),cudaSuccess);ASSERT_EQ(outputScales.download(observedScales),cudaSuccess);
+            ASSERT_EQ(outputMins.download(observedMins),cudaSuccess);ASSERT_EQ(outputEmins.download(observedEmins),cudaSuccess);
+            for(int kb=0;kb<K/32;++kb)for(int row=0;row<from_rows;++row)
+            {
+                const size_t index=size_t(kb)*from_rows+row;const bool active=row>=59 && kb>=1 && kb<3;
+                for(unsigned byte=0;byte<expected.payload_bytes_per_block;++byte)
+                    EXPECT_EQ(observed[index*expected.payload_bytes_per_block+byte],active?expected.payload[index*expected.payload_bytes_per_block+byte]:uint8_t(0xa5));
+                EXPECT_EQ(observedScales[index],active?expected.scales[index]:uint16_t(0xa5a5));
+                if(!observedMins.empty())EXPECT_EQ(observedMins[index],active?expected.mins[index]:uint16_t(0xa5a5));
+                if(!observedEmins.empty())EXPECT_EQ(observedEmins[index],active?expected.emins[index]:uint32_t(0xa5a5a5a5));
+            }
+        }
+    }
+}
 } }
