@@ -4402,3 +4402,24 @@ JUnit + verbatim failures. Same reds => inherited -> base owner
 evidence; green => ours -> Main fixes in PR. (Main's note:
 develop can't configure NEON_I8MM — that's the PR's port; control
 is legitimate on AVX512 x86.)
+
+### sa-gated.sh forwarded verbatim; A2 seal + discriminator + install3 GREEN (16:50Z)
+
+Sparks: FINAL sa-gated.sh on-disk (2533B, bash -n OK): set -euo
+pipefail, no tee, phase() aborts on non-zero via set -e (no DONE),
+test -s artifacts (llaminar2, CUDA binary, prerequisites.json,
+focus JUnit, CUDA JUnit + per-phase logs), CUDA absolute path,
+DONE last. Forwarded VERBATIM to Main's review with my check list
+(all pass) + ONE note: /w/sa-results (+receipt subdir?) persists
+from the 14:05Z failing run; mkdir -p won't clear it -> confirm
+driver tolerates pre-existing --output or clean before DRIVER
+(phase-1 FileExistsError class). A2 PIN = SEALED K14-A2CUDAB-
+1F92DCA1C (PartialQ6 0.88s green; 26/26 + single-GPU skip =
+UNQUALIFIED recorded). DISCRIMINATOR = MISMATCH confirmed (tree
+8b5a5043be… vs installed dbc86fd06e8b… = staleness ✓). INSTALL3
+= INST=0 GREEN (PASS native completed Broadcast compile (CPU
+contract only) + GIN 220 + threads 200 + shared-file PASS) — the
+progress_replay fix verified on GB10; new receipt written; .79
+NCCL current-for-T. Everything holds for Main's script pass ->
+gate resume at 91e0437c6 (K14-STAGEAGATE-91E0437C6). Pre-resume
+check dispatched to sparks (receipt-dir state).
