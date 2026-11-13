@@ -4062,3 +4062,33 @@ from the build phase (warm .o). BASE-OWNER NOTE routed: PR #43
 changes NCCL proof inputs -> every pre-PR nccl-out in the fleet goes
 stale at merge; install-refresh = merge-window checklist item.
 WSL x86 leg unaffected (CPU-only, no NCCL proofs).
+
+### .79 NCCL install-refresh AUTHORIZED (Main, 14:20Z, verbatim-recorded before dispatch)
+
+Main's sharper attribution: the input change = PR #43's own commit
+beb2389d7 "fix(nccl): expect the host ISA's trap signal in native
+replays" (Main's ARM-port fix: AArch64 traps SIGTRAP, x86 SIGILL;
+without it the canonical NCCL installer aborted on GB10) — changes
+exactly the 5 native-completed-broadcast scripts the GIN proof
+digests. .79's nccl-out predates the PR = stale BY DESIGN (the
+receipt correctly refuses a proof built from other script bytes).
+
+INSTALL-SYNC DECISION (Main's call, verbatim): "YES, refresh .79
+through the canonical installer only. sudo bash scripts/docker/
+install-nccl.sh inside the same cu13 builder image, from the gate
+tree at 609638aba. The scripts are identical to d5e04fdce, so the
+receipt is valid for the PR line too. Use the installer's normal
+output location, the one .79's gate configure points NCCL at. No
+hand-edited receipt, no skipped verify, no copying the .80 receipt.
+Before the refresh, record discriminator (a): the installed receipt
+prefix vs proof.py identity at the tree. Seal it with the gate as
+the staleness proof. Then sparks resumes the gate from the build
+phase (warm objects) with everything else unchanged. If the
+installer itself fails on GB10, that's a real PR #43 finding
+(beb2389d7 exists precisely to make it pass on AArch64). Stop and
+report it verbatim; don't work around it."
+
+MERGE-WINDOW CHECKLIST (Main + coordinator agreed; for the base
+owner): PR #43 changes the NCCL proof inputs (beb2389d7) -> every
+pre-PR NCCL install in the fleet needs install-nccl.sh re-run after
+the merge. Added to the post-merge cascade.
