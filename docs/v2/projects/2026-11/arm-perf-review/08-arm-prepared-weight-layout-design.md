@@ -681,16 +681,20 @@ canonical arm is a lane defect and blocks landing.
 
 ## 8. Phase plan (this branch; Unit green each phase; push per checkpoint)
 
-- **Current chain (seq 156/167):** `d5e04fdce` → `…` → `609638aba` →
-  `aa842a1be` → **`91e0437c6` (T)** → **`091e32db3` (T′, A2-R1 fixup)**;
-  PR side: `…` → `1011d0578` → `31dd1f7ee`. T is Main's
-  `fix(nccl)` dependency cherry-picked **verbatim** as ONE declared
-  commit (`git diff --name-only aa842a1be..T` is exactly
+- **Current chain (seq 156/167/180):** `d5e04fdce` → `…` → `609638aba` →
+  `aa842a1be` → **`91e0437c6` (T)** → `ee66b1ed6` (docs: T record) →
+  **`74104b6b6` (T′, A2-R1 code + prose)** → `c848e4061` (docs: T′
+  record) → **`03480d07e`** (Main's CUDA preflight TIMEOUT dependency,
+  cherry-picked verbatim) → this docs repair; PR side: `…` →
+  `1011d0578` → `31dd1f7ee`. T is Main's `fix(nccl)` dependency
+  cherry-picked **verbatim** as ONE declared commit (`git diff
+  --name-only aa842a1be..T` is exactly
   `scripts/docker/native-completed-broadcast/progress_replay.py`).
   T′ is the reviewer's A2 FINAL verdict fixup (noexcept bool/error
   contract on the host reference + audit + doc truthfulness). The
-  Stage-A gate runs early-surface at T and binds to T′.
->>>>>>> ed2dfdd9b (docs(arm-perf): record the A2-R1 fixup tip T' under the seq-167 verdict)
+  Stage-A gate runs early-surface at T and binds to T′; sparks/WSL
+  gates are pinned at `03480d07e` (the code tip; docs repairs do not
+  re-target them).
 
 - **Phase 0 — typed layout spine, zero byte change.** Layout enum, host
   constant, layout-aware stride functions (canonical arms delegate to the
