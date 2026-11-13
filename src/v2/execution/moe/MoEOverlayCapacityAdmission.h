@@ -26,12 +26,15 @@
 #include <stdexcept>
 #include <string>
 
-struct ClusterInventory;
 #include <utility>
 #include <vector>
 
 namespace llaminar2
 {
+    // Same entity as the DeviceInventory.h definition; never a second
+    // global-scope declaration that unqualified uses could find ambiguous.
+    struct ClusterInventory;
+
     /**
      * @brief Setup-time memory authority for one bound process-local device.
      *
