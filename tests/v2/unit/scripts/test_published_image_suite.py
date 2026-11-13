@@ -1312,7 +1312,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertEqual([check["context"] for check in checks], list(master_ruleset.REQUIRED_CHECKS))
         self.assertTrue(all(check["integration_id"] == 15368 for check in checks))
 
-    def test_develop_guard_requires_pr_and_only_dedicated_release_key_bypasses(self):
+    def test_develop_guard_requires_pr_and_scoped_admin_and_release_key_bypasses(self):
         current = {"name": "develop", "target": "branch", "enforcement": "disabled",
                    "conditions": {"ref_name": {"include": ["refs/heads/develop"], "exclude": []}},
                    "bypass_actors": [], "rules": [{"type": "deletion"},
@@ -1324,7 +1324,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
                          {"deletion", "non_fast_forward", "pull_request",
                           "required_status_checks"})
         self.assertEqual(proposed["bypass_actors"], [
-            {"actor_id": None, "actor_type": "DeployKey", "bypass_mode": "always"}])
+            {"actor_id": None, "actor_type": "DeployKey", "bypass_mode": "always"},
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}])
         checks = next(rule for rule in proposed["rules"]
                       if rule["type"] == "required_status_checks")["parameters"]
         self.assertTrue(checks["strict_required_status_checks_policy"])
@@ -1334,13 +1335,23 @@ class PublishedImageSuiteTests(unittest.TestCase):
             {"context": "Develop PR / Unit + host (AVX512)",
              "integration_id": 15368}])
         self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)
+        for previous in ([], master_ruleset.RELEASE_DEPLOY_KEY_BYPASS,
+                         list(reversed(proposed["bypass_actors"]))):
+            with self.subTest(previous=previous):
+                migrated = deepcopy(proposed)
+                migrated["bypass_actors"] = previous
+                self.assertEqual(master_ruleset.proposed_develop_ruleset(migrated), proposed)
         current["rules"].append({"type": "creation"})
         with self.assertRaisesRegex(ValueError, "unknown or missing guard"):
             master_ruleset.proposed_develop_ruleset(current)
-        proposed["bypass_actors"] = [
-            {"actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always"}]
-        with self.assertRaisesRegex(ValueError, "unrelated bypass actor"):
-            master_ruleset.proposed_develop_ruleset(proposed)
+        for actor in (
+                {"actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always"},
+                {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
+                {"actor_id": 4, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}):
+            with self.subTest(actor=actor):
+                proposed["bypass_actors"] = [actor]
+                with self.assertRaisesRegex(ValueError, "unrelated bypass actor"):
+                    master_ruleset.proposed_develop_ruleset(proposed)
 
     def test_release_bypass_rejects_any_other_writable_deploy_key(self):
         with patch.object(master_ruleset, "github_json", return_value=[

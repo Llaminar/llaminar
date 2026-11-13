@@ -2,10 +2,11 @@
 """Install release-branch protection after PR checks have run once.
 
 The master rule requires five GitHub Actions checks. The develop rule requires
-the image-bound device-free Unit check and blocks direct human pushes. Its only
-bypass is the repository's dedicated release-evidence deploy key, used to
-publish the certified post-squash two-parent ancestry join. Never grant the
-general GitHub Actions app bypass: it also arms ordinary PR auto-merge.
+both image-bound device-free Unit/host checks and blocks direct human pushes.
+Repository administrators may explicitly bypass develop checks through a PR;
+the dedicated release-evidence deploy key also publishes the certified
+post-squash two-parent ancestry join. Never grant the general GitHub Actions
+app bypass: it also arms ordinary PR auto-merge.
 Without that guard, the repository's auto-delete-on-merge setting could remove
 develop before its post-merge benchmark evidence is committed. Both proposals
 derive from the installed rulesets; run without ``--apply`` to inspect them.
@@ -37,6 +38,11 @@ DEVELOP_REQUIRED_CHECKS = (
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
 RELEASE_DEPLOY_KEY_BYPASS = [{"actor_id": None, "actor_type": "DeployKey",
                               "bypass_mode": "always"}]
+# GitHub's built-in repository administrator role is 5. PR-only bypass keeps
+# direct human pushes, deletion and force pushes protected.
+DEVELOP_BYPASS_ACTORS = [*RELEASE_DEPLOY_KEY_BYPASS,
+                         {"actor_id": 5, "actor_type": "RepositoryRole",
+                          "bypass_mode": "pull_request"}]
 
 
 def proposed_ruleset(current: dict) -> dict:
@@ -67,7 +73,7 @@ def proposed_ruleset(current: dict) -> dict:
 
 
 def proposed_develop_ruleset(current: dict) -> dict:
-    """Require the image-bound Unit gate, except for the dedicated release key."""
+    """Require both ISA gates with explicit admin PR and release-key exceptions."""
     if (current.get("target") != "branch" or current.get("name") != "develop"
             or current.get("conditions", {}).get("ref_name", {}).get("include")
             != ["refs/heads/develop"]):
@@ -77,7 +83,8 @@ def proposed_develop_ruleset(current: dict) -> dict:
                "pull_request", "required_status_checks"}
     if not {"deletion", "non_fast_forward"}.issubset(types) or not types.issubset(allowed):
         raise ValueError("develop ruleset contains an unknown or missing guard")
-    if current.get("bypass_actors", []) not in ([], RELEASE_DEPLOY_KEY_BYPASS):
+    if any(actor not in DEVELOP_BYPASS_ACTORS
+           for actor in current.get("bypass_actors", [])):
         raise ValueError("develop ruleset has an unrelated bypass actor")
     # A squash commit on master is not an ancestor of develop. The evidence
     # publisher must be able to join that exact master commit as parent two;
@@ -105,7 +112,7 @@ def proposed_develop_ruleset(current: dict) -> dict:
         }},
     ])
     return {"name": current["name"], "target": current["target"],
-            "enforcement": "active", "bypass_actors": RELEASE_DEPLOY_KEY_BYPASS,
+            "enforcement": "active", "bypass_actors": DEVELOP_BYPASS_ACTORS,
             "conditions": current["conditions"], "rules": rules}
 
 

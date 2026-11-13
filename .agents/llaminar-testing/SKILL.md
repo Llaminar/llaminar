@@ -66,6 +66,9 @@ The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
 only `@Llaminar/repository-approvers` on both protected branches. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.
+The develop CI ruleset also permits a PR-only repository-administrator bypass
+when the user explicitly authorizes a manual merge. Native auto-merge must still
+wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
 The `develop` push workflow remains on the AVX2 development host and

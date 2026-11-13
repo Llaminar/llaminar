@@ -34,8 +34,10 @@ release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
 The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
-and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
-are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
+and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
+Repository administrators have an explicit PR-only bypass for authorized
+manual merges. Direct human pushes, force pushes and deletion remain rejected.
+`.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
 when the PR targets `develop`. That installed copy uses the dedicated
@@ -229,8 +231,9 @@ that team's sole member is `@dbsanfte`. New reviewable commits dismiss stale
 approvals, and only `@dbsanfte` may dismiss reviews. Ordinary write access does
 not bypass these rules. The owner retains an explicit PR-only override for
 owner-authored changes; the existing release-evidence deploy-key exception
-preserves post-release evidence publication. Neither exception bypasses the
-separate CI rulesets. Keep approver-team membership restricted to the owner.
+preserves post-release evidence publication. The separate develop CI ruleset
+also permits an explicitly authorized PR-only administrator override; master
+CI requirements remain independent. Keep approver-team membership restricted to the owner.
 The check installer leaves this independent approval ruleset intact.
 
 ### ARC runner on the production host
@@ -489,8 +492,10 @@ check requirements, while retaining deletion and force-push protection.
 master squash merge, the release publisher records that exact master commit as
 the second parent of its fast-forward evidence commit, making the next master
 PR up to date without rewriting either branch. The publisher's dedicated
-`llaminar-release-evidence` writable deploy key is the sole ruleset bypass;
-the installer refuses any other writable deploy key. The general GitHub
+`llaminar-release-evidence` writable deploy key is the only direct-push bypass;
+develop also permits repository administrators to bypass through a PR. The
+installer retains these two exceptions and refuses unrelated actors, an
+unrestricted administrator bypass, or any other writable deploy key. The general GitHub
 Actions app must never bypass the `develop` ruleset, because the auto-merge
 workflow also runs under that app. Release automation supplies the private key
 through the `RELEASE_DEVELOP_DEPLOY_KEY` Actions secret only in the post-release
