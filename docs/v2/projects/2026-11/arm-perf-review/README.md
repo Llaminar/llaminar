@@ -2821,3 +2821,19 @@ arm-idea08 THINKING (tiering addendum — in flight), sparks tool:bash
 (compacted, 50% ctx — healthy), i08repair idle. A2 rider exports
 confirmed landed (i16rider/ + i16rider-t2/ paths verified earlier this
 session). No claim-vs-artifact drift anywhere.
+
+### REVIEWER SPINE FINDING (00:04Z, Main-confirmed): latent fail-closed gap in view/seal admission — Phase-1 entry item
+
+At spine d3e936fbd: WeightView.h:456-459 divides by the stride BEFORE
+rejecting an unimplemented layout; preparedUnitSections
+(PreparedFootprint.h:233-234) returns ZERO stride for
+InterleavedCompactA64 -> a compact descriptor reaches division by zero
+(also via MetadataSeal::validate :539-542) instead of precise fail-closed
+rejection. Spine test UnimplementedLayoutFailsClosed (:192-217) covers
+tables/footprints only, not view/seal admission. Latent (production
+never selects compact on the spine). Disposition: FIRST Phase-1 entry
+item — explicit zero-stride/unimplemented-layout rejection in view
+admission + seal before any division, view/seal-level regression; the
+fail-closed invariant generalizes to every future layout. Lane informed
+(folds into its Phase-1 queue alongside the tiering addendum). Plan
+holds until the six-question review completes.
