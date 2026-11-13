@@ -3944,3 +3944,19 @@ pricing scalars, LIST same-class validators in the commit. HOLD:
 reviewer still finishing A3 — ONE combined fixup (F1+F2+R1+R2+
 final items) on 569de492b when the verdict lands; Stage-A gate runs
 once on that tip. A2 2-cell rerun stands; A3 pin routed on source.
+
+### A2 BINDING SEALED (13:02Z): B2 fix verified; one env-skip -> pin call with Main
+
+K14-A2CUDAB-1F92DCA1C-20261113: PartialQ6PayloadPlane PASSED 0.88s
+(:121 gone); ExpertTierWeightKernels 26/26 PASSED + 1 SKIPPED =
+SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack
+(single-GPU GB10 env-conditional; the ctest FAIL_REGULAR_EXPRESSION
+no-skip policy flags the class). Green on every executable case.
+PIN CALL routed to Main: (a) pin now on executable-green + env-gate
+registration riding the combined fixup (coordinator's read; matches
+the repo's env-conditional precedent) or (b) hold for the gated re-
+run. A3 diagnostic seal K14-A3CUDAB-DIAG-848030067 recorded (20/22,
+2 expected reds) as the A3 source-pin evidence base. Sparks queued
+for the Stage-A gate at the combined tip (75G free). REMAINING:
+reviewer final A3 verdict -> ONE combined fixup (F1+F2+R1+R2+final
++env-gate) -> Stage-A gate once.
