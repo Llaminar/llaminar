@@ -3690,3 +3690,18 @@ frame shift -> stp/ldp split) so the constraint carries its reason.
 Chain: d0b43d81b (A2 tip) -> 848030067 (A3) -> 0607ca73a (doc,
 boundary-neutral — seals unaffected; left above the tips, no rebase
 churn). Next: census acceptance + both boundaries -> pins on green.
+
+### AUDIT 10:23Z EXCEPTION: a2d test phase failed operationally (caught pre-report)
+
+Artifact check (a2d = A2 boundary @ d0b43d81b): BUILD_OK but ctest
+died at CTestTestfile parsing — the target-set build never generated
+v2_integration_captured_transfer_channel_undiscovered_Debug.cmake
+which the full test registration includes; 0 tests ran; the script
+still printed DONE (pipeline-masked-exit class). CORRECTIVE
+dispatched: continue to the FULL build at d0b43d81b in the same tree
+(objects retained; witness generation should pass at base counts
+post-fix), rerun the A2 filter + JUnit + --no-tests=error, seal
+K14-A2CUDAB-D0B43D81B from the complete run; report the container
+re-census (step 1, still outstanding); runbook note — DONE markers
+must reflect per-phase exit codes. A3 boundary (848030067) queues
+after. .80 idle; sessions staged as designed; PR 43 OPEN.
