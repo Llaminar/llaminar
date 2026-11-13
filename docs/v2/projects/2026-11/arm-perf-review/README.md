@@ -3522,3 +3522,17 @@ binary) then A3 boundary K14-A3CUDAB-C24673B2A (adds full Unit gate +
 archive TU + A3 regressions); verbatim-first reporting enforced.
 Main routing: review targets = b37537145 (A2) + c24673b2a (A3);
 A1 acceptance still pending.
+
+### A2 BOUNDARY DISK-FULL (07:35Z): capacity not code; prune+resume dispatched
+
+a2c build at b37537145: all 3225 compiled targets CLEAN through the
+fix set (the source fixes held); the 41 "errors" = 39 ld failures +
+2 depfile writes, all "No space left on device" (df: 1.8T 100%, 94M
+free — tonight's three trees consumed the 81G headroom: a2b 38G +
+a2c 33G + a1h 5.6G + tips ~7G). DISPATCHED prune order: (1) build-a2b
++ tip-a2b (~40G, superseded failed attempt; logs stay as reviewer
+evidence); (2) build-gb10i 35G after verifying its seal evidence is
+outside the tree; (3) build-a1h+tip-a1h (artifacts preserved in
+a1h-results/, coordinator-verified) + old tip checkouts if <60G free.
+Then resume a2c (objects intact; failed links + ~440 targets only) ->
+test phase -> K14-A2CUDAB-B37537145 -> A3 boundary at c24673b2a.
