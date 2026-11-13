@@ -100,7 +100,7 @@ TEST_F(CUDAExpertTierWeightKernelsTest, PartialQ6UnitsCarryTheHighPlaneInsideThe
 {
     using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
     TestCUDAStream transfer_stream;
-    const auto* q6=nullptr;
+    const test::QuantizedVerifierFormatCase *q6=nullptr;
     for(const auto& candidate:test::quantizedVerifierFormats())
         if(candidate.label=="Q6_K"){q6=&candidate;break;}
     ASSERT_NE(q6,nullptr);
