@@ -4571,3 +4571,20 @@ per-phase exit+artifact reporting, DONE RC_ line, every red =
 Main's classification from JUnit, seal K14-STAGEAGATE-91E0437C6
 with discriminator+install3 evidence. Awaiting the gate result;
 lane's T' fixup in parallel (A2-R1 + doc truthfulness).
+
+### WSL probe answered (19:20Z per host clock): working, not silent; order approved
+
+WSL state from its own container artifacts: base-control armq-
+a512-d5e04fdce EXITED(1) = INFRA (cc1plus OOM-killed on the heavy
+parity TU Test__QwenSparseQueryParityEvidence.cpp at 2233s, 440/2779
+objects; NOT a source defect; retry at lower -j); head-gate armq-
+a512-609638aba EXITED(1) = the REAL RECORD-arity defect (tree
+retained 2.1G/440 objects for the BLOCKED seal); aa842a1be head
+gate NOT started. Approved order: (1) seal K14-STAGEAGATE-X86-
+609638ABA-BLOCKED (verbatim diagnostic + retained tree + in-tree
+verification + .79 convergence note); (2) aa842a1be head gate
+CPU-only -j5 (fresh tree); (3) base d5e04fdce retry -j5 (delta
+reference; OOM = infra note); (4) T=91e0437c6 acceptance record;
+(5) develop-control @118930745. Audit watch closed (answered —
+was mid-job, no silent failure). .79 early-surface gate + lane T'
+run in parallel. Main not waiting on WSL.
