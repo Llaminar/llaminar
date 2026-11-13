@@ -4930,3 +4930,30 @@ poll cycle -> verify container log/artifacts on recovery; if host
 dead -> .80 triage via sparks (ba2811e4c from origin). My lean:
 wait one cycle (container may be done; .80 restart duplicates).
 Main notified; qual T' gate may need a rerun post-recovery if lost.
+
+### MAIN: .80 focused ARM triage booked (ba2811e4c); WSL poll/harvest plan (21:53Z)
+
+Main: wait ONE poll cycle for WSL (no SSH retries beyond the lane's
+10-min poll; NO remote container kills); DON'T idle evidence: .80
+free (docker ps empty, Main-checked) -> Book .80 for sparks NOW:
+FOCUSED ARM triage @ ba2811e4c — Integration NEON_I8MM CPU-only
+(HAVE_CUDA=OFF), fresh tree, vendored onednn+cnpy; build ONLY the
+test executables owning the bucket-(b) names (MoEPipelineFixedMemory,
+MoEOverlayCapacityResolver, MoEOverlayDistributedResidencyProtocol,
+OrchestrationConfigDocument, ExpertTierEndpointLayoutIdentity,
+CPUTensorTP1PreparedStaticReplay, CPUExpertShardAccounting,
+CPUJoint*, AutomaticPlanningDiagnostics; resolve via ctest -N -V /
+V2_TEST_BUILD_TARGETS_<name>); ctest explicit regex, --no-tests=
+error, JUnit, gated-script pattern (fresh OUT, exit-gated, rc
+recorded), ONE job on the host; PASS = ARM-qualified; red =
+verbatim to the lane. COMPLEMENTS (not duplicates) the WSL x86
+triage — ISA-neutral; ARM evidence counts, x86 confirms later.
+CROSS-CHECK: 91e0437c6 early surface had NO per-test results
+(driver aborted at the TIMEOUT validation pre-run) — sparks to
+confirm from sa-DRIVER.log; the 03480d07e sealed gate's failed set
+= the real confirmation. WSL RECOVERY (Main): harvest finished
+triage/qual T' gate/byte-identity FIRST; qual lane re-plans the
+queue SERIALLY — ONE container at a time on that VM from now on
+(booking rule added to the runbook). DISPATCHED: sparks (.80 spec +
+cross-check confirm), lane (wait/poll/harvest plan + ledger
+continues).
