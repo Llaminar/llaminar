@@ -3584,3 +3584,31 @@ A2 boundary at b37537145 SUPERSEDED (a2c held ccache-warm, no test
 phase); re-fires at fixed tip + witness-discriminator resolution.
 Main reviews A3 after the A2 fixup (it rebases); wants both boundary
 results (build OK/fail + JUnit counts) when sealed.
+
+### A2-3 FIXUP bc91b0d71 + WITNESS FRAME-CHANGE (08:55Z): accounting artifact hypothesis
+
+A2-3 fixup (3 files +153/-46): named contract sectionPresence-
+SatisfiesSourceContract in the footprint header, both validators call
+it. Spec + one forced refinement: emins scoped source.has_emins &&
+encoding==CMS => has_emins (Q2_K ROTATED consumes emins into payload
+legitimately; unrotated Q2_K IS CMS so the specified regression still
+fails); !CMS => !has_emins; non-Q2_K CMS zero-filled OR dropped both
+pass; compensation REMOVED from validators (layout tables own it).
+Regression: Stage-B synthetic (no comp/no emins/Q6_K) passes; the
+three FAIL cases exact; 21-format canonical both rotations
+tautological. Gates: 12/12 + 297/297 + 5/5 + probes 0 errors.
+
+WITNESS REFRAME: branch moved g++-14 codegen but the 3 failing
+programs' movement = ACCOUNTING ARTIFACT — A1's view-field spans
+(metadata_secondary_/metadata_emins_) shifted the frame so a q15+q20
+stp/ldp PAIR (2 instr, adjacent slots) became str/ldr singles (4
+instr, non-adjacent); same registers/values, zero pressure change;
+witness counts instructions -> +2 = exactly 3->5/3->5/2->4. Mac
+g++-14 != container (directional only). Container census dispatched
+to sparks (seconds/side; prediction base 3/3/2 vs tip 5/5/4). If
+confirmed: Main/reviewer choose (a) Phase-0 restructure removing the
+pre-existing pair spill or (b) accounting/witness policy; if base
+also 5/5/4 = stale budgets = base gap. Sparks sequence: census ->
+A2 boundary at bc91b0d71 (target-set builds; witness not a seal
+blocker) -> A3 boundary at 365c29aeb. Main's A3 review can start on
+365c29aeb.
