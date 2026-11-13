@@ -3721,3 +3721,26 @@ bundle + census evidence + corrected diagnosis + witness provenance)
 for immediate successor request on green. With A4 in flight, every
 session productive; pins release with zero added latency once the
 boundaries land. Sparks: full-build corrective running (a2d).
+
+### A3 FULL REVIEW COMPLETE (11:10Z): Main OK with carried A3-B1; pins pre-staged
+
+Main full source review @ 848030067 OK: archive v8/exactly-v7/global
+pre-v7 + stride re-derivation in BOTH deserialize AND direct-MPI
+allocateTransferTarget (reviewer's before-allocation point met for
+stride identity); stream v4 hash; ABI 5 sealed/no-force/typed root
+mismatch; fabric layout equality; accessors section-derived. ONE
+BINDING GAP (A3-B1, pre-Stage-B, does NOT block the A3 pin; folded
+into A4): receiver EXECUTABILITY unchecked at admission — both
+receive paths admit any known-valid-tables layout; harmless today
+(canonical-only tables) but post-unlock an x86 rank would allocate +
+adopt compact bytes it cannot execute (view rejects only at
+fromPublished). FIX: execution-bound receive paths require
+admitted_layout == kHostPreparedLayout BEFORE allocation, typed
+rejection; byte-preserving relays name themselves explicitly.
+Regression: valid non-host v8 header rejected pre-allocation on both
+paths via the explicit-layout test hook (compact tables valid in
+test only). A3-B1 = the receive-side twin of A4's planning-time
+refusal (planning refuses; receivers fail closed if bypassed).
+MAIN PIN PACKAGES PRE-STAGED (A2: d0b43d81b lineage + census + std-
+mode/auto-nullptr bundle; A3: + A3-B1 flagged carried) — both go out
+on green boundaries. A4 (+A3-B1) in flight on the lane.
