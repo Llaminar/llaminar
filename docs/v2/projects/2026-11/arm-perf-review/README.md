@@ -4976,3 +4976,16 @@ a time, NEVER concurrent compiles, -j4/28g cap. Bridge back (qual
 message arrived 21:55Z); shell status = unknown until their report.
 Qual queue after recovery: harvest survivors -> T' gate -j4 ->
 byte-identity T' serialized -> develop-control, serial.
+
+### Qual lane recovery probe armed (21:56Z)
+
+Shell NOT back yet (intercom OK; VM up enough for messages, session
+cannot execute). 5-min probe (~22:00Z): free -m + uptime/kernel,
+docker ps -a survivors (03480d07e + ba2811e4c remnants incl. the
+lane's triage container fate), report state, then Main's serial
+queue (T' -j4 sole container -> byte-identity serialized ->
+develop-control last; no concurrency). Confirmed + acknowledged;
+lane's 10-min poll is session-side/minimal, no collision. .79
+sealed gate + .80 focused ARM triage (sparks) unaffected (parallel
+hosts); lane's root-cause ledger independent. Nothing else pending
+from me until the probe result.
