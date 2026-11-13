@@ -217,6 +217,35 @@ TEST(CPUNativeQuantisedPreparedLayout, UnimplementedLayoutFailsClosed)
         }
 }
 
+/** @test View and seal admission reject an unimplemented layout before any division (S1).
+ * The zero-stride sentinel of an unimplemented layout's section tables must
+ * surface as a precise admission rejection — never as a division operand in
+ * the extent overflow guard. Both published-view entry points
+ * (MetadataSeal::validate and fromPublished) enter through the one
+ * admission this exercises. */
+TEST(CPUNativeQuantisedPreparedLayout, UnimplementedLayoutIsRejectedByViewAndSealAdmission)
+{
+    for (const NativeQuantisedFormatInfo *source : kEncodingRepresentatives)
+    {
+        SCOPED_TRACE(traceSource(*source));
+        const NativeQuantisedPreparedByteFixture fixture(*source);
+        // The fixture owns canonical bytes; asking the actual seal admission
+        // to interpret them under a compact layout must fail closed.
+        CPUNativeQuantisedWeightDescriptor compact = fixture.descriptor;
+        compact.layout = CPUNativeQuantisedLayout::InterleavedCompactA64;
+        EXPECT_THROW(static_cast<void>(CPUNativeQuantisedMetadataSeal::validate(
+                         compact, fixture.bytes)),
+                     std::invalid_argument);
+        // A canonical seal must not admit a compact descriptor either: the
+        // layout is part of the sealed byte-range identity.
+        const CPUNativeQuantisedMetadataSeal canonical_seal =
+            CPUNativeQuantisedMetadataSeal::validate(fixture.descriptor, fixture.bytes);
+        EXPECT_THROW(static_cast<void>(CPUNativeQuantisedWeightView::fromPublished(
+                         compact, fixture.bytes, canonical_seal)),
+                     std::invalid_argument);
+    }
+}
+
 /** @test The production estimator carries the layout and prices canonical bytes exactly. */
 TEST(CPUNativeQuantisedPreparedLayout, FootprintCarriesLayoutAndCanonicalBytes)
 {

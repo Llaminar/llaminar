@@ -441,6 +441,16 @@ namespace llaminar2::cpu::native_quantised
                 (descriptor.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
                  descriptor.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
                 throw std::invalid_argument("Native CPU weight view requires a known source, encoding, layout and numerical policy");
+            // A layout whose section tables are not implemented fails closed
+            // HERE, before any division or extent work: the zero stride is a
+            // sentinel for unimplemented pricing/admission tables, never a
+            // value a division may consume (S1; MetadataSeal::validate and
+            // fromPublished both enter through this one admission).
+            const PreparedUnitSections admission_sections = preparedUnitSections(
+                descriptor.layout, descriptor.encoding, descriptor.is_asymmetric, *source);
+            if (!admission_sections.isValid())
+                throw std::invalid_argument(
+                    "Native CPU weight view requires a prepared layout with implemented section tables");
             // Explicit rotation may publish ExpandedInt8 for any original source.
             // Other encodings must retain the source-aware canonical preparation.
             if (descriptor.encoding != CPUNativeQuantisedEncoding::ExpandedInt8 &&
@@ -453,8 +463,7 @@ namespace llaminar2::cpu::native_quantised
             const std::int64_t blocks = (std::int64_t{descriptor.reduction_width} + 31) / 32;
             if (padded > std::numeric_limits<int>::max())
                 throw std::overflow_error("Native CPU padded output width exceeds its ABI");
-            const std::size_t stride = preparedInterleavedBlockStride(
-                descriptor.layout, descriptor.encoding, descriptor.is_asymmetric, *source);
+            const std::size_t stride = admission_sections.block_stride;
             const std::size_t chunks = static_cast<std::size_t>(padded / 64);
             if (chunks > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks) / stride)
                 throw std::overflow_error("Native CPU weight stream extent overflow");

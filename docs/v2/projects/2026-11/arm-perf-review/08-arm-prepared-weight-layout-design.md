@@ -6,7 +6,9 @@ operator-authorized 2026-11-12T20:58Z). Pinned to `d5e04fdce` (PR #43 tip;
 this lane's read-only base).
 All `file:line` citations resolve at that commit unless prefixed with another
 SHA. **§10 is the tiered-residency addendum (gate context, design-only,
-2026-11-12T23:37Z operator request) — no implementation authorization.**
+2026-11-12T23:37Z operator request) — no implementation authorization;
+§10.1 is corrected by §10.10 (premise error, seq 51) and §8 carries the
+queued Phase-1 entry items 0–2 (reviewer spine findings).**
 
 Inputs of record:
 
@@ -171,16 +173,19 @@ invocation; decode at these shapes is **dequant-compute-bound**, so the
    arm); ExpandedInt8/IQ3_S read pre-decoded bytes (the tournament's
    *winning* arm). Compaction here removes bytes those exact programs
    **never load** (§2.1 proves the read set equals the retained bytes per
-   family) and adds zero dequant arithmetic. There is no mechanism by which
-   the 7–8.6× price applies to it.
+   family — the reviewer's static pass finds this argument structurally
+   sound, seq 53) and adds zero dequant arithmetic. **That is the static
+   argument; it is not the performance guarantee. The binding guarantee is
+   the §7 measured gate on both ISAs.**
 2. **The tournament's bandwidth finding does transfer — as a ceiling on
    claims, not a cost.** CMS inline decode is the same class of per-block
    dequant work (scalar grid lane loads + transposes) the tournament
    measured as dominant. If decode is dequant-bound, removing unread bytes
-   is speed-neutral. This design therefore claims **capacity, not speed**;
-   its performance gate is non-regression under the operator's
-   same-or-better bar, with cache/stride side effects treated as noise to
-   measure, never a win to bank (§7, §8).
+   is *expected* to be speed-neutral — a hypothesis, not a construction
+   guarantee: stride/cache/prefetcher perturbations are real and are
+   measured, never argued away. This design therefore claims **capacity,
+   not speed**; its performance gate is non-regression under the operator's
+   same-or-better bar (§7, §8).
 
 Dead, explicitly: any proposal that trades pre-expanded bytes for inline
 decode (the tournament's shape) — measured-and-negative, sealed, not
@@ -266,25 +271,36 @@ Every retained load keeps its address expression and value; only the unit
 extent and the metadata section base (comp removal) change. This is the
 structural reason the tournament's 7.0–8.6× price cannot attach (§1.5).
 
-### 2.2 What is intentionally NOT compacted (V1)
+### 2.2 What is intentionally NOT compacted in L1 (V1) — and the L2 in-plan
+headroom
 
-- **Per-unit scale planes.** Primary/secondary stay per column per block.
-  Superblock dedup (store the shared base once per 8 units) would cut another
-  ~0.7–1.0 bpw for IQ2_S/IQ4_XS but changes view addressing across units —
-  an access-pattern change that no longer qualifies as zero-risk dead-byte
-  trimming under the post-tournament bar; **out of scope** for this lane
-  (§9.3), revisitable only with its own measured non-regression case.
-- **IQ2_S secondary width.** The coefficient is a byte (`≤ 255`,
-  `native_quantised_iq2s_scale::valid`, seal rule `WeightView.h:139`, check
-  sites `:82,:110,:533`) currently stored as uint16. Byte-packing saves 64
-  B/unit (6%) but adds a per-codebook layout branch through
-  seal/reader/packer and widens loads — access-pattern change, **out of
-  scope** (§9.3).
-- **IQ2_S 9th payload byte.** The ceil-to-group padding of 192 B/unit could
-  become a separate 64 B byte-plane section (832 B/unit) — a different
-  payload addressing family for the tail byte; access-pattern change,
-  **out of scope** (§9.3). The group form keeps one uniform payload
-  addressing family.
+The seq-51 premise correction (§10.10) re-classified the access-pattern
+items: the CMS/NLSS hot paths already decode their native payload inline,
+so tightening toward source bytes is a **load-shape change, not a program
+change** — the tournament's 7.0–8.6× never attaches to it. They are
+therefore **in-plan as L2** with their own measurement gates, no longer
+out-of-scope:
+
+- **L2-a — per-unit scale planes → superblock dedup (in-plan).**
+  Primary/secondary stay per column per block in L1. Superblock dedup
+  (store the shared base once per 8 units) would cut another ~0.7–1.0 bpw
+  for IQ2_S/IQ4_XS but changes view addressing across units. L2 enters the
+  plan with its own measured non-regression case (§7-class bench +
+  byte-equality), because the access-pattern change is real even though the
+  decode program is unchanged.
+- **L2-b — IQ2_S secondary width (in-plan).** The coefficient is a byte
+  (`≤ 255`, `native_quantised_iq2s_scale::valid`, seal rule
+  `WeightView.h:139`, check sites `:82,:110,:533`) currently stored as
+  uint16. Byte-packing saves 64 B/unit (6%) but adds a per-codebook layout
+  branch through seal/reader/packer and widens loads — same L2 gate.
+- **L2-c — IQ2_S 9th payload byte (in-plan).** The ceil-to-group padding of
+  192 B/unit could become a separate 64 B byte-plane section (832 B/unit) —
+  a different payload addressing family for the tail byte; same L2 gate.
+  The L1 group form keeps one uniform payload addressing family.
+
+L1 (this design) remains exactly the dead-byte trim with the access pattern
+unchanged; L2 items are sequenced behind L1's own gate and are not part of
+the Stage-A/A0–A4 chain (§8).
 
 ### 2.3 Sizing and the honest capacity claim (35B, census carrier split)
 
@@ -294,11 +310,14 @@ structural reason the tournament's 7.0–8.6× price cannot attach (§1.5).
 - IQ3S/ExpandedInt8 outliers (blk.39): ≈ −0.03 GB.
 - Q6K (output.weight, token_embd, 3 down tensors): unchanged.
 - **Total: 26.62 → ≈ 20.6 GB prepared quantised (−22.6%, −6.0 GB)**; plan-BOM
-  total 34.9 → ≈ 28.9 GB. Resident expert-byte capacity (gate/up+down)
-  rises ≈ 35% per admitted CMS byte and ≈ 10% per NLSS byte. The remaining
+  total 34.9 → ≈ 28.9 GB. **Capacity arithmetic (corrected, seq 55):** CMS
+  units 1536→1024 B = **−33% bytes ⇒ +50% units per admitted byte**; NLSS
+  1408→1280 = −9% ⇒ +10%; expert-routed totals 23.9→17.9 GB = −25% ⇒
+  **≈ +34–35% resident routed experts per admitted tier**. (An earlier
+  draft's “−6.0 GB ≈ 26% more resident experts” wrongly quoted the
+  prepared-byte reduction as the capacity increase.) The remaining
   gap to "source-sized" (15.34 GB) is scale-plane replication plus the
-  retained group granularity — the out-of-scope access-pattern headroom
-  catalogued (and excluded) in §2.2.
+  retained group granularity — the L2 in-plan headroom catalogued in §2.2.
 
 **What this capacity is worth — quantified against the coordinator's
 question ("which topologies does 26.6 GB block that 20.6 GB admits?"):**
@@ -310,16 +329,20 @@ question ("which topologies does 26.6 GB block that 20.6 GB admits?"):**
 - The value is **residency headroom on memory-bound axes**:
   (i) ExpertOverlay CPU/expert tiers are admitted by bytes
   (`PhysicalMemoryAuthority`, `--expert-tier … memory-mb /
-  max-experts-per-layer`): −6.0 GB ≈ 26% more routed experts resident per
-  admitted tier, i.e. fewer cross-tier migrations per token window on the
-  same hardware — a capacity/steady-state effect, **not** a per-token
-  speedup claim; (ii) KV/context headroom (+6 GB) on UMA hosts where KV,
-  weights and GPU workspaces share one pool (idea 2's live-admission gap
-  is the complementary piece); (iii) multi-model packing headroom.
-- **Speed expectation: neutral.** Per §1.5, CMS/NLSS decode is
-  dequant-compute-bound inline work; removing unread bytes does not remove
-  arithmetic. The binding gate is same-or-better measured performance
-  (§7/§8); anything slower is rejected and the lane reverts.
+  max-experts-per-layer`): −6.0 GB (−22.6% of prepared; −25% of
+  expert-routed) ⇒ **≈ +34–35% more routed experts resident per admitted
+  tier** (§2.3 arithmetic), i.e. fewer cross-tier migrations per token
+  window on the same hardware — a capacity/steady-state effect, **not** a
+  per-token speedup claim; (ii) KV/context headroom (+6 GB) on UMA hosts
+  where KV, weights and GPU workspaces share one pool (idea 2's
+  live-admission gap is the complementary piece); (iii) multi-model
+  packing headroom.
+- **Speed expectation: neutral — as a gated hypothesis, not a construction
+  guarantee.** Per §1.5, CMS/NLSS decode is dequant-compute-bound inline
+  work; removing unread bytes should not remove arithmetic, but
+  stride/cache effects are measured, never assumed away. The binding gate
+  is same-or-better measured performance (§7/§8); anything slower is
+  rejected and the lane reverts.
 
 Because the prize is capacity rather than a blocked-topology unlock, the
 lane's expected value is materially lower than the original brief assumed;
@@ -331,7 +354,8 @@ by this design — it belongs to the idea-16/B4 LM-head lane.
 
 ---
 
-## 3. Per-ISA layout identity — x86 unchanged **by construction**
+## 3. Per-ISA layout identity — x86 bytes unchanged by the host selector;
+performance by gate
 
 A typed layout dimension, not a runtime mode:
 
@@ -370,10 +394,15 @@ inline constexpr CPUNativeQuantisedLayout kHostPreparedLayout =
 - **The archive/wire records the layout** (§7) so mismatches are diagnosed,
   never silently reinterpreted.
 
-Operator bar ("x86 performance unchanged") is met structurally: every x86
-byte-producing and byte-consuming path compiles to the same code with the same
-strides; the only x86-visible changes are the added enum, the widened
-signatures, and the archive/wire version field.
+Operator bar ("x86 performance unchanged"): **byte identity** is selector-
+based — every x86 byte-producing and byte-consuming path compiles to the
+same code with the same strides (`kHostPreparedLayout` never selects
+compact off AArch64; the only x86-visible changes are the added enum, the
+widened signatures, and the archive/wire version field), and the x86
+byte-equality suites prove it. The **performance** half of the bar is
+gate-based, not construction-based: x86 cells in the §7 bench and the
+canonical CI matrix carry it, and any measurable x86 regression reverts the
+change.
 
 ---
 
@@ -543,12 +572,15 @@ repaired-after-the-fact condition.
    receiving CPU endpoint's layout (manifest carries it; conversion kernels
    parameterized by the layout scalars).
 3. **Cross-ISA CPU tier movement** (x86 rank ↔ AArch64 rank exchanging
-   prepared CPU experts) becomes a typed rejection at the manifest with a
-   precise diagnostic. It is not silently converted (no hidden repack path,
-   no fallback). Mixed-ISA clusters keep working for every topology that
-   does not move prepared CPU weights across ISAs; if a workload needs that
-   movement, an explicit conversion lane is a separate operator decision.
-   The rejection is registered as a focused regression.
+   prepared CPU experts) is a typed rejection **as direct prepared-byte
+   movement** — no hidden repack path, no fallback; the rejection is
+   registered as a focused regression. The commissioned alternative is a
+   **typed conversion targeting the remote endpoint's layout** — the same
+   parameterized-conversion machinery §6.2 uses for GPU→CPU demotion
+   (manifest carries the receiving endpoint's layout; conversion kernels
+   take the layout scalars) — as its own operator-approved lane. Mixed-ISA
+   clusters keep working for every topology that does not move prepared
+   CPU weights across ISAs.
 4. **Cache keys**: prepared-weight identity = (archive version, encoding,
    layout, source identity, geometry). Old keys cannot alias new bytes — the
    version bump changes the key space. Estimator byte-equality preflight
@@ -559,9 +591,12 @@ repaired-after-the-fact condition.
    descriptor layout, strides and extent against one authority; the seal
    binds the layout into the byte-range identity (`admits()` compares the
    full descriptor, `WeightView.h:168-182`).
-6. **Complete retirement**: after the AArch64 compact layout lands, no
-   AArch64 production path can materialize, admit, execute or move
-   canonical-layout CPU prepared weights. The canonical packer branches for
+6. **Complete retirement**: after the AArch64 compact layout is activated,
+   no AArch64 production path can materialize, admit, execute or move
+   canonical-layout CPU prepared weights **for its own residency**. Bytes
+   whose destination is a remote x86 endpoint are not "canonical weights
+   resident on AArch64" — they flow through the §6.3 typed conversion for
+   that remote endpoint's layout. The canonical packer branches for
    comp-bearing encodings remain compiled on AArch64 only where shared
    constexpr/table code requires them (pricing); they are unreachable from
    production entries.
@@ -637,11 +672,38 @@ canonical arm is a lane defect and blocks landing.
 - **OPERATOR GATE — capacity value vs ABI cost.** After Phase 0 the lane
   reports and waits: the tournament removed the decode-speed prize (§1.5),
   no measured topology is admission-blocked (§2.3), and the remaining
-  deliverable is −6.0 GB resident prepared bytes (−22.6%) at zero
-  arithmetic risk, for the price of the full ABI chain (§4) and its review.
-  Continue to Phase 1 only on an explicit operator confirmation that the
-  capacity/residency value justifies the churn; otherwise the lane closes
-  with the design + Phase 0 spine as its artifact.
+  deliverable is −6.0 GB resident prepared bytes (−22.6%; ≈ +34–35%
+  resident routed experts) at zero arithmetic risk, for the price of the
+  full ABI chain (§4) and its review.
+  **GATE LIFTED 2026-11-13T00:36Z (seq 55)** — the consolidated plan is
+  cleared by Main + coordinator; the operator flow is satisfied (details
+  settled → reviewer pass, #212 folded in → plan decided → start). Single
+  writer on this branch.
+- **Consolidated stage plan (seq 55, reviewer-accepted structure).** The
+  production selector stays **canonical until the whole
+  consumer/admission chain is layout-aware** — activation is Stage B, not
+  part of Stage A. **Stage A = layout-aware chain, ZERO byte change:**
+  `kHostPreparedLayout` stays canonical; the compact tables become real
+  pure-data entries exercisable through an explicit layout argument in
+  unit tests only.
+  - **A0 — S1 fail-closed + doc corrections** (one checkpoint push): entry
+    item 0 below, plus the doc corrections folded into the same push
+    (gate-based claims only; capacity math −33%/+50%/≈+35%; §6.3/§6.6
+    typed-conversion framing; §2.2 L2 in-plan; §10.10).
+  - **A1 — section-presence authority everywhere**, derived from
+    `PreparedUnitSections`, never from the encoding alone (Main-verified
+    citations): entry items 1 and 2 below, extended to every producer
+    (direct int8, deferred, rotation), every copier (gather/scatter/direct),
+    the absent-emins accessors (`WeightView.h:367-371`,
+    `PackedWeights.h:446-451` — fail explicitly), and the host reference
+    conversion (`ExpertTierWeightStream.cpp:1344-1356` / `:1554-1565`).
+  - **A2 — endpoint-layout GPU conversion**; **A3 — identity/transport/wire
+    v8**; **A4 — planning/inventory/PMA**. Same dispatch pattern, after
+    A0+A1; A3's detail is the former Phase-2 bullet below.
+  - **Stage B — activation** (the production selector moves to compact on
+    AArch64; packer compact placement `kHostPreparedLayout`-driven;
+  view/seal/NEON admission require it): held behind the reviewer's
+  **Gate A**, fed by Stage-A per-checkpoint evidence.
 - **Phase 1 — entry item 0 (reviewer spine finding, Main-confirmed
   2026-11-13, seq 45): fail-closed admission before any division.** At
   `d3e936fbd`, `admitStructure` (`CPUNativeQuantisedWeightView.h:456-459`)
@@ -661,18 +723,51 @@ canonical arm is a lane defect and blocks landing.
   the same way — a layout without implemented section tables is rejected at
   admission with a precise diagnostic; the zero stride is a sentinel for
   pricing/admission tables, never a value a division may consume.**
-- **Phase 1 — compact layout on AArch64.** Compact stride tables; packer
-  compact placement (`kHostPreparedLayout`-driven); view/seal/NEON admission;
-  estimator overloads with layout (host default + explicit target).
-  ARM-local Unit: accessor bit-identity vs canonical for every format;
-  execution vs scalar reference byte-exact for every encoding/family/tile.
-  x86: untouched bytes, all green.
-- **Phase 2 — archive/wire/movement versioning.** Archive v8 + layout field
+- **Phase 1 — entry item 1 (reviewer #212, Main-confirmed in source, seq
+  53): tier-stream section copy is encoding-only.**
+  `ExpertTierWeightStream.cpp:755-762` (`copyCPUEncodedColumn`): for every
+  CMS encoding it copies two u16 planes plus one u32 emins plane at
+  `data_stride + 4×columns` on **encoding-only** logic. With IQ2_S compact
+  (payload 768, stride 1024) the emins access begins outside the trimmed
+  unit; full-unit memcpy paths can hide it, but the partial/rectangular
+  paths use this helper. Fix: derive plane presence/offsets from the
+  layout's `PreparedUnitSections` — emins is present only when
+  `has_emins` (Q2_K sources).
+- **Phase 1 — entry item 2 (reviewer #212, Main-confirmed in source, seq
+  53): packer writes are section-derived but not section-guarded.**
+  `CPUNativeQuantisedWindowPacking.inc` — the CMS emins write (at
+  `sections.emins_offset`, currently unconditional for CMS) and the non-CMS
+  compensation write (at `sections.compensation_offset`, unconditional for
+  nibble/expanded) are safe under canonical Phase 0, but must be
+  **presence-guarded** from `PreparedUnitSections` before compact
+  activation: compact IQ2_S has no emins section and compact
+  nibble/expanded have no compensation section — an unguarded write lands
+  at offset 0 inside the payload.
+- **Focused regressions (entry items 1+2):** (a) a mixed-stride
+  partial/rectangular tier copy with IQ2_S and Q2_K units side by side;
+  (b) packer section-presence checks.
+- **Design invariant (reviewer's, adopted): every writer and copier derives
+  section presence and offsets from `PreparedUnitSections` — no
+  encoding-only assumption survives.**
+- Reviewer status note (seq 53): the NEON compute read-set argument for the
+  Phase-1 compact layout is structurally sound (static pass; final report
+  pending, separating these activation gaps from the Phase-0 division
+  defect).
+- **Stage B activation detail (former Phase 1 body).** Compact stride
+  tables become production-selected; packer compact placement
+  (`kHostPreparedLayout`-driven); view/seal/NEON admission require the
+  host layout; estimator overloads with layout (host default + explicit
+  target). ARM-local Unit: accessor bit-identity vs canonical for every
+  format; execution vs scalar reference byte-exact for every
+  encoding/family/tile. x86: untouched bytes, all green. Sequenced behind
+  Gate A.
+- **A3 detail (former Phase 2) — archive/wire/movement versioning.** Archive v8 + layout field
   + rejection tests; tier-stream/remote-projection/slot-pool/residency
   fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
   comp write (CMS kernels already parameterized); cross-layout rejection
   regressions; estimator/BOM byte-equality per-ISA in preflight.
-- **Phase 3 — bench + focused preflight regressions.** The §7 bench in the
+- **Gate-A evidence (former Phase 3) — bench + focused preflight
+  regressions.** The §7 bench in the
   performance namespace (non-regression reading); focused regressions
   registered in `ProductionTestPreflight` for the ABI invariants (layout
   identity mismatch, archive version rejection, estimator-byte-equality
@@ -688,8 +783,10 @@ canonical arm is a lane defect and blocks landing.
 1. **Lane-value assessment (the coordinator's close flag).** My reading:
   **do not close, but re-baseline expectations.** The design is sound and
   the tournament negative does not attach to it (§1.5: zero decode-program
-  change, read set preserved per family), so it cannot lose the operator's
-  performance bar by construction — but its deliverable is now purely
+  change; the read-set argument passed the reviewer's static pass, seq 53),
+  so the static case for neutrality is strong — but the performance bar is
+  enforced by the §7/§8 measured gate, not by construction, and its
+  deliverable is now purely
   capacity/residency (−6.0 GB, no blocked topology today), against a real
   ABI-chain cost. That trade is an operator call, hence the §8 gate. If the
   operator weighs only decode performance, the lane should close at the
@@ -698,15 +795,17 @@ canonical arm is a lane defect and blocks landing.
 2. **Cross-ISA CPU expert tiers** are typed-rejected (§6.3). If a serving
   topology needs x86↔ARM prepared-CPU movement, an explicit conversion lane
   must be commissioned — this lane does not build it.
-3. **V2 refinements** (§2.2) are **out of scope under the post-tournament
-  bar**, not merely deferred: superblock scale dedup and secondary
-  byte-packing change the access pattern (cross-unit scale addressing /
-  byte-widening loads), so they no longer qualify as zero-risk dead-byte
-  trimming. They would need their own measured non-regression case.
+3. **L2 refinements (§2.2) are in-plan behind their own gates, not part of
+  Stage A.** Superblock scale dedup, secondary byte-packing and the 9th
+  byte-plane change the access pattern (cross-unit scale addressing /
+  byte-widening loads); the seq-51 correction (§10.10) moved them from
+  out-of-scope to in-plan L2 because the CMS/NLSS decode programs are
+  unchanged — but each enters only with its own measured non-regression
+  case, sequenced after L1's gate.
 4. **Microarchitectural stride effects.** Changing the unit stride (e.g.
   1536→1024) perturbs DRAM row/bank and prefetcher behavior in principle;
-  the claim "zero speed risk" holds at the program level (identical loads)
-  but not against µarch noise. The §7 noise band (canonical self-run) and
+  the program-level read-set identity is the static argument, not a
+  performance guarantee. The §7 noise band (canonical self-run) and
   the E2E same-or-better gate are the binding protections; a measurable
   regression reverts the change.
 5. **ARM CI surface**: compact-layout tests are ARM-gated like the existing
@@ -717,13 +816,15 @@ canonical arm is a lane defect and blocks landing.
   decode-program trades for the IQ3_S family and the bandwidth-bound
   assumption at those shapes — nothing more. This design cites it as the
   reason its claims are capacity-only.
-7. **Tiered residency (§10)** is sized as a gate-context alternative: it can
-  beat Phase-1-only on resident bytes only with source-scale tier storage
-  (variant T2) and a hot set below ≈49 experts/layer, at the price of a
-  second representation in the ABI, a representation-aware migration cost
-  model, and — for its cold-serve path — production program-B kernels
-  across the full format sweep. The hot-set cardinality on real traffic is
-  unmeasured and is the decisive unknown for that option.
+7. **Tiered residency (§10)**: the T2-for-CMS branch was **invalid and is
+  corrected (§10.10, Main-found premise error, seq 51)** — the CMS/NLSS
+  hot paths already decode their native payload inline, so a source-size
+  form for those families is the same program with load-shape changes
+  only. Tiering survives solely for expanded-baseline families (≈0.7 GB
+  on the 35B — negligible), and the hot-set cardinality measurement is
+  **off the critical path**. The remaining §10 content (promotion cost,
+  cold-miss options, prefill interaction) stands for the
+  expanded-baseline families where applicable.
 
 ---
 
@@ -742,13 +843,24 @@ each. This section sizes that option from sealed inputs only (census
 K14-I08A-CENSUS-5C2CEF47, tournament K14-I08A-TOURNEY-3B109793C, idea-16
 per-step attribution, idea-25 prefill split). No new runs; no implementation.
 
-### 10.1 Three representations, two tier variants
+### 10.1 Three representations, two tier variants (corrected — §10.10)
+
+**Premise correction (Main-found, coordinator source-verified, seq
+51, 2026-11-13):** the original table attributed the tournament's program
+B (inline grid-decode, 7.0–8.6×) to every source-scale form. Verified in
+source at `d5e04fdce`: the CMS hot path (`dotHalfRowPairs` Codebook
+13/14/17, `CPUNativeQuantisedMultiScaleKernels.h:399-416` and `:470`)
+loads the unit's native grid words and decodes them **in-kernel** via
+`Ops::gridPair` — program A already includes the grid decode; the 1536 B
+unit is native payload + layout overhead, not decoded weights (§1.5
+documented this; the original §10.1 contradicted it). Corrected model —
+the source-scale form's program is family-dependent:
 
 | Representation | Bytes (35B) | Decode program | Speed |
 |---|---|---|---|
-| (a) canonical expanded (today) | 26.62 GB | A: inline gather from native payload regions | X (measured baseline) |
+| (a) canonical (today) | 26.62 GB | A per family: CMS/NLSS decode the native payload inline (grid/LUT); IQ3S/ExpandedInt8 families serve pre-decoded planes | X (measured baseline) |
 | (b) Phase-1 compact (§2) | 20.6 GB | A unchanged — dead bytes never loaded (§2.1 read-set proof) | ≈X claimed, Phase-3 bench-gated |
-| (c) source-scale compact (tournament arm) | ≈15.3 GB | B: inline grid-decode | X/7.0–8.6 (sealed, IQ3_S family) |
+| (c) source-scale (~source bytes) | ≈15.3 GB | **inline-decode families (CMS, NLSS)**: same program A, load-shape changes only. **expanded-baseline families (IQ3S, ExpandedInt8/Q5_K/Q8_0)**: program B — inline grid-decode of what their baseline pre-decodes | CMS/NLSS: no sealed penalty (the tournament did not price this class). Expanded families: X/7.0–8.6 (sealed, IQ3_S family) |
 
 The tiered option holds (b) or (c) at rest and expands to (a) on promotion:
 
@@ -758,14 +870,20 @@ The tiered option holds (b) or (c) at rest and expands to (a) on promotion:
   outcome. If §2.1 holds, promotion buys nothing measurable; if the bench
   refutes it, T1 is the fallback that keeps the −4.5 GB tier trim while
   restoring canonical hot-path speed.
-- **T2 — source-scale tiers**: tiers hold (c)-grade bytes (~source). This is
-  the only variant that beats Phase-1-only on resident bytes. Cold experts
-  either serve through program B (the sealed 7.0–8.6× on those reads) or
-  block until expanded; promotion is grid-decode + repack.
+- **T2 — source-scale tiers**: tiers hold (c)-grade bytes (~source).
+  **Valid only for expanded-baseline families** — where (c) genuinely
+  needs program B or expansion before it serves at speed. For
+  inline-decode families (the 35B's CMS gate/up + NLSS down carrier), (c)
+  is program A with load-shape changes: no tiering is needed to reach
+  ~source bytes on the hot path (§10.10). Cold experts in valid T2 either
+  serve through program B (the sealed 7.0–8.6× on those reads) or block
+  until expanded; promotion is grid-decode + repack.
 
 The operator's framing ("~source bytes in the tier pool") is T2. Both
 variants reuse the same promotion fabric; they differ in tier format,
-cold-serve path, and kernel surface (§10.5, §10.8).
+cold-serve path, and kernel surface (§10.5, §10.8). **The 35B T2 rows in
+§10.3/§10.6/§10.8 are superseded for the CMS/NLSS bulk by §10.10 — they
+survive only for the expanded-baseline families (≈0.7 GB on the 35B).**
 
 ### 10.2 Per-instance arithmetic (census-anchored)
 
@@ -965,3 +1083,45 @@ rounding. The hot-set cardinality, the Phase-3 bench outcome, and the
 representation-aware migration cost model are the three inputs that would
 change this table, and none of them exists today. Implementation of anything
 in this section remains gated on the operator's CONTINUE/CLOSE decision.
+
+### 10.10 Premise correction (Main-found, coordinator source-verified, seq 51) and its consequences
+
+**The error (in the original §10.1):** the canonical CMS form was treated
+as "expanded" and the tournament's program B (inline grid-decode,
+7.0–8.6×) was attributed to the source-scale tier form for **all**
+families. Source-verified at `d5e04fdce` and re-verified on this branch:
+the CMS hot path (`dotHalfRowPairs` Codebook 13/14/17,
+`CPUNativeQuantisedMultiScaleKernels.h:399-416` and `:470`) loads the
+unit's native grid words and decodes them in-kernel via `Ops::gridPair`;
+the packer writes the source's own packed payload bytes verbatim
+(`CPUNativeQuantisedWindowPacking.inc`, CMS payload branch). The canonical
+1536 B unit is native payload + layout overhead — not decoded weights.
+This was already §1.5's argument; the original §10.1 contradicted it. Only
+the expanded-baseline families (IQ3SExpandedSourceScale, ExpandedInt8) have
+pre-decoded canonical bytes, and only for them does source-scale storage
+require program B or expansion.
+
+**Consequences (accepted into the plan):**
+
+1. **T2-for-CMS is invalid.** The 35B's expert carrier (CMS gate/up + NLSS
+   down) is entirely inline-decode families: a source-size form is the
+   same program A with load-shape changes only. Phase 1 (L1) plus the §2.2
+   L2 access-pattern items reaches ~source bytes (≈ 15.8–16 GB potential:
+   gate/up 10.74 → ~6.9 GB, down 6.21 → ~5.3 GB) **on the hot path without
+   any tiering**, each L2 item behind its own measurement gate.
+2. **T2 tiering survives only for expanded-baseline families** — on the
+   35B: blk.39 IQ3S (0.64 GB) + dense ExpandedInt8 (0.04 GB) ≈ 0.7 GB,
+   negligible. The §10.4 promotion-cost and §10.3/§10.6 floor arithmetic
+   stands where applicable (those families only); the 35B T2 rows are
+   superseded for the CMS/NLSS bulk.
+3. **The hot-set cardinality measurement (§10.3's decisive unknown) drops
+   off the critical path** — it was T2's dependency.
+4. **Mirror option (design record):** the same source fact means today's
+   CMS hot path already runs the tournament's SLOW class (inline
+   grid-decode is the compact arm's program class). The mirror trade —
+   pre-expand IQ2_S for speed at +bytes (≈ the census's +9.2 GB carrier,
+   6.0 → 9.5 bpw) — is flagged at plan level with a measurement gate; the
+   sealed IQ3_S result (pre-decoded 8.6× faster at M=1) is the positive
+   evidence for that family class. It is a separate lane with its own
+   economics; this lane's bench gate stays non-regression for
+   compact-for-capacity.
