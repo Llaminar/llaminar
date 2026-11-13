@@ -2854,3 +2854,27 @@ mem_access is not calibrated DRAM traffic; analytic bound (~0.75GB/token
 active set) remains normative; upper-bound direction only strengthens
 the conclusion. Relayed to Main (closes its Q1 plan input). Both hosts
 free.
+
+### IDEA-08 TIERING ADDENDUM VERIFIED (00:14Z): 3b00c69d7 + coordinator units correction
+
+Lane deliverable on origin (docs-only, +274 lines): §10 tiering sizing +
+spine finding as Phase-1 entry item 0. Headlines: hot path reads
+canonical expanded by construction; R(h) = 15.96 + 0.0939h GB;
+break-even vs Phase-1-only h < ~49/layer (net-replace ~107), vs
+canonical h < ~113; combined floor 16.3-16.7 GB; promotion 54-105us
+per instance (tournament tile = expert tensor shape, direct
+translation), repays 2-3 activations, fabric-throttled fill (~25-30min
+for h=32/layer at defaults); cold-miss serve-compact-slow +0.3%/inst
+(T2-only, needs program-B kernel sweep), block-until-expanded rejected;
+cold-heavy prefill +8-32% marginal, expand-on-prefill not viable; T1 =
+insurance variant (no bytes). DECISIVE UNMEASURED INPUT: hot-set
+cardinality h on real routing traffic (no seal carries it) — candidate
+evidence step: rider-protocol run with residency demand-histogram
+export (DecodeExpertHistogram) to measure h on the 35B; Main's call at
+consolidation.
+COORDINATOR UNITS CORRECTION (recorded + sent to Main): the earlier
+"25.31 tok/s = 39.5us/token" was wrong — it is 39.5 MS/token.
+Conclusion unchanged and strengthened with Main's corrected 0.75GB/
+token active set: expert-read bandwidth ceiling ~363 tok/s vs 25.31
+achieved (>=14x slack); Q1 artifact (10-21GB/s whole-run, 4-8% of
+peak, ~34% stall/access) consistent.
